@@ -1,0 +1,13 @@
+[package]
+name = "bqlite"
+description = "Embeddable behavioral query engine — temporal pattern matching, funnels, retention, and cohort analysis over entity event streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bqlite-core = { workspace = true }
+bqlite-ast = { workspace = true }
+bqlite-parser = { workspace = true }
+bqlite-engine = { workspace = true }

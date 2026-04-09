@@ -1,0 +1,11 @@
+[package]
+name = "bqlite-parser"
+description = "BQL text parser: query text → AST"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bqlite-ast = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python extras
+.env
+*.whl
+venv/
+.venv/
+
+# bqlite databases (test artifacts)
+*.bqlite/

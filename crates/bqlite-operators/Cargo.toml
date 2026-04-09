@@ -1,0 +1,14 @@
+[package]
+name = "bqlite-operators"
+description = "Physical operator implementations: scan, filter, sequence, funnel, retention, etc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bqlite-core = { workspace = true }
+bqlite-storage = { workspace = true }
+bqlite-planner = { workspace = true }
+arrow = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "bqlite-engine"
+description = "Execution orchestration: plan execution, memory management, spill-to-disk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bqlite-core = { workspace = true }
+bqlite-storage = { workspace = true }
+bqlite-planner = { workspace = true }
+bqlite-operators = { workspace = true }
+arrow = { workspace = true }
+thiserror = { workspace = true }

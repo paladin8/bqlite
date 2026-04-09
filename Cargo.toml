@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/bqlite",
+    "crates/bqlite-core",
+    "crates/bqlite-ast",
+    "crates/bqlite-storage",
+    "crates/bqlite-parser",
+    "crates/bqlite-planner",
+    "crates/bqlite-operators",
+    "crates/bqlite-engine",
+    "crates/bqlite-cli",
+    "crates/bqlite-ffi",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/paladin8/bqlite"
+
+[workspace.dependencies]
+# Internal crates
+bqlite-core = { path = "crates/bqlite-core" }
+bqlite-ast = { path = "crates/bqlite-ast" }
+bqlite-storage = { path = "crates/bqlite-storage" }
+bqlite-parser = { path = "crates/bqlite-parser" }
+bqlite-planner = { path = "crates/bqlite-planner" }
+bqlite-operators = { path = "crates/bqlite-operators" }
+bqlite-engine = { path = "crates/bqlite-engine" }
+bqlite-ffi = { path = "crates/bqlite-ffi" }
+
+# External dependencies
+arrow = "54"
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

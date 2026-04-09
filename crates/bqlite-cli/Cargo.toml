@@ -1,0 +1,15 @@
+[package]
+name = "bqlite-cli"
+description = "Command-line interface for bqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bqlite"
+path = "src/main.rs"
+
+[dependencies]
+bqlite-engine = { workspace = true }
+anyhow = { workspace = true }

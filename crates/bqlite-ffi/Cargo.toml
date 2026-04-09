@@ -1,0 +1,11 @@
+[package]
+name = "bqlite-ffi"
+description = "C ABI surface for PyO3 Python bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bqlite-engine = { workspace = true }
+thiserror = { workspace = true }

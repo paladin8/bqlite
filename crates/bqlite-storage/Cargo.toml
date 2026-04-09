@@ -1,0 +1,14 @@
+[package]
+name = "bqlite-storage"
+description = "Native storage engine: segments, WAL, memtable, compaction, entity-major layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bqlite-core = { workspace = true }
+arrow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

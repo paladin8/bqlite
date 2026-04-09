@@ -1,0 +1,11 @@
+[package]
+name = "bqlite-ast"
+description = "AST types for BQL queries, shared by parser and builder APIs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bqlite-core = { workspace = true }
+serde = { workspace = true }
