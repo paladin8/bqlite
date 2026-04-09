@@ -9,3 +9,7 @@ Deep-dive design documents for bqlite. These cover the detailed technical decisi
 3. **execution-model.md** -- Iterator protocol, entity-aware batching, memory management (STATUS: not started)
 4. **sequence-matching.md** -- NFA construction, time windows, negation, held properties (STATUS: not started)
 5. **type-system.md** -- Data types, null handling, coercion, Arrow mapping (STATUS: draft)
+
+## Infrastructure
+
+6. **agent-workflow.md** -- Parallel agent containers, task locking, git workflow, cmux integration (STATUS: draft)
