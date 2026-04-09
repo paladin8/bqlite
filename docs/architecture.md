@@ -10,8 +10,8 @@
 | `bqlite-storage` | Native storage format, compaction, ingest from CSV/JSON/Parquet, entity-sorted columnar layout, merge scanning, database directory management |
 | `bqlite-parser` | BQL text → AST |
 | `bqlite-planner` | AST → logical plan → optimizer → physical plan, schema validation at plan construction time |
-| `bqlite-operators` | Physical operator implementations: scan, filter, sequence, funnel, retention, sessionize, aggregate, cohort, paths, limit |
-| `bqlite-engine` | Execution orchestration, memory management, spill-to-disk, plan execution, slab allocator |
+| `bqlite-operators` | Physical operator implementations: scan, filter, sequence, sessionize, aggregate, window, paths, limit |
+| `bqlite-engine` | Execution orchestration, memory management, spill-to-disk, plan execution |
 | `bqlite-cli` | Command-line interface |
 | `bqlite-ffi` | C ABI surface for PyO3 Python bindings |
 
@@ -104,7 +104,7 @@ BQL Text
 
 ## Execution Model
 
-- **Pull-based iterator** with entity-aware batching.
+- **Hybrid push/pull execution** — push-based for stateless vectorized operators, pull-based for stateful entity operators, with entity-aware batching.
 - **Entity-sorted columnar layout** -- data is stored in columnar row-groups sorted by `(entity_id, timestamp)`, giving entity locality while preserving columnar encoding and compression benefits.
 - **Entity-at-a-time** for stateful temporal operators (sequence matching, sessionization, funnels).
 - **Columnar batches** for stateless operators (filter, project, aggregate).

@@ -24,9 +24,9 @@ Single-session deep dives with human review. Produces design documents before im
 - Cohort × query join semantics: is a cohort join an entity-level semi-join (filter to entities in the cohort) or can it also carry cohort-level properties into the downstream query?
 
 ### TASK-003: Execution Model Design
-**Status**: unclaimed
+**Status**: draft
 **Output**: docs/design/execution-model.md
-**Description**: Pull-based iterator protocol, entity-aware batching interface, operator trait signatures, memory budget enforcement, spill-to-disk strategy, parallel execution model, merge-scan protocol, partial entity state handling.
+**Description**: Pull-based iterator protocol with PhysicalOperator and EntityOperator traits, entity-aligned batches with sub-batch streaming, demand propagation and generic operator fusion, shard-per-thread parallelism, compaction scheduling, memory budget enforcement, error handling and cancellation, Python integration, per-query metrics.
 
 ### TASK-004: Sequence Matching Design
 **Status**: unclaimed
@@ -48,7 +48,7 @@ Core types, AST, storage format basics, CI pipeline. Establishes shared interfac
 ---
 
 ## Wave 2: Storage Engine
-Native format, WAL, memtable, compaction, ingest from CSV/JSON/Parquet, entity-partitioned scan.
+Native format, compaction, ingest from CSV/JSON/Parquet, entity-partitioned scan.
 
 *Tasks to be defined after Wave 1.*
 

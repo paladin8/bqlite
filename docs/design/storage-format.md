@@ -102,7 +102,7 @@ Backfilling historical data writes new L0 segments into the corresponding old wi
 
 Within each time window, data is hash-partitioned by entity: `shard = xxhash64(entity_id) % num_shards`. xxHash64 is chosen for speed, good distribution, and consistency with the checksum hash. Each shard is an independent file.
 
-Default: **8 shards**, configurable at table creation time (fixed after creation — no resharding).
+Default: **32 shards**, configurable at table creation time (fixed after creation — no resharding). The default matches the core count of modern hardware so that one shard-task per core keeps all cores busy during query execution (see execution-model.md Section 9.3).
 
 ### 5.2 On-Disk Layout
 
@@ -119,7 +119,7 @@ db/
       shard_01/
         ...
       ...
-      shard_07/
+      shard_31/
         ...
     window_20250131/
       shard_00/
@@ -294,7 +294,7 @@ window_20250531/shard_03  ──┘
 
 **Sequential access.** Each merge input stream is read front-to-back in sorted order. OS readahead works in favor of this pattern.
 
-**Bounded buffers.** 4 MB read buffer per merge input stream. Modern SSDs deliver peak throughput at ≥128 KB I/O sizes, but larger buffers (2-4 MB) reduce syscall overhead and amortize seek latency on spinning disks. With k=6 (30-day windows, 6-month query) and 8 shards, total buffer memory is 48 streams * 4 MB = 192 MB — well within the 3 GB query budget, and a good tradeoff for saturating disk bandwidth.
+**Bounded buffers.** 4 MB read buffer per merge input stream. Modern SSDs deliver peak throughput at ≥128 KB I/O sizes, but larger buffers (2-4 MB) reduce syscall overhead and amortize seek latency on spinning disks. With k=6 (30-day windows, 6-month query) and 32 shards, total buffer memory is 192 streams * 4 MB = 768 MB — within the 3 GB query budget. Note that not all shards read simultaneously — the thread pool (sized to num_cores) limits concurrency, so actual buffer usage at any instant is `num_cores * k * 4 MB`.
 
 **Entity-batch handoff.** The merge produces entity batches: "here are all N events for entity X, in timestamp order." The temporal operator consumes the batch, produces a result, the merge advances. Only one entity's data is in memory at a time.
 
@@ -739,7 +739,7 @@ The default 4 GB memory budget is split across concurrent activities:
 
 Within query execution, per-query memory is `3 GB / num_concurrent_queries`. The engine tracks allocations and rejects new queries if the budget is exhausted (returning a clear error, not OOM).
 
-**Per-shard read buffers** for the k-way merge: 4 MB per input stream. A query scanning 8 shards across 6 windows = 48 streams * 4 MB = 192 MB — well within the query budget and necessary to saturate disk I/O.
+**Per-shard read buffers** for the k-way merge: 4 MB per input stream. Active buffer usage is bounded by `num_concurrent_shard_tasks * k * 4 MB` since the thread pool limits how many shards read simultaneously.
 
 **Compaction memory** is bounded by the size of the input segments being merged. The k-way merge during compaction streams rows and writes output incrementally — it does not materialize the full merged result in memory.
 
@@ -818,7 +818,7 @@ Encoded as three components:
 | Data layout | Columnar row-groups, sorted by `(entity_id, timestamp)` | Standard columnar infra + entity locality from sort order |
 | Row-group size | 65,536 rows | Balances encoding efficiency, zone map selectivity, memory footprint |
 | Partitioning | Time windows (N days, default 30) | Window pruning for time-range queries; keeps merge k small |
-| Sharding | Hash on entity_id (default 8 shards) | Parallel reads/writes, entity locality across windows |
+| Sharding | Hash on entity_id (default 32 shards) | Parallel reads/writes, entity locality across windows, one shard per core |
 | Ingestion model | Batch-only, no WAL/memtable | Eliminates recovery complexity; appropriate for analytics workload |
 | Compaction strategy | Size-tiered within (window, shard) | Simple, effective, embarrassingly parallel |
 | Segment format | Custom container + custom encodings | Full control over read path performance |

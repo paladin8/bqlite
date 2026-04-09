@@ -14,9 +14,9 @@ All errors must be typed and recoverable. Panics are not acceptable error handli
 
 Ingestion is batch-only — each ingest call produces complete segment files directly on disk. A write is durable once the segment file is fsynced and the manifest is atomically updated. There is no WAL or memtable. If the process crashes mid-ingest, partially written segment files (identified by `.tmp` suffix) are cleaned up on next startup. No data that was acknowledged can be lost; no recovery replay is needed.
 
-## Concurrent Access Prevention
+## Concurrent Write Access Prevention
 
-A lock file prevents concurrent access to the same database directory. Attempting to open a database that is already locked returns a clear error rather than corrupting data.
+A lock file prevents concurrent write access to the same database from multiple processes. Attempting to open a database for writing when another process holds the lock returns a clear error. Multiple read-only opens are allowed. Within a single process, multiple queries and ingest operations can run concurrently — concurrency is managed by the execution engine's thread pool and manifest locking, not the lock file.
 
 ## Non-blocking Compaction
 

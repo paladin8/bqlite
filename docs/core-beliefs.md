@@ -2,7 +2,7 @@
 
 These are the design principles that guide all decisions in bqlite.
 
-1. **Performance is the top priority.** Vectorized execution, cache-aware data layouts, lock-free design, optimized compression, predicate pushdown, operator fusion. bqlite should be the fastest engine for its problem domain by a wide margin. Consider custom memory allocation (slab allocator) where it provides measurable benefit.
+1. **Performance is the top priority.** Vectorized execution, cache-aware data layouts, lock-free design, optimized compression, predicate pushdown, operator fusion. bqlite should be the fastest engine for its problem domain by a wide margin.
 
 2. **Powerful primitives over specialized features.** The query language exposes composable primitives (sequence matching, windowing, filtering, aggregation). Funnels, retention, and cohorts are expressible as compositions of these primitives — they are convenience wrappers, not special cases. The primitives must be powerful enough to express features like holding a property constant across funnel steps, custom retention brackets, and complex session definitions. The execution engine may use specialized operators under the hood, but the language remains general.
 
