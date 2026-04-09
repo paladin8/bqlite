@@ -34,7 +34,7 @@ Single-session deep dives with human review. Produces design documents before im
 **Description**: NFA construction from patterns, time window enforcement, negation semantics, repetition quantifier semantics, held property variable binding, performance characteristics, relationship to funnel/retention/session operators.
 
 ### TASK-005: Type System Design
-**Status**: unclaimed
+**Status**: draft
 **Output**: docs/design/type-system.md
 **Description**: Supported data types (string, int, float, bool, timestamp, list, map), null handling, type coercion rules, schema declaration syntax, schema validation at plan construction time, Arrow type mapping.
 
