@@ -2,10 +2,6 @@
 
 Operational requirements that all components must satisfy.
 
-## I/O Timeouts
-
-All I/O operations must have timeouts. No unbounded waits on disk, network, or any external resource.
-
 ## Memory Budget
 
 All operators must respect the configured memory budget. When an operator's intermediate state exceeds its allocation, it must spill to disk rather than grow unbounded. The default memory budget is 4 GB.
@@ -14,13 +10,9 @@ All operators must respect the configured memory budget. When an operator's inte
 
 All errors must be typed and recoverable. Panics are not acceptable error handling. Callers must be able to distinguish between different failure modes and take appropriate action.
 
-## Entity Event Limit
-
-An entity event limit must prevent pathological entities from consuming unbounded resources. Entities with event counts exceeding the configured limit are skipped and flagged in the result metadata — not silently dropped, not allowed to blow up memory.
-
 ## Crash Safety
 
-The WAL (write-ahead log) ensures crash safety for writes. Any write that has been acknowledged is durable. Recovery on startup replays the WAL to restore consistent state.
+Ingestion is batch-only — each ingest call produces complete segment files directly on disk. A write is durable once the segment file is fsynced and the manifest is atomically updated. There is no WAL or memtable. If the process crashes mid-ingest, partially written segment files (identified by `.tmp` suffix) are cleaned up on next startup. No data that was acknowledged can be lost; no recovery replay is needed.
 
 ## Concurrent Access Prevention
 
@@ -29,3 +21,7 @@ A lock file prevents concurrent access to the same database directory. Attemptin
 ## Non-blocking Compaction
 
 Compaction must not block reads. Background compaction merges segments while active queries continue to read from the pre-compaction state. Segment switching is atomic.
+
+## Versioning
+
+Version everything (data format, schema format, API format, table schema, etc) that can change in the future and cause backwards-compatibility issues. During most of development, the version will be 1.

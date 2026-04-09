@@ -7,7 +7,7 @@
 | `bqlite` | Top-level re-export crate |
 | `bqlite-core` | Core types: Event, Entity, Schema, Timestamp, PropertyValue, EntityEventStream, TableSchema |
 | `bqlite-ast` | AST types shared by parser and builder APIs |
-| `bqlite-storage` | Native storage format, WAL, memtable, compaction, ingest from CSV/JSON/Parquet, entity-major layout, merge scanning, database directory management |
+| `bqlite-storage` | Native storage format, compaction, ingest from CSV/JSON/Parquet, entity-sorted columnar layout, merge scanning, database directory management |
 | `bqlite-parser` | BQL text → AST |
 | `bqlite-planner` | AST → logical plan → optimizer → physical plan, schema validation at plan construction time |
 | `bqlite-operators` | Physical operator implementations: scan, filter, sequence, funnel, retention, sessionize, aggregate, cohort, paths, limit |
@@ -105,6 +105,6 @@ BQL Text
 ## Execution Model
 
 - **Pull-based iterator** with entity-aware batching.
-- **Entity-major storage layout** -- data is physically organized by entity, not by time.
+- **Entity-sorted columnar layout** -- data is stored in columnar row-groups sorted by `(entity_id, timestamp)`, giving entity locality while preserving columnar encoding and compression benefits.
 - **Entity-at-a-time** for stateful temporal operators (sequence matching, sessionization, funnels).
 - **Columnar batches** for stateless operators (filter, project, aggregate).

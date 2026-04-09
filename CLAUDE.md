@@ -9,7 +9,7 @@ Embeddable behavioral query engine — temporal pattern matching, funnels, reten
 | `bqlite` | Top-level re-export crate (what users depend on) |
 | `bqlite-core` | Core types: Event, Entity, Schema, Timestamp, PropertyValue |
 | `bqlite-ast` | AST types shared by parser and builder APIs |
-| `bqlite-storage` | Native storage format, WAL, memtable, compaction, ingest, entity-major layout |
+| `bqlite-storage` | Native storage format, compaction, ingest, entity-sorted columnar layout |
 | `bqlite-parser` | BQL text → AST |
 | `bqlite-planner` | AST → logical plan → optimizer → physical plan |
 | `bqlite-operators` | Physical operator implementations (scan, filter, sequence, funnel, etc.) |
@@ -50,7 +50,6 @@ cargo fmt --check                                         # formatting check
 - `thiserror` for library error types, `anyhow` for CLI/test errors
 - Idiomatic Rust: prefer iterators, zero-copy, stack over heap
 - Every operator respects configurable memory budgets
-- All I/O operations must have timeouts
 - All errors must be typed and recoverable
 
 ## Documentation

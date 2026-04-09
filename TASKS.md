@@ -5,9 +5,9 @@
 Single-session deep dives with human review. Produces design documents before implementation begins.
 
 ### TASK-001: Storage Format Design
-**Status**: unclaimed
+**Status**: draft
 **Output**: docs/design/storage-format.md
-**Description**: Design the native segment format, entity-major layout, segment metadata, compression strategy per column type, WAL design, memtable structure, flush triggers, compaction strategy, segment merging, index structures (bloom filters, zone maps), concurrency between readers and compaction, database directory layout.
+**Description**: Design the native segment format, entity-sorted columnar row-groups, segment metadata, comprehensive encoding layer (dictionary, delta, double-delta, bitpacking, RLE, constant, FSST, FOR, PFOR, ALP, frequency encoding, LZ4), near-zero-copy Arrow decode, late materialization, batch-only ingestion with batch IDs, time-window partitioning, entity-hash sharding, size-tiered compaction, zone maps, tombstone-based deletes (row/batch/entity), manifest catalog, concurrency between readers and compaction, database directory layout.
 
 ### TASK-002: Query Language Design
 **Status**: unclaimed

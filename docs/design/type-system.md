@@ -557,8 +557,7 @@ pub enum PropertyValue {
 **Where it appears:**
 
 1. **Ingest.** Raw data (CSV, JSON, Parquet) is parsed into `PropertyValue`, validated against `TableSchema`, then written to columnar storage.
-2. **Memtable.** The in-memory write buffer stores events as rows with `PropertyValue` fields before flushing to columnar segments.
-3. **Test fixtures.** `input.json` and `expected.json` map naturally to `PropertyValue`.
+2. **Test fixtures.** `input.json` and `expected.json` map naturally to `PropertyValue`.
 
 **Where it does NOT appear:** the query execution hot path. Once data is in columnar storage or flowing through the query engine, everything is Arrow arrays. `PropertyValue` is a boundary type, not a runtime type.
 
