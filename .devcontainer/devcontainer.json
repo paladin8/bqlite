@@ -9,6 +9,7 @@
     }
   },
   "postCreateCommand": "cargo build && pip install maturin pytest",
+  "workspaceFolder": "/workspace",
   "customizations": {
     "vscode": {
       "extensions": [
