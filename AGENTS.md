@@ -16,7 +16,7 @@ STALE_LOCK_TIMEOUT_MINUTES=45
 
 Run this loop continuously:
 
-1. `git pull origin main`
+1. `git fetch origin && git pull origin main` (fetch all refs so task branch info is current)
 2. Scan `tasks/active/` for existing lock files and `tasks/completed/` for done markers
 3. Read `TASKS.md` — select an unclaimed task whose **Depends on** tasks all have `.done` markers in `tasks/completed/`
 4. Claim the task (see Task Claiming Protocol)

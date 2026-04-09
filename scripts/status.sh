@@ -32,7 +32,7 @@ fi
 
 echo ""
 echo "=== Container Status ==="
-docker ps --filter "name=bqlite-agent-" --format "{{.Names}}\t{{.Status}}" 2>/dev/null || echo "  (docker not available)"
+docker ps --filter "name=^bqlite-agent-[0-9]+$" --format "{{.Names}}\t{{.Status}}" 2>/dev/null || echo "  (docker not available)"
 
 echo ""
 echo "Active: $ACTIVE_COUNT  Completed: $DONE_COUNT"

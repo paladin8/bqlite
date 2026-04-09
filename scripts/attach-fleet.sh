@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTAINERS=$(docker ps --filter "name=bqlite-agent-" --format "{{.Names}}" | sort -V)
+CONTAINERS=$(docker ps --filter "name=^bqlite-agent-[0-9]+$" --format "{{.Names}}" | sort -V)
 
 if [ -z "$CONTAINERS" ]; then
   echo "No running bqlite-agent containers found."
