@@ -17,7 +17,7 @@ cmux new-workspace "bqlite agents"
 
 for CONTAINER in $CONTAINERS; do
   AGENT_NUM="${CONTAINER##*-}"
-  SURFACE=$(cmux new-surface --type terminal)
+  SURFACE=$(cmux new-surface --type terminal | grep -o 'surface:[0-9]*')
 
   SYSTEM_PROMPT="You are ${CONTAINER}, an autonomous agent building bqlite. Read AGENTS.md for your complete operating protocol. Begin the agent loop now."
 
