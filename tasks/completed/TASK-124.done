@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-3",
   "task_id": "TASK-124",
   "claimed_at": "2026-04-10T23:00:54Z",
+  "completed_at": "2026-04-10T23:13:44Z",
   "branch": "task/TASK-124",
   "description": "Property-test harness — tests/prop/mod.rs, tests/prop/property_value.rs"
 }
