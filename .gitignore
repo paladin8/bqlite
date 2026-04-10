@@ -29,3 +29,6 @@ venv/
 
 # bqlite databases (test artifacts)
 *.bqlite/
+
+# agents
+.claude/worktrees/
