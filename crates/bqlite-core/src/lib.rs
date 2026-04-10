@@ -14,6 +14,7 @@
 //! dependency graph and is imported by every other bqlite crate.
 
 pub mod error;
+pub mod telemetry;
 pub use error::{BqliteError, Result};
 
 pub mod time;
