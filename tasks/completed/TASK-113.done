@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-1",
   "task_id": "TASK-113",
   "claimed_at": "2026-04-10T23:00:29Z",
+  "completed_at": "2026-04-10T23:28:16Z",
   "branch": "task/TASK-113",
   "description": "AST node skeletons"
 }
