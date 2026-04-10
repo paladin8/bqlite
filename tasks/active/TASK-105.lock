@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-2",
+  "task_id": "TASK-105",
+  "claimed_at": "2026-04-10T23:00:06Z",
+  "branch": "task/TASK-105",
+  "description": "EntityId and Event primitives"
+}
