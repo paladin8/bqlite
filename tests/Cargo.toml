@@ -1,0 +1,25 @@
+[package]
+name = "bqlite-tests"
+description = "Workspace-level property and integration tests for bqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+# Explicit test targets. This package intentionally has no lib/bin — it
+# exists only to host workspace-level tests whose file layout (tests/prop/,
+# tests/suite/, tests/smoke.rs, ...) does not match Cargo's default target
+# auto-discovery. Every test file is listed here with an explicit path.
+[[test]]
+name = "prop_property_value"
+path = "prop/property_value.rs"
+
+[dev-dependencies]
+bqlite-core = { workspace = true }
+proptest = { workspace = true }
+serde_json = { workspace = true }
