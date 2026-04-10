@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-1",
+  "task_id": "TASK-113",
+  "claimed_at": "2026-04-10T23:00:29Z",
+  "branch": "task/TASK-113",
+  "description": "AST node skeletons"
+}
