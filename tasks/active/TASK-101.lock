@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-1",
+  "task_id": "TASK-101",
+  "claimed_at": "2026-04-10T21:24:48Z",
+  "branch": "task/TASK-101",
+  "description": "Dependency direction check script wired into CI"
+}
