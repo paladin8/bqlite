@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-1",
   "task_id": "TASK-103",
   "claimed_at": "2026-04-10T00:00:00Z",
+  "completed_at": "2026-04-10T00:30:00Z",
   "branch": "task/TASK-103",
   "description": "Timestamp and time-range types"
 }
