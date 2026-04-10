@@ -286,17 +286,21 @@ Every operator produces a precisely defined output schema. These definitions are
 
 ### 6.1 MATCH / sequence
 
-Only entities that match the pattern appear in the output. Unmatched entities are not emitted — there is no `matched: Bool` column. Downstream operators that need a boolean "did this entity match?" signal use the presence/absence of the entity in the result set.
+Without EMIT ALL, only entities that complete the full sequence appear in the output. With EMIT ALL, all entities that enter the NFA (match step 1) appear, including incomplete sequences. See sequence-matching.md Section 5.3 and Section 12 for full semantics.
 
-| Column | Type | Nullable | Description |
-|---|---|---|---|
-| `entity_id` | String or Int (matches entity key) | no | Entity identifier |
-| `match_duration` | Int | no | First-to-last matched event time in nanoseconds |
-| `match_events` | Map(Timestamp) | no | Step name -> timestamp of the matched event at that step |
+| Column | Type | Nullable | Present | Description |
+|---|---|---|---|---|
+| `entity_id` | String or Int (matches entity key) | no | Always | Entity identifier |
+| `$var` | (per variable type) | no | When variables are bound | One column per bound variable (e.g., `$plan`), named by the variable |
+| `step_reached` | Int | no | When EMIT ALL is enabled | 1-indexed step number of the farthest step matched |
+| `match_duration` | Int | yes | When demanded | First-to-last matched event time in nanoseconds (NULL if `step_reached == 1`) |
+| `match_events` | Map(Timestamp) | yes | When demanded | Step name → timestamp of the matched event at that step (partial if incomplete) |
 
 The `match_events` map keys are the event type names from the pattern (e.g., `"signup"`, `"purchase"`). When a pattern contains repeated event types, keys are disambiguated with a numeric suffix (e.g., `"page_view_0"`, `"page_view_1"`).
 
-**Note:** Since MATCH only emits matched entities, downstream pipelines do not need a `matched: Bool` column. The bootstrap example `| WHERE matched = true` is unnecessary — every row in the MATCH output is a match. A `STATS COUNT(*)` after MATCH counts matched entities directly.
+**Variable binding columns.** Each `$variable` in the pattern produces an output column with the bound value. The column type matches the source column's type (validated at plan time). Variable columns are non-nullable — only events with non-NULL binding values match the step predicate (sequence-matching.md Section 6.2).
+
+**Without EMIT ALL,** downstream pipelines do not need a `matched: Bool` column — every row is a completed match. A `STATS COUNT(*)` after MATCH counts matched entities directly. **With EMIT ALL,** the `step_reached` column distinguishes completed (`step_reached = num_steps`) from incomplete sequences.
 
 ### 6.2 FUNNEL and RETENTION
 

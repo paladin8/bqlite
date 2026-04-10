@@ -29,9 +29,9 @@ Single-session deep dives with human review. Produces design documents before im
 **Description**: Pull-based iterator protocol with PhysicalOperator and EntityOperator traits, entity-aligned batches with sub-batch streaming, demand propagation and generic operator fusion, shard-per-thread parallelism, compaction scheduling, memory budget enforcement, error handling and cancellation, Python integration, per-query metrics.
 
 ### TASK-004: Sequence Matching Design
-**Status**: unclaimed
+**Status**: draft
 **Output**: docs/design/sequence-matching.md
-**Description**: NFA construction from patterns, time window enforcement, negation semantics, repetition quantifier semantics, held property variable binding, performance characteristics, relationship to funnel/retention/session operators.
+**Description**: Thompson's NFA simulation, global time window enforcement, negation via poison transitions, repetition, $variable binding with independent match tracks, two match modes (FIRST/ALL), EMIT ALL for funnel analysis, tiered execution strategies (step counter fast path for linear patterns, full NFA for general), candidate deque propagation with deferred consumption, filter pushdown to scan layer, aggregation fusion at window expiry.
 
 ### TASK-005: Type System Design
 **Status**: draft
