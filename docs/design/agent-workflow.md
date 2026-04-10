@@ -298,11 +298,9 @@ Read AGENTS.md for your complete operating protocol. Begin the agent loop now."
 
 This is the minimal trigger that separates agent sessions from human sessions. CLAUDE.md loads automatically. The system prompt points to AGENTS.md. AGENTS.md contains the full protocol.
 
-### 5.4 Skills (Existing — Extend Per Wave)
+### 5.4 Per-Task Guidance
 
-Existing skills (`implement-operator`, `add-parser-production`, `add-test-fixture`, `fix-ci`) provide task-type-specific checklists. AGENTS.md instructs agents to check `.claude/skills/` for applicable playbooks before starting a task.
-
-New skills can be added per wave. For Wave 0, a `design-deep-dive` skill could encode the design document authoring process.
+Detailed per-subsystem guidance lives in `docs/design/`. AGENTS.md instructs agents to read the relevant design doc before touching a task. A skills layer (`.claude/skills/`) was tried earlier but removed — the skills were written before the design docs and drifted into either stale or redundant content, so the design docs are now the single source of truth. Skills may be reintroduced later if a workflow emerges that clearly isn't captured by the design docs or AGENTS.md.
 
 ---
 

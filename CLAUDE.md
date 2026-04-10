@@ -64,14 +64,6 @@ cargo fmt --check                                         # formatting check
 
 See [TASKS.md](TASKS.md) for the development roadmap and task assignments.
 
-## Skills
-
-See `.claude/skills/` for task-specific agent playbooks:
-- `implement-operator` — how to add a new physical operator
-- `add-parser-production` — how to add new BQL syntax
-- `add-test-fixture` — how to write integration tests
-- `fix-ci` — how to diagnose and fix CI failures
-
 ## Agent Coordination
 
 See [AGENTS.md](AGENTS.md) for the autonomous agent operating protocol (task claiming, checkpoints, git workflow).

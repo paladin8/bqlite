@@ -21,10 +21,9 @@ Run this loop continuously:
 3. Read `TASKS.md` — select an unclaimed task whose **Depends on** tasks all have `.done` markers in `tasks/completed/`
 4. Claim the task (see Task Claiming Protocol)
 5. Read the task's design doc and any relevant source files
-6. Check `.claude/skills/` for an applicable playbook — follow it if one exists
-7. Implement in small checkpoints (see Checkpoint Discipline)
-8. After the final checkpoint, mark the task complete (see Completion Protocol)
-9. Return to step 1
+6. Implement in small checkpoints (see Checkpoint Discipline)
+7. After the final checkpoint, mark the task complete (see Completion Protocol)
+8. Return to step 1
 
 ## Task Claiming Protocol
 
