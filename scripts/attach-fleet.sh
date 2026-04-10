@@ -12,12 +12,21 @@ fi
 COUNT=$(echo "$CONTAINERS" | wc -l | tr -d ' ')
 echo "Attaching to $COUNT agent containers via cmux..."
 
-# Create a cmux workspace for the fleet
-WORKSPACE=$(cmux new-workspace "bqlite agents" | grep -o 'workspace:[0-9]*')
+# Create a cmux workspace — it comes with one terminal tab already
+WORKSPACE=$(cmux new-workspace --name "bqlite agents" | grep -o 'workspace:[0-9]*')
+cmux select-workspace --workspace "$WORKSPACE"
 
+# Get the surface that came with the new workspace
+FIRST_SURFACE=$(cmux list-pane-surfaces --workspace "$WORKSPACE" | grep -o 'surface:[0-9]*' | head -1)
+
+FIRST=true
 for CONTAINER in $CONTAINERS; do
-  AGENT_NUM="${CONTAINER##*-}"
-  SURFACE=$(cmux new-surface --type terminal --workspace "$WORKSPACE" | grep -o 'surface:[0-9]*')
+  if [ "$FIRST" = true ]; then
+    SURFACE="$FIRST_SURFACE"
+    FIRST=false
+  else
+    SURFACE=$(cmux new-surface --type terminal --workspace "$WORKSPACE" | grep -o 'surface:[0-9]*')
+  fi
 
   SYSTEM_PROMPT="You are ${CONTAINER}, an autonomous agent building bqlite. Read AGENTS.md for your complete operating protocol. Begin the agent loop now."
 
@@ -28,5 +37,5 @@ for CONTAINER in $CONTAINERS; do
   echo "  Tab created for $CONTAINER"
 done
 
-cmux notify "Fleet attached: $COUNT agents"
+cmux notify --title "bqlite fleet" --body "Fleet attached: $COUNT agents"
 echo "Done. Switch to cmux to interact with agents."
