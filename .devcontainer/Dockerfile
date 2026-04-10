@@ -7,6 +7,9 @@ RUN apt-get update && apt-get install -y \
     jq \
     && rm -rf /var/lib/apt/lists/*
 
+# rust-analyzer binary for the rust-analyzer-lsp Claude Code plugin
+RUN rustup component add rust-analyzer
+
 # Install Claude Code
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/root/.local/bin:/home/vscode/.local/bin:${PATH}"

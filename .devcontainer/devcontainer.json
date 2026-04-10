@@ -8,7 +8,7 @@
       "version": "3.11"
     }
   },
-  "postCreateCommand": "cargo build && pip install maturin pytest",
+  "postCreateCommand": "cargo build && pip install maturin pytest && claude plugin marketplace add anthropics/claude-plugins-official && claude plugin install rust-analyzer-lsp@claude-plugins-official",
   "workspaceFolder": "/workspace",
   "customizations": {
     "vscode": {
