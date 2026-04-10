@@ -12,30 +12,31 @@ fi
 COUNT=$(echo "$CONTAINERS" | wc -l | tr -d ' ')
 echo "Attaching to $COUNT agent containers via cmux..."
 
-# Create a cmux workspace — it comes with one terminal tab already
-WORKSPACE=$(cmux new-workspace --name "bqlite agents" | grep -o 'workspace:[0-9]*')
-cmux select-workspace --workspace "$WORKSPACE"
-
-# Get the surface that came with the new workspace
-FIRST_SURFACE=$(cmux list-pane-surfaces --workspace "$WORKSPACE" | grep -o 'surface:[0-9]*' | head -1)
+# Build the docker exec command for an agent container
+agent_cmd() {
+  local container="$1"
+  local prompt="You are ${container}, an autonomous agent building bqlite. Read AGENTS.md for your complete operating protocol. Begin the agent loop now."
+  echo "docker exec -it -w /workspace ${container} claude --system-prompt '${prompt}'"
+}
 
 FIRST=true
 for CONTAINER in $CONTAINERS; do
+  CMD=$(agent_cmd "$CONTAINER")
+
   if [ "$FIRST" = true ]; then
-    SURFACE="$FIRST_SURFACE"
+    # First agent: create workspace with the command already running
+    WORKSPACE=$(cmux new-workspace --name "bqlite agents" --command "$CMD" | grep -o 'workspace:[0-9]*')
     FIRST=false
   else
+    # Additional agents: create a new surface, then respawn it with the command
     SURFACE=$(cmux new-surface --type terminal --workspace "$WORKSPACE" | grep -o 'surface:[0-9]*')
+    sleep 0.5
+    cmux respawn-pane --surface "$SURFACE" --workspace "$WORKSPACE" --command "$CMD"
   fi
-
-  SYSTEM_PROMPT="You are ${CONTAINER}, an autonomous agent building bqlite. Read AGENTS.md for your complete operating protocol. Begin the agent loop now."
-
-  cmux send --surface "$SURFACE" \
-    "docker exec -it -w /workspace $CONTAINER claude --system-prompt '$SYSTEM_PROMPT'"
-  cmux send-key --surface "$SURFACE" enter
 
   echo "  Tab created for $CONTAINER"
 done
 
+cmux select-workspace --workspace "$WORKSPACE"
 cmux notify --title "bqlite fleet" --body "Fleet attached: $COUNT agents"
 echo "Done. Switch to cmux to interact with agents."
