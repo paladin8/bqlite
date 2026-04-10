@@ -23,7 +23,7 @@ The storage engine serves three constraints from [core-beliefs.md](../core-belie
 
 ## 2. Conventions
 
-**Terminology.** A *segment* is the logical unit of storage — a sorted, encoded collection of rows for a single `(window, shard)` at a given compaction level. A *segment file* is its on-disk representation (e.g., `L0_0001.segment`). This document uses "segment" for the logical concept and "segment file" when referring to the physical file.
+**Terminology.** A *segment* is the logical unit of storage — a sorted, encoded collection of rows for a single `(window, shard)` at a given compaction level. A *segment file* is its on-disk representation (e.g., `segment_1001.seg`; the naming scheme is specified in Section 5.2). This document uses "segment" for the logical concept and "segment file" when referring to the physical file.
 
 **Byte order.** All multi-byte integers in the segment file format are **little-endian**. This matches the native byte order of x86 and ARM (the target platforms) and avoids byte-swapping on the read path.
 
@@ -88,7 +88,7 @@ Configurable as **N days** (single integer parameter, no calendar complexity). D
 
 The 30-day default keeps k small for cross-window merges. A 6-month retention query merges k=6 sorted streams — trivial. Daily windows (k=180) create significant merge overhead and should only be used when window-level pruning is the dominant performance factor.
 
-Window boundaries are aligned to UTC day boundaries. A 30-day window starting 2025-03-01 covers `[2025-03-01T00:00:00Z, 2025-03-31T00:00:00Z)`. Window directories are named by their start date: `window_20250301/`.
+Window boundaries are aligned to UTC day boundaries. A 30-day window starting 2025-03-01 covers `[2025-03-01T00:00:00Z, 2025-03-31T00:00:00Z)`. Window directories are named by their window ID — the number of days since epoch (1970-01-01) for the window start, zero-padded to six digits. `2025-03-01` is day 20148, so this window's directory is `w_020148/` (see Section 5.2 for the full layout).
 
 ### 4.3 Backfill Behavior
 
@@ -106,30 +106,40 @@ Within each time window, data is hash-partitioned by entity: `shard = xxhash64(e
 
 **Why database-level, not per-table.** Cross-table entity joins (query-language.md Section 19) rely on the fact that a given entity hashes to the same shard in every table. If tables could choose their own shard counts, a join between `events` (32 shards) and `purchases` (16 shards) could require hash resharding at query time, which defeats the merge-join performance model. By fixing shard count at the database level, cross-table entity alignment is guaranteed by construction: shard N of table A and shard N of table B both contain entities with `xxhash64(entity_id) % 32 == N`, so the streaming merge join reads one shard per table with no resharding.
 
-**Database UUID.** A randomly generated UUID is also assigned at database initialization and stored in the manifest. It never rotates. The UUID serves as the default seed for SAMPLE determinism (query-language.md Section 14.2) and can be used by external tools for database identity.
+**Database UUID.** A randomly generated UUID is also assigned at database initialization and stored in the database-level `db.json` file (Section 12.1). It never rotates. The UUID serves as the default seed for SAMPLE determinism (query-language.md Section 14.2) and can be used by external tools for database identity.
 
 ### 5.2 On-Disk Layout
 
 ```
-db/
-  manifest.json
-  .lock
+db_root/
+  .lock                              ← file lock (POSIX flock / Windows equivalent)
+  db.json                            ← database-wide metadata (UUID, engine version)
   table_name/
-    window_20250101/
-      shard_00/
-        L0_0001.segment
-        L0_0002.segment
-        L1_0001.segment
-      shard_01/
+    manifest.json                    ← per-table manifest (Section 12)
+    windows/
+      w_000000/                      ← window_id = days since epoch for window start
+        shard_00/
+          segment_1001.seg
+          segment_1002.seg
+          tombstones.json
+        shard_01/
+          segment_1003.seg
+          tombstones.json
         ...
-      ...
-      shard_31/
-        ...
-    window_20250131/
-      shard_00/
-        ...
-      ...
+        shard_31/
+          ...
+      w_000030/                      ← next 30-day window
+        shard_00/
+          ...
 ```
+
+**Naming conventions.**
+
+- **Windows.** `w_<6-digit zero-padded days-since-epoch>/`. Days-since-epoch is a stable integer that doesn't depend on calendar formatting and sorts lexicographically in creation order. Window 0 is `1970-01-01`.
+- **Segments.** `segment_<segment_id>.seg`. The `segment_id` is assigned from the manifest's monotonically-increasing counter; the compaction level is *not* encoded in the filename because a segment's level can change during compaction. The level lives in `SegmentMeta` inside the manifest (Section 12.3).
+- **Tombstones.** `tombstones.json` — one file per shard, not per segment. Section 7.5 defines the contents.
+
+Orphaned files (present on disk but not referenced by the manifest) are candidates for GC on startup and after compaction (Section 7.4).
 
 ### 5.3 Benefits
 
@@ -175,7 +185,7 @@ There is no write-ahead log and no in-memory memtable. This eliminates recovery 
 
 **Batch ID.** Every ingest call is assigned a monotonically increasing **64-bit batch ID**, returned to the caller on successful ingest and exposed through the implicit system column `__batch_id`. A batch ID identifies all rows written in a single ingest call.
 
-- Assignment: per-table atomic counter, separate from the sequence ID counter. One `fetch_add` per ingest call. Both the sequence ID counter and batch ID counter are persisted in a database-level metadata file (see Section 12).
+- Assignment: per-table atomic counter, separate from the sequence ID counter. One `fetch_add` per ingest call. Both the sequence ID counter and batch ID counter are persisted in the per-table manifest as `next_sequence_id` and `next_batch_id` (Section 12.3) so monotonicity survives restarts.
 - Each segment file records the batch ID it was produced from (in the segment footer).
 - The manifest tracks the batch ID range for each segment.
 - **Batch-level deletion:** `DELETE FROM table WHERE __batch_id = N` tombstones all rows from that batch. This is useful for undoing a bad ingest — the caller retains the batch ID from the original insert and can use it to cleanly remove the data. Batch-level tombstones are stored alongside row-level and entity-level tombstones (Section 7.5).
@@ -252,22 +262,49 @@ If the process crashes at any point:
 
 ### 7.5 Deletes
 
-Deletes are tracked via **tombstone files** per shard.
+Deletes are tracked via **tombstone files** per shard. Tombstones are *data*, not metadata, and are not stored in the manifest (Section 12.4).
 
-| Granularity | Tombstone format | Use case |
+| Granularity | Tombstone field | Use case |
 |---|---|---|
 | Row-level | `__seq_id` | Delete specific events |
 | Batch-level | `__batch_id` | Undo a bad ingest |
 | Entity-level | `entity_id` | GDPR right-to-erasure, remove all events for an entity |
+| Time-range | `max_ts` | Drop everything before a given timestamp (retention cutoff) |
+
+Each shard has one tombstone file at `<window>/<shard>/tombstones.json`. The contents:
+
+```rust
+/// Serialized as JSON. Updated atomically via write + rename.
+#[derive(Serialize, Deserialize)]
+pub struct TombstoneFile {
+    /// Entity-level deletes: all events for these entities are deleted.
+    pub entity_deletes: HashSet<ScalarValue>,
+
+    /// Row-level deletes: specific sequence IDs.
+    pub row_deletes: HashSet<u64>,
+
+    /// Batch-level deletes: specific batch IDs.
+    pub batch_deletes: HashSet<u64>,
+
+    /// Time-range delete: all events with ts < this value are dropped.
+    pub time_range_delete: Option<i64>,
+}
+```
 
 Tombstone lifecycle:
 
 1. A delete operation writes a new tombstone file (not append — write + rename for atomicity, same pattern as manifest updates). Each tombstone file is a complete snapshot of the shard's active tombstones.
-2. During reads, the scan layer loads the tombstone file at query start (snapshotted alongside the manifest) and skips matching rows.
+2. During reads, the scan layer loads the tombstone file for each `(window, shard)` at scan setup (snapshotted alongside the manifest). The checks are all `HashSet` lookups (`entity_id`, `__seq_id`, `__batch_id`) plus one comparison (`ts < time_range_delete`), applied after column filtering but before rows reach operators.
 3. During compaction, tombstoned rows are physically removed from the output segment.
-4. After compaction completes for a `(window, shard)` and the output segment no longer contains any tombstoned rows, those tombstones are removed from the tombstone file. Since compaction merges *all* segments within a `(window, shard)`, a single compaction pass is sufficient to resolve all tombstones for that scope — there are no older segments that might still contain the tombstoned rows.
+4. After compaction completes for a `(window, shard)` and the output segment no longer contains any tombstoned rows, those tombstones are removed from the tombstone file. Since compaction merges *all* segments within a `(window, shard)`, a single compaction pass resolves every tombstone for that scope — there are no older segments still containing the deleted rows.
 
-Tombstone files are small (`__seq_id`, `__batch_id`, or entity ID values only) and loaded into memory at query time. Concurrent deletes and query execution within the owning process are safe because each query snapshots the tombstone file at start — a concurrent delete writes a new file that only subsequent queries will see.
+**Why not in the manifest.** See Section 12.4 for the full rationale. Briefly:
+
+- Tombstones describe deleted *data*, not which segments exist.
+- If tombstones lived in a (table-wide) manifest, a re-inserted entity after a delete would still be suppressed — the wrong semantics for tombstone-as-data.
+- Per-shard files keep delete writes local: a delete to shard 3 does not block ingest on shards 0–2, 4–31.
+
+Tombstone files are small (`__seq_id`, `__batch_id`, entity ID values, and one timestamp) and are loaded into memory at query time. Concurrent deletes and query execution within the owning process are safe because each query snapshots the tombstone file at start — a concurrent delete writes a new file that only subsequent queries will see.
 
 ### 7.6 Query Snapshots and Compaction
 
@@ -286,12 +323,12 @@ Queries acquire a reference to the current manifest at query start. Compaction p
 A query spanning multiple windows (e.g., 6-month retention) requires merging an entity's events across windows. Since the entity hashes to the same shard in every window, this is a merge of sorted streams from `shard_N` across windows.
 
 ```
-window_20250101/shard_03  ──┐
-window_20250131/shard_03  ──┤
-window_20250302/shard_03  ──┼──→  k-way merge on (entity_id, timestamp)  ──→  entity batches
-window_20250401/shard_03  ──┤
-window_20250501/shard_03  ──┤
-window_20250531/shard_03  ──┘
+windows/w_020088/shard_03  ──┐    (2025-01-01 + 30d windows)
+windows/w_020118/shard_03  ──┤
+windows/w_020148/shard_03  ──┼──→  k-way merge on (entity_id, timestamp)  ──→  entity batches
+windows/w_020178/shard_03  ──┤
+windows/w_020208/shard_03  ──┤
+windows/w_020238/shard_03  ──┘
 ```
 
 ### 8.2 Performance Design
@@ -704,30 +741,141 @@ Bloom filters on `entity_id` and roaring bitmap indexes on `event_type` are defe
 
 ### 12.1 Purpose
 
-The manifest is a **database-level** metadata structure that serves as the source of truth for the database state. A single `manifest.json` lives at the database root (`db/manifest.json`), covering all tables in the database. It tracks:
+Each **table** has its own manifest file at `<db_root>/<table_name>/manifest.json`. The manifest is the source of truth for that table's state: the authoritative schema, table-level configuration, active segment inventory, compaction state, and the persisted sequence-ID / batch-ID counters.
 
-- **Per-table metadata:** current table schema (the authoritative schema for query planning), table-level configuration (shard count, window granularity)
-- **Per-table segment inventory:** active segments per `(window, shard)`, with their level (L0, L1, ...), row count, byte size, schema version, sequence ID range, batch ID
-- Zone map summary (entity ID range per segment, for segment-level pruning)
-- Compaction state: last compaction timestamp per `(window, shard)`, pending tombstone counts
-- **Counters:** current sequence ID and batch ID counters per table (persisted here to survive restarts)
+A database also has a small `<db_root>/db.json` holding truly database-wide properties (database UUID, engine version), alongside the `.lock` file. Per-table configuration like shard count is stored in each table's manifest (Section 12.3), and is required to be identical across all tables in the database so that cross-table joins can rely on shard alignment (Section 5.1).
 
-**Schema authority:** The manifest holds the *current* table schema. Each segment footer holds the schema *at the time it was written*. The scan layer uses the manifest's schema as the output schema, filling missing columns from older segments with NULL/default values (Section 6.4).
+Per-table isolation has two important consequences:
 
-### 12.2 Lifecycle
+- **Independent updates.** Ingest and compaction for table `A` never touch table `B`'s manifest, so there is no cross-table contention on the manifest lock.
+- **Tombstones are not in the manifest.** Tombstones are data, not metadata, and live in separate files per shard — see Section 12.4 and Section 7.5. Keeping them out of the manifest ensures a re-inserted entity after a delete does not inherit the old delete.
 
-- **Startup:** Load the manifest into memory. Validate against files on disk (orphan cleanup).
-- **Ingest:** After writing new L0 segments, update the manifest atomically.
-- **Compaction:** After merging segments, write a new manifest (Section 7.4).
-- **Query:** Queries snapshot the manifest at query start. The snapshot is immutable for the query's lifetime.
+### 12.2 Schema Authority
+
+The manifest holds the *current* table schema. Each segment footer holds the schema *at the time it was written*. The scan layer uses the manifest's schema as the output schema, filling missing columns from older segments with NULL/default values (Section 6.4).
 
 ### 12.3 Format
 
-JSON for v1. The manifest is small enough to load entirely into memory at startup (even with thousands of segments, the metadata is a few MB). JSON is human-readable and debuggable.
+JSON for v1. Each manifest is small enough to load entirely into memory at startup (even with thousands of segments across dozens of tables, each table's metadata is a few MB at most). JSON is human-readable and debuggable, and compilation time is dominated by execution, not metadata parsing.
 
-Atomicity: write to temp file -> `fsync` -> rename over `manifest.json`.
+**Concrete layout** — the fields the manifest serializer writes:
 
-A future version may switch to a binary format if manifest load time becomes a bottleneck, but this is unlikely given the expected size.
+```rust
+/// Per-table manifest. Serialized as JSON and updated atomically
+/// (write manifest.json.tmp, fsync, rename to manifest.json).
+#[derive(Serialize, Deserialize)]
+pub struct Manifest {
+    /// Monotonically increasing version. Incremented on every manifest update.
+    pub version: u64,
+
+    /// Current table schema (latest version after any ALTER TABLE ADD COLUMN).
+    pub schema: TableSchema,
+
+    /// Table-level configuration.
+    pub config: TableConfig,
+
+    /// Active segments organized by (window, shard).
+    pub windows: Vec<WindowManifest>,
+
+    /// Next sequence_id to assign (persisted for monotonicity across restarts).
+    pub next_sequence_id: u64,
+
+    /// Next batch_id to assign.
+    pub next_batch_id: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TableConfig {
+    /// Window size in days. See Section 4.2.
+    pub window_days: u32,                    // default 30
+
+    /// Number of shards. Database-wide constraint: every table in the same
+    /// database must have the same value (see Section 5.1).
+    pub num_shards: u16,                     // default 32
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct WindowManifest {
+    /// Window identifier: days since epoch for the window start.
+    pub window_id: u32,
+
+    /// Active segments per shard. Outer index = shard_id.
+    pub shards: Vec<Vec<SegmentMeta>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SegmentMeta {
+    /// Unique segment identifier (used for the filename: segment_{id}.seg).
+    pub segment_id: u64,
+
+    /// Compaction level (0 = freshly ingested, higher = more compacted).
+    pub level: u8,
+
+    /// Schema version this segment was written with. Used to determine
+    /// which columns may be missing (filled with NULL/default at scan time).
+    pub schema_version: u32,
+
+    pub row_count: u64,
+    pub byte_size: u64,
+
+    /// (min_ts, max_ts) across all events in this segment.
+    pub ts_range: (i64, i64),
+
+    /// (min_entity, max_entity) — for entity zone map pruning (Section 11.1).
+    /// String entities use lexicographic ordering.
+    pub entity_range: (ScalarValue, ScalarValue),
+
+    /// Per-column zone maps (min/max).
+    pub column_stats: Vec<ColumnStats>,
+
+    /// Creation timestamp (for compaction scheduling).
+    pub created_at: i64,
+
+    /// Batch that produced this segment (Section 6.2).
+    pub batch_id: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ColumnStats {
+    pub column_name: String,
+    pub min: Option<ScalarValue>,
+    pub max: Option<ScalarValue>,
+    pub null_count: u64,
+    /// Optional HyperLogLog estimate of distinct cardinality from ingest.
+    pub distinct_count_estimate: Option<u64>,
+}
+```
+
+**Why zone maps inline.** Zone maps are small — one `(min, max)` pair per column per segment, a few hundred bytes per segment at most. Keeping them inside the manifest lets the planner do segment-level pruning without opening any segment files. On a cold database, opening the manifest already happens at query start, and the zone maps come for free.
+
+**Atomic update.** Write to `manifest.json.tmp`, `fsync` the file, then `rename` over `manifest.json`. Standard crash-safe pattern. No WAL needed for the manifest — the manifest itself is small and the rename is atomic on POSIX (`rename(2)`) and Windows (`ReplaceFile`).
+
+**Reader isolation.** A query takes a snapshot of the manifest at start:
+
+```rust
+let manifest: Arc<Manifest> = table.current_manifest();   // atomic load
+```
+
+Compaction publishes new manifests by atomically swapping the `Arc`. Old manifests stay alive as long as any running query holds a snapshot. A background GC pass checks for orphaned segment files not referenced by the current manifest and not held by any active query's manifest snapshot, and deletes them once the refcount drops (Section 7.6).
+
+**next_sequence_id / next_batch_id.** Both counters are persisted in the manifest so that ingest after a process restart still produces monotonically increasing IDs. They are loaded from the manifest on startup, incremented atomically during ingest, and persisted on the next manifest update.
+
+### 12.4 Tombstones Are Not in the Manifest
+
+Tombstones live in separate per-shard files (`tombstones.json` next to the segment files) and are updated independently from the manifest. The format is specified in Section 7.5. The reasoning:
+
+1. **Tombstones are data, not metadata.** They describe which rows of which shard's data to skip, not which segments exist.
+2. **New ingestion should not inherit old deletes.** If tombstones lived in the (global) manifest, a `DELETE FROM events WHERE entity_id = 'alice'` would continue to suppress alice's events after a subsequent re-insertion — that is the wrong semantics. Per-shard tombstone files that are garbage-collected after the next compaction have the right lifecycle.
+3. **Writes are small and local.** Updating a tombstone touches one shard's file, not the table-wide manifest. This avoids blocking other shards' ingest or compaction on a delete operation.
+
+### 12.5 Lifecycle
+
+- **Startup:** Load every table's manifest into memory. Validate against files on disk (orphan cleanup — Section 7.4).
+- **Ingest:** After writing new L0 segments, update the table's manifest atomically.
+- **Compaction:** After merging segments, write a new manifest (Section 7.4).
+- **Query:** Queries snapshot the manifest at query start. The snapshot is immutable for the query's lifetime.
+
+A future version may switch to a binary manifest format if manifest load time becomes a bottleneck, but this is unlikely given the expected size.
 
 ---
 
@@ -753,7 +901,7 @@ Within query execution, the 3 GB budget is fixed for the process's query worker 
 
 ### 14.1 Database Lock File
 
-A lock file (`db/.lock`) prevents multiple processes from opening the same database concurrently. Attempting to open a database when another process holds the lock returns a clear error.
+A lock file at `<db_root>/.lock` (see the directory layout in Section 5.2) prevents multiple processes from opening the same database concurrently. Attempting to open a database when another process holds the lock returns a clear error.
 
 The lock file uses `flock()` on POSIX systems. Queries, ingestion, and compaction may still run concurrently inside the owning process.
 
@@ -771,8 +919,8 @@ This is lock-free on the query read path. Queries never wait for compaction; com
 
 Multiple ingest calls can run concurrently inside the owning process because they write to independent L0 segment files. The only coordination is:
 
-- Sequence ID / batch ID reservation: atomic `fetch_add` on the per-table counters.
-- **Manifest update: serialized via a manifest lock.** Ingest and compaction both need to update the manifest, so they contend on this lock. The actual segment writes are concurrent and lock-free; only the final manifest update is serialized. Since manifest updates are fast (write JSON, fsync, rename), this lock is held briefly and is not a bottleneck.
+- Sequence ID / batch ID reservation: atomic `fetch_add` on the per-table counters (Section 12.3).
+- **Manifest update: serialized via a per-table manifest lock.** Ingest and compaction for the same table both need to update that table's manifest, so they contend on a table-scoped lock. Different tables never contend with each other — that is the main motivation for per-table manifests (Section 12.1). The actual segment writes are concurrent and lock-free; only the final manifest update is serialized. Manifest updates are fast (write JSON, fsync, rename), so the lock is held briefly and is not a bottleneck.
 
 ---
 
@@ -830,10 +978,11 @@ Encoded as three components:
 | Encoding selection | Multi-pass heuristics using statistics | Covers all common patterns; evolve to sampling in v2 |
 | Compression | LZ4 only | Decode speed over ratio; ZSTD deferred |
 | Index structures | Zone maps (all columns) | Nearly free; entity_id zone maps highly selective given sort order |
-| Manifest format | JSON, atomic rename | Human-readable, debuggable, small enough for memory |
+| Manifest format | JSON per-table + `db.json` for db-wide settings, atomic rename | Human-readable, debuggable; per-table isolation avoids cross-table lock contention |
+| Manifest scope | One manifest per table (Section 12); db-wide UUID in `db.json` | Independent updates per table; tombstones stay out of metadata |
 | Checksums | xxHash64 per segment | Fast; per-row-group deferred to v2 |
 | Batch ID | 64-bit, returned to caller, supports batch-level deletion | Enables undo of bad ingests |
-| Delete mechanism | Tombstone files per shard (row, batch, entity granularity) | Applied during compaction; lightweight for reads |
+| Delete mechanism | Per-shard `tombstones.json` with row/batch/entity/time-range deletes; **not** in the manifest | Re-inserted entities get the right semantics; local writes for per-shard deletes |
 | Decode strategy | Near-zero-copy to Arrow, late materialization | DictionaryArray/RunEndEncoded propagate through pipeline |
 | Concurrency | Lock file for writes, manifest snapshots for reads | Lock-free read path |
 | Memory budget split | 75% query / 20% compaction / 5% ingest | Query-dominant workload |

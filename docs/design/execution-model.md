@@ -80,12 +80,14 @@ All operators implement a common interface:
 ```rust
 pub trait PhysicalOperator: Send {
     /// The output schema of this operator, determined at plan time.
-    fn schema(&self) -> &OperatorSchema;
+    fn output_schema(&self) -> &OperatorSchema;
 
     /// Pull the next batch of results. Returns None when exhausted.
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, OperatorError>;
 }
 ```
+
+`output_schema()` is the same name used by `EntityOperator` (Section 4), so an `EntityOperatorAdapter` can forward the call unchanged when presenting its inner operator's schema to downstream consumers.
 
 The pull interface is the external API for consumers (the engine, Python bindings, CLI). Internally, fused push segments are wrapped in a `PhysicalOperator` that drives the push loop inside `next_batch()`.
 
@@ -137,6 +139,44 @@ Batches target **65,536 rows** (64K), the same size as storage row-groups. Note 
 
 This alignment between row-group and batch size eliminates an unnecessary boundary and simplifies the scan layer. Small entities (10-100 events) pack many per batch; a single large entity (100K+ events) is handled via sub-batch streaming (Section 5) with the same 64K batch size.
 
+### 3.7 RecordBatch Schema Conventions
+
+All `RecordBatch` values flowing through the pipeline obey a small set of conventions that operators can rely on without re-deriving them per-query.
+
+**Column ordering.** Batches produced by the scan layer lay out columns in a fixed order:
+
+1. `entity_id` (first)
+2. `ts` — timestamp (second)
+3. `event_type` (third)
+4. `__seq_id` — sequence identifier (fourth)
+5. Remaining property columns sorted by **encoded size ascending** — the narrowest columns first, for cache efficiency in vectorized scans.
+
+The property column ordering is decided at ingest/compaction time by the storage layer (storage-format.md §3.4 encoding selection has access to per-chunk sizes), not at plan time. Smaller columns first means more columns fit in cache lines during vectorized filter and project passes.
+
+**Reference columns by name, not position.** Projection pruning removes and reorders columns between the scan and the first operator that references them, so any operator that hard-codes column indices is fragile. Every operator looks up columns by name through its `OperatorSchema`. The one exception is the `EntityOperatorAdapter`, which caches `entity_id_col_idx` once at construction.
+
+**Dictionary encoding preservation.** The scan layer produces columns in whatever encoding the storage provides. For string columns, this is most commonly `DictionaryArray<Int32, Utf8View>` from a single-segment read. Downstream operators must handle dictionary columns without forcing materialization:
+
+- **For filtering.** At scan setup (before iterating rows), the scan precomputes a **dictionary filter bitset** per `(segment, filtered string column)` pair:
+
+  ```rust
+  /// Computed once per (segment, filtered column) pair at scan setup.
+  struct DictFilterBitset {
+      /// bitset[i] = true iff dictionary entry i satisfies the predicate.
+      /// For `event_type IN ('signup', 'purchase')`, the bitset is true at the
+      /// dictionary codes for those two strings.
+      matching_codes: BitVec,
+  }
+  ```
+
+  During row iteration, filtering is an integer bitset lookup — no string comparison in the hot loop. Each of the `k` segment files in a k-way merge has its own dictionary, so each has its own precomputed bitset.
+
+- **For materialization.** When downstream needs the actual string value (output, variable binding, step property forwarding), decode via a single dictionary lookup per row. This only runs on rows that pass filtering, which is typically a small fraction of the input.
+
+**Timestamp format.** The `ts` column is always `Int64` nanoseconds (Arrow `Timestamp(Nanosecond, UTC)`). No timezone conversion at query time — all conversion happens at ingest (type-system.md §7.2 width consolidation).
+
+**Null bitmaps.** Nullable columns always carry an Arrow-compatible null bitmap. Non-nullable columns (`entity_id`, `ts`, `event_type`, `__seq_id`) never do — operators skip the null check entirely on these columns, and the storage layer does not allocate bitmaps for them. The schema declares which columns are nullable; the decoder trusts the schema and does not insert defensive checks.
+
 ---
 
 ## 4. Entity Operator Interface
@@ -144,45 +184,56 @@ This alignment between row-group and batch size eliminates an unnecessary bounda
 Stateful temporal operators implement a separate trait that the engine wraps inside a `PhysicalOperator` adapter:
 
 ```rust
-pub trait EntityOperator: Send {
-    /// Per-entity mutable state. Compact — typically tens of bytes.
-    type State;
+/// Stateful per-entity operator.
+/// The operator itself is immutable (&self) — all mutable state lives in State.
+/// This makes the compiled operator safely shareable across shard-tasks.
+pub trait EntityOperator: Send + Sync {
+    /// Per-entity mutable state. Created fresh for each entity.
+    type State: Send;
 
-    /// Create initial state for a new entity.
-    fn create_state(&self) -> Self::State;
+    /// Create initial state for a new entity. The `entity_id` is passed so
+    /// operators that need per-entity warning attribution can capture it;
+    /// most operators ignore the argument.
+    fn create_state(&self, entity_id: &ScalarValue) -> Self::State;
 
     /// Output schema for this operator's results.
-    fn schema(&self) -> &OperatorSchema;
+    fn output_schema(&self) -> &OperatorSchema;
 
     /// Process a sub-batch of events for the current entity.
+    /// The adapter guarantees that the rows in `batch` are:
+    ///   - all for the same entity_id,
+    ///   - sorted by timestamp ascending,
+    ///   - no more than SUB_BATCH_SIZE rows (configurable, default 65,536).
     fn process_sub_batch(
         &self,
         state: &mut Self::State,
         batch: &RecordBatch,
-    ) -> Result<(), OperatorError>;
+    );
 
-    /// Emit the result for the completed entity. Called once after all
-    /// sub-batches have been processed. Returns None to skip this entity
-    /// in the output (e.g., entity didn't match the pattern).
-    /// Consumes the state.
-    fn finish_entity(
-        &self,
-        state: Self::State,
-    ) -> Result<Option<RecordBatch>, OperatorError>;
+    /// Extract results after all sub-batches for this entity.
+    /// Called exactly once per entity, after the last `process_sub_batch()`.
+    /// Returns `None` if this entity produces no output rows (e.g. the entity
+    /// did not match the pattern). Consumes `state` — there is no reuse.
+    fn finish_entity(&self, state: Self::State) -> Option<RecordBatch>;
 
-    /// The set of input columns this operator actually reads.
-    /// Used by demand propagation (Section 8) to avoid decoding unused columns.
-    fn required_columns(&self) -> &[String];
-
-    /// Fused aggregation path. Updates the accumulator directly
-    /// instead of materializing a per-entity result row.
-    /// Default implementation calls finish_entity() and feeds the result
-    /// to the accumulator — operators override for zero-materialization fusion.
+    /// Fused aggregation path. If the operator has a fused accumulator, the
+    /// adapter calls this INSTEAD of `finish_entity()`. Updates the accumulator
+    /// directly without materializing per-entity rows.
+    /// The default implementation calls `finish_entity()` and feeds the result
+    /// into the accumulator — operators override for zero-materialization fusion.
     fn finish_entity_into(
         &self,
         state: Self::State,
         accumulator: &mut dyn Accumulator,
-    ) -> Result<(), OperatorError>;
+    ) {
+        if let Some(batch) = self.finish_entity(state) {
+            accumulator.update_batch(&batch);
+        }
+    }
+
+    /// The set of input columns this operator actually reads.
+    /// Drives projection pruning at the scan layer (Section 8).
+    fn required_columns(&self) -> &[String];
 
     /// Advertise what demand-based strategies this operator supports.
     /// The planner uses this to select the cheapest strategy that satisfies
@@ -193,38 +244,64 @@ pub trait EntityOperator: Send {
 
 **Key design choices:**
 
-- **`create_state()` instead of `State: Default`** — allows operator configuration (pattern definition, gap threshold) to influence the initial state without baking it into the state type.
-- **`finish_entity()` is the sole completion signal** — no `is_last` flag on `process_sub_batch()`. The adapter calls `process_sub_batch()` for every sub-batch, then `finish_entity()` once. Clean single-responsibility: `process_sub_batch` accumulates, `finish_entity` emits.
-- **`finish_entity()` returns `Option<RecordBatch>`** not `Option<Row>` — a single-row RecordBatch for entity operators that emit one result per entity, or a multi-row RecordBatch for operators like SESSIONIZE that emit one row per session. Avoids an undefined `Row` type and keeps everything in Arrow's type system.
-- **`finish_entity_into()`** is the fused aggregation path (Section 8.4). The default implementation calls `finish_entity()` and feeds the result to the accumulator. Operators override this for zero-materialization fusion.
+- **`&self` is immutable.** The compiled operator (NFA program, predicates, schema, configuration) is shared across all shard-tasks via `Arc`. All mutable state lives in `Self::State`, created fresh per entity by `create_state`. This is what makes `Send + Sync` sound even though each shard-task runs independently — no shard-task can mutate the operator itself.
+- **`create_state(entity_id)` instead of `State: Default`** — allows operator configuration to influence the initial state, and gives the operator access to the entity identifier for warning attribution (`QueryWarning::EntityEventLimitExceeded`, `ActiveStateLimitExceeded`, etc.).
+- **`finish_entity()` is the sole completion signal** — no `is_last` flag on `process_sub_batch()`. The adapter calls `process_sub_batch()` for every sub-batch, then `finish_entity()` exactly once. Clean single-responsibility: `process_sub_batch` accumulates, `finish_entity` emits and consumes the state.
+- **`finish_entity()` returns `Option<RecordBatch>`** not `Option<Row>` — a single-row `RecordBatch` for operators that emit one result per entity, or a multi-row `RecordBatch` for operators like SESSIONIZE (one row per session) or windowed operators (one row per input event). Avoids an undefined `Row` type and keeps everything in Arrow's type system.
+- **`finish_entity_into()` has a default implementation.** Non-fused operators leave it alone; fused operators override it to skip the per-entity `RecordBatch` materialization entirely.
+- **No `Result<...>` returns on the hot-path methods.** Errors surface through different channels to keep the inner loop branch-free:
+  - **Memory pressure** is caught at the allocation site (`MemoryTracker::try_reserve` inside operator internals). Operators that cannot spill set an error flag on the shared `QueryContext` and return early from `process_sub_batch`; the adapter observes the flag between sub-batches and aborts the query.
+  - **Cancellation** is checked against `QueryContext::cancelled` between sub-batches, not inside the per-event loop.
+  - **Invariant violations** panic — the engine catches panics at the shard-task boundary and surfaces them as `ExecutionError::OperatorPanic`.
 
 ### 4.1 EntityOperatorAdapter
 
 The engine wraps an `EntityOperator` in a `PhysicalOperator` adapter that handles entity boundary detection and sub-batch routing:
 
 ```rust
-pub struct EntityOperatorAdapter<E: EntityOperator> {
-    inner: E,
+pub struct EntityOperatorAdapter<O: EntityOperator> {
+    operator: O,
     input: Box<dyn PhysicalOperator>,
-    current_state: Option<E::State>,
-    current_entity_id: Option<PropertyValue>,
+
+    // Per-entity tracking
+    current_entity: Option<ScalarValue>,
+    current_state: Option<O::State>,
+
+    /// Leftover rows after an entity boundary split. Processed on the next
+    /// `next_batch()` call before pulling more input.
+    pending_batch: Option<RecordBatch>,
+
+    /// Cached index of the entity_id column in the input's schema.
+    entity_id_col_idx: usize,
+
+    // Output accumulation: collect per-entity outputs until `target_output_rows`
+    // is reached, to avoid emitting one-row batches per entity.
     output_buffer: Vec<RecordBatch>,
+    target_output_rows: usize,                  // default ~8,192
+
     ctx: Arc<QueryContext>,
 }
 ```
 
-The adapter's `next_batch()` implementation:
+The adapter's `next_batch()` implementation runs this boundary-detection loop:
 
-1. Pull a batch from the input operator. If the input returns `None` (exhausted), call `finish_entity()` on any in-progress entity state and return the final results.
-2. Scan the `entity_id` column. Compare the first row's entity ID against `current_entity_id` to detect cross-batch entity continuations.
-3. For each contiguous entity span within the batch, call `process_sub_batch()` on the current state.
-4. When an entity boundary is detected (entity ID changes), call `finish_entity()` on the completed entity's state, store the result if non-None, and call `create_state()` for the new entity.
-5. Check the `cancelled` flag in `QueryContext` between entities for cooperative cancellation/timeout.
-6. Collect non-None results into an output `RecordBatch` and return it.
+1. **Drain any pending sub-batch** first. If `pending_batch` is `Some`, process it as if it had just been pulled (it holds the rows that belong to a new entity after a split).
+2. **Pull the next batch from input.** If the input is exhausted and no in-progress entity remains, drain `output_buffer` and return.
+3. **Scan the entity_id column** for a value change. Because the data is sorted by `(entity_id, timestamp)`, a value change is always a boundary.
+4. **No boundary found.** The entire batch belongs to `current_entity`. Call `operator.process_sub_batch(state, &batch)` and continue to the next iteration.
+5. **Boundary found at row N.**
+   a. Slice `batch[0..N]` — this is the last sub-batch for the current entity. Call `process_sub_batch(state, &slice)`.
+   b. Call `finish_entity(state)` (or `finish_entity_into(state, accumulator)` when fused). Append any returned `RecordBatch` to `output_buffer`.
+   c. Slice `batch[N..]` and store it as `pending_batch` for the next iteration.
+   d. Call `create_state()` for the new entity and update `current_entity`.
+   e. **Re-enter the loop at step 1.** Step 1 drains the slice we just stashed in 5c before any further pulls — this is the "leftover slice belongs to the new entity" path. Do not fall through to step 2.
+6. **Input exhausted** (step 2 observed `None` and there is no in-progress entity). At this point `pending_batch` is guaranteed to be empty, because step 1 always drains it before step 2 can pull again. Call `finish_entity()` on the final in-progress entity if any, drain `output_buffer`, and return `None` on subsequent calls.
 
-Entity boundaries are detected by comparing `entity_id` values — both within a batch (scanning for changes) and across batch pulls (comparing the first row of the new batch against `current_entity_id`). This works because the data is always sorted by `entity_id`.
+Between iterations, the adapter checks `QueryContext::cancelled` so cooperative cancellation observes a per-entity upper bound on latency. Output is only returned from `next_batch()` once `output_buffer`'s total row count reaches `target_output_rows`, which prevents the common "one-row `RecordBatch` per entity" pathology in non-fused pipelines.
 
-**`finish_entity()` overhead.** Creating a single-row `RecordBatch` per entity involves schema validation and buffer allocation. For 10M entities in a non-fused pipeline, this is 10M small allocations. In practice this is acceptable — Arrow's `RecordBatch::try_new()` is lightweight for single-row batches (~100ns), and the fused path (Section 8.4) eliminates it entirely for the common aggregate case. The adapter also batches multiple single-row results into a single output `RecordBatch` before returning, amortizing the overhead.
+The `pending_batch` slot is what makes this loop work across `next_batch()` boundaries. If a boundary lands mid-batch and the freshly-started entity's sub-batch is non-trivial, the adapter does **not** recurse into another pull — it stashes the leftover slice and returns to the caller with whatever output is ready. The next call picks up the leftover slice first, preserving the "process the current entity before pulling more" invariant.
+
+**`finish_entity()` overhead.** Creating a single-row `RecordBatch` per entity involves schema validation and buffer allocation. For 10M entities in a non-fused pipeline, this is 10M small allocations. In practice this is acceptable — Arrow's `RecordBatch::try_new()` is lightweight for single-row batches (~100ns), and the fused path (Section 8.4) eliminates it entirely for the common aggregate case. The output-buffer accumulation above amortizes the cost by concatenating many single-row batches into one output batch before returning.
 
 ### 4.2 Layered Extraction for Stateful Operators
 
@@ -260,7 +337,9 @@ fn on_match_complete(&mut self) {
         // extract value from retained event reference
     }
     if let Some(acc) = &mut self.config.fused_accumulator {
-        acc.update_from_match(/* ... */);
+        // Reduced values are laid out in FusableAggregate::functions order;
+        // see sequence-matching.md §13.4 for the concrete MATCH version.
+        acc.update(group_key.as_deref(), &reduced_values);
     } else {
         self.output_batch.push(/* ... */);
     }
@@ -356,7 +435,7 @@ Sequence match, sessionize, event sub-selection, attribution. Pull-based process
 
 ### Stage 4: Aggregation
 
-If not fused with Stage 3, standard hash aggregation on the output of the entity stage. Partial aggregation per shard, final merge across shards. Spills to disk if memory budget is exceeded (Section 10.3).
+If not fused with Stage 3, standard hash aggregation on the output of the entity stage via `HashAccumulator` (Section 9.4). Partial aggregation per shard, final merge across shards via `Accumulator::merge`. Group cardinality is bounded by `max_groups` (default 1M); overflow produces `OperatorError::MaxGroupsExceeded`. There is no aggregation spill in v1 — see Section 10.3.
 
 ### Stage 5: Output
 
@@ -457,9 +536,9 @@ Fusion is valid when:
 
 ### 8.5 GROUP BY With Fusion
 
-For `STATS COUNT(*) GROUP BY held.plan` after a sequence match, the fused operator maintains a `HashMap<GroupKey, AccumulatorState>`. For each entity, it resolves the group key (held property value) and updates the right accumulator. Still no per-entity materialization.
+For `STATS COUNT(*) GROUP BY held.plan` after a sequence match, the fused operator maintains a `HashMap<GroupKey, Vec<AggState>>` (the same layout as `HashAccumulator`, Section 9.4). For each entity it resolves the group key (held property value) and updates the right `AggState` slot. Still no per-entity materialization.
 
-Group cardinality is bounded by a configurable max (default: 1 million). If exceeded, aggregation state spills to disk (Section 10.3).
+Group cardinality is bounded by `max_groups` (default: 1,000,000). If exceeded, the fused accumulator raises `OperatorError::MaxGroupsExceeded` — v1 does not spill aggregation state (Section 10.3).
 
 ### 8.6 Fusion Opportunities
 
@@ -509,17 +588,94 @@ Non-aggregated results (selection queries) are concatenated across shards and op
 The `Accumulator` trait supports both incremental updates and cross-shard merging:
 
 ```rust
+/// Receives incremental updates from fused entity operators and from
+/// non-fused aggregate nodes. One accumulator per shard-task; merged
+/// across shards after execution.
 pub trait Accumulator: Send {
-    /// Update the accumulator with a single value.
-    fn update(&mut self, value: &dyn Array) -> Result<(), OperatorError>;
+    /// Update with the reduced values for one entity, match, session, or path.
+    /// `group_key` is `None` for ungrouped aggregation. `values` contains
+    /// one slot per aggregate function, in the order declared by the
+    /// corresponding `FusableAggregate::functions` list.
+    fn update(
+        &mut self,
+        group_key: Option<&[ScalarValue]>,
+        values: &[ScalarValue],
+    );
 
-    /// Merge another accumulator's state into this one (for cross-shard merge).
-    fn merge(&mut self, other: &dyn Accumulator) -> Result<(), OperatorError>;
+    /// Bulk update from a `RecordBatch` — the non-fused path used by the
+    /// default `EntityOperator::finish_entity_into()` and by the plain
+    /// `AggregatePhysical` node when no fusion is in effect.
+    fn update_batch(&mut self, batch: &RecordBatch);
 
-    /// Emit the final result.
-    fn finish(&self) -> Result<ArrayRef, OperatorError>;
+    /// Merge another accumulator into this one (for cross-shard reduction).
+    /// Each shard produces one accumulator; they are merged pairwise on the
+    /// coordinator after all shard-tasks finish.
+    fn merge(&mut self, other: Box<dyn Accumulator>);
+
+    /// Produce the final aggregated `RecordBatch`.
+    fn finish(&mut self) -> RecordBatch;
+
+    /// Current memory usage estimate — reported to the memory tracker and
+    /// surfaced through query metrics for observability. Aggregation does not
+    /// spill in v1 (Section 10.3), so this is informational rather than a
+    /// spill trigger.
+    fn memory_usage(&self) -> usize;
 }
 ```
+
+**Concrete implementation: `HashAccumulator`.** The default aggregate accumulator is a flat hash map from group key to per-function state:
+
+```rust
+pub struct HashAccumulator {
+    /// Per-group state. Key is the group-by values tuple.
+    groups: HashMap<GroupKey, Vec<AggState>>,
+    /// Schema of the final aggregated output.
+    output_schema: OperatorSchema,
+    /// Hard cap on distinct groups before `update()` returns an error.
+    /// Default: 1,000,000. Configurable per query.
+    max_groups: usize,
+}
+
+/// Compact group key — `SmallVec` inline storage avoids heap allocation for
+/// the common case of 1–3 group-by columns.
+#[derive(Eq, PartialEq, Hash, Clone)]
+pub struct GroupKey(SmallVec<[ScalarValue; 4]>);
+```
+
+**Per-function state: `AggState`.** Every aggregate in v1 is incrementally computable, which is what enables the fusion framework (Section 8.4 and planner-pipeline.md §7.2). The per-function state enum is:
+
+```rust
+pub enum AggState {
+    Count(u64),
+    Sum(SumState),                           // tracks i64 or f64 without cross-type promotion
+    Min(Option<ScalarValue>),
+    Max(Option<ScalarValue>),
+    Avg { sum: f64, count: u64 },            // algebraic; not associative but incremental
+    CountDistinct(HashSet<ScalarValue>),
+    Percentile(DDSketch),                    // ~1–2 KB per group, constant-time merge
+    Variance { count: u64, mean: f64, m2: f64 },  // Welford's algorithm; parallel merge formula
+}
+
+pub enum SumState {
+    Int(i64),
+    Float(f64),
+}
+```
+
+**Mergeability.** Every `AggState` variant supports a pairwise merge operation for cross-shard reduction — this is a hard requirement of the v1 aggregate list:
+
+| `AggState`       | Merge operation                                        |
+| ---------------- | ------------------------------------------------------ |
+| `Count`          | Sum the counts                                         |
+| `Sum`            | Sum the sums                                           |
+| `Min`            | Take the smaller                                       |
+| `Max`            | Take the larger                                        |
+| `Avg`            | Sum the sums and the counts                            |
+| `CountDistinct`  | Set union                                              |
+| `Percentile`     | `DDSketch::merge()` — constant-time native operation   |
+| `Variance`       | Parallel Welford merge formula                         |
+
+**Group cardinality limit.** The limit is enforced inside `update()`: if `groups.len() >= max_groups` and the incoming `group_key` is new, the accumulator raises an error (surfaced through `QueryContext` as described in Section 4). There is no spill-to-disk for aggregation state in v1 — the combination of bounded groups + the memory budget provides a hard upper bound on accumulator memory. Spill is a v2 concern.
 
 For fused entity operators that use `finish_entity_into()`, each shard-task produces its own accumulator(s). The coordinator merges them via `Accumulator::merge()` to produce the final result.
 
@@ -564,22 +720,14 @@ Each shard-task uses:
 | K-way merge read buffers | k × 4 MB (k = windows) | Configurable buffer size |
 | Current batch | ~5 MB (64K rows × ~10 cols × 8 bytes) | One row-group |
 | Operator state | 10-100 bytes per entity | Compact by design |
-| Partial aggregation state | ~100 bytes per group | Bounded by max group count or spill |
+| Partial aggregation state | ~100 bytes per group | Hard cap at `max_groups` (default 1M); error on overflow |
 | Decoded column data | Variable | Only demanded columns decoded |
 
 At most `num_cores` shard-tasks run simultaneously (the thread pool bounds concurrency). On a 16-core machine: 16 × (24 MB merge buffers + 5 MB batch) ≈ 464 MB base. On a 32-core machine: 32 × 29 MB ≈ 930 MB. Both fit within the 3 GB query budget with headroom for aggregation state. The per-thread budget (`3 GB / num_cores`) provides a stable upper bound regardless of shard count or query concurrency.
 
 ### 10.3 Spill-to-Disk
 
-When an operator's memory reservation exceeds the remaining budget, it spills intermediate state to disk:
-
-**Hash aggregation spill.** When the aggregation hash table exceeds its memory allocation:
-1. Partition the hash table by hash(group_key) into N partitions.
-2. Spill the largest partition(s) to sorted temporary files on disk.
-3. Continue processing — new rows for spilled partitions are appended to the temp files.
-4. After all input is consumed, read back each spilled partition, re-aggregate, and emit results.
-
-This is the standard external hash aggregation approach used by DuckDB and DataFusion.
+When an operator's memory reservation exceeds the remaining budget, it spills intermediate state to disk. Two operators support spill in v1; a third has a hard cap instead.
 
 **Sort spill (for ORDER BY).** When the sort buffer exceeds its allocation:
 1. Sort the current buffer in memory.
@@ -590,11 +738,13 @@ This is the standard external hash aggregation approach used by DuckDB and DataF
 1. Write the hash set to a temporary on-disk hash table (sorted file with binary search).
 2. Probe the on-disk table for each entity during the outer query scan.
 
-Spill files are written to a configurable temp directory (default: the database directory). They are cleaned up when the query completes or is cancelled.
+**Aggregation: no spill in v1.** `HashAccumulator` enforces a hard cap (`max_groups`, default 1M) at `update()` time and returns an error on overflow — see Section 9.4. At ~100 bytes per group, 1M groups fit comfortably in the query budget, and analytics queries rarely exceed that. External hash aggregation is deferred to v2; the cap is the v1 backstop.
+
+Spill files (sort, IN subquery) are written to a configurable temp directory (default: the database directory). They are cleaned up when the query completes or is cancelled.
 
 ### 10.4 Aggregation State Bounds
 
-Running aggregation state is small per group (counts, sums, min/max). Configurable max group count (default: 1 million) provides a first line of defense. When exceeded, the aggregation spills per Section 10.3. At 100 bytes per group, 1M groups = 100 MB — well within budget for most queries. Spill handles the tail case.
+Running aggregation state is small per group (counts, sums, min/max — see `AggState` in Section 9.4). The `max_groups` hard cap (default 1M) is enforced inside `HashAccumulator::update()` and is the only defense against runaway cardinality. When the cap is hit, the query fails with `OperatorError::MaxGroupsExceeded { limit }`, not a spill. 1M groups × ~100 bytes = ~100 MB — well within the 3 GB query budget, with no spill complexity to manage.
 
 ---
 
@@ -624,7 +774,7 @@ Compaction state is suspendable: the k-way merge iterators hold their position, 
 
 ### 11.3 Manifest Contention
 
-Compaction and ingest both need to update the manifest, so they contend on a serialized manifest lock (storage-format.md Section 14.3). The actual segment writes are concurrent and lock-free; only the final manifest update is serialized. Since manifest updates are fast (write JSON, fsync, rename), the lock is held briefly.
+Compaction and ingest for the same table both need to update that table's manifest, so they contend on a **per-table** manifest lock (storage-format.md Section 14.3). Different tables never contend with each other. The actual segment writes are concurrent and lock-free; only the final manifest update is serialized. Since manifest updates are fast (write JSON, fsync, rename), the lock is held briefly.
 
 ---
 
@@ -639,6 +789,9 @@ Errors propagate upward through the pipeline in two layers. Operators return `Op
 pub enum OperatorError {
     #[error("memory budget exceeded: {used} bytes used, {budget} bytes budgeted")]
     MemoryBudgetExceeded { used: u64, budget: u64 },
+
+    #[error("aggregation group cardinality limit exceeded: {limit} groups")]
+    MaxGroupsExceeded { limit: usize },
 
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
@@ -728,10 +881,12 @@ Each shard-task maintains its own `QueryMetrics` in its `ShardTaskContext` (Sect
 
 | Type | Crate | Rationale |
 |---|---|---|
-| `PhysicalOperator` trait | `bqlite-operators` | Operators implement this |
+| `PhysicalOperator` trait | `bqlite-operators` | Operators implement this; `bqlite-engine` consumes it via trait object |
 | `EntityOperator` trait | `bqlite-operators` | Temporal operators implement this |
 | `EntityOperatorAdapter` | `bqlite-operators` | Wraps `EntityOperator` into `PhysicalOperator` |
-| `Accumulator` trait | `bqlite-operators` | Aggregation accumulators |
+| `Accumulator` trait | `bqlite-operators` | Aggregation accumulator protocol |
+| `HashAccumulator`, `AggState`, `GroupKey`, `SumState` | `bqlite-operators` | Default accumulator implementation |
+| `DictFilterBitset` | `bqlite-storage` | Scan-time precomputed dictionary filter |
 | `TypedKernel` | `bqlite-operators` | Monomorphized vectorized kernels |
 | `OperatorError` | `bqlite-operators` | Operator-facing execution failures |
 | `DemandSet` / `DemandCapabilities` | `bqlite-planner` | Plan-time demand propagation |
@@ -763,7 +918,7 @@ This follows the dependency direction in CLAUDE.md: `bqlite-engine` depends on `
 | Default shard count | 32 | One shard per core on modern hardware; thread pool handles scheduling |
 | Compaction scheduling | Up to num_cores threads, bounded by spare capacity | Uses idle cores; scales down under query load |
 | Memory management | Hierarchical MemoryTracker; per-thread budget = query_budget / num_cores | Runtime enforcement with stable per-thread bounds |
-| Spill-to-disk | External hash aggregation, sort spill, hash set spill | Preferred response to memory pressure; error as fallback |
+| Spill-to-disk | Sort spill and IN subquery spill only; aggregation has hard `max_groups` cap | Aggregation spill deferred to v2; hard cap keeps the v1 engine small |
 | Query timeout | Timer sets AtomicBool cancel flag; cooperative checking | Fast stopping, no polling overhead |
 | Error handling | `OperatorError` in operators, wrapped by engine `ExecutionError`; warnings for non-fatal conditions | Keeps crate boundaries clean while preserving typed failures |
 | Python integration | GIL released, zero-copy Arrow, results fully materialized | Simple API, no streaming complexity |

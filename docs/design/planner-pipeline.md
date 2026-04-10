@@ -55,7 +55,7 @@ Planner (bqlite-planner)         ── logical::LogicalPlan
   │
   ▼
 Optimizer (bqlite-planner)       ── logical::LogicalPlan (rewritten)
-  │   - 7 fixed passes
+  │   - 6 fixed passes
   │
   ▼
 Physical Planner (bqlite-planner) ── physical::PhysicalPlan
@@ -750,7 +750,10 @@ fn on_match_complete(&mut self) {
     }
 
     if let Some(acc) = &mut self.config.fused_accumulator {
-        acc.update_from_match(/* ... */);
+        // Accumulator::update takes (group_key, values) — values are laid out
+        // in FusableAggregate::functions order. See execution-model.md §9.4
+        // for the trait and sequence-matching.md §13.4 for the MATCH call site.
+        acc.update(group_key.as_deref(), &reduced_values);
     } else {
         self.output_batch.push(/* ... */);
     }
@@ -1394,8 +1397,9 @@ The following open questions from TASK-006 and the design notes are resolved:
 | Optimizer passes 1–7                | `bqlite-planner` | Rule-based structural rewrites                            |
 | `DemandSet`                          | `bqlite-planner` | Downstream-needs value carried through backward pass      |
 | Physical planner                    | `bqlite-planner` | Strategy selection, fused operator emission               |
-| `PhysicalOperator` trait             | `bqlite-engine`  | Per execution-model.md §3.2 (engine owns the trait)       |
+| `PhysicalOperator` trait             | `bqlite-operators` | Operators implement this; see execution-model.md §15     |
 | Physical operator implementations    | `bqlite-operators` | Per execution-model.md §4                                 |
+| `Accumulator` / `HashAccumulator` / `AggState` | `bqlite-operators` | Fused + non-fused aggregation — see execution-model.md §9.4 |
 | `MatchExecutionConfig`               | `bqlite-operators` | Layered extraction configuration for MATCH              |
 | `ExplainNode` and formatter         | `bqlite-planner` | Stable EXPLAIN output                                     |
 

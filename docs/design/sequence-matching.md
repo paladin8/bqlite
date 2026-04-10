@@ -718,13 +718,32 @@ Called after all sub-batches for the entity (execution-model.md Section 4). Retu
 
 ### 13.4 finish_entity_into() (Aggregation Fusion)
 
-When the demand is aggregate-only, the sequence matcher accumulates the aggregate internally via `finish_entity_into()`, which calls `Accumulator::update()` with the final aggregated values for the entity:
+When the demand is aggregate-only, the sequence matcher overrides `finish_entity_into()` and calls the `Accumulator` (execution-model.md §9.4) directly rather than going through a per-entity `RecordBatch`:
 
-- **Count of matches per entity:** Internal counter across all binding tracks, passed to accumulator at entity end.
-- **Funnel step counts:** Internal `[u64; num_steps]` array, incremented at match completion, window expiry (EMIT ALL), and entity end. Passed to accumulator.
-- **Grouped counts:** Internal `HashMap<GroupKey, Counts>`, keyed by bound variable values or other GROUP BY fields. Passed to accumulator.
+```rust
+fn finish_entity_into(&self, state: Self::State, acc: &mut dyn Accumulator) {
+    match state {
+        SequenceMatchState::StepCounter(sc) => {
+            for track in sc.tracks {
+                // values[] carries the reduced values the fused aggregate reads
+                // (step counts, match counts, extracted step properties, etc).
+                acc.update(group_key(&track).as_deref(), &track.reduced_values());
+            }
+            // Separate path for expired candidates already counted via EMIT ALL
+            // (see Section 5.3).
+        }
+        SequenceMatchState::Nfa(ems) => { /* analogous walk over binding tracks */ }
+    }
+}
+```
 
-Zero intermediate materialization — no per-entity rows emitted between the sequence match and aggregation operators.
+The `group_key` is constructed from bound variables, quantized timestamps, or other group-by columns the planner resolved into the fused aggregate. The `values` slice is laid out in the same order as `FusableAggregate::functions` (planner-pipeline.md §5.3), so the accumulator updates each `AggState` slot in one pass. Per-operator internal bookkeeping:
+
+- **Count of matches per entity:** `track.match_count` across all binding tracks, passed as the sole value.
+- **Funnel step counts:** Internal `[u64; num_steps]` array, incremented at match completion, window expiry (EMIT ALL), and entity end. Replayed into the accumulator as one `update` call per step at entity end.
+- **Grouped counts:** Internal `HashMap<GroupKey, Counts>`, keyed by bound variable values or other GROUP BY fields. Drained into `acc.update(Some(&key), &counts)` at entity end.
+
+Zero intermediate materialization — no per-entity rows emitted between the sequence match and aggregation operators. The `Accumulator::update` path bypasses `RecordBatch` construction entirely, which is the main reason `finish_entity_into` exists as a separate hot-path entry point.
 
 ### 13.5 supported_demands()
 
