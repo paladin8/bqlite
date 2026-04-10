@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-4",
   "task_id": "TASK-122",
   "claimed_at": "2026-04-10T00:05:00Z",
+  "completed_at": "2026-04-10T00:30:00Z",
   "branch": "task/TASK-122",
   "description": "Logging and tracing setup"
 }
