@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-1",
+  "task_id": "TASK-102",
+  "claimed_at": "2026-04-10T00:00:00Z",
+  "branch": "task/TASK-102",
+  "description": "Error type hierarchy: thiserror-based BqliteError enum in bqlite-core"
+}
