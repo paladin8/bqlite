@@ -321,22 +321,7 @@ sessionize(gap: 30m) by user_id
   | stats avg(session_duration), p50(session_duration), count
 ```
 
-### 4.7 Path Analysis (Sankey)
-
-Path analysis / Sankey diagram aggregation is a complex query type that aggregates event sequences into flow graphs:
-
-```sql
--- Top paths through the product (Sankey-style)
-paths(depth: 5, from: signup)
-  by user_id
-  | stats count by path
-  | order by count desc
-  | limit 20
-```
-
-This requires a dedicated design spec — the output schema (paths as arrays, counts, branching factors) and the aggregation strategy need careful thought.
-
-### 4.8 Cross-Table Queries
+### 4.7 Cross-Table Queries
 
 Tables can be joined for queries that need to correlate events across different data sources:
 
@@ -448,7 +433,6 @@ bqlite/
 │   │   │   ├── sessionize.rs   # Session segmentation (gap + end events)
 │   │   │   ├── aggregate.rs    # Hash/sort aggregation
 │   │   │   ├── cohort.rs       # Behavioral cohort materializer
-│   │   │   ├── paths.rs        # Sankey-style path aggregation
 │   │   │   ├── limit.rs        # Entity event limit enforcement
 │   │   │   └── ...
 │   ├── bqlite-engine/          # Execution orchestration, memory management,
@@ -469,7 +453,6 @@ bqlite/
 │       ├── funnel/
 │       ├── retention/
 │       ├── sessionize/
-│       ├── paths/
 │       └── ...
 ├── benches/                    # Criterion benchmarks
 └── .devcontainer/              # Dev container for agent execution

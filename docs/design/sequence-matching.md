@@ -303,8 +303,6 @@ The top-level per-entity state:
 struct EntityMatchState {
     /// One track per distinct binding value combination.
     tracks: SmallVec<[BindingTrack; 4]>,
-    /// Timestamp of the previous event (for consecutive matching).
-    last_event_ts: i64,
 }
 ```
 
@@ -511,6 +509,8 @@ At compile time, classify the pattern:
 pub enum PatternClass {
     /// Ordered steps, no negation, no repetition, no variable bindings.
     LinearSimple,
+    /// Linear with one or more IMMEDIATELY transitions.
+    LinearImmediate,
     /// Linear with poison transitions.
     LinearWithNegation,
     /// Linear with variable bindings.
@@ -529,6 +529,7 @@ Combined with match mode and demand set, select the optimal execution strategy a
 | Pattern Shape | Match Mode | Demand | Strategy | Approx. Speed |
 |---|---|---|---|---|
 | Linear | FIRST | Any | Step counter + candidate deque at step 0 | ~1-3 ns/event |
+| Linear + IMMEDIATELY | Any | Any | Dedicated consecutive matcher with previous-event slot | ~1-3 ns/event |
 | Linear | FIRST | Entity presence only | Step counter, stop at first accept | ~1-2 ns/event |
 | Linear + negation | FIRST | Any | Step counter + poison flags + candidate deque | ~2-5 ns/event |
 | Linear + bindings | FIRST | Any | Step counter per track + candidate deque | ~3-7 ns/event |
@@ -540,6 +541,8 @@ Combined with match mode and demand set, select the optimal execution strategy a
 | Any | Any | Match details | Full NFA with path tracking | ~10-30 ns/event |
 
 The strategy is a **compile-time decision** — no runtime branching between strategies. The operator inspects the compiled pattern shape and demand set during physical planning.
+
+Patterns containing `IMMEDIATELY` do not use the general non-consecutive NFA transition logic. They compile to a dedicated consecutive matcher because adjacency is a positional constraint, not a timestamp-only check.
 
 ### 10.3 Step Counter Fast Path (Linear Patterns)
 
@@ -569,10 +572,10 @@ struct StepCounterState {
     /// Step 0 candidate deque (for window rebinding on expiration).
     /// Shared across tracks before bindings are established.
     step0_candidates: ArrayVec<CandidateEntry, 8>,
-    /// Timestamp of the previous event (for consecutive matching).
-    last_event_ts: i64,
 }
 ```
+
+This fast path is for non-consecutive linear patterns only. `IMMEDIATELY` patterns use the dedicated consecutive matcher described above.
 
 For MATCH FIRST, when the window expires at an intermediate step, fall back to `step0_candidates` and rebind to the next eligible anchor. If no eligible anchors remain, reset to step 0.
 
@@ -819,7 +822,7 @@ Strategy Selection (depends on demand):
 
 ### 15.1 Strict Timestamp Ordering
 
-THEN requires **strictly increasing timestamps**. Two events at the same timestamp do not satisfy THEN, even if they have different `sequence_id` values. Same-timestamp events are considered simultaneous and cannot form a conversion.
+THEN requires **strictly increasing timestamps**. Two events at the same timestamp do not satisfy THEN, even if they have different `__seq_id` values. Same-timestamp events are considered simultaneous and cannot form a conversion.
 
 Implementation: the forward transition check `event.ts > candidate.last_step_ts` enforces this. `last_step_ts` tracks the timestamp of the event that advanced the candidate to its current state. An event at the same timestamp as the previous step's event fails this check.
 
@@ -835,7 +838,7 @@ Events must be adjacent — no events between matched steps (considering only ev
 events | MATCH FIRST SEQUENCE(A THEN IMMEDIATELY B THEN IMMEDIATELY C)
 ```
 
-Implementation: the state tracks `last_event_ts` (included in both `StepCounterState` and `EntityMatchState`). A forward transition with IMMEDIATELY only fires if no other (filtered) events occurred between the previous matched step and this event. The check is: `event.ts == last_event_ts` is only valid if the previous event was the step match itself. `last_event_ts` persists across sub-batch boundaries.
+Implementation: patterns with `IMMEDIATELY` compile to a dedicated consecutive matcher rather than the general non-consecutive NFA. The matcher keeps only the previous filtered event (per binding track where relevant) and advances the pattern iff the current event is the very next filtered event after the prior matched step. This is substantially simpler than trying to retrofit adjacency onto the general NFA state model.
 
 ### 15.4 Greedy/Lazy for MATCH ALL
 

@@ -80,7 +80,7 @@ pub trait PhysicalOperator: Send {
     fn schema(&self) -> &OperatorSchema;
 
     /// Pull the next batch of results. Returns None when exhausted.
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError>;
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, OperatorError>;
 }
 ```
 
@@ -116,7 +116,7 @@ Operators receive a reference to `QueryContext` at construction time and check `
 
 ### 3.4 Query Timeout
 
-The engine spawns a lightweight timer when a query starts. If the query has a timeout (configurable per-query or via a global default), the timer sets the `cancelled` flag after the timeout elapses. The next yield point in any shard-task observes the flag and returns `Err(ExecutionError::Cancelled)`. This provides fast stopping without polling overhead — the flag check is a single atomic load.
+The engine spawns a lightweight timer when a query starts. If the query has a timeout (configurable per-query or via a global default), the timer sets the `cancelled` flag after the timeout elapses. The next yield point in any shard-task observes the flag and returns `Err(OperatorError::Cancelled)`. The engine maps that to `ExecutionError::Timeout` when the timeout fired, or `ExecutionError::Cancelled` for caller-initiated cancellation. This provides fast stopping without polling overhead — the flag check is a single atomic load.
 
 ### 3.5 Entity-Aligned Batches
 
@@ -156,7 +156,7 @@ pub trait EntityOperator: Send {
         &self,
         state: &mut Self::State,
         batch: &RecordBatch,
-    ) -> Result<(), ExecutionError>;
+    ) -> Result<(), OperatorError>;
 
     /// Emit the result for the completed entity. Called once after all
     /// sub-batches have been processed. Returns None to skip this entity
@@ -165,7 +165,7 @@ pub trait EntityOperator: Send {
     fn finish_entity(
         &self,
         state: Self::State,
-    ) -> Result<Option<RecordBatch>, ExecutionError>;
+    ) -> Result<Option<RecordBatch>, OperatorError>;
 
     /// The set of input columns this operator actually reads.
     /// Used by demand propagation (Section 8) to avoid decoding unused columns.
@@ -179,7 +179,7 @@ pub trait EntityOperator: Send {
         &self,
         state: Self::State,
         accumulator: &mut dyn Accumulator,
-    ) -> Result<(), ExecutionError>;
+    ) -> Result<(), OperatorError>;
 
     /// Advertise what demand-based strategies this operator supports.
     /// The planner uses this to select the cheapest strategy that satisfies
@@ -440,7 +440,7 @@ Each shard-task produces partial aggregation results. The coordinator thread per
 - `MIN` / `MAX`: min/max across partials.
 - `AVG`: algebraic aggregate — each shard tracks `(sum, count)`; final merge computes `total_sum / total_count`.
 - `P50` / `P90` / `P95` / `P99`: each shard collects a t-digest; final merge combines digests and extracts quantiles.
-- `COUNT_DISTINCT`: each shard maintains a `HyperLogLog` or exact set; final merge combines them.
+- `COUNT_DISTINCT`: each shard maintains an exact set; final merge unions those sets.
 
 Non-aggregated results (selection queries) are concatenated across shards and optionally merge-sorted (k-way binary heap, k = num_shards) for `ORDER BY`.
 
@@ -449,13 +449,13 @@ The `Accumulator` trait supports both incremental updates and cross-shard mergin
 ```rust
 pub trait Accumulator: Send {
     /// Update the accumulator with a single value.
-    fn update(&mut self, value: &dyn Array) -> Result<(), ExecutionError>;
+    fn update(&mut self, value: &dyn Array) -> Result<(), OperatorError>;
 
     /// Merge another accumulator's state into this one (for cross-shard merge).
-    fn merge(&mut self, other: &dyn Accumulator) -> Result<(), ExecutionError>;
+    fn merge(&mut self, other: &dyn Accumulator) -> Result<(), OperatorError>;
 
     /// Emit the final result.
-    fn finish(&self) -> Result<ArrayRef, ExecutionError>;
+    fn finish(&self) -> Result<ArrayRef, OperatorError>;
 }
 ```
 
@@ -480,7 +480,7 @@ pub struct MemoryTracker {
 impl MemoryTracker {
     /// Try to reserve `bytes` of memory. Returns Err if budget would be exceeded.
     /// Callers should attempt to spill before propagating the error.
-    pub fn try_reserve(&self, bytes: u64) -> Result<MemoryReservation, ExecutionError>;
+    pub fn try_reserve(&self, bytes: u64) -> Result<MemoryReservation, OperatorError>;
 
     /// Release a reservation, returning memory to the budget.
     pub fn release(&self, reservation: MemoryReservation);
@@ -570,11 +570,11 @@ Compaction and ingest both need to update the manifest, so they contend on a ser
 
 ### 12.1 Error Propagation
 
-Errors propagate upward through the pipeline. When `next_batch()` returns an `Err`, the error is propagated to the caller. The pipeline is torn down and resources (including spill files) are released.
+Errors propagate upward through the pipeline in two layers. Operators return `OperatorError`. The engine wraps that in `ExecutionError` when surfacing the failure to callers. The pipeline is torn down and resources (including spill files) are released.
 
 ```rust
 #[derive(Debug, thiserror::Error)]
-pub enum ExecutionError {
+pub enum OperatorError {
     #[error("memory budget exceeded: {used} bytes used, {budget} bytes budgeted")]
     MemoryBudgetExceeded { used: u64, budget: u64 },
 
@@ -586,6 +586,12 @@ pub enum ExecutionError {
 
     #[error("query cancelled")]
     Cancelled,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExecutionError {
+    #[error(transparent)]
+    Operator(#[from] OperatorError),
 
     #[error("query timed out after {elapsed_ms}ms")]
     Timeout { elapsed_ms: u64 },
@@ -665,8 +671,9 @@ Each shard-task maintains its own `QueryMetrics` in its `ShardTaskContext` (Sect
 | `EntityOperatorAdapter` | `bqlite-operators` | Wraps `EntityOperator` into `PhysicalOperator` |
 | `Accumulator` trait | `bqlite-operators` | Aggregation accumulators |
 | `TypedKernel` | `bqlite-operators` | Monomorphized vectorized kernels |
+| `OperatorError` | `bqlite-operators` | Operator-facing execution failures |
 | `DemandSet` / `DemandCapabilities` | `bqlite-planner` | Plan-time demand propagation |
-| `ExecutionError` | `bqlite-engine` | Engine-level errors |
+| `ExecutionError` | `bqlite-engine` | Query-facing wrapper around operator failures and timeouts |
 | `QueryContext` / `QueryMetrics` | `bqlite-engine` | Execution-time state and metrics |
 | `MemoryTracker` | `bqlite-engine` | Memory budget enforcement |
 | Thread pool, query scheduler | `bqlite-engine` | Orchestration |
@@ -696,7 +703,7 @@ This follows the dependency direction in CLAUDE.md: `bqlite-engine` depends on `
 | Memory management | Hierarchical MemoryTracker; per-thread budget = query_budget / num_cores | Runtime enforcement with stable per-thread bounds |
 | Spill-to-disk | External hash aggregation, sort spill, hash set spill | Preferred response to memory pressure; error as fallback |
 | Query timeout | Timer sets AtomicBool cancel flag; cooperative checking | Fast stopping, no polling overhead |
-| Error handling | Typed `ExecutionError` enum; warnings for non-fatal conditions | Clean separation of fatal errors and informational warnings |
+| Error handling | `OperatorError` in operators, wrapped by engine `ExecutionError`; warnings for non-fatal conditions | Keeps crate boundaries clean while preserving typed failures |
 | Python integration | GIL released, zero-copy Arrow, results fully materialized | Simple API, no streaming complexity |
 
 ---

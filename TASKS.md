@@ -10,7 +10,7 @@ Single-session deep dives with human review. Produces design documents before im
 **Description**: Design the native segment format, entity-sorted columnar row-groups, segment metadata, comprehensive encoding layer (dictionary, delta, double-delta, bitpacking, RLE, constant, FSST, FOR, PFOR, ALP, frequency encoding, LZ4), near-zero-copy Arrow decode, late materialization, batch-only ingestion with batch IDs, time-window partitioning, entity-hash sharding, size-tiered compaction, zone maps, tombstone-based deletes (row/batch/entity), manifest catalog, concurrency between readers and compaction, database directory layout.
 
 ### TASK-002: Query Language Design
-**Status**: unclaimed
+**Status**: draft
 **Output**: docs/design/query-language.md
 **Description**: Complete BQL grammar specification, operator output schemas (exact column names and types), pipe composition rules, event type quoting syntax, property predicate syntax, variable binding syntax, time literal syntax, aggregation function list, error message strategy. Must also design:
 - **Cohorts**: query-computed entity sets (e.g., "users who converted in the last 7 days") that can be joined with any other query as a reusable filter or grouping dimension.
@@ -38,6 +38,17 @@ Single-session deep dives with human review. Produces design documents before im
 **Output**: docs/design/type-system.md
 **Description**: Supported data types (string, int, float, bool, timestamp, list, map), null handling, type coercion rules, schema declaration syntax, schema validation at plan construction time, Arrow type mapping.
 
+### TASK-006: Planner Pipeline Design
+**Status**: unclaimed
+**Output**: docs/design/planner-pipeline.md
+**Description**: Complete compiler pipeline from AST to executable physical plan. Logical plan node catalog (Scan, Filter, Project, Match, Funnel, Aggregate, Sessionize, Retention, etc.), AST-to-logical-plan lowering (how pipe syntax desugars into a plan tree), optimizer rules (predicate pushdown, projection pruning, constant folding, filter-before-match reordering), physical planning (logical-to-physical mapping, strategy selection e.g. StepCounter vs NFA), DemandCapabilities propagation protocol (formalize the demand system referenced by execution-model.md and sequence-matching.md), schema validation algorithm (when type checking runs, how TypeErrors propagate, plan-time vs runtime checks), plan serialization/explain output.
+
+**Open design questions**:
+- Cost model: rule-based only or cost-based with cardinality estimates? If cost-based, where do statistics come from (zone maps, manifest metadata)?
+- Optimizer rule ordering: fixed pass order or iterative until fixpoint?
+- Multi-query optimization: can shared scan/filter subplans be detected and deduplicated across queries in the same session?
+- Plan caching: should compiled physical plans be cached for repeated queries with different parameters?
+
 ---
 
 ## Wave 1: Foundation
@@ -62,7 +73,7 @@ BQL grammar, logical plan, optimizer, physical planner, schema validation.
 ---
 
 ## Wave 4: Operators
-Sequence matcher, funnel, retention, sessionizer, filter, aggregate, paths. High parallelism — most tasks are independent.
+Sequence matcher, funnel, retention, sessionizer, filter, aggregate. High parallelism — most tasks are independent.
 
 *Tasks to be defined after Wave 3.*
 

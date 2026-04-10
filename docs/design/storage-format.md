@@ -55,7 +55,7 @@ Default: **65,536 rows** (64K). This balances:
 
 - **Encoding efficiency.** Dictionary encoding, delta encoding, and bit-packing all benefit from larger chunks. Below ~8K rows, dictionary overhead dominates for low-cardinality columns.
 - **Zone map selectivity.** Larger row-groups mean coarser zone maps. At 64K rows with `(entity_id, timestamp)` sort order, each row-group covers a contiguous entity range — zone maps on `entity_id` remain highly selective.
-- **Memory footprint.** A single decoded row-group with 10 columns at 8 bytes each is ~5 MB. This fits comfortably in L3 cache and leaves headroom for multiple concurrent readers.
+- **Memory footprint.** A single decoded row-group with 10 columns at 8 bytes each is ~5 MB. This fits comfortably in L3 cache and leaves headroom for multiple active worker threads inside the owning process.
 
 ### 3.4 Segment-Level Data Structures
 
@@ -102,7 +102,11 @@ Backfilling historical data writes new L0 segments into the corresponding old wi
 
 Within each time window, data is hash-partitioned by entity: `shard = xxhash64(entity_id) % num_shards`. xxHash64 is chosen for speed, good distribution, and consistency with the checksum hash. Each shard is an independent file.
 
-Default: **32 shards**, configurable at table creation time (fixed after creation — no resharding). The default matches the core count of modern hardware so that one shard-task per core keeps all cores busy during query execution (see execution-model.md Section 9.3).
+**Shard count is a database-level property.** It is set once when the database is initialized and is fixed for the lifetime of the database — no resharding, no per-table override. Default: **32 shards**, configurable via CLI options at database initialization (`bqlite init --shards N`). There is no BQL statement for creating a database; initialization is a CLI-only operation. The default matches the core count of modern hardware so that one shard-task per core keeps all cores busy during query execution (see execution-model.md Section 9.3).
+
+**Why database-level, not per-table.** Cross-table entity joins (query-language.md Section 19) rely on the fact that a given entity hashes to the same shard in every table. If tables could choose their own shard counts, a join between `events` (32 shards) and `purchases` (16 shards) could require hash resharding at query time, which defeats the merge-join performance model. By fixing shard count at the database level, cross-table entity alignment is guaranteed by construction: shard N of table A and shard N of table B both contain entities with `xxhash64(entity_id) % 32 == N`, so the streaming merge join reads one shard per table with no resharding.
+
+**Database UUID.** A randomly generated UUID is also assigned at database initialization and stored in the manifest. It never rotates. The UUID serves as the default seed for SAMPLE determinism (query-language.md Section 14.2) and can be used by external tools for database identity.
 
 ### 5.2 On-Disk Layout
 
@@ -159,23 +163,23 @@ There is no write-ahead log and no in-memory memtable. This eliminates recovery 
 
 **Tradeoff:** Very small writes produce many tiny L0 files. Compaction handles this. "Please batch your writes" is a reasonable expectation for an analytics engine — the target ingest pattern is bulk loading (CSV/Parquet files), not single-event streaming.
 
-### 6.2 Sequence ID and Batch ID
+### 6.2 Sequence ID and Batch ID (`__seq_id` / `__batch_id`)
 
-**Sequence ID.** Every row gets a monotonically increasing **64-bit sequence ID** assigned at ingestion time.
+**Sequence ID.** Every row gets a monotonically increasing **64-bit sequence ID** assigned at ingestion time and exposed through the implicit system column `__seq_id`.
 
-- `(entity_id, timestamp, sequence_id)` is globally unique.
+- `(entity_id, timestamp, __seq_id)` is globally unique.
 - Provides: unique row identity, tiebreaker for same-timestamp events, unambiguous delete targets.
 - Assignment: per-table atomic counter. One `fetch_add` per batch reserves a range of IDs.
-- Exposed to users in query results for debugging and deterministic pagination.
+- Exposed to users only when selected explicitly (`SELECT __seq_id`) — it is excluded from `SELECT *`.
 - **Ordering guarantee:** Sequence IDs are monotonically increasing per batch, but concurrent ingest batches may write segments with interleaved ID ranges (batch A reserves [1000, 2000), batch B reserves [2000, 3000), but B may finish writing first). The only guarantee is global uniqueness and within-batch monotonicity. No component should assume sequence ID order correlates with segment creation or visibility order.
 
-**Batch ID.** Every ingest call is assigned a monotonically increasing **64-bit batch ID**, returned to the caller on successful ingest. A batch ID identifies all rows written in a single ingest call.
+**Batch ID.** Every ingest call is assigned a monotonically increasing **64-bit batch ID**, returned to the caller on successful ingest and exposed through the implicit system column `__batch_id`. A batch ID identifies all rows written in a single ingest call.
 
 - Assignment: per-table atomic counter, separate from the sequence ID counter. One `fetch_add` per ingest call. Both the sequence ID counter and batch ID counter are persisted in a database-level metadata file (see Section 12).
 - Each segment file records the batch ID it was produced from (in the segment footer).
 - The manifest tracks the batch ID range for each segment.
-- **Batch-level deletion:** `DELETE FROM table WHERE batch_id = N` tombstones all rows from that batch. This is useful for undoing a bad ingest — the caller retains the batch ID from the original insert and can use it to cleanly remove the data. Batch-level tombstones are stored alongside row-level and entity-level tombstones (Section 7.5).
-- Batch IDs are not exposed in query results by default (they are operational metadata, not analytical data), but can be accessed via `SELECT batch_id` for debugging.
+- **Batch-level deletion:** `DELETE FROM table WHERE __batch_id = N` tombstones all rows from that batch. This is useful for undoing a bad ingest — the caller retains the batch ID from the original insert and can use it to cleanly remove the data. Batch-level tombstones are stored alongside row-level and entity-level tombstones (Section 7.5).
+- Batch IDs are excluded from `SELECT *`, but can be accessed explicitly via `SELECT __batch_id` for debugging.
 
 ### 6.3 Ingest Sources
 
@@ -207,7 +211,7 @@ Each `(window, shard)` compacts independently. This means compaction is embarras
 **Process:**
 
 1. Open all input segments for the `(window, shard)`.
-2. K-way merge on `(entity_id, timestamp, sequence_id)`.
+2. K-way merge on `(entity_id, timestamp, __seq_id)`.
 3. Apply tombstones — skip deleted rows.
 4. Re-encode columns (fresh encoding analysis on the merged data).
 5. Write a single output segment to a temp file.
@@ -252,8 +256,8 @@ Deletes are tracked via **tombstone files** per shard.
 
 | Granularity | Tombstone format | Use case |
 |---|---|---|
-| Row-level | `sequence_id` | Delete specific events |
-| Batch-level | `batch_id` | Undo a bad ingest |
+| Row-level | `__seq_id` | Delete specific events |
+| Batch-level | `__batch_id` | Undo a bad ingest |
 | Entity-level | `entity_id` | GDPR right-to-erasure, remove all events for an entity |
 
 Tombstone lifecycle:
@@ -263,15 +267,15 @@ Tombstone lifecycle:
 3. During compaction, tombstoned rows are physically removed from the output segment.
 4. After compaction completes for a `(window, shard)` and the output segment no longer contains any tombstoned rows, those tombstones are removed from the tombstone file. Since compaction merges *all* segments within a `(window, shard)`, a single compaction pass is sufficient to resolve all tombstones for that scope — there are no older segments that might still contain the tombstoned rows.
 
-Tombstone files are small (sequence IDs, batch IDs, or entity IDs only) and loaded into memory at query time. Concurrent deletes and reads are safe because readers snapshot the tombstone file at query start — a concurrent delete writes a new file that only subsequent queries will see.
+Tombstone files are small (`__seq_id`, `__batch_id`, or entity ID values only) and loaded into memory at query time. Concurrent deletes and query execution within the owning process are safe because each query snapshots the tombstone file at start — a concurrent delete writes a new file that only subsequent queries will see.
 
-### 7.6 Concurrent Compaction and Reads
+### 7.6 Query Snapshots and Compaction
 
-Readers acquire a reference to the current manifest at query start. Compaction publishes a new manifest and only deletes old segments after all readers referencing them have released. This is a lightweight reference-counting scheme:
+Queries acquire a reference to the current manifest at query start. Compaction publishes a new manifest and only deletes old segments after all in-process queries referencing them have released. This is a lightweight reference-counting scheme:
 
-- Readers increment a per-manifest refcount on open, decrement on close.
+- Queries increment a per-manifest refcount on start, decrement on completion.
 - Compaction waits for the old manifest's refcount to reach zero before deleting its segments.
-- No locks on the read path.
+- No locks on the query read path.
 
 ---
 
@@ -536,7 +540,7 @@ The encoding selector is designed to be conservative — it picks the first matc
 | `entity_id` (String, sorted) | Dictionary + FreqEncoding/RLE on codes |
 | `timestamp` (Timestamp, sorted within entity) | DoubleDelta + BitPacking (near-constant intervals) or Delta + BitPacking |
 | `event_type` (String, low cardinality) | Dictionary + FreqEncoding + BitPacking on codes |
-| `sequence_id` (Int, monotonic) | Delta + BitPacking |
+| `__seq_id` (Int, monotonic) | Delta + BitPacking |
 | Boolean properties | RLE |
 | High-cardinality string properties (URLs, queries) | FSST |
 | Numeric properties (clustered range) | FOR or PFOR + BitPacking |
@@ -715,7 +719,7 @@ The manifest is a **database-level** metadata structure that serves as the sourc
 - **Startup:** Load the manifest into memory. Validate against files on disk (orphan cleanup).
 - **Ingest:** After writing new L0 segments, update the manifest atomically.
 - **Compaction:** After merging segments, write a new manifest (Section 7.4).
-- **Query:** Readers snapshot the manifest at query start. The snapshot is immutable for the query's lifetime.
+- **Query:** Queries snapshot the manifest at query start. The snapshot is immutable for the query's lifetime.
 
 ### 12.3 Format
 
@@ -733,11 +737,11 @@ The default 4 GB memory budget is split across concurrent activities:
 
 | Activity | Default allocation | Notes |
 |---|---|---|
-| Query execution | 75% (3 GB) | Shared across concurrent queries |
+| Query execution | 75% (3 GB) | Shared across the fixed query worker pool |
 | Compaction | 20% (800 MB) | One compaction at a time per table |
 | Ingest buffering | 5% (200 MB) | Sort buffer for batch ingest |
 
-Within query execution, per-query memory is `3 GB / num_concurrent_queries`. The engine tracks allocations and rejects new queries if the budget is exhausted (returning a clear error, not OOM).
+Within query execution, the 3 GB budget is fixed for the process's query worker pool. Only shard-tasks that have actually started work reserve memory against it; queued tasks do not. Admission control and runtime reservations prevent the pool from exceeding the budget (returning a clear error rather than OOM when necessary).
 
 **Per-shard read buffers** for the k-way merge: 4 MB per input stream. Active buffer usage is bounded by `num_concurrent_shard_tasks * k * 4 MB` since the thread pool limits how many shards read simultaneously.
 
@@ -749,23 +753,23 @@ Within query execution, per-query memory is `3 GB / num_concurrent_queries`. The
 
 ### 14.1 Database Lock File
 
-A lock file (`db/.lock`) prevents concurrent write access from multiple processes. Attempting to open a database for writing when another process holds the lock returns a clear error.
+A lock file (`db/.lock`) prevents multiple processes from opening the same database concurrently. Attempting to open a database when another process holds the lock returns a clear error.
 
-Multiple readers can operate concurrently (read-only opens do not acquire the write lock). The lock file uses `flock()` on POSIX systems.
+The lock file uses `flock()` on POSIX systems. Queries, ingestion, and compaction may still run concurrently inside the owning process.
 
-### 14.2 Concurrent Reads and Compaction
+### 14.2 Queries and Compaction Within One Process
 
-Compaction does not block reads. The mechanism (Section 7.6):
+Compaction does not block query execution inside the owning process. The mechanism (Section 7.6):
 
-1. Readers snapshot the manifest at query start.
+1. Queries snapshot the manifest at query start.
 2. Compaction writes new segments and publishes a new manifest.
-3. Old segments are deleted only after all readers referencing the old manifest have finished.
+3. Old segments are deleted only after all in-process queries referencing the old manifest have finished.
 
-This is lock-free on the read path. Readers never wait for compaction; compaction never waits for readers (it only defers cleanup).
+This is lock-free on the query read path. Queries never wait for compaction; compaction never waits for queries except to defer old-segment cleanup.
 
 ### 14.3 Concurrent Ingestion
 
-Multiple ingest calls can run concurrently because they write to independent L0 segment files. The only coordination is:
+Multiple ingest calls can run concurrently inside the owning process because they write to independent L0 segment files. The only coordination is:
 
 - Sequence ID / batch ID reservation: atomic `fetch_add` on the per-table counters.
 - **Manifest update: serialized via a manifest lock.** Ingest and compaction both need to update the manifest, so they contend on this lock. The actual segment writes are concurrent and lock-free; only the final manifest update is serialized. Since manifest updates are fast (write JSON, fsync, rename), this lock is held briefly and is not a bottleneck.

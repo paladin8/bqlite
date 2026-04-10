@@ -43,7 +43,7 @@ pub enum BqlType {
 | `Float` | `f64` | `Float64` | `amount`, `latency`, percentiles |
 | `String` | — | `Utf8View` | `user_id`, `event_type`, `device` |
 | `Timestamp` | `i64` (epoch nanos) | `Timestamp(Nanosecond, Some("UTC"))` | `ts`, step timestamps |
-| `List(T)` | — | `List(T.to_arrow())` | `match_events`, `path` |
+| `List(T)` | — | `List(T.to_arrow())` | `match_events`, `tags` |
 | `Map(V)` | — | `Map(Utf8View, V.to_arrow())` | flexible property bags |
 
 ### 2.2 Design Rationale
@@ -58,7 +58,7 @@ pub enum BqlType {
 
 **No Duration type.** Durations (e.g., `match_duration`, `session_duration`, timestamp differences) are represented as `Int` — nanoseconds as i64. In a domain-specific temporal query engine, the context makes durations unambiguous. A separate Duration type would add a variant to every type-dispatch site, complicate coercion and aggregate return-type rules, and provide marginal safety in a domain where every i64 from timestamp arithmetic is obviously a duration. Duration literals like `7d` and `30m` parse to i64 nanosecond values at plan time. Duration-specific display formatting (e.g., "2h 15m") belongs in the presentation layer, not the type system.
 
-**List is homogeneously typed.** `List(BqlType)` requires all elements to share a type. This is mandated by Arrow's List type and is sufficient for the domain: `match_events` is `List(Struct)`, `step_timestamps` is `List(Timestamp)`, `path` is `List(String)`.
+**List is homogeneously typed.** `List(BqlType)` requires all elements to share a type. This is mandated by Arrow's List type and is sufficient for the domain: `match_events` is `List(Struct)`, `step_timestamps` is `List(Timestamp)`, `tags` is `List(String)`.
 
 **Map has String keys.** Event properties are accessed by name. Restricting keys to String simplifies key comparison and hashing, and matches Arrow's Map ergonomics. The value type is parameterized: `Map(Float)` for numeric property bags, `Map(String)` for string property bags.
 
@@ -117,7 +117,7 @@ bqlite uses SQL three-valued logic (TRUE, FALSE, NULL). This is the established 
 
 ```sql
 -- IS NULL / IS NOT NULL always produce non-null Bool
-MATCH(checkout WHERE discount IS NOT NULL -> purchase) WITHIN 1h BY user_id
+events | MATCH FIRST SEQUENCE(checkout WHERE discount IS NOT NULL THEN purchase) WITHIN 1h
 ```
 
 ### 3.5 COALESCE
@@ -159,6 +159,7 @@ CAST(expression AS type)
 |---|---|---|
 | `Int` | `Float` | Exact if in [-2^53, 2^53]; planner warning otherwise |
 | `Float` | `Int` | Truncates toward zero |
+| `Bool` | `Int` | `TRUE -> 1`, `FALSE -> 0`, `NULL -> NULL` |
 | `String` | `Int` | Parses decimal integer; `NULL` on failure |
 | `String` | `Float` | Parses decimal float; `NULL` on failure |
 | `String` | `Timestamp` | Parses ISO-8601; `NULL` on failure |
@@ -171,6 +172,8 @@ CAST(expression AS type)
 | `Int` | `Timestamp` | Interprets as epoch nanoseconds |
 
 **Failed casts produce NULL, not errors.** Queries operate over large datasets where a few unparseable values should not halt execution. This follows TRY_CAST semantics by default.
+
+The `Bool -> Int` cast makes `SUM(CAST(predicate AS INT))` the standard idiom for counting rows where a predicate is true.
 
 ### 4.3 Coercion in Comparisons
 
@@ -213,7 +216,7 @@ pub struct TableSchema {
     /// Index into `columns` for the entity key column.
     pub entity_key_index: usize,
 
-    /// Index into `columns` for the timestamp column.
+    /// Index into `columns` for the canonical event-time column.
     pub timestamp_index: usize,
 
     /// Index into `columns` for the event type column.
@@ -226,15 +229,25 @@ pub struct TableSchema {
 }
 ```
 
+**Declared vs logical schema.** `TableSchema.columns` stores the user-declared columns in DDL order. The logical table schema seen by planning and schema introspection also includes two implicit system columns:
+
+| Column | Type | Nullable | Meaning |
+|---|---|---|---|
+| `__seq_id` | Int | no | Unique row identity assigned at ingest |
+| `__batch_id` | Int | no | Ingest-batch identity assigned at ingest |
+
+These names, and the full `__` prefix, are reserved for system use. System columns are selectable explicitly, appear in `DESCRIBE`, and may be used in predicates and `DELETE`, but they are excluded from `SELECT *` expansion and are never accepted as `INSERT` inputs.
+
 **Validation rules enforced at schema creation time:**
 
 1. Entity key column must be `String` or `Int`, non-nullable.
-2. Timestamp column must be `Timestamp`, non-nullable.
+2. The canonical event-time column must be `Timestamp`, non-nullable.
 3. Event type column must be `String`, non-nullable.
 4. Column names must be unique (case-sensitive).
 5. Column names must be valid identifiers (alphanumeric + underscore, not starting with digit).
 6. A table must have at least the three mandatory columns.
 7. `List` and `Map` types are allowed for property columns but not for the three mandatory columns.
+8. User-declared column names may not start with `__`.
 
 ### 5.2 OperatorSchema
 
@@ -254,6 +267,8 @@ Key methods:
 - `to_arrow_schema() -> arrow::datatypes::Schema` — convert for execution.
 - `validate_against(required) -> Result<(), TypeError>` — check compatibility.
 
+When an `OperatorSchema` contains system columns, wildcard expansion in `SELECT *` still excludes them. This is a query-language rule, not a schema omission.
+
 ### 5.3 Schema Evolution
 
 **v1 supports adding columns.** `ALTER TABLE ADD COLUMN` appends a nullable column to an existing table. This is the only schema mutation supported in v1 — no column removal, no type changes, no renaming.
@@ -266,7 +281,7 @@ ALTER TABLE events ADD COLUMN score FLOAT NOT NULL DEFAULT 0.0
 **Rules:**
 
 1. Added columns must be nullable, OR must specify a `DEFAULT` value. Existing segments cannot retroactively populate a non-null column without a default.
-2. The new column cannot be `ENTITY KEY`, `EVENT TYPE`, or `TIMESTAMP` — the three mandatory column roles are immutable after table creation.
+2. The new column cannot be `ENTITY KEY`, `EVENT TYPE`, or `EVENT TIME` — the three mandatory column roles are immutable after table creation.
 3. Column names must not conflict with existing columns.
 4. `List` and `Map` columns can be added.
 
@@ -350,28 +365,19 @@ Passes through input schema unchanged. The filter predicate must evaluate to `Bo
 
 Projects to requested columns, preserving their types and nullability. Computed expressions get types inferred from the expression.
 
-### 6.7 PATHS
-
-| Column | Type | Nullable | Description |
-|---|---|---|---|
-| `entity_id` | String or Int | no | |
-| `path` | List(String) | no | Sequence of event types traversed |
-| `path_length` | Int | no | Number of steps |
-
-### 6.8 Event sub-selection (FIRST, LAST, NTH)
+### 6.7 Event sub-selection (FIRST, LAST, NTH)
 
 Per-entity operators that extract a specific event from the entity's event stream. The output schema matches the source table's columns — each row is a single event.
 
 ```sql
--- First purchase per user
-FIRST(purchase) BY user_id
+-- First purchase per entity
+events | FIRST(purchase)
 
--- Last event before churn (within a MATCH pipeline)
-MATCH(signup -> purchase -> churn) WITHIN 30d BY user_id
-  | LAST(purchase)
+-- Last event from a filtered set
+events | LAST(page_view WHERE url LIKE '/checkout%')
 
 -- Nth occurrence
-NTH(page_view, 3) BY user_id
+events | NTH(page_view, 3)
 ```
 
 | Column | Type | Nullable | Description |
@@ -383,18 +389,20 @@ NTH(page_view, 3) BY user_id
 
 The output has exactly one row per entity (entities with no matching event are omitted). This means sub-selection results compose naturally with other operators: pipe into STATS for aggregation, into WHERE for filtering on properties of the selected event, or use in an IN clause as a cohort.
 
-### 6.9 Window functions (OVER)
+### 6.8 Window functions (OVER)
 
 Window functions compute values across the entity's ordered event stream without collapsing rows. They pass through all input columns and add computed columns.
 
 ```sql
 -- Time since previous event per entity
-SESSIONIZE(gap: 30m) BY user_id
-  | SELECT *, LAG(ts, 1) OVER (BY user_id ORDER BY ts) AS prev_ts
+events
+  | SESSIONIZE(gap: 30m)
+  | SELECT *, LAG(ts, 1) OVER (ORDER BY ts) AS prev_ts
 
--- Running purchase count per user
-WHERE event_type = 'purchase'
-  | SELECT *, ROW_NUMBER() OVER (BY user_id ORDER BY ts) AS purchase_num
+-- Running purchase count per entity
+events
+  | WHERE event_type = 'purchase'
+  | SELECT *, ROW_NUMBER() OVER (ORDER BY ts) AS purchase_num
 ```
 
 Output: all input columns, plus the window function result column. The added column's type depends on the function:
@@ -410,41 +418,46 @@ Output: all input columns, plus the window function result column. The added col
 | `COUNT(*) OVER ...` | Int, non-nullable | Running count |
 | `MIN(col) OVER ...` / `MAX(col) OVER ...` | same as `col`, nullable | Running min/max |
 
-Window functions require `OVER (BY entity_key ORDER BY col)`. The `BY` clause is implicit (always the entity key) and can be omitted. The `ORDER BY` clause defaults to the timestamp column.
+Window functions always partition by the entity key implicitly (BQL is an entity-first query language). The `OVER` clause accepts an optional `PARTITION BY` to subdivide further and an optional `ORDER BY` (defaults to the timestamp column).
 
-### 6.10 IN (subquery filtering)
+### 6.9 IN (subquery filtering)
 
 Filters rows where a tuple of columns matches results from a subquery. This is the primary mechanism for cohort-style composition — cohorts are just queries that produce entity IDs, not special objects.
 
 ```sql
--- Purchases by users who signed up in January
-WHERE event_type = 'purchase' BY user_id
-  | WHERE (user_id) IN (
-      WHERE event_type = 'signup' AND ts >= '2024-01-01' AND ts < '2024-02-01'
-        BY user_id
+-- Purchases by entities who signed up in January
+events
+  | WHERE event_type = 'purchase'
+  | WHERE entity_id IN (
+      events
+      | WHERE event_type = 'signup' AND ts >= '2024-01-01' AND ts < '2024-02-01'
       | SELECT entity_id
     )
 
--- Events from users who completed a funnel
-MATCH(signup -> add_to_cart -> purchase) WITHIN 7d BY user_id
-  | SELECT entity_id AS converted_users
+-- Events from entities who completed a funnel, using an alias
+converted_users = events
+  | MATCH FIRST SEQUENCE(signup THEN add_to_cart THEN purchase) WITHIN 7d
+  | SELECT entity_id
 
-WHERE event_type = 'support_ticket' BY user_id
-  | WHERE (user_id) IN (converted_users)
+events
+  | WHERE event_type = 'support_ticket'
+  | WHERE entity_id IN converted_users
 ```
 
 Output schema: passes through input schema unchanged. The IN clause is a filter — it reduces rows but does not alter columns.
 
 **Type rules:** The column tuple on the left must type-match the corresponding columns from the subquery. Typically this is a single entity ID column (`String` or `Int`), but multi-column IN is supported for compound keys.
 
-### 6.11 PIVOT
+### 6.10 PIVOT
 
 Reshapes long-form results into wide-form by turning values of a pivot column into separate output columns.
 
 ```sql
--- Retention as wide-form: one row per entity, one column per period
-RETENTION(entry: signup, returning: any, brackets: [1d, 7d, 30d]) BY user_id
-  | PIVOT period_name ON period_active
+-- Retention as wide-form: one row per entity, one column per bracket
+events
+  | MATCH FIRST SEQUENCE(signup THEN purchase) BRACKETS [1d, 7d, 30d] EMIT ALL
+  | STATS retained = SUM(CAST(step_reached >= 2 AS INT)) GROUP BY bracket
+  | PIVOT bracket ON retained
 ```
 
 Output schema: group-by columns, plus one new column per distinct value in the pivot column. The new column types match the value column's type. The set of distinct values must be known at plan time (provided as a literal list, or inferred from the query structure for operators like RETENTION that produce a fixed set of values).
@@ -458,26 +471,27 @@ Output schema: group-by columns, plus one new column per distinct value in the p
 
 Pivot columns are nullable because not every group may have a value for every pivot category.
 
-### 6.12 SAMPLE
+### 6.11 SAMPLE
 
 Random sampling of entities. Reduces the entity set to a fraction or fixed count before processing.
 
 ```sql
 -- 10% random sample of entities
-SAMPLE(fraction: 0.1) BY user_id
-  | MATCH(signup -> purchase) WITHIN 7d
+events
+  | SAMPLE(fraction: 0.1)
+  | MATCH FIRST SEQUENCE(signup THEN purchase) WITHIN 7d
 
 -- Fixed sample size
-SAMPLE(count: 10000) BY user_id
+events | SAMPLE(count: 10000)
 ```
 
 Output schema: passes through input schema unchanged. SAMPLE is a scan-level operator — it filters entities early to avoid processing the full dataset.
 
-### 6.13 ORDER BY
+### 6.12 ORDER BY
 
 Passes through input schema unchanged. The sort column must exist in the input schema and its type must support ordering — all scalar types (`Bool`, `Int`, `Float`, `String`, `Timestamp`) are orderable; `List` and `Map` are not.
 
-### 6.14 LIMIT
+### 6.13 LIMIT
 
 Passes through input schema unchanged.
 
@@ -579,7 +593,7 @@ Key methods:
 ```sql
 CREATE TABLE events (
     user_id STRING ENTITY KEY,
-    ts TIMESTAMP,
+    ts TIMESTAMP EVENT TIME,
     event_type STRING EVENT TYPE,
     amount FLOAT,
     query STRING,
@@ -598,7 +612,7 @@ column_def       := identifier type_expr column_modifier*
 type_expr        := scalar_type | composite_type
 scalar_type      := "BOOL" | "INT" | "FLOAT" | "STRING" | "TIMESTAMP"
 composite_type   := "LIST" "(" type_expr ")" | "MAP" "(" type_expr ")"
-column_modifier  := "ENTITY" "KEY" | "EVENT" "TYPE" | "NOT" "NULL" | "NULL"
+column_modifier  := "ENTITY" "KEY" | "EVENT" "TYPE" | "EVENT" "TIME" | "NOT" "NULL" | "NULL"
 alter_modifier   := "NOT" "NULL" | "NULL" | "DEFAULT" literal
 ```
 
@@ -606,9 +620,11 @@ alter_modifier   := "NOT" "NULL" | "NULL" | "DEFAULT" literal
 
 - Exactly one column must have `ENTITY KEY`. Must be `STRING` or `INT`.
 - Exactly one column must have `EVENT TYPE`. Must be `STRING`.
-- Exactly one column must be `TIMESTAMP` type. If multiple `TIMESTAMP` columns exist, one must be annotated (syntax TBD in query-language.md).
-- `ENTITY KEY`, `EVENT TYPE`, and the `TIMESTAMP` column are implicitly `NOT NULL`.
+- If exactly one `TIMESTAMP` column exists and none is annotated, it is inferred as the `EVENT TIME` column.
+- If multiple `TIMESTAMP` columns exist, exactly one must be annotated `EVENT TIME`.
+- `ENTITY KEY`, `EVENT TYPE`, and the `EVENT TIME` column are implicitly `NOT NULL`.
 - Property columns are `NULL` by default. `NOT NULL` overrides.
+- User-declared column names starting with `__` are rejected because the prefix is reserved for implicit system columns.
 - Type names are case-insensitive (`string`, `STRING`, `String` all valid).
 
 ### 9.4 DESCRIBE TABLE
@@ -617,7 +633,7 @@ alter_modifier   := "NOT" "NULL" | "NULL" | "DEFAULT" literal
 DESCRIBE events
 ```
 
-Output columns: name, type, nullable, role (entity_key / timestamp / event_type / property).
+Output columns: name, type, nullable, role (entity_key / event_time / event_type / property / system).
 
 ---
 
@@ -654,6 +670,16 @@ This is the initial set. Additional functions will be specified in the query lan
 | `EPOCH_SECONDS(Timestamp)` | `Float` | Extract epoch seconds (float for sub-second precision) |
 
 Timezone-aware `QUANTIZE` is essential for analytics: "by day" means different boundaries in `America/New_York` vs `Asia/Tokyo`. Without it, daily/weekly aggregations silently produce wrong results for non-UTC users. The two-argument form defaults to UTC alignment. The timezone string is validated at plan time — invalid IANA names produce a planner error.
+
+**Numeric bucketing:**
+
+| Function | Signature | Description |
+|---|---|---|
+| `QUANTIZE(Int, Int)` | `Int` | Floor-divide numeric value by bucket width, multiply back: `(v / w) * w`. Bucket width must be positive. |
+| `QUANTIZE(Float, Float)` | `Float` | Same semantics for floating-point values. |
+| `QUANTIZE(Int, Float)` | `Float` | Int is implicitly promoted to Float. |
+
+The numeric overload of `QUANTIZE` shares a name with the temporal overload but uses the scalar bucket-width type to disambiguate at plan time. `QUANTIZE(amount, 100)` produces buckets `0, 100, 200, ...`; `QUANTIZE(price, 0.05)` produces 5-cent price buckets.
 
 **String:**
 
@@ -694,8 +720,9 @@ Scalar functions are registered in a function registry. The planner resolves fun
 In pattern matching, variables bind a value from one step and enforce equality in subsequent steps:
 
 ```sql
-MATCH(view WHERE category = $c -> purchase WHERE category = $c)
-    WITHIN 7d BY user_id
+events | MATCH FIRST SEQUENCE(
+    view WHERE category = $c THEN purchase WHERE category = $c
+  ) WITHIN 7d
 ```
 
 ### 11.1 Type Inference Rules
