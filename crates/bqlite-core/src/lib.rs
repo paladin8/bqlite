@@ -28,3 +28,8 @@ pub use property::{BqlType, PropertyValue};
 
 pub mod event;
 pub use event::{EntityEventStream, EntityEventStreamError, EntityId, Event, VecEntityEventStream};
+
+pub mod schema;
+pub use schema::{
+    ColumnDef, OperatorSchema, TableSchema, BATCH_ID_COLUMN, SEQ_ID_COLUMN, SYSTEM_COLUMN_PREFIX,
+};
