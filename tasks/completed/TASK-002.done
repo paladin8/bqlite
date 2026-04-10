@@ -1,0 +1,9 @@
+{
+  "agent_id": "manual",
+  "task_id": "TASK-002",
+  "claimed_at": "2026-04-10T09:23:01-07:00",
+  "completed_at": "2026-04-10T09:23:01-07:00",
+  "branch": "main",
+  "description": "Query Language Design",
+  "note": "Completed outside the agent execution workflow; recorded after the fact for completeness."
+}

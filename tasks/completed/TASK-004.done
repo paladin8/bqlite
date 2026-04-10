@@ -1,0 +1,9 @@
+{
+  "agent_id": "manual",
+  "task_id": "TASK-004",
+  "claimed_at": "2026-04-09T18:41:28-07:00",
+  "completed_at": "2026-04-09T18:41:28-07:00",
+  "branch": "main",
+  "description": "Sequence Matching Design",
+  "note": "Completed outside the agent execution workflow; recorded after the fact for completeness."
+}

@@ -1,0 +1,9 @@
+{
+  "agent_id": "manual",
+  "task_id": "TASK-005",
+  "claimed_at": "2026-04-08T23:58:20-07:00",
+  "completed_at": "2026-04-08T23:58:20-07:00",
+  "branch": "main",
+  "description": "Type System Design",
+  "note": "Completed outside the agent execution workflow; recorded after the fact for completeness."
+}
