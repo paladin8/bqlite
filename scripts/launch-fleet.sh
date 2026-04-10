@@ -5,10 +5,9 @@ N="${1:-4}"
 IMAGE="bqlite-agent"
 REPO_URL="git@github.com:paladin8/bqlite.git"
 
-# Validate SSH agent is running
-if [ -z "${SSH_AUTH_SOCK:-}" ]; then
-  echo "ERROR: SSH_AUTH_SOCK is not set. Start your SSH agent first:"
-  echo "  eval \$(ssh-agent -s) && ssh-add"
+# Validate Docker is running
+if ! docker info >/dev/null 2>&1; then
+  echo "ERROR: Docker is not running. Start Docker Desktop first."
   exit 1
 fi
 
@@ -33,7 +32,7 @@ for i in $(seq 1 "$N"); do
     --name "$NAME" \
     -e AGENT_ID="agent-$i" \
     -v "$HOME/.claude:/home/vscode/.claude-host:ro" \
-    -v "${SSH_AUTH_SOCK}:/ssh-agent" \
+    --mount type=bind,src=/run/host-services/ssh-auth.sock,target=/ssh-agent \
     -e SSH_AUTH_SOCK=/ssh-agent \
     -w /workspace \
     "$IMAGE" \
@@ -41,6 +40,10 @@ for i in $(seq 1 "$N"); do
       # Copy auth files to writable location
       mkdir -p /home/vscode/.claude
       cp -r /home/vscode/.claude-host/* /home/vscode/.claude/ 2>/dev/null || true
+
+      # Add GitHub to known hosts
+      mkdir -p /root/.ssh
+      ssh-keyscan -t ed25519 github.com >> /root/.ssh/known_hosts 2>/dev/null
 
       # Clone and configure
       git clone $REPO_URL /workspace &&
