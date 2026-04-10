@@ -100,42 +100,36 @@ Single-session deep dives with human review. Produces design documents before im
 
 ### TASK-001: Storage Format Design
 **Output**: docs/design/storage-format.md
-**Description**: Design the native segment format, entity-sorted columnar row-groups, segment metadata, comprehensive encoding layer (dictionary, delta, double-delta, bitpacking, RLE, constant, FSST, FOR, PFOR, ALP, frequency encoding, LZ4), near-zero-copy Arrow decode, late materialization, batch-only ingestion with batch IDs, time-window partitioning, entity-hash sharding, size-tiered compaction, zone maps, tombstone-based deletes (row/batch/entity), manifest catalog, concurrency between readers and compaction, database directory layout.
+**Description**: Native segment format, entity-sorted columnar row-groups, segment file structure with versioning and checksums, v1 encoding layer (dictionary, delta, bitpacking, constant, LZ4) with extension points for deferred encodings (FSST, ALP, PFOR, FOR, frequency, double-delta, RLE) researched in Wave 4, near-zero-copy Arrow decode, late materialization, batch-only ingestion with `__seq_id` / `__batch_id`, time-window partitioning, entity-hash sharding, size-tiered compaction with manifest-swap atomicity, k-way merge read path, zone maps (bloom filters deferred), tombstone-based deletes (row/batch/entity), manifest catalog with UUID-stamped database identity, reader/compaction concurrency via `flock` + immutable segments, list/map column encoding, database directory layout.
 
 ### TASK-002: Query Language Design
 **Output**: docs/design/query-language.md
-**Description**: Complete BQL grammar specification, operator output schemas (exact column names and types), pipe composition rules, event type quoting syntax, property predicate syntax, variable binding syntax, time literal syntax, aggregation function list, error message strategy. Must also design:
-- **Cohorts**: query-computed entity sets (e.g., "users who converted in the last 7 days") that can be joined with any other query as a reusable filter or grouping dimension.
-- **Event sub-selection**: extracting specific events from a match — e.g., "the first time an entity did X", "the timestamp when entity completed step Z in an A→B→Z funnel". These are per-entity event references, not aggregates.
-- **Result aliases**: a declarative naming mechanism (`AS` or similar) for query results — cohorts, event sub-selections, intermediate pipe stages — that can be referenced in downstream computation. This enables multi-step analytical pipelines where named intermediate results compose naturally.
+**Description**: Complete BQL grammar, pipeline composition rules, event-type quoting, property predicate and variable binding syntax, time and duration literals, expression language, error-message strategy, and the full per-operator surface:
+- **MATCH**: sequence patterns with named steps, property predicates, time windows, negation (WITHOUT), alternation, repetition, IMMEDIATELY, variable bindings, BRACKETS (retention time slicing), match modes (FIRST / ALL / EMIT ALL).
+- **FUNNEL / RETENTION**: convenience sugar desugared in the planner to MATCH + STATS.
+- **Pipeline operators**: SESSIONIZE, STATS (aggregation + GROUP BY), WHERE, SELECT, LET, CASE, OVER (window functions), ORDER BY, LIMIT, PIVOT, IN (set membership with inline or subquery right-hand side).
+- **Entity operators**: FIRST / LAST / NTH / SAMPLE / ATTRIBUTE — the per-entity event references that cover event sub-selection.
+- **Aliases**: `name = pipeline` declarations that let named intermediate results compose into multi-stage analyses; cohort-style semi-joins are expressed via `IN QUERY alias`, and entity-level joins via cross-table JOIN.
+- **DML / DDL**: INSERT, DELETE, CREATE TABLE, DESCRIBE, EXPLAIN.
+- **Error strategy**: parser halts on first error; categorized plan-time type errors.
 
-**Open design questions**:
-- Cohort materialization: are cohorts computed inline (subquery-style) or materialized/cached for reuse across queries? What's the persistence model?
-- Event sub-selection output schema: does a sub-selection produce full events, timestamps, or structured match records? What columns does `select first(X)` yield?
-- Alias scoping: can aliases reference results from earlier pipe stages? Are they lexically scoped to a single query or can they span a session/script? Lazy vs eager evaluation?
-- Cohort × query join semantics: is a cohort join an entity-level semi-join (filter to entities in the cohort) or can it also carry cohort-level properties into the downstream query?
+Resolved design questions (including cohort materialization, alias scoping, event sub-selection output, and cross-step property access) are recorded in §30 of the delivered doc.
 
 ### TASK-003: Execution Model Design
 **Output**: docs/design/execution-model.md
-**Description**: Pull-based iterator protocol with PhysicalOperator and EntityOperator traits, entity-aligned batches with sub-batch streaming, demand propagation and generic operator fusion, shard-per-thread parallelism, compaction scheduling, memory budget enforcement, error handling and cancellation, Python integration, per-query metrics.
+**Description**: Hybrid push/pull iterator protocol with PhysicalOperator and EntityOperator traits, entity-aligned RecordBatches with sub-batch streaming for oversized entities, layered extraction for stateful operators, demand propagation driving generic operator fusion (including aggregation fusion via `finish_entity_into`), shard-per-thread parallelism with partial aggregation and final merge, compaction scheduling and interruptibility, memory budget enforcement with spill-to-disk, error propagation and query warnings, cancellation and timeout semantics, Python integration via PyO3, per-query metrics and span-based observability.
 
 ### TASK-004: Sequence Matching Design
 **Output**: docs/design/sequence-matching.md
-**Description**: Thompson's NFA simulation, global time window enforcement, negation via poison transitions, repetition, $variable binding with independent match tracks, two match modes (FIRST/ALL), EMIT ALL for funnel analysis, tiered execution strategies (step counter fast path for linear patterns, full NFA for general), candidate deque propagation with deferred consumption, filter pushdown to scan layer, aggregation fusion at window expiry.
+**Description**: Thompson's NFA simulation, global time window enforcement, negation via poison transitions, repetition, `$variable` bindings with independent match tracks per distinct value, match modes (MATCH FIRST, MATCH ALL non-overlapping, EMIT ALL for funnel-shape aggregation), tiered execution strategies (single-event bypass, step-counter fast path for linear patterns, full NFA for the general case) with a strategy-selection matrix, candidate deque propagation with deferred consumption and anchor consumption strategy, filter pushdown to the scan layer across three levels (event-type, property predicate, step predicate bitmask), aggregation fusion at window expiry with compact-step-counter state for the fused path, demand-driven output schema reduction, active-state and entity-event safety valves.
 
 ### TASK-005: Type System Design
 **Output**: docs/design/type-system.md
-**Description**: Supported data types (string, int, float, bool, timestamp, list, map), null handling, type coercion rules, schema declaration syntax, schema validation at plan construction time, Arrow type mapping.
+**Description**: `BqlType` enum (string, int, float, bool, timestamp, list, map) with design rationale, nullability model under SQL three-valued logic, null propagation and COALESCE, implicit coercion rules and explicit `CAST`, arithmetic type rules, `TableSchema` and `OperatorSchema` with schema evolution rules, per-operator output schemas for every operator in the language (MATCH, FUNNEL, RETENTION, SESSIONIZE, STATS, WHERE, SELECT, FIRST/LAST/NTH, OVER, IN, PIVOT, SAMPLE, ORDER BY, LIMIT, ATTRIBUTE), bidirectional Arrow type mapping with round-trip guarantee, `PropertyValue` for dynamic typing at ingest, `CREATE TABLE` / `DESCRIBE` schema declaration syntax, scalar function catalog with type signatures, variable binding type inference, `TypeError` taxonomy, plan-construction-time validation sequence.
 
 ### TASK-006: Planner Pipeline Design
 **Output**: docs/design/planner-pipeline.md
-**Description**: Complete compiler pipeline from AST to executable physical plan. Logical plan node catalog (Scan, Filter, Project, Match, Funnel, Aggregate, Sessionize, Retention, etc.), AST-to-logical-plan lowering (how pipe syntax desugars into a plan tree), optimizer rules (predicate pushdown, projection pruning, constant folding, filter-before-match reordering), physical planning (logical-to-physical mapping, strategy selection e.g. StepCounter vs NFA), DemandCapabilities propagation protocol (formalize the demand system referenced by execution-model.md and sequence-matching.md), schema validation algorithm (when type checking runs, how TypeErrors propagate, plan-time vs runtime checks), plan serialization/explain output.
-
-**Open design questions**:
-- Cost model: rule-based only or cost-based with cardinality estimates? If cost-based, where do statistics come from (zone maps, manifest metadata)?
-- Optimizer rule ordering: fixed pass order or iterative until fixpoint?
-- Multi-query optimization: can shared scan/filter subplans be detected and deduplicated across queries in the same session?
-- Plan caching: should compiled physical plans be cached for repeated queries with different parameters?
+**Description**: Complete compiler pipeline from AST to executable physical plan. Parser output as a flat pipeline; planner converts it to a tree during lowering. Logical plan node catalog (Scan, Filter, Project, Match, Funnel, Retention, Sessionize, Stats, Attribute, Pivot, Order, Limit, Over, FusedDownstream, etc.) with schema computation rules. Integrated schema validation at construction time via `TypedExpr` (no separate type-check pass; a `LogicalPlan` value is provably valid). FUNNEL/RETENTION/LET desugaring in the planner. Six-pass rule-based optimizer (expression inlining, predicate pushdown, scan predicate extraction from MATCH, projection pruning via backward demand collection, constant folding, general fusion detection). General fusion framework targeting any stateful operator fused with an adjacent `(filter →)? aggregate`, with layered extraction and column forwarding driven by per-`(step, column)` demand bits. Physical planning with strategy selection (StepCounter vs NFA) emitting plain-data physical descriptors — `bqlite-planner` never holds `PhysicalOperator` trait objects; the engine's bind step materializes them. `DemandSet` propagation protocol formalizing the demand system referenced by execution-model.md and sequence-matching.md. Structured `ExplainNode` tree for CLI rendering. Rule-based (not cost-based) optimizer with fixed pass order; no multi-query optimization or plan caching in v1 — resolved questions recorded in §14 of the delivered doc.
 
 ---
 
