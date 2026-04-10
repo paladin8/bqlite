@@ -10,7 +10,7 @@ Deep-dive design documents for bqlite. These cover the detailed technical decisi
 4. **sequence-matching.md** -- NFA construction, time windows, negation, variable bindings, match modes, EMIT ALL (STATUS: draft)
 5. **type-system.md** -- Data types, null handling, coercion, Arrow mapping (STATUS: draft)
 
-6. **planner-pipeline.md** -- Logical plan nodes, AST lowering, optimizer rules, physical planning, DemandCapabilities, schema validation (STATUS: not started)
+6. **planner-pipeline.md** -- Logical plan nodes, AST lowering, optimizer rules, physical planning, DemandCapabilities, schema validation (STATUS: draft)
 
 ## Infrastructure
 

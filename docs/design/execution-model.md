@@ -27,17 +27,20 @@ The engine has two fundamentally different operator categories, each with its ow
 
 ### 2.1 Stateful Temporal Operators
 
-Operators that need to see an entity's events in timestamp order: sequence matching, sessionization, path extraction. These are inherently **entity-at-a-time** — they maintain per-entity state, process events sequentially, and emit a result (or nothing) when the entity stream ends. Executed via a **pull-based** protocol where the adapter pulls entity sub-batches from upstream.
+Operators that need to see an entity's events in timestamp order: sequence matching, sessionization, event sub-selection (FIRST/LAST/NTH), attribution. These are inherently **entity-at-a-time** — they maintain per-entity state, process events sequentially, and emit a result (or nothing) when the entity stream ends. Executed via a **pull-based** protocol where the adapter pulls entity sub-batches from upstream.
 
 Each stateful operator has its own optimal execution strategy:
 
 | Operator | Execution Strategy | State Per Entity |
 |---|---|---|
-| Sequence match | NFA or specialized fast path (see Section 8) | Active state set + timestamps + held properties |
-| Sessionization | Streaming fold | Current session ID + last event timestamp |
-| Path/Sankey | N-gram counter | Sliding window of last N event types |
+| Sequence match (MATCH) | NFA or specialized fast path (see Section 8) | Active state set + timestamps + held properties |
+| Sessionization (SESSIONIZE) | Streaming fold | Current session ID + last event timestamp |
+| Event sub-selection (FIRST/LAST/NTH) | Single-event extraction with predicate filter | At most one retained event |
+| Attribution (ATTRIBUTE) | Sliding window deque of qualifying touchpoints; auto-unnested emission on conversion | Deque entries are `(ts, pre-computed touchpoint_key)` pairs — minimal per-touchpoint state |
 
 All stateful operators share the `EntityOperator` interface (Section 4) despite having different internal strategies.
+
+**ATTRIBUTE auto-unnests.** Rather than emitting a list of touchpoints per conversion, ATTRIBUTE emits **one row per `(entity, conversion, matched-touchpoint)` triple** with a single pre-computed `touchpoint_key: String` column (query-language.md §14.3). This keeps the output schema fully within BQL's scalar type system (no `List(Struct)` / `List(Map)` workaround) and removes the need for a separate UNNEST operator.
 
 ### 2.2 Stateless Columnar Operators
 
@@ -223,6 +226,51 @@ Entity boundaries are detected by comparing `entity_id` values — both within a
 
 **`finish_entity()` overhead.** Creating a single-row `RecordBatch` per entity involves schema validation and buffer allocation. For 10M entities in a non-fused pipeline, this is 10M small allocations. In practice this is acceptable — Arrow's `RecordBatch::try_new()` is lightweight for single-row batches (~100ns), and the fused path (Section 8.4) eliminates it entirely for the common aggregate case. The adapter also batches multiple single-row results into a single output `RecordBatch` before returning, amortizing the overhead.
 
+### 4.2 Layered Extraction for Stateful Operators
+
+A single stateful operator often needs to support many different downstream shapes — MATCH alone serves bare `COUNT(*)`, step-counter funnel counts, match-detail extraction, step-property forwarding, and fused aggregations. Rather than implementing a separate code path per shape, stateful operators use **layered extraction**: a fixed inner loop with independently toggled optional hooks that run at match/session/event completion.
+
+```rust
+pub struct MatchExecutionConfig {
+    // Core (always runs): NFA / step counter transitions + step_reached tracking.
+    pub track_match_duration: bool,
+    pub track_match_events: bool,
+    pub step_properties: Vec<StepPropertyExtraction>,
+    pub fused_accumulator: Option<Box<dyn Accumulator>>,
+}
+
+pub struct StepPropertyExtraction {
+    pub step_index: u8,
+    pub column_name: String,
+    pub bql_type: BqlType,
+}
+```
+
+**The inner per-event loop has zero demand-related branches.** All feature toggles are evaluated only at match/session/event completion, which is infrequent compared to the per-event transition hot path. This pattern is load-bearing for performance: the step-counter fast path (sequence-matching.md §10.3) cannot afford per-event `if` checks for "should we materialize `match_events`" or "should we extract `s.plan`". Layered extraction moves all such decisions to completion time.
+
+```rust
+fn on_match_complete(&mut self) {
+    if self.config.track_match_duration {
+        // compute last_step_ts - anchor_ts
+    }
+    if self.config.track_match_events {
+        // build Map(String, Timestamp)
+    }
+    for extraction in &self.config.step_properties {
+        // extract value from retained event reference
+    }
+    if let Some(acc) = &mut self.config.fused_accumulator {
+        acc.update_from_match(/* ... */);
+    } else {
+        self.output_batch.push(/* ... */);
+    }
+}
+```
+
+SESSIONIZE, event sub-selection (FIRST/LAST/NTH), and ATTRIBUTE use the same pattern. The set of optional hooks differs per operator, but the principle is identical: branch only at completion, never in the per-event hot loop.
+
+The `MatchExecutionConfig` (and its counterparts for other stateful operators) is populated by the physical planner during demand propagation — see planner-pipeline.md §7.5 and §9.4. The planner reads the downstream `DemandSet`, resolves each `StepPropertyRef` into a `StepPropertyExtraction` by looking up the step index in the compiled pattern, and enables the layered-extraction hooks that correspond to the downstream's demanded columns.
+
 ---
 
 ## 5. Sub-Batch Streaming for Large Entities
@@ -304,7 +352,7 @@ Filter, project, scalar expressions. Push-based vectorized processing on entity-
 
 ### Stage 3: Stateful Entity Processing
 
-Sequence match, sessionize, path extraction. Pull-based processing via the `EntityOperator` interface. Selects execution strategy based on the demand set (Section 8). Optionally fuses with downstream aggregation.
+Sequence match, sessionize, event sub-selection, attribution. Pull-based processing via the `EntityOperator` interface. Selects execution strategy based on the demand set (Section 8). Optionally fuses with downstream aggregation.
 
 ### Stage 4: Aggregation
 
@@ -346,21 +394,35 @@ Each operator declares at plan time what capabilities it needs from its input. T
 
 1. **Output schema:** what the operator can produce (all fields, full detail).
 2. **Required input columns:** what the operator reads from its input.
-3. **Demand set:** what downstream operators need from this operator's output — propagated backward by the planner.
+3. **`DemandSet`:** what downstream operators need from this operator's output — propagated backward by the planner.
+
+**`DemandSet` is the formal type** carried by the backward pass. It is defined in `bqlite-planner` and specified by planner-pipeline.md §9.3. The key fields:
+
+- `columns: HashSet<ColumnId>` — columns the downstream needs.
+- `needs_match_detail: bool` — whether `match_events` / `match_duration` are needed.
+- `needs_step_reached: bool` — whether the `step_reached` column is needed.
+- `step_properties: Vec<StepPropertyRef>` — per-(step, column) demand bits for named step property forwarding.
+- `forwarded: Vec<ColumnId>` — forwarded columns from SESSIONIZE / ATTRIBUTE (demand-driven column carrying).
+- `fused_aggregate` / `fused_filter` — set by the optimizer's fusion pass.
+
+The **per-(step, column) `step_properties`** field is finer-grained than a plain column set. A downstream reference to `s.plan` adds `(step_name: "s", column_name: "plan")` — not a column named `s.plan` or a materialized `match_events` map. The stateful operator uses this information to retain exactly the referenced properties from the matched events at the moment the corresponding step is consumed, and to discard everything else. Planner-pipeline.md §8.2 specifies the semantics; type-system.md §6.1 documents how these demands add first-class columns to the MATCH output schema.
 
 The physical planner walks the pipeline backward, propagating demand. Stateful operators inspect the demand set and select the cheapest execution strategy that satisfies it:
 
 ```
-SequenceMatch receives demand = {entity_id, step_reached}
+SequenceMatch receives demand = {columns: {entity_id, step_reached}}
   → Uses step-counter strategy (funnel fast path)
 
-SequenceMatch receives demand = {entity_id, matched}
+SequenceMatch receives demand = {columns: {entity_id}, no match detail}
   → Uses boolean-match strategy (cheapest: just "did any full match occur?")
 
-SequenceMatch receives demand = {entity_id, step_reached, held.country}
-  → Uses step-counter + held property strategy
+SequenceMatch receives demand = {
+  columns: {entity_id, step_reached},
+  step_properties: [(s, country, String)],
+}
+  → Uses step-counter + step-property forwarding strategy (retain 's.country' at step 1)
 
-SequenceMatch receives demand = {entity_id, match_events, match_duration}
+SequenceMatch receives demand = {needs_match_detail: true}
   → Uses full NFA with match materialization (most expensive, full detail)
 ```
 
@@ -389,7 +451,7 @@ SequenceMatch maintains step_counts: [u64; num_steps] internally
 
 Fusion is valid when:
 
-- The aggregation function is **incrementally computable** — `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` (via sum + count), and percentile estimates (via t-digest). `AVG` is not associative but is incrementally computable via `(sum, count)` state.
+- The aggregation function is **incrementally computable** — `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` (via sum + count), and percentile estimates (via **DDSketch**: bounded relative error, ~1–2 KB sketch per group, constant-time merge). `AVG` is not associative but is incrementally computable via `(sum, count)` state.
 - No operator between the stateful operator and the aggregation needs per-entity rows (no `HAVING` that filters on match results, no `ORDER BY` on per-entity data).
 - `GROUP BY` keys, if any, are available inside the stateful operator (held properties, cohort time).
 
@@ -439,7 +501,7 @@ Each shard-task produces partial aggregation results. The coordinator thread per
 - `COUNT` / `SUM`: sum the partial values.
 - `MIN` / `MAX`: min/max across partials.
 - `AVG`: algebraic aggregate — each shard tracks `(sum, count)`; final merge computes `total_sum / total_count`.
-- `P50` / `P90` / `P95` / `P99`: each shard collects a t-digest; final merge combines digests and extracts quantiles.
+- `P50` / `P90` / `P95` / `P99`: each shard collects a DDSketch; final merge combines sketches (constant-time under DDSketch's merge operator) and extracts quantiles with bounded relative error.
 - `COUNT_DISTINCT`: each shard maintains an exact set; final merge unions those sets.
 
 Non-aggregated results (selection queries) are concatenated across shards and optionally merge-sorted (k-way binary heap, k = num_shards) for `ORDER BY`.

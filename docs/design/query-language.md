@@ -387,7 +387,7 @@ MATCH FIRST SEQUENCE(s: signup THEN p: purchase) WITHIN 7d
 | SELECT s.ts AS signup_time, p.amount AS purchase_amount, p.ts - s.ts AS time_to_convert
 ```
 
-Step property access requires the `match_events` column to be materialized by the engine's demand propagation (execution-model.md Section 8.2) — accessing `s.ts` or `p.amount` from a downstream operator implicitly sets a demand bit on `match_events`.
+Step property access is driven by **per-(step, column) demand bits**. When a downstream operator references `s.ts`, `p.amount`, or any other step-property expression, the planner records a `(step_name, column_name)` entry on the MATCH operator's demand set. MATCH retains exactly those properties — no full `match_events` map, no non-referenced columns from the matched events. The `match_events` map (and `match_duration`) are only materialized when a downstream expression references those specific names. This is specified in planner-pipeline.md §8.2 and §9.3; see Section 30.1 for the decision record.
 
 For filtering on match structure:
 
@@ -396,7 +396,7 @@ MATCH FIRST SEQUENCE(s: signup THEN p: purchase THEN r: refund) WITHIN 37d
 | WHERE p.ts - s.ts < 7d AND r.ts - p.ts < 30d
 ```
 
-**Property access beyond timestamps.** `s.ts` always works — the step timestamp is always available. Non-timestamp properties (e.g., `p.amount`) require the engine to carry additional per-step state through the match. This is a compile-time demand declared by the MATCH operator when it sees downstream references, set per-step per-property — only the referenced (step, property) pairs are materialized. See Section 30.1.
+**Property access beyond timestamps.** `s.ts` always works — the step timestamp is always available. Non-timestamp properties (e.g., `p.amount`) require the engine to retain the referenced column value at the moment that step's event is consumed. This is a compile-time demand declared by the MATCH operator when it sees downstream references, set per-(step, column) — only the referenced pairs are carried, everything else is discarded.
 
 ### 5.3 MATCH Does Not Preserve the Event Stream
 
@@ -434,7 +434,7 @@ FUNNEL and RETENTION are syntactic sugar over MATCH + EMIT ALL + STATS. They are
 ### 6.1 FUNNEL
 
 ```bql
--- Sugar:
+-- Basic sugar:
 events LAST 30d
 | FUNNEL(signup THEN add_to_cart THEN purchase) WITHIN 7d
 
@@ -447,7 +447,38 @@ events LAST 30d
     purchase = SUM(CAST(step_reached >= 3 AS INT))
 ```
 
-FUNNEL accepts the same step constructs as MATCH (named steps, property constraints, variable bindings, WITHOUT, alternation, repetition). The desugaring is mechanical: wrap in MATCH FIRST ... EMIT ALL, generate a STATS clause with one aggregate per step, name each aggregate after its step name.
+**FUNNEL accepts the full MATCH step grammar.** Named steps, property constraints, variable bindings, WITHOUT exclusions, alternation, repetition, and IMMEDIATELY are all valid inside a FUNNEL. The sugar layer only fixes the *match mode* (always `FIRST`), forces `EMIT ALL`, and generates the step-reached STATS — everything else is inherited from MATCH. This is intentional: a funnel is "count how many entities reach each step of a pattern", and that definition is useful for any pattern, not just linear bare-event sequences.
+
+```bql
+-- Funnel with property constraints, bindings, and an exclusion:
+events LAST 30d
+| FUNNEL(
+    s: signup WHERE s.country = 'US'
+    THEN a: add_to_cart WHERE a.cart_value > 50
+    WITHOUT churn
+    THEN p: purchase WHERE p.plan = $plan AND p.plan = s.signup_plan
+  ) WITHIN 7d
+
+-- Desugars to (the planner fills in the STATS automatically):
+events LAST 30d
+| MATCH FIRST SEQUENCE(
+    s: signup WHERE s.country = 'US'
+    THEN a: add_to_cart WHERE a.cart_value > 50
+    WITHOUT churn
+    THEN p: purchase WHERE p.plan = $plan AND p.plan = s.signup_plan
+  ) WITHIN 7d EMIT ALL
+| STATS
+    s = SUM(CAST(step_reached >= 1 AS INT)),
+    a = SUM(CAST(step_reached >= 2 AS INT)),
+    p = SUM(CAST(step_reached >= 3 AS INT))
+```
+
+**Step naming in the desugared STATS.** The output aggregate names follow these rules:
+
+1. If the step is named (`s: signup`), the aggregate output name is the step name (`s`).
+2. If the step is a bare event type (`signup`), the aggregate output name is the event type (`signup`).
+3. If the step is a backtick-quoted name, the backticks are stripped for the output name.
+4. If two steps produce the same output name (e.g. `signup THEN signup` without step names), the planner raises `TypeError::NameCollision { name: "signup", context: "FUNNEL step outputs" }` (type-system.md §12) — the user must add step names to disambiguate (e.g. `s1: signup THEN s2: signup`).
 
 **Note on the aggregation idiom.** Per type-system.md Section 6.4, `COUNT(col)` counts non-null values of `col`. Since `step_reached` is non-nullable, `COUNT(step_reached >= N)` would count every row regardless of the predicate's value — which is wrong. The correct pattern for "count rows where predicate is true" is `SUM(CAST(predicate AS INT))`, which leverages `CAST(Bool AS INT)` producing 0 or 1 (type-system.md Section 4.2). This same idiom is used in the RETENTION desugaring (Section 6.3) and all funnel examples in Section 28.
 
@@ -829,6 +860,87 @@ Output: passes through input schema unchanged. SAMPLE is a scan-level operator t
 Sampling is entity-level, not event-level. A sampled entity's full event stream is included; non-sampled entities contribute zero events.
 
 **Determinism.** SAMPLE uses a hash of the entity ID, making results deterministic across runs with the same seed. An optional `seed: <int>` parameter fixes the seed for reproducibility; without it, the seed is derived from the database identity so repeat queries on the same database produce the same sample.
+
+### 14.3 ATTRIBUTE
+
+Find touchpoint events preceding each conversion event within a time window and emit one row per `(entity, conversion, touchpoint)` triple:
+
+```bql
+events | ATTRIBUTE(
+    conversion: purchase,
+    touchpoints: ad_click,
+    window: 30d,
+    touchpoint_key: channel
+)
+```
+
+**Parameters:**
+- `conversion: <event_type>` — the conversion-defining event. Required.
+- `touchpoints: <event_type>` — the touchpoint event type whose occurrences are credited to conversions. Required.
+- `window: <duration>` — the lookback window before each conversion in which touchpoints count. Required.
+- `touchpoint_key: <expr>` — an expression evaluated against the touchpoint event's schema that produces a `String`. The result appears as the `touchpoint_key` output column. Required. Use `CAST(… AS STRING)` if the source column isn't already a string. The expression cannot reference conversion properties — it is evaluated purely in the touchpoint's context.
+
+**Output schema.** One row per `(entity_id, conversion, matched-touchpoint)`. See type-system.md Section 6.14.
+
+| Column | Type | Nullable | Description |
+|---|---|---|---|
+| `entity_id` | String or Int | no | Entity |
+| `conversion_ts` | Timestamp | no | Conversion event's timestamp |
+| *conversion properties* | (resolved from source) | follows source | Accessed as `<conversion_event_type>.<column>` downstream; demand-driven |
+| `touchpoint_ts` | Timestamp | yes | Timestamp of the matched touchpoint. NULL when no touchpoint qualified. |
+| `touchpoint_key` | String | yes | Result of the `touchpoint_key` expression. NULL when no touchpoint qualified. |
+
+**Auto-unnest semantics.** ATTRIBUTE emits flat rows, not a list column. A conversion with N qualifying touchpoints produces N rows. This makes attribution aggregation straightforward: `STATS attributions = COUNT(*) GROUP BY touchpoint_key` directly gives you per-channel counts without an intermediate list materialization step.
+
+**Un-attributed conversions (LEFT-UNNEST).** A conversion with zero qualifying touchpoints still emits **one row**, with `touchpoint_ts = NULL` and `touchpoint_key = NULL`. This preserves un-attributed conversions so the user can count them (`STATS unattributed = SUM(CAST(touchpoint_ts IS NULL AS INT))`). For INNER-join semantics — drop un-attributed conversions entirely — append `| WHERE touchpoint_ts IS NOT NULL`.
+
+**Conversion property access.** Forwarded conversion properties are accessed downstream with the conversion event type as a prefix, parallel to MATCH's bare-step property access (Section 5.2). For `conversion: purchase`, downstream writes `purchase.amount`. Conversion property forwarding is demand-driven: only referenced properties are retained. If the conversion event type shares its name with a column on the source table, the planner raises `TypeError::NameCollision`.
+
+```bql
+-- Last-touch attribution by channel
+events LAST 60d
+| ATTRIBUTE(
+    conversion: purchase,
+    touchpoints: ad_click,
+    window: 30d,
+    touchpoint_key: channel
+)
+| LET rn = ROW_NUMBER() OVER (PARTITION BY entity_id, conversion_ts ORDER BY touchpoint_ts DESC)
+| WHERE rn = 1
+| STATS revenue = SUM(purchase.amount) GROUP BY touchpoint_key
+```
+
+```bql
+-- Equal-weight attribution: every touchpoint gets one count
+events LAST 60d
+| ATTRIBUTE(
+    conversion: purchase,
+    touchpoints: ad_click,
+    window: 30d,
+    touchpoint_key: channel
+)
+| WHERE touchpoint_ts IS NOT NULL
+| STATS attributions = COUNT(*) GROUP BY touchpoint_key
+```
+
+```bql
+-- Computed key: channel + campaign concatenated
+events LAST 60d
+| ATTRIBUTE(
+    conversion: purchase,
+    touchpoints: ad_click,
+    window: 30d,
+    touchpoint_key: CONCAT(channel, ':', campaign)
+)
+| WHERE touchpoint_ts IS NOT NULL
+| STATS revenue = SUM(purchase.amount) GROUP BY touchpoint_key
+```
+
+**Why one key column, not a list.** Earlier designs of ATTRIBUTE emitted a `List(Struct)` of touchpoints per conversion, which required a companion `UNNEST` operator to flatten for analysis. The list form also hit a dead end in BQL's type system: BQL has no `Struct` type, and `Map(V)` has a single value type, so a list of heterogeneously-typed touchpoint fields has no natural representation. Auto-unnesting sidesteps both problems: flat rows compose naturally with STATS and window functions, multi-column attribution keys are handled via the `touchpoint_key` expression (CONCAT, CASE, etc.), and the language needs no Struct type or UNNEST operator. Credit distribution policies (first-touch, last-touch, equal, time-decay, position-based) are all expressible with window functions and standard aggregates on the flat row form.
+
+**Touchpoint consumption.** A touchpoint can contribute to multiple conversions — there is no consumption. Consumption is a potential v2 modifier.
+
+**Execution model.** Entity-streaming operator: maintain a sliding-window deque of qualifying touchpoints per entity. When a conversion event arrives, drop touchpoints older than `conversion_ts - window`, then emit one row per remaining touchpoint. If the deque is empty after pruning, emit one row with NULL touchpoint fields.
 
 ---
 
@@ -1309,7 +1421,7 @@ Line comments start with `--` and extend to end of line. Block comments are `/* 
 |---|---|---|
 | Source | table reference with optional time range | Produces entity event stream |
 | Filter/Transform | WHERE, SELECT, LET | Passes through entity boundaries |
-| Entity ops | MATCH, FUNNEL, RETENTION, SESSIONIZE, FIRST/LAST/NTH, SAMPLE | Operates per entity |
+| Entity ops | MATCH, FUNNEL, RETENTION, SESSIONIZE, FIRST/LAST/NTH, SAMPLE, ATTRIBUTE | Operates per entity |
 | Post-entity | STATS, window functions (OVER) | Aggregates across entities or per entity |
 | Post-agg | WHERE (on aggregates), ORDER BY, LIMIT, PIVOT | Operates on aggregated rows |
 
@@ -1319,15 +1431,16 @@ FUNNEL and RETENTION appear as entity ops in the category table, but the planner
 
 | Upstream | Valid Downstream |
 |---|---|
-| Source (table) | WHERE, SELECT, LET, MATCH, FUNNEL, RETENTION, SESSIONIZE, FIRST/LAST/NTH, SAMPLE, STATS |
-| SAMPLE | WHERE, SELECT, LET, MATCH, FUNNEL, RETENTION, SESSIONIZE, FIRST/LAST/NTH, STATS |
-| WHERE (pre-aggregate) | WHERE, SELECT, LET, MATCH, FUNNEL, RETENTION, SESSIONIZE, FIRST/LAST/NTH, STATS |
-| SELECT / LET (pre-aggregate) | WHERE, SELECT, LET, MATCH, FUNNEL, RETENTION, SESSIONIZE, STATS, ORDER BY, LIMIT |
+| Source (table) | WHERE, SELECT, LET, MATCH, FUNNEL, RETENTION, SESSIONIZE, FIRST/LAST/NTH, SAMPLE, ATTRIBUTE, STATS |
+| SAMPLE | WHERE, SELECT, LET, MATCH, FUNNEL, RETENTION, SESSIONIZE, FIRST/LAST/NTH, ATTRIBUTE, STATS |
+| WHERE (pre-aggregate) | WHERE, SELECT, LET, MATCH, FUNNEL, RETENTION, SESSIONIZE, FIRST/LAST/NTH, ATTRIBUTE, STATS |
+| SELECT / LET (pre-aggregate) | WHERE, SELECT, LET, MATCH, FUNNEL, RETENTION, SESSIONIZE, ATTRIBUTE, STATS, ORDER BY, LIMIT |
 | MATCH | WHERE, SELECT, LET, STATS, ORDER BY, LIMIT |
 | FUNNEL | (terminal after desugaring — produces aggregated rows; follows STATS rules) |
 | RETENTION | (terminal after desugaring — produces aggregated rows; follows STATS rules) |
 | SESSIONIZE | WHERE, SELECT, LET, MATCH, STATS |
 | FIRST/LAST/NTH | WHERE, SELECT, LET, STATS, ORDER BY, LIMIT |
+| ATTRIBUTE | WHERE, SELECT, LET, STATS, ORDER BY, LIMIT |
 | STATS | WHERE, SELECT, LET, ORDER BY, LIMIT, PIVOT |
 | PIVOT | WHERE, SELECT, LET, ORDER BY, LIMIT |
 | ORDER BY | WHERE, SELECT, LET, LIMIT |
@@ -1381,7 +1494,7 @@ time_range       := LAST duration
 
 operator         := where_op | select_op | let_op | match_op | funnel_op | retention_op
                   | sessionize_op | stats_op | order_op | limit_op | pivot_op
-                  | first_last_op | nth_op | sample_op
+                  | first_last_op | nth_op | sample_op | attribute_op
 
 -- WHERE
 where_op         := WHERE predicate
@@ -1448,6 +1561,12 @@ nth_op           := NTH "(" event_ref (WHERE predicate)? "," integer ")"
 -- SAMPLE
 sample_op        := SAMPLE "(" sample_param ("," "seed" ":" integer)? ")"
 sample_param     := "fraction" ":" number | "count" ":" integer
+
+-- ATTRIBUTE
+attribute_op     := ATTRIBUTE "(" "conversion" ":" event_ref ","
+                                  "touchpoints" ":" event_ref ","
+                                  "window" ":" duration ","
+                                  "touchpoint_key" ":" expr ")"
 
 -- ORDER BY
 order_op         := ORDER BY order_item ("," order_item)*
@@ -1562,7 +1681,7 @@ comment          := "--" [^\n]* | "/*" .* "*/"
 The parser is case-insensitive for keywords (Section 2.2), and the following identifiers are reserved — they cannot be used as table names, column names, event names, alias names, or variable names (without quoting, see Section 23):
 
 ```
-ADD AND ALL ALTER AS ASC AVG BETWEEN BRACKETS BY
+ADD AND ALL ALTER AS ASC ATTRIBUTE AVG BETWEEN BRACKETS BY
 CASE CAST COALESCE COLUMN CONTAINS COUNT COUNT_DISTINCT CREATE CUMULATIVE
 DEFAULT DELETE DESC DESCRIBE DISTINCT DROP
 ELSE EMIT END ENTITY EVENT EXPLAIN

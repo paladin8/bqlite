@@ -542,6 +542,8 @@ Combined with match mode and demand set, select the optimal execution strategy a
 
 The strategy is a **compile-time decision** — no runtime branching between strategies. The operator inspects the compiled pattern shape and demand set during physical planning.
 
+**Fusion is orthogonal to strategy selection.** When the planner fuses a downstream aggregate into the MATCH operator (planner-pipeline.md §7), the strategy chosen from this matrix does not change. A fused MATCH can be a step counter, a dedicated consecutive matcher, or a full NFA — fusion only affects what happens at match completion (update an accumulator instead of emitting a row). The per-event inner loop of each strategy is identical whether fusion is enabled or not.
+
 Patterns containing `IMMEDIATELY` do not use the general non-consecutive NFA transition logic. They compile to a dedicated consecutive matcher because adjacency is a positional constraint, not a timestamp-only check.
 
 ### 10.3 Step Counter Fast Path (Linear Patterns)
@@ -638,9 +640,12 @@ The sequence match operator produces a `RecordBatch` with the following columns 
 |---|---|---|---|---|
 | `entity_id` | String or Int | no | Always | Entity key (type matches table schema) |
 | `$var` | (per variable type) | no | When variables are bound | One column per bound variable, named by the variable |
+| *step-property columns* | (resolved from source schema) | follows source | When downstream references `step_name.column` | One column per referenced named-step property |
 | `step_reached` | Int | no | When EMIT ALL is enabled | 1-indexed step number of the farthest step matched |
 | `match_duration` | Int | yes | When demanded | Nanoseconds between first and last matched step (NULL if `step_reached == 1`) |
 | `match_events` | Map(Timestamp) | yes | When demanded | Step name → timestamp for each matched step (partial map if incomplete) |
+
+**Step-property columns.** When a pattern contains named steps (`s: signup THEN p: purchase`) and a downstream operator references a per-step property (`s.plan`, `p.amount`), the planner adds that property as a first-class column in the output schema. The column's name is `step_name.column_name` internally and its type is resolved from the source table's schema for the step's event type. Step-property demand is per-(step, column) — see planner-pipeline.md §8.2 and type-system.md §6.1. Only the demanded properties are retained by the operator; `match_events` is *not* materialized as a side effect of step-property access.
 
 Without EMIT ALL, only completed matches appear in output. `step_reached` is omitted (implicitly equals `num_steps`). `match_duration` and `match_events` are non-NULL for completed matches.
 
@@ -662,9 +667,10 @@ The planner propagates downstream demand to strip columns that are never read:
 
 - If downstream only needs `entity_id` + aggregate → no match detail columns materialized.
 - If downstream needs `step_reached` for funnel counting → step counter strategy, no match trace.
-- If downstream needs `match_events` → full NFA with path tracking.
+- If downstream needs named step properties (`s.plan`, `p.amount`) → per-(step, column) layered extraction; no `match_events` materialized.
+- If downstream needs `match_events` explicitly → full NFA with path tracking.
 
-The `finish_entity()` return type is always `Option<RecordBatch>`, but the batch's schema is the demand-reduced version. Demand propagation uses the `DemandCapabilities` / `DemandSet` types defined in `bqlite-planner` (execution-model.md Section 8.2, Section 15).
+The `finish_entity()` return type is always `Option<RecordBatch>`, but the batch's schema is the demand-reduced version. Demand propagation uses the **`DemandSet`** type formally defined in planner-pipeline.md §9.3 — this is the downstream-needs struct propagated backward through the plan by the physical planner (execution-model.md §8.2).
 
 ---
 
@@ -722,7 +728,14 @@ Zero intermediate materialization — no per-entity rows emitted between the seq
 
 ### 13.5 supported_demands()
 
-The operator advertises its capabilities to the planner. `DemandCapabilities` is defined in `bqlite-planner` (execution-model.md Section 8.2 and Section 15); `SequenceMatchOperator` in `bqlite-operators` returns it — this respects the dependency direction (`bqlite-operators → bqlite-planner`).
+The operator advertises its capabilities to the planner. The planner-side type carried through the backward pass is `DemandSet` (planner-pipeline.md §9.3). The operator's **capability advertisement** — a distinct type that describes which demand shapes the operator can satisfy — is `DemandCapabilities`. Both types live in `bqlite-planner`; `SequenceMatchOperator` in `bqlite-operators` imports and returns them, which respects the dependency direction (`bqlite-operators → bqlite-planner`).
+
+The two types are **dual** concepts:
+
+- `DemandSet` (downstream side): "the downstream needs these columns, these match details, these step properties, and optionally this fused aggregate". Constructed during the backward pass.
+- `DemandCapabilities` (operator side): "this operator supports step counts, match counts, full match detail, and aggregation fusion". Advertised once per operator via `supported_demands()`.
+
+The physical planner matches the `DemandSet` for each plan node against the upstream operator's `DemandCapabilities` to decide whether the operator can satisfy the demand directly, and if so, which strategy from Section 10.2 to use.
 
 ```rust
 fn supported_demands(&self) -> DemandCapabilities {
@@ -734,6 +747,7 @@ fn supported_demands(&self) -> DemandCapabilities {
         supports_match_count: true,
         supports_full_detail: true,
         supports_aggregation_fusion: true,
+        supports_step_property_forwarding: true,   // per-(step, column) forwarding
     }
 }
 ```
@@ -749,6 +763,7 @@ Returns the union of:
 - Columns referenced by step predicates.
 - Columns referenced by variable bindings.
 - Columns referenced by negation predicates.
+- **Columns referenced by named step property forwarding** — each `StepPropertyRef` in the planner's `DemandSet` (e.g., `s.plan` → column `plan` from the `signup` event type) adds the underlying source column to the required set. These columns are decoded only for the relevant event-type rows, but scan-level decoding is columnar so the whole column must be read.
 
 This drives demand propagation upstream — the scan layer only decodes these columns (late materialization).
 

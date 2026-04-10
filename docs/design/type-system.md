@@ -58,7 +58,7 @@ pub enum BqlType {
 
 **No Duration type.** Durations (e.g., `match_duration`, `session_duration`, timestamp differences) are represented as `Int` — nanoseconds as i64. In a domain-specific temporal query engine, the context makes durations unambiguous. A separate Duration type would add a variant to every type-dispatch site, complicate coercion and aggregate return-type rules, and provide marginal safety in a domain where every i64 from timestamp arithmetic is obviously a duration. Duration literals like `7d` and `30m` parse to i64 nanosecond values at plan time. Duration-specific display formatting (e.g., "2h 15m") belongs in the presentation layer, not the type system.
 
-**List is homogeneously typed.** `List(BqlType)` requires all elements to share a type. This is mandated by Arrow's List type and is sufficient for the domain: `match_events` is `List(Struct)`, `step_timestamps` is `List(Timestamp)`, `tags` is `List(String)`.
+**List is homogeneously typed.** `List(BqlType)` requires all elements to share a type. This is mandated by Arrow's List type and is sufficient for the domain: a user-declared column like `tags` is `List(String)`, `page_views_per_session` could be `List(Int)`, and so on. **BQL has no `Struct` type**, so there is no `List(Struct)`. This is intentional — adding Struct would multiply every coercion, schema-validation, and Arrow-mapping rule to handle nested-field access. The operators that would otherwise need heterogeneously-typed list elements (notably ATTRIBUTE — see Section 6.14) auto-unnest into flat rows instead, which keeps the type system small without losing expressiveness.
 
 **Map has String keys.** Event properties are accessed by name. Restricting keys to String simplifies key comparison and hashing, and matches Arrow's Map ergonomics. The value type is parameterized: `Map(Float)` for numeric property bags, `Map(String)` for string property bags.
 
@@ -307,6 +307,7 @@ Without EMIT ALL, only entities that complete the full sequence appear in the ou
 |---|---|---|---|---|
 | `entity_id` | String or Int (matches entity key) | no | Always | Entity identifier |
 | `$var` | (per variable type) | no | When variables are bound | One column per bound variable (e.g., `$plan`), named by the variable |
+| *step-property columns* | (resolved from source schema) | follows source column | When downstream references `step_name.column` | One column per referenced named-step property — see below |
 | `step_reached` | Int | no | When EMIT ALL is enabled | 1-indexed step number of the farthest step matched |
 | `match_duration` | Int | yes | When demanded | First-to-last matched event time in nanoseconds (NULL if `step_reached == 1`) |
 | `match_events` | Map(Timestamp) | yes | When demanded | Step name → timestamp of the matched event at that step (partial if incomplete) |
@@ -314,6 +315,12 @@ Without EMIT ALL, only entities that complete the full sequence appear in the ou
 The `match_events` map keys are the event type names from the pattern (e.g., `"signup"`, `"purchase"`). When a pattern contains repeated event types, keys are disambiguated with a numeric suffix (e.g., `"page_view_0"`, `"page_view_1"`).
 
 **Variable binding columns.** Each `$variable` in the pattern produces an output column with the bound value. The column type matches the source column's type (validated at plan time). Variable columns are non-nullable — only events with non-NULL binding values match the step predicate (sequence-matching.md Section 6.2).
+
+**Named step property columns.** When a MATCH step is named (`s: signup THEN p: purchase`) and a downstream operator references a per-step property (`s.plan`, `p.amount`, `s.ts`), that property becomes a **first-class column** in the MATCH output schema at plan time. The column's type is resolved from the source table's schema for the step's event type (e.g., `s.plan` has the type of `signup.plan`). Nullability follows the source column. The column is only present when demanded — if nothing downstream references `s.plan`, it does not appear in the output schema.
+
+Step property access is **per-(step, column)**, not per-(step, everything). Referencing `s.plan` adds only `s.plan` to the output schema; `s.country` remains absent unless separately referenced. This fine granularity is the basis for MATCH's column forwarding (planner-pipeline.md §8.2). The `match_events` map is not materialized by named step property access — only by explicit references to `match_events` itself or to `match_duration`.
+
+If a referenced step name is not defined in the pattern, or the referenced column does not exist on the step's event type, the planner raises `TypeError::ColumnNotFound` with a context identifying the step (e.g., `"step 's' of MATCH pattern"`).
 
 **Without EMIT ALL,** downstream pipelines do not need a `matched: Bool` column — every row is a completed match. A `STATS COUNT(*)` after MATCH counts matched entities directly. **With EMIT ALL,** the `step_reached` column distinguishes completed (`step_reached = num_steps`) from incomplete sequences.
 
@@ -356,6 +363,8 @@ Output depends on GROUP BY and aggregate expressions:
 | `SUM`, `AVG` | `Int`, `Float` | `Bool`, `String`, `Timestamp`, `List`, `Map` |
 | `MIN`, `MAX` | `Int`, `Float`, `String`, `Timestamp` | `Bool`, `List`, `Map` |
 | `P50`, `P90`, `P95`, `P99` | `Int`, `Float` | `Bool`, `String`, `Timestamp`, `List`, `Map` |
+
+**Percentile implementation.** `P50`/`P90`/`P95`/`P99` are computed using **DDSketch** (bounded relative error, ~1–2 KB sketch per group, constant-time merge). DDSketch's merge operator makes percentile aggregates incrementally computable, which is load-bearing for fusion into upstream stateful operators (planner-pipeline.md §7.2, execution-model.md §8.4).
 
 ### 6.5 WHERE / filter
 
@@ -494,6 +503,30 @@ Passes through input schema unchanged. The sort column must exist in the input s
 ### 6.13 LIMIT
 
 Passes through input schema unchanged.
+
+### 6.14 ATTRIBUTE
+
+Finds touchpoint events preceding each conversion within a time window. See query-language.md Section 14.3 for surface syntax and planner-pipeline.md Section 13 for execution semantics.
+
+**Output schema**: one row per `(entity_id, conversion, matched-touchpoint)`. ATTRIBUTE auto-unnests — it emits flat rows, not a list column.
+
+| Column | Type | Nullable | Present | Description |
+|---|---|---|---|---|
+| `entity_id` | String or Int (matches entity key) | no | Always | Entity identifier |
+| `conversion_ts` | Timestamp | no | Always | Conversion event's timestamp |
+| *conversion properties* | (resolved from source schema) | follows source | When downstream references `<conversion_event_type>.<column>` | Demand-driven forwarded conversion properties |
+| `touchpoint_ts` | Timestamp | **yes** | Always | Touchpoint timestamp; `NULL` when no touchpoint qualified for this conversion |
+| `touchpoint_key` | String | **yes** | Always | Result of the `touchpoint_key` expression; `NULL` when no touchpoint qualified |
+
+**`touchpoint_key` typing.** The `touchpoint_key` expression in the ATTRIBUTE parameters must evaluate to `String`. Any other type is a plan-time error; use `CAST(expr AS STRING)` to forward non-string columns. The expression is type-checked against the touchpoint event type's schema only — it cannot reference conversion properties or columns from other event types.
+
+**Conversion property forwarding.** Properties of the conversion event are accessed downstream using the conversion event type as a prefix — for `conversion: purchase`, downstream writes `purchase.amount`. This mirrors MATCH's bare-step property access (Section 6.1). Only referenced properties are materialized. If the conversion event type's name collides with a column name on the source table, the planner raises `TypeError::NameCollision` (Section 12).
+
+**LEFT-UNNEST semantics.** Conversions with no qualifying touchpoints still emit one row, with `touchpoint_ts = NULL` and `touchpoint_key = NULL`. This preserves un-attributed conversions so they can be counted. Use `WHERE touchpoint_ts IS NOT NULL` downstream to drop them for INNER-join semantics.
+
+**Row cardinality.** For an entity with K conversions and, on average, N qualifying touchpoints per conversion (within `window`), the operator emits `K * max(N, 1)` rows. The `max(N, 1)` accounts for the LEFT-UNNEST row emitted for un-attributed conversions.
+
+**Why no separate UNNEST operator in BQL.** Earlier designs of ATTRIBUTE emitted a `List(Struct)` of touchpoints per conversion and relied on a generic UNNEST operator to flatten it. BQL's type system doesn't have `Struct`, and `Map(V)` has a single value type, so a list of heterogeneously-typed touchpoint fields has no natural representation. Auto-unnesting sidesteps the type-system gap: ATTRIBUTE itself is the "unnest", the output is flat rows with a single typed `touchpoint_key` column, and the language needs no `Struct` type or `UNNEST` operator. All common attribution models (last-touch, first-touch, equal-weight, time-decay, position-based) are expressible with window functions and standard aggregates on the flat row form.
 
 ---
 
@@ -804,8 +837,37 @@ pub enum TypeError {
         second_type: BqlType,
         second_step: String,
     },
+
+    #[error("alias cycle detected: {path}")]
+    AliasCycle {
+        /// Dot-separated alias path showing the cycle, e.g. "A -> B -> C -> A".
+        path: String,
+    },
+
+    #[error("step '{step_name}' not found in MATCH pattern (available: {available})")]
+    StepNotFound {
+        step_name: String,
+        available: String,
+    },
+
+    #[error("name collision in {context}: '{name}' would be defined twice")]
+    NameCollision {
+        /// The colliding name.
+        name: String,
+        /// Where the collision occurred, e.g. "FUNNEL step outputs",
+        /// "SELECT aliases", "STATS output names", "JOIN result columns".
+        context: String,
+    },
 }
 ```
+
+**`NameCollision` usage.** This variant covers all cases where the planner would need to produce two output columns with the same name and cannot silently pick one:
+
+- **FUNNEL step outputs.** A FUNNEL with repeated event types and no step names (`signup THEN signup`) would produce two `signup = SUM(...)` aggregates. The planner raises `NameCollision { name: "signup", context: "FUNNEL step outputs" }`; the user must add step names to disambiguate (`s1: signup THEN s2: signup`).
+- **SELECT aliases.** `| SELECT a AS x, b AS x` is caught at the planner level when both aliases are user-written. Bare column references (`| SELECT x, x`) are a parser-level duplicate which the parser also rejects.
+- **STATS output names.** `| STATS total = COUNT(*), total = SUM(x)` raises the same collision.
+- **JOIN result columns.** A cross-table JOIN whose schema-combining step would produce two columns with the same name (despite the required table qualifier rule in query-language.md §19.1) — this is a defensive check.
+- **LET rebinding.** `| LET x = a | LET x = b` also raises this error (query-language.md §11 forbids rebinding).
 
 ### 12.1 Validation Sequence
 
