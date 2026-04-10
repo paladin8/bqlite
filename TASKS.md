@@ -141,14 +141,16 @@ Single-session deep dives with human review. Produces design documents before im
 
 ## Wave 1: Foundation & Skeleton
 
-**Goal.** By the end of Wave 1, `bqlite query "events"` compiles, parses, plans, executes, and returns an empty result set. All crate scaffolds land, shared types ship, the v0 trait surface is frozen, every crate has a working stub, and CI + bench harness + logging are green.
+**Goal.** By the end of Wave 1, `bqlite query "events"` parses, plans, executes against an auto-bootstrapped `events` table in a freshly created database directory, and returns an empty result set. Shared types ship, the v0 trait surface is frozen, every subsystem crate (core, ast, parser, planner, storage, operators, engine, cli) has a working stub, and CI + bench harness + logging are green.
 
-**Size.** 24 tasks.
+**Scope exclusions.** The top-level `bqlite` re-export crate and `bqlite-ffi` already exist as compile-only scaffolds from initial crate creation and are not extended in Wave 1 — the public Rust and Python APIs land in Wave 6. The builder API mentioned historically in architecture docs is deferred; no Wave 1 task exists for it.
+
+**Size.** 25 tasks.
 **Parallelism.** 6-8 agents concurrent at peak.
 
 Wave 1 is deliberately trait-heavy — it's the only wave where `[TRAIT]` is the norm rather than the exception. After Wave 1, the trait surface is frozen and any change requires a high-priority `[TRAIT]` task.
 
-All 24 Wave 1 tasks are enumerated below (no placeholder slots — Wave 1 is the next thing to execute, so it is fully planned).
+All 25 Wave 1 tasks are enumerated below (no placeholder slots — Wave 1 is the next thing to execute, so it is fully planned).
 
 ### TASK-101: [IMPL] Dependency direction check
 **Output**: scripts/check-dep-direction.sh, .github/workflows/ci.yml
@@ -163,7 +165,7 @@ All 24 Wave 1 tasks are enumerated below (no placeholder slots — Wave 1 is the
 ### TASK-103: [IMPL] Timestamp and time-range types
 **Output**: crates/bqlite-core/src/time.rs
 **Depends on**: none
-**Description**: Millisecond-precision `Timestamp`, `TimeRange` with inclusive/exclusive bounds, ordering, arithmetic helpers. Serde impls for debug/logging.
+**Description**: `Timestamp` newtype over `i64` epoch nanoseconds, UTC, matching the `Timestamp(Nanosecond, Some("UTC"))` Arrow mapping frozen in docs/design/type-system.md §2.1-§2.2. `TimeRange` with inclusive/exclusive bounds, ordering, arithmetic helpers (duration math stays in i64 nanos — no Duration type per type-system.md §2.2). Serde impls for debug/logging.
 
 ### TASK-104: [IMPL] PropertyValue type
 **Output**: crates/bqlite-core/src/property.rs
@@ -175,10 +177,14 @@ All 24 Wave 1 tasks are enumerated below (no placeholder slots — Wave 1 is the
 **Depends on**: TASK-103, TASK-104
 **Description**: `EntityId` newtype, `Event { entity, timestamp, type, properties }`, and an entity-aligned iteration trait that later operators implement. Zero-copy where possible.
 
-### TASK-106: [IMPL] TableSchema
+### TASK-106: [IMPL] TableSchema and OperatorSchema
 **Output**: crates/bqlite-core/src/schema.rs
 **Depends on**: TASK-104
-**Description**: Column definitions, designated entity-id column, timestamp column, event-type column, per-column property schema, schema validation API used by the planner at plan construction time.
+**Description**: Two schema types per docs/design/type-system.md §5:
+- `ColumnDef` + `TableSchema` — declared table shape, designated entity-id column, timestamp column, event-type column, per-column property schema, `__seq_id`/`__batch_id` system columns, and the schema-creation-time validation rules (§5.1).
+- `OperatorSchema` — the contract between piped operators (§5.2): ordered `Vec<ColumnDef>` output shape, `column(name)` lookup, `to_arrow_schema()`, and `validate_against(required)` compatibility check.
+
+Both types are foundational: TableSchema is what the catalog (TASK-125) returns, OperatorSchema is what the planner propagates through the plan tree (used by TASK-108 and the Wave 2 logical-plan work).
 
 ### TASK-107: [IMPL] Arrow type mapping
 **Output**: crates/bqlite-core/src/arrow.rs
@@ -186,9 +192,9 @@ All 24 Wave 1 tasks are enumerated below (no placeholder slots — Wave 1 is the
 **Description**: Bidirectional conversion between `PropertyValue`/`TableSchema` and Arrow `DataType`/`Schema`. Handles nested types (list, map) and null semantics.
 
 ### TASK-108: [DESIGN][TRAIT] PhysicalOperator + EntityOperator traits
-**Output**: docs/design/engine/operator-traits.md, crates/bqlite-core/src/operator.rs
+**Output**: docs/design/operators/operator-traits.md, crates/bqlite-operators/src/operator.rs
 **Depends on**: TASK-105, TASK-106
-**Description**: The core execution contract. Design note first checkpoint covers: pull-based iterator protocol, schema propagation, open/next/close lifecycle, error propagation, cancellation hook, the entity-aligned batching layer EntityOperator adds on top, and sub-batch streaming. Impl second checkpoint lands the trait definitions. Merge-first — later Phase D tasks depend on this.
+**Description**: The core execution contract. Design note first checkpoint covers: pull-based iterator protocol, `OperatorSchema` propagation, open/next/close lifecycle, error propagation, cancellation hook, the entity-aligned batching layer `EntityOperator` adds on top, and sub-batch streaming. Impl second checkpoint lands the trait definitions in `bqlite-operators` per docs/design/execution-model.md §13.2 module map — the trait cannot live in `bqlite-engine` because `bqlite-operators` does not depend on `bqlite-engine`, so placing the trait in engine would block operator impls (TASK-117) from implementing it. Also file a follow-up doc task to correct docs/design/planner-pipeline.md §15 line 1397 which inconsistently lists the trait in `bqlite-engine`. Merge-first — later Phase D tasks depend on this.
 
 ### TASK-109: [DESIGN][TRAIT] SegmentReader trait
 **Output**: docs/design/storage/reader-trait.md, crates/bqlite-core/src/storage.rs
@@ -222,28 +228,45 @@ All 24 Wave 1 tasks are enumerated below (no placeholder slots — Wave 1 is the
 
 ### TASK-115: [IMPL] Planner stub
 **Output**: crates/bqlite-planner/src/lib.rs
-**Depends on**: TASK-108, TASK-113
-**Description**: AST → logical plan stub → physical plan stub. Minimal logical node enum (just `Scan` for now), direct one-to-one physical mapping, no optimizer pass. Returns a plan that the engine can execute.
+**Depends on**: TASK-113, TASK-125
+**Description**: AST → logical plan stub → physical plan stub. `plan(statement, catalog: &dyn Catalog)` entry point resolves the scanned table via the catalog (returning a `TypeError` for unknown tables, per planner-pipeline.md §4.1), builds a minimal logical node enum (just `Scan { schema: TableSchema }` for now), and lowers it one-to-one to a plain-data physical descriptor (`ScanPhysical`) per planner-pipeline.md §15 — the planner emits plain data, not trait objects. No optimizer pass. The returned physical descriptor is consumed by the engine's bind step (TASK-118). Does not depend on TASK-108 directly because the planner never holds a `PhysicalOperator` value.
 
-### TASK-116: [IMPL] Storage stub
-**Output**: crates/bqlite-storage/src/lib.rs
-**Depends on**: TASK-109
-**Description**: `Database::open_or_create(path)` creates a minimal empty manifest if the directory does not exist or is empty, then implements `SegmentReader` returning an empty segment iterator. No real format yet. Must actually create the directory and manifest file — the smoke test depends on this.
+### TASK-116: [IMPL] Storage stub and database bootstrap
+**Output**: crates/bqlite-storage/src/{lib,database,manifest}.rs
+**Depends on**: TASK-106, TASK-109
+**Description**: `Database::open_or_create(path)` implements the full v0 database-open contract from docs/design/storage-format.md §5 + §12 + §14 and docs/reliability.md — even though nothing is stored yet, Wave 1 freezes the on-disk shape so later waves don't have to retrofit it:
+
+- **Directory layout.** Create `<path>/`, `<path>/manifest.json`, and acquire `<path>/.lock` via `flock()` (storage-format.md §14.1). Release the lock on drop. A second concurrent open returns a clear error.
+- **Manifest contents on empty-database init.** Write `manifest.json` with: `format_version: 1` (reliability.md §Versioning), a freshly generated `database_uuid` (v4, never rotates — storage-format.md §5.1), `shard_count: 32` with override hook for future `bqlite init --shards N`, an empty `tables: {}` map (populated by TASK-125's bootstrap), per-table counters `{ next_seq_id: 0, next_batch_id: 0 }` ready to be added, and a `segments: []` inventory.
+- **Manifest atomicity.** Writes go `manifest.json.tmp` → `fsync` → `rename` per storage-format.md §12.3.
+- **Open behavior.** Existing databases load `manifest.json` and validate `format_version` (rejecting unknown versions). Empty or missing directory triggers init. Corrupted manifest returns a typed error.
+- **SegmentReader.** Implements TASK-109's trait returning an empty segment iterator. No real format yet.
+
+The smoke test (TASK-123) depends on this: it creates a fresh temp directory, opens it, and must observe a valid, versioned, UUID-stamped manifest that later waves can keep extending.
 
 ### TASK-117: [IMPL] Operator stubs
 **Output**: crates/bqlite-operators/src/{scan,filter,project}.rs
 **Depends on**: TASK-108, TASK-109
 **Description**: Scan/filter/project operators implementing `PhysicalOperator`. Scan actually calls into `SegmentReader::segments()` and drives the iterator (not hard-coded to return empty). Filter and project wrap a child operator and are no-ops in this stub. Gives downstream planner and engine real types to wire to.
 
-### TASK-118: [IMPL] Engine stub
-**Output**: crates/bqlite-engine/src/lib.rs
-**Depends on**: TASK-115, TASK-117
-**Description**: Accepts a physical plan, drives it to completion, collects output batches, returns an `ExecutionResult` containing the schema and the (possibly empty) result set. No memory management, no concurrency, no cancellation yet.
+### TASK-118: [IMPL] Engine stub, query API, and physical-plan bind step
+**Output**: crates/bqlite-engine/src/{lib,query,bind}.rs, crates/bqlite-engine/Cargo.toml, docs/architecture.md, CLAUDE.md
+**Depends on**: TASK-114, TASK-115, TASK-117, TASK-125
+**Description**: Engine's public `Engine::query(text: &str, db: &Database) -> Result<ExecutionResult>` entry point — the single surface the CLI, Python bindings, and eventually the top-level `bqlite` crate call. Internally it:
+
+1. **Parses** the text via `bqlite-parser` into a `Statement` (Wave 1 accepts the one-identifier grammar from TASK-114).
+2. **Plans** by calling `bqlite-planner` with the database's `&dyn Catalog` (from TASK-125), producing the plain-data physical descriptor per planner-pipeline.md §15.
+3. **Binds** the plain-data descriptor into a `Box<dyn PhysicalOperator>` tree. The bind step lives in engine per planner-pipeline.md §15 line 1404 — planner never holds trait objects. For Wave 1 the only binding is `ScanPhysical` → `bqlite_operators::ScanOperator`.
+4. **Drives** the resulting operator tree to completion, collecting output batches, returning `ExecutionResult { schema: OperatorSchema, rows: Vec<RecordBatch> }`.
+
+No memory management, no concurrency, no cancellation yet.
+
+**Crate-boundary change.** Adds `bqlite-parser` to `bqlite-engine`'s `Cargo.toml` and updates the dependency graphs in `docs/architecture.md` and `CLAUDE.md` to show `bqlite-engine → parser, planner, operators, storage, core`. This preserves the `bqlite-cli → engine` constraint (architecture.md line 30) while giving engine a single text-in, rows-out API — without this, CLI would need direct parser/planner deps, which the architecture forbids. TASK-101's dep-direction check must be updated in the same PR.
 
 ### TASK-119: [IMPL] CLI stub
 **Output**: crates/bqlite-cli/src/main.rs
 **Depends on**: TASK-118, TASK-122
-**Description**: `bqlite query "<bql>" --db <path>` subcommand. Parses via bqlite-parser, plans via bqlite-planner, executes via bqlite-engine, prints the result as a simple text table (even if empty: "0 rows"). Initializes the tracing subscriber from TASK-122.
+**Description**: `bqlite query "<bql>" --db <path>` subcommand. Opens the database via `bqlite_engine::Database::open_or_create(path)`, calls `engine.query(text, &db)` — the single text-in entry point from TASK-118 — and prints the `ExecutionResult` as a simple text table (even if empty: "0 rows"). CLI only depends on `bqlite-engine` per architecture.md line 30; it does not import `bqlite-parser` or `bqlite-planner` directly. Initializes the tracing subscriber from TASK-122.
 
 ### TASK-120: [IMPL] Integration test fixture framework
 **Output**: tests/common/mod.rs
@@ -269,6 +292,17 @@ All 24 Wave 1 tasks are enumerated below (no placeholder slots — Wave 1 is the
 **Output**: tests/prop/mod.rs, tests/prop/property_value.rs
 **Depends on**: TASK-104
 **Description**: Adds `proptest` as a dev-dep, writes one round-trip test on `PropertyValue` as a template, documents the pattern in tests/prop/README.md. Later waves add real property tests for storage encodings, parser round-trips, and the sequence matcher.
+
+### TASK-125: [IMPL] Catalog trait and bootstrap events table
+**Output**: crates/bqlite-core/src/catalog.rs, crates/bqlite-storage/src/catalog.rs
+**Depends on**: TASK-106, TASK-116
+**Description**: Resolves the gap between "the planner requires a `Catalog` handle to resolve tables" (planner-pipeline.md §4.1 line 200) and "database initialization is CLI-only, no BQL DDL in v0" (query-language.md §29 line 1911) — without which the Wave 1 smoke test `bqlite query "events"` cannot parse-plan-execute.
+
+- **`Catalog` trait in `bqlite-core`.** Minimal surface: `resolve_table(name: &str) -> Result<TableSchema, TypeError>`, `list_tables() -> Vec<&str>`. The planner takes `&dyn Catalog` at plan time and never depends on storage directly (preserving the planner → ast, core dependency rule).
+- **Manifest-backed impl in `bqlite-storage`.** Reads the `tables: { <name>: TableSchema }` map from the manifest written by TASK-116. The impl is the value returned by `Database::catalog() -> &dyn Catalog`.
+- **Bootstrap rule.** When `Database::open_or_create(path)` initializes a fresh manifest (TASK-116), it seeds the `tables` map with a single default `events` table whose schema is the minimum required by type-system.md §5.1 validation: `entity_id STRING NOT NULL (ENTITY KEY)`, `ts TIMESTAMP NOT NULL (EVENT TIME)`, `event_type STRING NOT NULL (EVENT TYPE)`. This is a Wave 1 shortcut — proper `CREATE TABLE` DDL execution is Wave 2's parser + planner work. The bootstrap rule is documented in the manifest as `bootstrap_events_table: true` so later waves can distinguish seeded state from user state and retire the shortcut cleanly.
+
+Unlocks: TASK-115 planner stub (needs `Catalog` to resolve `events`), TASK-118 engine query API (wires catalog into the planner call), TASK-123 smoke test (needs a resolvable `events` table in a freshly created database).
 
 ---
 

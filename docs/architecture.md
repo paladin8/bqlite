@@ -6,7 +6,7 @@
 |-------|---------|
 | `bqlite` | Top-level re-export crate |
 | `bqlite-core` | Core types: Event, Entity, Schema, Timestamp, PropertyValue, EntityEventStream, TableSchema |
-| `bqlite-ast` | AST types shared by parser and builder APIs |
+| `bqlite-ast` | AST types produced by the parser and consumed by the planner |
 | `bqlite-storage` | Native storage format, compaction, ingest from CSV/JSON/Parquet, entity-sorted columnar layout, merge scanning, database directory management |
 | `bqlite-parser` | BQL text → AST |
 | `bqlite-planner` | AST → logical plan → optimizer → physical plan, schema validation at plan construction time |
