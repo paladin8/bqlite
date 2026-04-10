@@ -25,3 +25,6 @@ pub use memory::{MemoryBudget, MemoryReservation, SpillNotification, UnboundedMe
 
 pub mod property;
 pub use property::{BqlType, PropertyValue};
+
+pub mod event;
+pub use event::{EntityEventStream, EntityEventStreamError, EntityId, Event, VecEntityEventStream};
