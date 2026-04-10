@@ -13,11 +13,11 @@ COUNT=$(echo "$CONTAINERS" | wc -l | tr -d ' ')
 echo "Attaching to $COUNT agent containers via cmux..."
 
 # Create a cmux workspace for the fleet
-cmux new-workspace "bqlite agents"
+WORKSPACE=$(cmux new-workspace "bqlite agents" | grep -o 'workspace:[0-9]*')
 
 for CONTAINER in $CONTAINERS; do
   AGENT_NUM="${CONTAINER##*-}"
-  SURFACE=$(cmux new-surface --type terminal | grep -o 'surface:[0-9]*')
+  SURFACE=$(cmux new-surface --type terminal --workspace "$WORKSPACE" | grep -o 'surface:[0-9]*')
 
   SYSTEM_PROMPT="You are ${CONTAINER}, an autonomous agent building bqlite. Read AGENTS.md for your complete operating protocol. Begin the agent loop now."
 
