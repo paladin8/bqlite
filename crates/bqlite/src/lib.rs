@@ -27,3 +27,7 @@ pub use bqlite_ast as ast;
 pub use bqlite_core as types;
 pub use bqlite_engine as engine;
 pub use bqlite_parser as parser;
+
+// Re-export the error type and Result alias so users can write
+// `use bqlite::{BqliteError, Result}` without drilling into internal crates.
+pub use bqlite_core::{BqliteError, Result};

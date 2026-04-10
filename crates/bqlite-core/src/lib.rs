@@ -12,3 +12,6 @@
 //!
 //! This crate has no internal dependencies — it sits at the bottom of the
 //! dependency graph and is imported by every other bqlite crate.
+
+pub mod error;
+pub use error::{BqliteError, Result};
