@@ -37,9 +37,10 @@ for i in $(seq 1 "$N"); do
     -w /workspace \
     "$IMAGE" \
     bash -c "
-      # Copy auth files to writable location
-      mkdir -p /home/vscode/.claude
-      cp -r /home/vscode/.claude-host/* /home/vscode/.claude/ 2>/dev/null || true
+      # Copy auth files to writable location (container runs as root)
+      mkdir -p /root/.claude
+      cp -r /home/vscode/.claude-host/* /root/.claude/ 2>/dev/null || true
+      chmod -R 600 /root/.claude/* 2>/dev/null || true
 
       # Add GitHub to known hosts
       mkdir -p /root/.ssh
