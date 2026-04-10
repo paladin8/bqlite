@@ -11,14 +11,17 @@
 //! - `EntityEventStream`: ordered stream of events for a single entity
 //!
 //! This crate has no internal dependencies — it sits at the bottom of the
-//! dependency graph and is imported by every other bqlite crate.
+//! dependency graph and is imported by every other bqlite crates.
 
 pub mod error;
 pub mod telemetry;
 pub use error::{BqliteError, Result};
 
 pub mod time;
-pub use time::{Timestamp, TimeRange, duration};
+pub use time::{duration, TimeRange, Timestamp};
 
 pub mod memory;
 pub use memory::{MemoryBudget, MemoryReservation, SpillNotification, UnboundedMemory};
+
+pub mod property;
+pub use property::{BqlType, PropertyValue};
