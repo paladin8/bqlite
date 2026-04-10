@@ -19,3 +19,6 @@ pub use error::{BqliteError, Result};
 
 pub mod time;
 pub use time::{Timestamp, TimeRange, duration};
+
+pub mod memory;
+pub use memory::{MemoryBudget, MemoryReservation, SpillNotification, UnboundedMemory};
