@@ -264,7 +264,10 @@ mod tests {
     fn range_duration() {
         let r = TimeRange::new(Timestamp(0), Timestamp(100));
         assert_eq!(r.duration_nanos(), Some(100));
-        assert_eq!(TimeRange::new(Timestamp(5), Timestamp(5)).duration_nanos(), None);
+        assert_eq!(
+            TimeRange::new(Timestamp(5), Timestamp(5)).duration_nanos(),
+            None
+        );
     }
 
     #[test]
@@ -298,7 +301,10 @@ mod tests {
             r.shift(5),
             Some(TimeRange::new(Timestamp(15), Timestamp(25)))
         );
-        assert_eq!(r.shift(-5), Some(TimeRange::new(Timestamp(5), Timestamp(15))));
+        assert_eq!(
+            r.shift(-5),
+            Some(TimeRange::new(Timestamp(5), Timestamp(15)))
+        );
     }
 
     #[test]

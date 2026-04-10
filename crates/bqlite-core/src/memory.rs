@@ -25,8 +25,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::Result;
 use crate::error::BqliteError;
+use crate::Result;
 
 // ---------------------------------------------------------------------------
 // MemoryReservation
@@ -259,7 +259,11 @@ mod tests {
         };
         let bytes = r.forget();
         assert_eq!(bytes, 100);
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "release should not be called after forget");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "release should not be called after forget"
+        );
     }
 
     #[test]

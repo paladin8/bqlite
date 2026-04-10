@@ -367,10 +367,7 @@ mod tests {
             PropertyValue::Int(1),
             PropertyValue::Int(2),
         ]);
-        assert_eq!(
-            list.bql_type(),
-            Some(BqlType::List(Box::new(BqlType::Int)))
-        );
+        assert_eq!(list.bql_type(), Some(BqlType::List(Box::new(BqlType::Int))));
     }
 
     #[test]
@@ -388,10 +385,7 @@ mod tests {
             ("a".into(), PropertyValue::Null),
             ("b".into(), PropertyValue::Float(2.5)),
         ]);
-        assert_eq!(
-            map.bql_type(),
-            Some(BqlType::Map(Box::new(BqlType::Float)))
-        );
+        assert_eq!(map.bql_type(), Some(BqlType::Map(Box::new(BqlType::Float))));
     }
 
     // ── coerce_to ─────────────────────────────────────────────────────────────
@@ -405,7 +399,10 @@ mod tests {
             BqlType::String,
             BqlType::Timestamp,
         ] {
-            assert_eq!(PropertyValue::Null.coerce_to(&target), Some(PropertyValue::Null));
+            assert_eq!(
+                PropertyValue::Null.coerce_to(&target),
+                Some(PropertyValue::Null)
+            );
         }
     }
 
@@ -517,7 +514,10 @@ mod tests {
 
     #[test]
     fn float_nan_equals_nan() {
-        assert_eq!(PropertyValue::Float(f64::NAN), PropertyValue::Float(f64::NAN));
+        assert_eq!(
+            PropertyValue::Float(f64::NAN),
+            PropertyValue::Float(f64::NAN)
+        );
     }
 
     // ── ordering ─────────────────────────────────────────────────────────────
