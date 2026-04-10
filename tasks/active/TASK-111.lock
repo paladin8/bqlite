@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-3",
+  "task_id": "TASK-111",
+  "claimed_at": "2026-04-10T00:03:00Z",
+  "branch": "task/TASK-111",
+  "description": "MemoryBudget trait - byte-accounting trait, reservation API, spill notification hook"
+}
