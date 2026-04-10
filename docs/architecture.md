@@ -17,7 +17,10 @@
 
 ## Dependency Direction
 
-Enforced in CI:
+Enforced in CI by `scripts/check-dep-direction.sh`. The script walks every
+`crates/*/Cargo.toml`, extracts internal `bqlite-*` dependencies, and fails
+the build on any violation. Update the script's allowed-deps table and this
+section in the same commit when adding, removing, or re-wiring a crate.
 
 ```
 bqlite-core          (no internal deps)

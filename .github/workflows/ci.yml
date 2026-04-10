@@ -21,6 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Format check
         run: cargo fmt --all --check
+      - name: Dependency direction check
+        run: scripts/check-dep-direction.sh
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Build
