@@ -92,8 +92,8 @@ for i in $(seq 1 "$N"); do
       # Clone and configure
       git clone $REPO_URL /workspace &&
       cd /workspace &&
-      git config user.name \"bqlite-agent-$i\" &&
-      git config user.email \"bqlite-agent-${i}@agent.local\" &&
+      git config user.name \"Jeffrey Wang\" &&
+      git config user.email \"jeffreyw314159@gmail.com\" &&
       mkdir -p /root/.claude/hooks &&
       install -m 755 /workspace/scripts/cmux-notify.sh /root/.claude/hooks/cmux-notify.sh &&
       echo \"Container bqlite-agent-$i ready\" &&
