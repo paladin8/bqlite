@@ -86,10 +86,9 @@ To break a stale lock: remove the lock file, commit, and push. The atomic push p
 
 Break every task into the smallest self-contained units of progress. Each checkpoint must:
 
-1. Compile: `cargo build`
-2. Pass tests: `cargo test`
-3. Pass lint: `cargo clippy --all-targets --all-features -- -D warnings`
-4. Be merged to main immediately — do not accumulate checkpoints
+1. Pass `scripts/local-ci.sh` (mirrors `.github/workflows/ci.yml`: fmt, dep-direction, clippy, build, test)
+2. Pass a subagent code review of the staged changes (see Behavioral Requirement #4)
+3. Be merged to main immediately — do not accumulate checkpoints
 
 **Merge protocol for each checkpoint:**
 
@@ -141,12 +140,12 @@ git checkout task/TASK-NNN
 
 3. **Write thorough tests.** Test every code path including edge cases: empty inputs, single-event entities, entity event limits, segment boundary crossings. Add benchmarks for performance-critical paths.
 
-4. **Code review via subagent.** After implementing a complex change (new operator, storage engine modification, planner change), spawn a subagent to review the code for: correctness, performance, API ergonomics, error handling, documentation, and test coverage.
+4. **Code review via subagent — mandatory before every commit.** Before every commit (not just complex changes), spawn a subagent to review the staged diff for: correctness, performance, API ergonomics, error handling, documentation, and test coverage. If the reviewer raises any blocking issue, address it and re-review before committing.
 
 5. **Always validate before committing.** No commit without:
-   - `cargo test` passing
-   - `cargo clippy --all-targets --all-features -- -D warnings` clean
-   - Documentation updated
+   - `scripts/local-ci.sh` passing end-to-end (mirrors the GitHub Actions CI)
+   - Subagent code review completed with no blocking findings (see #4)
+   - Documentation updated in the same checkpoint as the code change
 
 6. **Consider refactoring.** After completing a task, evaluate whether the code benefits from refactoring. Small, focused refactoring is encouraged. Large refactors should be filed as separate tasks.
 

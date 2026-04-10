@@ -45,7 +45,7 @@ agent_cmd() {
   if [ -n "$MAX_TASKS" ]; then
     initial="${initial} Stop after completing ${MAX_TASKS} task(s): exit the loop and report done instead of claiming another task."
   fi
-  echo "docker exec -it -e IS_SANDBOX=1 -w /workspace ${container} claude --dangerously-skip-permissions --append-system-prompt '${system_prompt}' '${initial}'"
+  echo "docker exec -it -e IS_SANDBOX=1 -w /workspace ${container} claude --model 'claude-opus-4-6[1m]' --effort high --permission-mode bypassPermissions --append-system-prompt '${system_prompt}' '${initial}'"
 }
 
 FIRST=true

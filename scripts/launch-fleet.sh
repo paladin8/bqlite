@@ -56,7 +56,7 @@ for i in $(seq 1 "$N"); do
 
       # Merge bypass-permissions + cmux notification hook into settings.json
       # (preserves host config if present)
-      PATCH='{\"permissions\":{\"defaultMode\":\"bypassPermissions\",\"skipDangerousModePermissionPrompt\":true},\"hooks\":{\"Notification\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"/root/.claude/hooks/cmux-notify.sh\"}]}]}}'
+      PATCH='{\"skipDangerousModePermissionPrompt\":true,\"permissions\":{\"defaultMode\":\"bypassPermissions\"},\"hooks\":{\"Notification\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"/root/.claude/hooks/cmux-notify.sh\"}]}]}}'
       if [ -f /root/.claude/settings.json ]; then
         jq --argjson patch \"\$PATCH\" '. + \$patch' /root/.claude/settings.json > /tmp/settings.json && mv /tmp/settings.json /root/.claude/settings.json
       else
