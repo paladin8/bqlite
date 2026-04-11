@@ -24,10 +24,13 @@
 //!   chunks and emits the v1 byte layout atomically at a path, or
 //!   composes the bytes in memory via [`writer::encode_segment`] for
 //!   byte-exact testing.
+//! - [`reader`] — low-level segment file reader (TASK-215). Opens a
+//!   v1 segment file, validates every rule in §15, and exposes the
+//!   parsed footer + loaded dictionaries for the scan iterator.
 //!
-//! TASK-215 lands the reader in `segment::reader` alongside this
-//! module; both tasks build on top of [`layout`] without reshaping it
-//! — the on-disk format is frozen for Wave 2.
+//! Both tasks build on top of [`layout`] without reshaping it — the
+//! on-disk format is frozen for Wave 2.
 
 pub mod layout;
+pub mod reader;
 pub mod writer;
