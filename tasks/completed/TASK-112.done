@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-2",
   "task_id": "TASK-112",
   "claimed_at": "2026-04-11T00:37:30Z",
+  "completed_at": "2026-04-11T00:40:21Z",
   "branch": "task/TASK-112",
   "description": "[TRAIT] Metrics trait — per-operator metric counters (rows in, rows out, bytes, wall time), query-level aggregation hook. Designed to compose with TASK-122 telemetry."
 }
