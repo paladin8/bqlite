@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-1",
   "task_id": "TASK-215",
   "claimed_at": "2026-04-11T14:34:31Z",
+  "completed_at": "2026-04-11T15:30:56Z",
   "branch": "task/TASK-215",
   "description": "[IMPL] Segment file reader + row-group iterator"
 }
