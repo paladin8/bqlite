@@ -11,5 +11,9 @@ name = "bqlite"
 path = "src/main.rs"
 
 [dependencies]
+# Only the engine. The architecture rule `bqlite-cli → engine`
+# (docs/architecture.md §"Dependency Direction") forbids the CLI from
+# importing any other bqlite crate directly; the text-in, rows-out
+# surface plus `Database`, `init_tracing`, and `format_result_as_text`
+# are all re-exported from `bqlite-engine`.
 bqlite-engine = { workspace = true }
-anyhow = { workspace = true }

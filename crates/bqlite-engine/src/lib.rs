@@ -51,13 +51,20 @@
 
 pub mod bind;
 pub mod query;
+pub mod render;
 
 pub use bind::bind_physical;
 pub use query::{Engine, ExecutionResult};
+pub use render::format_result_as_text;
 
 // Convenience re-exports so downstream crates only need to depend on
 // `bqlite-engine`. This matches the architecture.md rule
-// `bqlite-cli → engine` — the CLI must not import `bqlite-storage` or
-// `bqlite-planner` directly.
+// `bqlite-cli → engine` — the CLI must not import `bqlite-storage`,
+// `bqlite-planner`, or `bqlite-core` directly. `init_tracing` is
+// re-exported here so that `bqlite-cli` (TASK-119) can install the
+// global subscriber at startup without reaching past the engine — the
+// telemetry module itself lives in `bqlite-core` (TASK-122), but the
+// architecture requires the CLI to go through engine for everything.
+pub use bqlite_core::telemetry::init_tracing;
 pub use bqlite_planner::PhysicalPlan;
 pub use bqlite_storage::Database;
