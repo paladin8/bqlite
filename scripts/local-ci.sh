@@ -16,7 +16,7 @@ run scripts/check-dep-direction.sh
 run cargo clippy --all-targets --all-features -- -D warnings
 run cargo build --all-targets
 run cargo test --all-targets
-run python3 -m unittest discover -s scripts -p 'test_task_tool*.py'
+run python3 -m unittest discover -s scripts/agents -p 'test_*.py'
 
 echo ""
 echo "local-ci: all checks passed"
