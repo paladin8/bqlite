@@ -1,24 +1,22 @@
 //! v1 segment-file reader (TASK-215).
 //!
-//! Parses a segment file's header, trailer, footer, and segment
-//! dictionaries region per `docs/design/storage/segment-format-v1.md`
-//! §4–§13 and validates every rule listed in §15. The resulting
-//! [`SegmentFileReader`] owns the file bytes and a pre-resolved
-//! [`FooterV1`] plus the eagerly-loaded segment-level dictionaries,
-//! and exposes those as read-only accessors for the [`SegmentFileScan`]
-//! iterator (lands in a later checkpoint) to decode row groups from.
+//! Two layers live in this module:
 //!
-//! # Scope split
-//!
-//! This file owns two distinct layers:
-//!
-//! - **Framing + footer + dictionary load** (checkpoint 2 — this
-//!   checkpoint). Everything needed to confirm a segment file is
-//!   well-formed and to answer metadata queries about it without
-//!   touching any row-group bytes.
-//! - **Row-group decode + `SegmentScan` impl** (checkpoint 3). The
-//!   lazy column-chunk iterator that materializes [`RecordBatch`]es
-//!   from the parsed footer.
+//! - [`SegmentFileReader`] — opens a v1 segment file from disk or
+//!   an in-memory buffer, validates every §15 rule, parses the
+//!   postcard footer, verifies the xxHash64 checksum, and eagerly
+//!   loads every segment-level dictionary from the
+//!   segment-dictionaries region. Pinned by
+//!   `docs/design/storage/segment-format-v1.md` §4–§13.
+//! - [`SegmentFileScan`] — a streaming row-group iterator produced
+//!   by [`SegmentFileReader::scan`] and implementing the
+//!   `bqlite_core::storage::SegmentScan` trait. Decodes column
+//!   chunks on demand via the [`crate::encoding::Encoding`] trait,
+//!   splices nulls back into dense Arrow arrays for nullable
+//!   columns, handles schema-evolution backfill for columns
+//!   introduced by `ALTER TABLE ADD COLUMN` after the segment was
+//!   written, and prunes row groups whose zone maps are rejected
+//!   by a pushed-down [`bqlite_core::storage::Predicate`].
 //!
 //! Keeping the two layers in one file is intentional: the scan
 //! borrows the reader's `Arc<[u8]>`, `Arc<FooterV1>`, and
@@ -33,17 +31,41 @@
 //! `segment-format-v1.md` §17 open question 2. Wave 2 benches will
 //! tell us whether the full-file-in-memory strategy is the
 //! bottleneck before we optimize.
+//!
+//! # Known limitations (deferred to later tasks)
+//!
+//! - **Default-value backfill for NOT NULL evolution columns.** If
+//!   the current manifest schema declares a NOT NULL column the
+//!   segment's write-time schema does not carry, the reader errors
+//!   with `BqliteError::Schema`. Nullable evolution columns
+//!   backfill with all-null arrays per §14.
+//! - **Nested-type null splicing.** Splicing for `List` / `Map`
+//!   columns is not implemented; the reader errors if asked to
+//!   decode a nullable nested column. Non-nullable nested columns
+//!   decode via the `Plain` encoding directly.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use bqlite_core::{BqlType, BqliteError, Result, TableSchema};
+use ::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringViewArray,
+    TimestampNanosecondArray,
+};
+use ::arrow::buffer::{BooleanBuffer, NullBuffer};
+use ::arrow::datatypes::{Field, Schema as ArrowSchema};
+use bqlite_core::arrow::bql_type_to_arrow;
+use bqlite_core::storage::{ColumnProjection, Predicate, SegmentScan, ZoneMap};
+use bqlite_core::{BqlType, BqliteError, ColumnDef, Result, TableSchema};
 
+use crate::encoding::{
+    decompress_lz4, BitPacking, Constant, Delta, Dictionary, EncodedChunk, Encoding, EncodingType,
+    Plain,
+};
 use crate::segment::layout::{
-    CompressionType, FooterV1, CHECKSUM_LEN, CHECKSUM_SEED, FILE_HEADER_LEN, FOOTER_SUFFIX_LEN,
-    MAGIC, SEGMENT_FORMAT_VERSION, TRAILER_LEN,
+    ColumnChunkMeta, CompressionType, FooterV1, CHECKSUM_LEN, CHECKSUM_SEED, FILE_HEADER_LEN,
+    FOOTER_SUFFIX_LEN, MAGIC, SEGMENT_FORMAT_VERSION, TRAILER_LEN,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,13 +217,54 @@ impl SegmentFileReader {
         self.footer.row_count
     }
 
-    /// The underlying byte buffer. Exposed (crate-visible only) so
-    /// the row-group decoder in the next checkpoint can pass the
-    /// bytes to column-chunk parsing helpers without re-reading the
-    /// file.
-    #[allow(dead_code)] // used by the SegmentFileScan impl in checkpoint 3
+    /// The underlying byte buffer. Crate-private; used by the
+    /// tests in this module to assert `Arc` sharing after a clone.
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> &Arc<[u8]> {
         &self.bytes
+    }
+
+    /// Construct a streaming scan over this segment.
+    ///
+    /// The scan materializes [`RecordBatch`]es one row group at a
+    /// time via [`SegmentScan::next_row_group`]. Column chunks are
+    /// decoded lazily — the reader touches a chunk's bytes only when
+    /// the scan reaches that row group and that column is in the
+    /// projection.
+    ///
+    /// `projection.is_all()` returns every column in the segment's
+    /// write-time schema in ordinal order; an explicit column list
+    /// returns exactly those columns in the requested order. Column
+    /// names are resolved against the current manifest schema first;
+    /// columns that don't exist in the current schema error with
+    /// [`BqliteError::Schema`]. Columns that exist in the current
+    /// schema but not in the segment's write-time schema are
+    /// **backfilled with all-null values** — matching the schema
+    /// evolution rule from `segment-format-v1.md` §14. Default
+    /// values for backfilled columns are **not yet supported** (see
+    /// the module-level TODO note).
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Schema`] if any projected column is not in
+    ///   the current schema, or if a column's type in the current
+    ///   schema disagrees with the same column's type in the
+    ///   segment's write-time schema.
+    pub fn scan(
+        &self,
+        projection: &ColumnProjection,
+        predicate: Option<Arc<dyn Predicate>>,
+    ) -> Result<SegmentFileScan> {
+        let plan = build_scan_plan(&self.current_schema, &self.footer.schema, projection)?;
+        Ok(SegmentFileScan {
+            bytes: self.bytes.clone(),
+            footer: self.footer.clone(),
+            dictionaries: self.dictionaries.clone(),
+            plan,
+            predicate,
+            next_idx: 0,
+            exhausted: false,
+        })
     }
 }
 
@@ -215,6 +278,797 @@ impl std::fmt::Debug for SegmentFileReader {
             .field("dictionaries", &self.dictionaries.len())
             .field("schema", &self.footer.schema.name())
             .finish()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scan — streaming row-group iterator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Streaming iterator over a single segment's row groups.
+///
+/// Constructed via [`SegmentFileReader::scan`] and typically held
+/// by a scan operator (TASK-230) for the lifetime of a query. Each
+/// call to [`SegmentScan::next_row_group`] decodes one row group into
+/// a [`RecordBatch`] and advances the iterator; dropping the scan
+/// releases every borrowed `Arc`.
+///
+/// # Resource sharing
+///
+/// Clones the reader's `Arc<[u8]>`, `Arc<FooterV1>`, and
+/// `Arc<[DictionaryValues]>`. A `SegmentFileScan` is therefore cheap
+/// to create — the only per-scan allocations are the [`ScanPlan`]
+/// and the predicate pointer.
+pub struct SegmentFileScan {
+    bytes: Arc<[u8]>,
+    footer: Arc<FooterV1>,
+    dictionaries: Arc<[DictionaryValues]>,
+    plan: ScanPlan,
+    predicate: Option<Arc<dyn Predicate>>,
+    next_idx: usize,
+    exhausted: bool,
+}
+
+/// Pre-resolved projection: for every output column, how to
+/// materialize its Arrow array when decoding a row group.
+///
+/// Built once in [`SegmentFileReader::scan`] and kept immutable for
+/// the scan's lifetime — the hot-path decoder walks this vector,
+/// not the raw [`ColumnProjection`].
+struct ScanPlan {
+    /// Arrow schema for the output batches, matching `entries`
+    /// order.
+    arrow_schema: Arc<ArrowSchema>,
+    entries: Vec<PlannedColumn>,
+}
+
+/// One output column's decode plan.
+struct PlannedColumn {
+    /// Output column name as seen by consumers.
+    output_name: String,
+    /// Output `BqlType` — the type the Arrow field in the batch
+    /// schema must match.
+    output_type: BqlType,
+    /// Source of the values.
+    source: PlannedColumnSource,
+}
+
+/// How a planned column's values come from a row group.
+enum PlannedColumnSource {
+    /// Decode a column chunk from the segment file at the given
+    /// write-time ordinal. The cached [`ColumnDef`] carries the
+    /// nullable flag and `bql_type` the decoder needs.
+    FromSegment {
+        write_time_ordinal: usize,
+        write_time_col: ColumnDef,
+    },
+    /// Fabricate an all-null Arrow array of the output type — the
+    /// column exists in the current schema but not in the segment's
+    /// write-time schema, so the segment predates the `ALTER TABLE
+    /// ADD COLUMN` that introduced it.
+    BackfillAllNull,
+}
+
+fn build_scan_plan(
+    current_schema: &TableSchema,
+    write_time_schema: &TableSchema,
+    projection: &ColumnProjection,
+) -> Result<ScanPlan> {
+    let mut entries: Vec<PlannedColumn> = Vec::new();
+    let mut arrow_fields: Vec<Field> = Vec::new();
+
+    let column_names: Vec<String> = if projection.is_all() {
+        current_schema
+            .columns()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
+    } else {
+        projection.columns().to_vec()
+    };
+
+    for name in column_names {
+        let current_col = current_schema
+            .columns()
+            .iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| {
+                BqliteError::Schema(format!(
+                    "segment reader: column `{name}` not found in current schema `{}`",
+                    current_schema.name()
+                ))
+            })?;
+
+        let source = match write_time_schema
+            .columns()
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.name == name)
+        {
+            Some((ordinal, wt_col)) => {
+                if wt_col.bql_type != current_col.bql_type {
+                    return Err(BqliteError::Schema(format!(
+                        "segment reader: column `{name}` has type {:?} in the segment \
+                             but {:?} in the current schema",
+                        wt_col.bql_type, current_col.bql_type
+                    )));
+                }
+                PlannedColumnSource::FromSegment {
+                    write_time_ordinal: ordinal,
+                    write_time_col: wt_col.clone(),
+                }
+            }
+            None => {
+                if !current_col.nullable {
+                    return Err(BqliteError::Schema(format!(
+                        "segment reader: column `{name}` is not in the segment's \
+                             write-time schema and the current schema marks it NOT NULL; \
+                             defaults are not yet supported by the reader"
+                    )));
+                }
+                PlannedColumnSource::BackfillAllNull
+            }
+        };
+
+        arrow_fields.push(Field::new(
+            current_col.name.clone(),
+            bql_type_to_arrow(&current_col.bql_type),
+            current_col.nullable,
+        ));
+        entries.push(PlannedColumn {
+            output_name: current_col.name.clone(),
+            output_type: current_col.bql_type.clone(),
+            source,
+        });
+    }
+
+    Ok(ScanPlan {
+        arrow_schema: Arc::new(ArrowSchema::new(arrow_fields)),
+        entries,
+    })
+}
+
+impl SegmentScan for SegmentFileScan {
+    fn row_group_count(&self) -> usize {
+        self.footer.row_groups.len()
+    }
+
+    fn row_group_zone_maps(&self, idx: usize) -> Result<HashMap<String, ZoneMap>> {
+        let rg = self.footer.row_groups.get(idx).ok_or_else(|| {
+            BqliteError::Execution(format!(
+                "segment reader: row group index {idx} out of range (total {})",
+                self.footer.row_groups.len()
+            ))
+        })?;
+        let mut map = HashMap::with_capacity(rg.columns.len());
+        for meta in &rg.columns {
+            let name = self
+                .footer
+                .schema
+                .columns()
+                .get(meta.column_ordinal as usize)
+                .map(|c| c.name.clone());
+            if let Some(name) = name {
+                map.insert(
+                    name,
+                    ZoneMap {
+                        min: meta.zone_min.clone(),
+                        max: meta.zone_max.clone(),
+                        null_count: meta.null_count,
+                        row_count: rg.row_count,
+                    },
+                );
+            }
+        }
+        Ok(map)
+    }
+
+    fn next_row_group(&mut self) -> Result<Option<RecordBatch>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        loop {
+            if self.next_idx >= self.footer.row_groups.len() {
+                self.exhausted = true;
+                return Ok(None);
+            }
+            let idx = self.next_idx;
+            self.next_idx += 1;
+
+            // Predicate pruning — a single "accepts_zone" pass over
+            // every projected column that has a zone map. If any
+            // column's predicate rejects its zone, the row group is
+            // guaranteed to produce zero rows and we skip it.
+            if let Some(pred) = self.predicate.clone() {
+                let zones = self.row_group_zone_maps(idx)?;
+                let mut pruned = false;
+                for entry in &self.plan.entries {
+                    if let Some(zone) = zones.get(&entry.output_name) {
+                        if !pred.accepts_zone(&entry.output_name, zone) {
+                            pruned = true;
+                            break;
+                        }
+                    }
+                }
+                if pruned {
+                    // Per the trait: "Implementations may return
+                    // `Ok(None)` early if they know every remaining
+                    // row-group is pruned." We can't assume that in
+                    // general, so we just skip this one and continue.
+                    continue;
+                }
+            }
+
+            return self.decode_row_group(idx).map(Some);
+        }
+    }
+}
+
+impl SegmentFileScan {
+    /// Decode row group `idx` to a [`RecordBatch`], honoring the
+    /// scan's projection plan.
+    fn decode_row_group(&self, idx: usize) -> Result<RecordBatch> {
+        let rg = &self.footer.row_groups[idx];
+        let row_count = rg.row_count as usize;
+
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.plan.entries.len());
+        for entry in &self.plan.entries {
+            let array = match &entry.source {
+                PlannedColumnSource::FromSegment {
+                    write_time_ordinal,
+                    write_time_col,
+                } => {
+                    let meta = &rg.columns[*write_time_ordinal];
+                    decode_column_chunk(
+                        &self.bytes,
+                        meta,
+                        write_time_col,
+                        row_count,
+                        &self.dictionaries,
+                    )?
+                }
+                PlannedColumnSource::BackfillAllNull => {
+                    backfill_all_null(&entry.output_type, row_count)?
+                }
+            };
+            columns.push(array);
+        }
+
+        RecordBatch::try_new(self.plan.arrow_schema.clone(), columns).map_err(|e| {
+            BqliteError::Execution(format!(
+                "segment reader: failed to assemble row group {idx}: {e}"
+            ))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Column chunk decoder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Decode one column chunk: parse null bitmap + encoding header,
+/// (optionally) LZ4-decompress the payload, reconstruct the
+/// trait-level [`EncodedChunk`], decode via the [`Encoding`] trait,
+/// and splice the null bitmap back into the dense result.
+fn decode_column_chunk(
+    bytes: &[u8],
+    meta: &ColumnChunkMeta,
+    write_time_col: &ColumnDef,
+    row_group_row_count: usize,
+    dictionaries: &[DictionaryValues],
+) -> Result<ArrayRef> {
+    let chunk_start = meta.byte_offset as usize;
+    let chunk_end = chunk_start + meta.byte_length as usize;
+    if chunk_end > bytes.len() {
+        return Err(BqliteError::Corruption(format!(
+            "segment reader: column chunk for ordinal {} extends beyond file ({} > {})",
+            meta.column_ordinal,
+            chunk_end,
+            bytes.len()
+        )));
+    }
+    let chunk_bytes = &bytes[chunk_start..chunk_end];
+    let mut cursor = 0usize;
+
+    // 1. Null bitmap (if the column is nullable).
+    let null_bitmap = if write_time_col.nullable {
+        let bitmap_len = row_group_row_count.div_ceil(8);
+        if chunk_bytes.len() < bitmap_len {
+            return Err(BqliteError::Corruption(format!(
+                "segment reader: column chunk for `{}` too short for null bitmap \
+                 (expected at least {} bytes, got {})",
+                write_time_col.name,
+                bitmap_len,
+                chunk_bytes.len()
+            )));
+        }
+        let bitmap = chunk_bytes[..bitmap_len].to_vec();
+        cursor += bitmap_len;
+        Some(bitmap)
+    } else {
+        None
+    };
+
+    // 2. Encoding discriminant.
+    if chunk_bytes.len() <= cursor {
+        return Err(BqliteError::Corruption(format!(
+            "segment reader: column chunk for `{}` missing encoding discriminant",
+            write_time_col.name
+        )));
+    }
+    let encoding_byte = chunk_bytes[cursor];
+    cursor += 1;
+    let encoding = EncodingType::from_discriminant(encoding_byte).map_err(|e| {
+        BqliteError::Corruption(format!(
+            "segment reader: column chunk for `{}`: {e}",
+            write_time_col.name
+        ))
+    })?;
+
+    // 3. Encoding-specific params.
+    let params_start = cursor;
+    let params_len =
+        parse_encoding_params_len(encoding, &chunk_bytes[cursor..], &write_time_col.bql_type)
+            .map_err(|e| {
+                BqliteError::Corruption(format!(
+                    "segment reader: column chunk for `{}`: {e}",
+                    write_time_col.name
+                ))
+            })?;
+    cursor += params_len;
+    let on_disk_params = &chunk_bytes[params_start..params_start + params_len];
+
+    // 4. uncompressed_payload_length: u32 LE.
+    if chunk_bytes.len() < cursor + 4 {
+        return Err(BqliteError::Corruption(format!(
+            "segment reader: column chunk for `{}` missing uncompressed_payload_length",
+            write_time_col.name
+        )));
+    }
+    let uncompressed_payload_length = u32::from_le_bytes(
+        chunk_bytes[cursor..cursor + 4]
+            .try_into()
+            .expect("slice length checked above"),
+    ) as usize;
+    cursor += 4;
+
+    // 5. Payload bytes (compressed or raw).
+    let on_disk_payload = &chunk_bytes[cursor..];
+
+    // 6. Decompress if needed.
+    let compression = CompressionType::from_discriminant(meta.compression).map_err(|e| {
+        BqliteError::Corruption(format!(
+            "segment reader: column chunk for `{}`: {e}",
+            write_time_col.name
+        ))
+    })?;
+    let uncompressed_payload: Vec<u8> = match compression {
+        CompressionType::None => {
+            if on_disk_payload.len() != uncompressed_payload_length {
+                return Err(BqliteError::Corruption(format!(
+                    "segment reader: column chunk for `{}`: uncompressed payload length \
+                     disagrees with on-disk size ({} vs {})",
+                    write_time_col.name,
+                    uncompressed_payload_length,
+                    on_disk_payload.len()
+                )));
+            }
+            on_disk_payload.to_vec()
+        }
+        CompressionType::Lz4 => decompress_lz4(on_disk_payload, uncompressed_payload_length)
+            .map_err(|e| {
+                BqliteError::Corruption(format!(
+                    "segment reader: column chunk for `{}`: lz4 decompress failed: {e}",
+                    write_time_col.name
+                ))
+            })?,
+    };
+
+    // 7. Build a trait-level `EncodedChunk`. For every encoding
+    //    except `Dictionary`, the on-disk params are byte-for-byte
+    //    what the trait decoder expects. `Dictionary` needs the
+    //    self-contained params block reconstructed by looking up the
+    //    segment-level dictionary by `dict_id`.
+    let encoded_chunk = match encoding {
+        EncodingType::Plain
+        | EncodingType::Delta
+        | EncodingType::BitPacking
+        | EncodingType::Constant => EncodedChunk {
+            encoding,
+            params: on_disk_params.to_vec(),
+            payload: uncompressed_payload,
+            row_count: meta.row_count as usize,
+        },
+        EncodingType::Dictionary => {
+            if on_disk_params.len() != 5 {
+                return Err(BqliteError::Corruption(format!(
+                    "segment reader: Dictionary on-disk params for `{}` are {} bytes (expected 5)",
+                    write_time_col.name,
+                    on_disk_params.len()
+                )));
+            }
+            let dict_id = u32::from_le_bytes(
+                on_disk_params[..4]
+                    .try_into()
+                    .expect("slice length checked above"),
+            ) as usize;
+            let code_bit_width = on_disk_params[4];
+            if dict_id >= dictionaries.len() {
+                return Err(BqliteError::Corruption(format!(
+                    "segment reader: Dictionary dict_id {dict_id} out of range \
+                     (segment has {} dictionaries)",
+                    dictionaries.len()
+                )));
+            }
+            let dict_values = &dictionaries[dict_id];
+            let trait_params = build_dictionary_trait_params(dict_values, code_bit_width);
+            EncodedChunk {
+                encoding,
+                params: trait_params,
+                payload: uncompressed_payload,
+                row_count: meta.row_count as usize,
+            }
+        }
+    };
+
+    // 8. Decode via the Encoding trait.
+    let dense_array: ArrayRef =
+        dispatch_decode(encoding, &encoded_chunk, &write_time_col.bql_type)?;
+
+    // 9. Splice nulls back in (if the column is nullable).
+    if let Some(bitmap) = null_bitmap {
+        splice_nulls(
+            &dense_array,
+            &bitmap,
+            row_group_row_count,
+            &write_time_col.bql_type,
+        )
+    } else {
+        // Non-nullable column: the dense array must already have the
+        // correct length.
+        if dense_array.len() != row_group_row_count {
+            return Err(BqliteError::Corruption(format!(
+                "segment reader: column `{}` decoded to {} rows, expected {}",
+                write_time_col.name,
+                dense_array.len(),
+                row_group_row_count
+            )));
+        }
+        Ok(dense_array)
+    }
+}
+
+/// Length in bytes of the on-disk encoding params block, computed
+/// by consuming just enough of the buffer to know the full header
+/// size. For every encoding except `Constant` this is a fixed
+/// per-discriminant value; `Constant` needs the column type and the
+/// `value_kind` byte to determine the length.
+fn parse_encoding_params_len(
+    encoding: EncodingType,
+    after_discriminant: &[u8],
+    col_type: &BqlType,
+) -> std::result::Result<usize, String> {
+    match encoding {
+        EncodingType::Plain => Ok(0),
+        // `dict_id: u32 LE` + `code_bit_width: u8`.
+        EncodingType::Dictionary => Ok(5),
+        // `base_value: i64 LE` + `residual_bit_width: u8`.
+        EncodingType::Delta => Ok(9),
+        // `min_value: i64 LE` + `bit_width: u8`.
+        EncodingType::BitPacking => Ok(9),
+        EncodingType::Constant => {
+            if after_discriminant.is_empty() {
+                return Err("Constant encoding missing value_kind byte".to_string());
+            }
+            let value_kind = after_discriminant[0];
+            if value_kind == 1 {
+                // All-null: exactly `value_kind`.
+                return Ok(1);
+            }
+            if value_kind != 0 {
+                return Err(format!("Constant value_kind {value_kind} is not 0 or 1"));
+            }
+            let literal_len = match col_type {
+                BqlType::Bool => 1,
+                BqlType::Int | BqlType::Float | BqlType::Timestamp => 8,
+                BqlType::String => {
+                    if after_discriminant.len() < 5 {
+                        return Err(
+                            "Constant encoding with String literal missing length prefix"
+                                .to_string(),
+                        );
+                    }
+                    let s_len = u32::from_le_bytes(
+                        after_discriminant[1..5]
+                            .try_into()
+                            .expect("slice length checked above"),
+                    ) as usize;
+                    4 + s_len
+                }
+                BqlType::List(_) | BqlType::Map(_) => {
+                    return Err(format!(
+                        "Constant encoding does not support nested type {col_type:?}"
+                    ));
+                }
+            };
+            Ok(1 + literal_len)
+        }
+    }
+}
+
+/// Reconstruct the self-contained trait-level `params` block for a
+/// Dictionary-encoded chunk from the segment-level dictionary
+/// values and the code bit width carried in the on-disk params.
+///
+/// The self-contained shape (matching the `Dictionary` impl's
+/// module docs) is:
+/// ```text
+/// [type_tag: u8]              // 0 = Int, 1 = String
+/// [code_bit_width: u8]
+/// [cardinality: u32 LE]
+/// [dict_values: variable]
+/// ```
+fn build_dictionary_trait_params(values: &DictionaryValues, code_bit_width: u8) -> Vec<u8> {
+    let mut params = Vec::new();
+    match values {
+        DictionaryValues::Int(vs) => {
+            params.push(0u8); // type_tag = Int
+            params.push(code_bit_width);
+            params.extend_from_slice(&(vs.len() as u32).to_le_bytes());
+            for v in vs {
+                params.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        DictionaryValues::String(vs) => {
+            params.push(1u8); // type_tag = String
+            params.push(code_bit_width);
+            params.extend_from_slice(&(vs.len() as u32).to_le_bytes());
+            for s in vs {
+                params.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                params.extend_from_slice(s.as_bytes());
+            }
+        }
+    }
+    params
+}
+
+/// Dispatch a trait-level [`EncodedChunk`] to the concrete
+/// [`Encoding`] impl. Box allocation is avoided by stack-dispatching
+/// each variant to its zero-sized impl.
+fn dispatch_decode(encoding: EncodingType, chunk: &EncodedChunk, ty: &BqlType) -> Result<ArrayRef> {
+    match encoding {
+        EncodingType::Plain => Plain.decode(chunk, ty),
+        EncodingType::Dictionary => Dictionary.decode(chunk, ty),
+        EncodingType::Delta => Delta.decode(chunk, ty),
+        EncodingType::BitPacking => BitPacking.decode(chunk, ty),
+        EncodingType::Constant => Constant.decode(chunk, ty),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Null splicing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Splice a dense Arrow array (no nulls, `non_null_count` rows)
+/// back into a nullable array of `row_group_row_count` rows using
+/// the given null bitmap.
+///
+/// The null bitmap is Arrow LSB-first: bit `i == 1` means row `i`
+/// is non-null. Non-null rows consume values from `dense` in order.
+/// Null rows carry a type-appropriate placeholder (`0` / empty
+/// string / `false`) and have their null-buffer bit cleared.
+fn splice_nulls(
+    dense: &ArrayRef,
+    null_bitmap: &[u8],
+    row_group_row_count: usize,
+    ty: &BqlType,
+) -> Result<ArrayRef> {
+    // Validate the dense length first — `Encoding::decode` returns
+    // exactly `chunk.row_count` values, which equals
+    // `row_group_row_count - null_count`. We recompute it from the
+    // bitmap to catch a writer that wrote an inconsistent chunk.
+    let non_null_count = count_set_bits(null_bitmap, row_group_row_count);
+    if dense.len() != non_null_count {
+        return Err(BqliteError::Corruption(format!(
+            "segment reader: dense array length {} disagrees with non-null count \
+             {} from the null bitmap ({} rows)",
+            dense.len(),
+            non_null_count,
+            row_group_row_count
+        )));
+    }
+
+    let boolean_buffer = BooleanBuffer::new(
+        ::arrow::buffer::Buffer::from_slice_ref(null_bitmap),
+        0,
+        row_group_row_count,
+    );
+    let null_buffer = NullBuffer::new(boolean_buffer);
+
+    match ty {
+        BqlType::Int => splice_primitive_i64(dense, row_group_row_count, null_buffer),
+        BqlType::Float => splice_primitive_f64(dense, row_group_row_count, null_buffer),
+        BqlType::Timestamp => splice_primitive_timestamp(dense, row_group_row_count, null_buffer),
+        BqlType::Bool => splice_bool(dense, row_group_row_count, null_buffer),
+        BqlType::String => splice_string(dense, row_group_row_count, &null_buffer),
+        BqlType::List(_) | BqlType::Map(_) => Err(BqliteError::Execution(format!(
+            "segment reader: null splicing for nested type {ty:?} is not yet implemented"
+        ))),
+    }
+}
+
+/// Count the number of bits set to 1 in the first `len` bits of
+/// `bitmap` (LSB-first).
+fn count_set_bits(bitmap: &[u8], len: usize) -> usize {
+    let full_bytes = len / 8;
+    let tail_bits = len % 8;
+    let mut count: usize = 0;
+    for b in &bitmap[..full_bytes] {
+        count += b.count_ones() as usize;
+    }
+    if tail_bits > 0 {
+        let last = bitmap[full_bytes];
+        let mask = (1u8 << tail_bits) - 1;
+        count += (last & mask).count_ones() as usize;
+    }
+    count
+}
+
+fn splice_primitive_i64(
+    dense: &ArrayRef,
+    row_group_row_count: usize,
+    null_buffer: NullBuffer,
+) -> Result<ArrayRef> {
+    let dense = dense.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+        BqliteError::Execution("segment reader: expected Int64Array dense input".into())
+    })?;
+    let mut full = vec![0i64; row_group_row_count];
+    let mut dense_idx = 0usize;
+    for (i, slot) in full.iter_mut().enumerate().take(row_group_row_count) {
+        if null_buffer.is_valid(i) {
+            *slot = dense.value(dense_idx);
+            dense_idx += 1;
+        }
+    }
+    let arr = Int64Array::new(full.into(), Some(null_buffer));
+    Ok(Arc::new(arr))
+}
+
+fn splice_primitive_f64(
+    dense: &ArrayRef,
+    row_group_row_count: usize,
+    null_buffer: NullBuffer,
+) -> Result<ArrayRef> {
+    let dense = dense
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| {
+            BqliteError::Execution("segment reader: expected Float64Array dense input".into())
+        })?;
+    let mut full = vec![0.0f64; row_group_row_count];
+    let mut dense_idx = 0usize;
+    for (i, slot) in full.iter_mut().enumerate().take(row_group_row_count) {
+        if null_buffer.is_valid(i) {
+            *slot = dense.value(dense_idx);
+            dense_idx += 1;
+        }
+    }
+    let arr = Float64Array::new(full.into(), Some(null_buffer));
+    Ok(Arc::new(arr))
+}
+
+fn splice_primitive_timestamp(
+    dense: &ArrayRef,
+    row_group_row_count: usize,
+    null_buffer: NullBuffer,
+) -> Result<ArrayRef> {
+    let dense = dense
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .ok_or_else(|| {
+            BqliteError::Execution(
+                "segment reader: expected TimestampNanosecondArray dense input".into(),
+            )
+        })?;
+    let mut full = vec![0i64; row_group_row_count];
+    let mut dense_idx = 0usize;
+    for (i, slot) in full.iter_mut().enumerate().take(row_group_row_count) {
+        if null_buffer.is_valid(i) {
+            *slot = dense.value(dense_idx);
+            dense_idx += 1;
+        }
+    }
+    let arr = TimestampNanosecondArray::new(full.into(), Some(null_buffer)).with_timezone("UTC");
+    Ok(Arc::new(arr))
+}
+
+fn splice_bool(
+    dense: &ArrayRef,
+    row_group_row_count: usize,
+    null_buffer: NullBuffer,
+) -> Result<ArrayRef> {
+    let dense = dense
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            BqliteError::Execution("segment reader: expected BooleanArray dense input".into())
+        })?;
+    let mut full = vec![false; row_group_row_count];
+    let mut dense_idx = 0usize;
+    for (i, slot) in full.iter_mut().enumerate().take(row_group_row_count) {
+        if null_buffer.is_valid(i) {
+            *slot = dense.value(dense_idx);
+            dense_idx += 1;
+        }
+    }
+    let bool_buffer = BooleanBuffer::from_iter(full);
+    let arr = BooleanArray::new(bool_buffer, Some(null_buffer));
+    Ok(Arc::new(arr))
+}
+
+fn splice_string(
+    dense: &ArrayRef,
+    row_group_row_count: usize,
+    null_buffer: &NullBuffer,
+) -> Result<ArrayRef> {
+    // Strings don't have a dense-buffer-plus-null-buffer two-part
+    // layout the way fixed-width primitives do — we rebuild a
+    // `StringViewArray` from an `Iterator<Item = Option<&str>>`
+    // instead, which derives its own null buffer from the `None`
+    // entries. We still consult the input `null_buffer` for the
+    // validity check (it carries the on-disk bitmap verbatim) so the
+    // two nulls sets agree by construction.
+    let dense = dense
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .ok_or_else(|| {
+            BqliteError::Execution("segment reader: expected StringViewArray dense input".into())
+        })?;
+    let mut dense_idx = 0usize;
+    let values: Vec<Option<String>> = (0..row_group_row_count)
+        .map(|i| {
+            if null_buffer.is_valid(i) {
+                let v = dense.value(dense_idx).to_string();
+                dense_idx += 1;
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let arr: StringViewArray = values.into_iter().collect();
+    Ok(Arc::new(arr))
+}
+
+/// Fabricate an all-null Arrow array of the given BQL type for
+/// schema-evolution backfill. Used when the current schema has a
+/// column that the segment's write-time schema doesn't.
+fn backfill_all_null(ty: &BqlType, row_count: usize) -> Result<ArrayRef> {
+    match ty {
+        BqlType::Int => {
+            let values: Vec<Option<i64>> = (0..row_count).map(|_| None).collect();
+            Ok(Arc::new(Int64Array::from(values)))
+        }
+        BqlType::Float => {
+            let values: Vec<Option<f64>> = (0..row_count).map(|_| None).collect();
+            Ok(Arc::new(Float64Array::from(values)))
+        }
+        BqlType::Bool => {
+            let values: Vec<Option<bool>> = (0..row_count).map(|_| None).collect();
+            Ok(Arc::new(BooleanArray::from(values)))
+        }
+        BqlType::String => {
+            let values: Vec<Option<&str>> = (0..row_count).map(|_| None).collect();
+            Ok(Arc::new(StringViewArray::from(values)))
+        }
+        BqlType::Timestamp => {
+            let values: Vec<Option<i64>> = (0..row_count).map(|_| None).collect();
+            let arr = TimestampNanosecondArray::from(values).with_timezone("UTC");
+            Ok(Arc::new(arr))
+        }
+        BqlType::List(_) | BqlType::Map(_) => Err(BqliteError::Execution(format!(
+            "segment reader: backfill for nested type {ty:?} is not yet implemented"
+        ))),
     }
 }
 
@@ -1737,5 +2591,1246 @@ mod tests {
             BqliteError::Corruption(msg) => assert!(msg.contains("encoding"), "got: {msg}"),
             other => panic!("expected Corruption, got {other:?}"),
         }
+    }
+
+    // ── Round-trip tests (writer → reader → decoded values) ─────────
+    //
+    // These tests exercise the scan iterator end-to-end: build an
+    // Arrow array, encode it via the `Encoding` trait, feed it to
+    // TASK-213's writer, and read it back through this reader. The
+    // round-trip is the strongest test we can write because it
+    // validates every layer (encoding trait, writer byte layout,
+    // reader parser, encoding decoder, null splicer) at once.
+
+    use crate::encoding::{
+        BitPacking as BitPackingEnc, Constant as ConstantEnc, Delta as DeltaEnc,
+        Encoding as EncodingTrait, Plain as PlainEnc,
+    };
+    use crate::segment::writer::{
+        encode_segment, PreparedColumnChunk, PreparedRowGroup, SegmentWriteRequest,
+    };
+    use ::arrow::array::{
+        BooleanArray as ArrowBoolArray, Int64Array as ArrowIntArray,
+        StringViewArray as ArrowStringView, TimestampNanosecondArray as ArrowTimestampArray,
+    };
+    use bqlite_core::storage::{ColumnProjection, ZoneMap as CoreZoneMap};
+
+    /// Minimum schema for round-trip tests: entity_id (String),
+    /// ts (Timestamp), event_type (String), amount (nullable Int).
+    fn roundtrip_schema() -> TableSchema {
+        TableSchema::new(
+            "events",
+            vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+                ColumnDef::nullable("amount", BqlType::Int),
+            ],
+            "entity_id",
+            "ts",
+            "event_type",
+        )
+        .unwrap()
+    }
+
+    /// Build the "amount" column's LSB-first null bitmap for the
+    /// round-trip tests. `valid[i] == true` means row `i` is
+    /// non-null.
+    fn build_null_bitmap(valid: &[bool]) -> Vec<u8> {
+        let byte_count = valid.len().div_ceil(8);
+        let mut out = vec![0u8; byte_count];
+        for (i, v) in valid.iter().enumerate() {
+            if *v {
+                out[i / 8] |= 1 << (i % 8);
+            }
+        }
+        out
+    }
+
+    fn encode_plain_string(values: &[&str]) -> EncodedChunk {
+        let arr: ArrowStringView = values.iter().map(|s| Some(*s)).collect();
+        PlainEnc.encode(&arr).unwrap()
+    }
+
+    fn encode_plain_timestamp(values: &[i64]) -> EncodedChunk {
+        let arr = ArrowTimestampArray::from(values.iter().map(|v| Some(*v)).collect::<Vec<_>>())
+            .with_timezone("UTC");
+        PlainEnc.encode(&arr).unwrap()
+    }
+
+    fn encode_plain_int(values: &[i64]) -> EncodedChunk {
+        let arr = ArrowIntArray::from(values.iter().map(|v| Some(*v)).collect::<Vec<_>>());
+        PlainEnc.encode(&arr).unwrap()
+    }
+
+    #[test]
+    fn roundtrip_plain_encodings_all_non_nullable() {
+        let schema = roundtrip_schema();
+        let entity_values = ["u1", "u1", "u2", "u2"];
+        let ts_values: Vec<i64> = vec![
+            1_700_000_000_000_000_000,
+            1_700_000_000_100_000_000,
+            1_700_000_000_200_000_000,
+            1_700_000_000_300_000_000,
+        ];
+        let event_values = ["view", "checkout", "view", "click"];
+        let amount_values: Vec<i64> = vec![10, 20, 30, 40];
+
+        // Encode every column with Plain.
+        let entity_chunk = encode_plain_string(&entity_values);
+        let ts_chunk = encode_plain_timestamp(&ts_values);
+        let event_chunk = encode_plain_string(&event_values);
+        let amount_chunk = encode_plain_int(&amount_values);
+        // Non-null amount column still needs a null bitmap because
+        // the schema declares it nullable.
+        let amount_bitmap = build_null_bitmap(&[true, true, true, true]);
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 4,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: entity_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u2".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: ts_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(ts_values[0])),
+                        zone_max: Some(PropertyValue::Timestamp(*ts_values.last().unwrap())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: event_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("checkout".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(amount_bitmap),
+                        encoded: amount_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(10)),
+                        zone_max: Some(PropertyValue::Int(40)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 1_700_000_000_000_000_000,
+            seq_id_range: (0, 3),
+            batch_id: 1,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        assert_eq!(reader.row_count(), 4);
+
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let batch = scan.next_row_group().unwrap().expect("one row group");
+        assert_eq!(batch.num_rows(), 4);
+        assert_eq!(batch.num_columns(), 4);
+
+        // Check each column's values.
+        let entity_out = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ArrowStringView>()
+            .unwrap();
+        for (i, v) in entity_values.iter().enumerate() {
+            assert_eq!(entity_out.value(i), *v, "entity_id row {i}");
+        }
+
+        let ts_out = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ArrowTimestampArray>()
+            .unwrap();
+        for (i, v) in ts_values.iter().enumerate() {
+            assert_eq!(ts_out.value(i), *v, "ts row {i}");
+        }
+
+        let event_out = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<ArrowStringView>()
+            .unwrap();
+        for (i, v) in event_values.iter().enumerate() {
+            assert_eq!(event_out.value(i), *v, "event_type row {i}");
+        }
+
+        let amount_out = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<ArrowIntArray>()
+            .unwrap();
+        for (i, v) in amount_values.iter().enumerate() {
+            assert!(!amount_out.is_null(i), "amount row {i}");
+            assert_eq!(amount_out.value(i), *v, "amount row {i}");
+        }
+
+        // Second pull returns None; further pulls stay None.
+        assert!(scan.next_row_group().unwrap().is_none());
+        assert!(scan.next_row_group().unwrap().is_none());
+    }
+
+    #[test]
+    fn roundtrip_null_splicing_int_column() {
+        // Nullable amount column with three real values and two nulls
+        // interleaved. Dense Plain-encoded payload carries only the
+        // non-null values.
+        let schema = roundtrip_schema();
+        let ts_values: Vec<i64> = vec![
+            1_700_000_000_000_000_000,
+            1_700_000_000_100_000_000,
+            1_700_000_000_200_000_000,
+            1_700_000_000_300_000_000,
+            1_700_000_000_400_000_000,
+        ];
+        let valid = [true, false, true, false, true];
+        let dense_amounts: Vec<i64> = vec![10, 30, 50];
+
+        let amount_bitmap = build_null_bitmap(&valid);
+        let amount_chunk = encode_plain_int(&dense_amounts);
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 5,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1", "u1", "u1", "u1", "u1"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u1".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&ts_values),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(ts_values[0])),
+                        zone_max: Some(PropertyValue::Timestamp(*ts_values.last().unwrap())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view"; 5]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(amount_bitmap),
+                        encoded: amount_chunk,
+                        compression: CompressionType::None,
+                        null_count: 2,
+                        zone_min: Some(PropertyValue::Int(10)),
+                        zone_max: Some(PropertyValue::Int(50)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 4),
+            batch_id: 2,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let batch = scan.next_row_group().unwrap().expect("one row group");
+
+        let amount_out = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<ArrowIntArray>()
+            .unwrap();
+        assert_eq!(amount_out.len(), 5);
+        let expected = [Some(10i64), None, Some(30), None, Some(50)];
+        for (i, exp) in expected.iter().enumerate() {
+            match exp {
+                Some(v) => {
+                    assert!(!amount_out.is_null(i), "row {i} should be non-null");
+                    assert_eq!(amount_out.value(i), *v, "row {i}");
+                }
+                None => assert!(amount_out.is_null(i), "row {i} should be null"),
+            }
+        }
+    }
+
+    #[test]
+    fn roundtrip_delta_encoding_timestamp() {
+        // Delta-encoded monotonic timestamps.
+        let schema = roundtrip_schema();
+        let ts_values: Vec<i64> = vec![
+            1_700_000_000_000_000_000,
+            1_700_000_000_100_000_000,
+            1_700_000_000_200_000_000,
+            1_700_000_000_300_000_000,
+        ];
+        let ts_array =
+            ArrowTimestampArray::from(ts_values.iter().map(|v| Some(*v)).collect::<Vec<_>>())
+                .with_timezone("UTC");
+        let ts_chunk = DeltaEnc.encode(&ts_array).unwrap();
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 4,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1"; 4]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u1".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: ts_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(ts_values[0])),
+                        zone_max: Some(PropertyValue::Timestamp(*ts_values.last().unwrap())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view"; 4]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true, true, true, true])),
+                        encoded: encode_plain_int(&[1, 2, 3, 4]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(1)),
+                        zone_max: Some(PropertyValue::Int(4)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 3),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let batch = scan.next_row_group().unwrap().unwrap();
+        let ts_out = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ArrowTimestampArray>()
+            .unwrap();
+        for (i, v) in ts_values.iter().enumerate() {
+            assert_eq!(ts_out.value(i), *v);
+        }
+    }
+
+    #[test]
+    fn roundtrip_bitpacking_encoding_int() {
+        // BitPacking for a narrow-range Int column.
+        let schema = roundtrip_schema();
+        let amount_values: Vec<i64> = vec![100, 110, 105, 120, 115];
+        let amount_array = ArrowIntArray::from(amount_values.clone());
+        let amount_chunk = BitPackingEnc.encode(&amount_array).unwrap();
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 5,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1"; 5]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u1".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[0; 5]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(0)),
+                        zone_max: Some(PropertyValue::Timestamp(0)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view"; 5]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true; 5])),
+                        encoded: amount_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(100)),
+                        zone_max: Some(PropertyValue::Int(120)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 4),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let batch = scan.next_row_group().unwrap().unwrap();
+        let amount_out = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<ArrowIntArray>()
+            .unwrap();
+        for (i, v) in amount_values.iter().enumerate() {
+            assert_eq!(amount_out.value(i), *v);
+        }
+    }
+
+    #[test]
+    fn roundtrip_constant_encoding_int() {
+        // Constant encoding: every non-null value is the same.
+        let schema = roundtrip_schema();
+        let amount_values: Vec<i64> = vec![42; 6];
+        let amount_array = ArrowIntArray::from(amount_values.clone());
+        let amount_chunk = ConstantEnc.encode(&amount_array).unwrap();
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 6,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1"; 6]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u1".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[0; 6]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(0)),
+                        zone_max: Some(PropertyValue::Timestamp(0)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view"; 6]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true; 6])),
+                        encoded: amount_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(42)),
+                        zone_max: Some(PropertyValue::Int(42)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 5),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let batch = scan.next_row_group().unwrap().unwrap();
+        let amount_out = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<ArrowIntArray>()
+            .unwrap();
+        for v in amount_out.iter() {
+            assert_eq!(v, Some(42));
+        }
+    }
+
+    #[test]
+    fn roundtrip_lz4_compressed_plain_payload() {
+        // LZ4-wrapped Plain payload for strings. The writer applies
+        // LZ4 to the encoded bytes; the reader decompresses before
+        // passing to `Plain::decode`.
+        let schema = roundtrip_schema();
+        // Enough repetition that LZ4 actually shrinks the payload.
+        let event_values: Vec<&str> = (0..40).map(|_| "view").collect();
+        let event_chunk = encode_plain_string(&event_values);
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 40,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1"; 40]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u1".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[0i64; 40]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(0)),
+                        zone_max: Some(PropertyValue::Timestamp(0)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: event_chunk,
+                        compression: CompressionType::Lz4,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true; 40])),
+                        encoded: encode_plain_int(&(0..40).collect::<Vec<_>>()),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(0)),
+                        zone_max: Some(PropertyValue::Int(39)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 39),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let batch = scan.next_row_group().unwrap().unwrap();
+        let event_out = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<ArrowStringView>()
+            .unwrap();
+        for i in 0..40 {
+            assert_eq!(event_out.value(i), "view");
+        }
+    }
+
+    #[test]
+    fn roundtrip_schema_evolution_backfills_added_column() {
+        // Write a segment against a 4-column schema, then open it
+        // with a 5-column current schema. The reader must backfill
+        // the new column with all-nulls.
+        let write_time_schema = roundtrip_schema();
+        let mut current_columns = write_time_schema.columns().to_vec();
+        current_columns.push(ColumnDef::nullable("device", BqlType::String));
+        let current_schema =
+            TableSchema::new("events", current_columns, "entity_id", "ts", "event_type").unwrap();
+
+        let request = SegmentWriteRequest {
+            schema: write_time_schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 2,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1", "u2"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u2".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[1, 2]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(1)),
+                        zone_max: Some(PropertyValue::Timestamp(2)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view", "view"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true, true])),
+                        encoded: encode_plain_int(&[10, 20]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(10)),
+                        zone_max: Some(PropertyValue::Int(20)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 1),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, current_schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let batch = scan.next_row_group().unwrap().unwrap();
+        assert_eq!(batch.num_columns(), 5);
+
+        // The first 4 columns come from the segment.
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<ArrowStringView>()
+                .unwrap()
+                .value(0),
+            "u1"
+        );
+        // The 5th column (`device`) is backfilled with nulls.
+        let device_out = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<ArrowStringView>()
+            .unwrap();
+        assert_eq!(device_out.len(), 2);
+        assert!(device_out.is_null(0));
+        assert!(device_out.is_null(1));
+    }
+
+    #[test]
+    fn projection_selects_subset_and_reorders_columns() {
+        let schema = roundtrip_schema();
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 2,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["a", "b"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("a".into())),
+                        zone_max: Some(PropertyValue::String("b".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[10, 20]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(10)),
+                        zone_max: Some(PropertyValue::Timestamp(20)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view", "view"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true, true])),
+                        encoded: encode_plain_int(&[1, 2]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(1)),
+                        zone_max: Some(PropertyValue::Int(2)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 1),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let projection = ColumnProjection::with_columns(["amount", "entity_id"]);
+        let mut scan = reader.scan(&projection, None).unwrap();
+        let batch = scan.next_row_group().unwrap().unwrap();
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.schema().field(0).name(), "amount");
+        assert_eq!(batch.schema().field(1).name(), "entity_id");
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ArrowStringView>()
+                .unwrap()
+                .value(0),
+            "a"
+        );
+    }
+
+    #[derive(Debug)]
+    struct RejectAllInts;
+    impl Predicate for RejectAllInts {
+        fn accepts_zone(&self, column: &str, _zone: &CoreZoneMap) -> bool {
+            column != "amount"
+        }
+    }
+
+    #[test]
+    fn predicate_prunes_row_group_when_zone_rejected() {
+        let schema = roundtrip_schema();
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 2,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1", "u2"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u2".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[0, 0]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(0)),
+                        zone_max: Some(PropertyValue::Timestamp(0)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view", "view"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true, true])),
+                        encoded: encode_plain_int(&[1, 2]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(1)),
+                        zone_max: Some(PropertyValue::Int(2)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 1),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let predicate: Arc<dyn Predicate> = Arc::new(RejectAllInts);
+        let mut scan = reader
+            .scan(&ColumnProjection::all(), Some(predicate))
+            .unwrap();
+        // The only row group should be pruned — next_row_group returns None.
+        assert!(scan.next_row_group().unwrap().is_none());
+    }
+
+    #[test]
+    fn roundtrip_dictionary_via_fixture_with_hoisted_form() {
+        // Hand-craft a segment whose Dictionary column chunk uses
+        // the on-disk hoisted form (dict_id + code_bit_width) and
+        // whose segment-dictionaries region holds the values as a
+        // Plain payload. The reader must reconstruct the
+        // self-contained params, hand them to Dictionary::decode,
+        // and produce the expected StringArray.
+        //
+        // Values: ["click", "view", "view", "click"] — cardinality 2,
+        // so `code_bit_width = 1`. The dictionary column lives at
+        // ordinal 2 in a minimal three-column schema.
+        let schema = TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+            ],
+            "entity_id",
+            "ts",
+            "event_type",
+        )
+        .unwrap();
+
+        // Sorted dictionary values, per §10.3.
+        let dict_values: Vec<&str> = vec!["click", "view"];
+        let dict_bytes = string_dictionary_bytes(&dict_values);
+
+        // Code stream for rows ["click", "view", "view", "click"]:
+        // codes = [0, 1, 1, 0]. The Dictionary encoding's `decode`
+        // wants a self-contained params block; our reader's job is
+        // to rebuild it. We build the payload as a 1-bit-packed
+        // code stream, padded up to the next 8-byte multiple.
+        //
+        // Bits laid out LSB-first: byte0 = 0b0000_0110 (codes 0,1,1,0
+        // at positions 0..4, remaining bits 0). Pad to 8 bytes.
+        let mut payload = vec![0u8; 8];
+        payload[0] = 0b0000_0110;
+
+        // On-disk encoding header: discriminant (1) + params (dict_id
+        // u32 LE = 0 + code_bit_width u8 = 1) + uncompressed_payload_length u32 LE = 8.
+        let mut chunk = Vec::new();
+        chunk.push(EncodingType::Dictionary.discriminant());
+        chunk.extend_from_slice(&0u32.to_le_bytes()); // dict_id
+        chunk.push(1u8); // code_bit_width
+        chunk.extend_from_slice(&8u32.to_le_bytes()); // uncompressed_payload_length
+        chunk.extend_from_slice(&payload);
+
+        // Row group: three column chunks, one per schema column. We
+        // only care about the Dictionary chunk at ordinal 2.
+        let col0 = plain_empty_chunk();
+        let col1 = plain_empty_chunk();
+        let col2 = chunk;
+
+        let col0_off = FILE_HEADER_LEN as u64;
+        let col0_len = col0.len() as u64;
+        let col1_off = col0_off + col0_len;
+        let col1_len = col1.len() as u64;
+        let col2_off = col1_off + col1_len;
+        let col2_len = col2.len() as u64;
+
+        let mut row_group = Vec::new();
+        row_group.extend_from_slice(&col0);
+        row_group.extend_from_slice(&col1);
+        row_group.extend_from_slice(&col2);
+
+        let rg_len = row_group.len() as u64;
+        let rg_end = col0_off + rg_len;
+        let dict_off = rg_end;
+        let dict_len = dict_bytes.len() as u64;
+
+        let footer = FooterV1 {
+            format_version: SEGMENT_FORMAT_VERSION,
+            schema: schema.clone(),
+            schema_version: 0,
+            row_count: 4,
+            row_group_count: 1,
+            row_group_size_hint: 65_536,
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 3),
+            batch_id: 0,
+            compaction_level: 0,
+            dictionaries: vec![SegmentDictRef {
+                column_ordinal: 2,
+                byte_offset: dict_off,
+                byte_length: dict_len,
+                cardinality: dict_values.len() as u32,
+                value_type: BqlType::String,
+            }],
+            row_groups: vec![RowGroupIndex {
+                byte_offset: col0_off,
+                byte_length: rg_len,
+                row_count: 4,
+                columns: vec![
+                    ColumnChunkMeta {
+                        column_ordinal: 0,
+                        byte_offset: col0_off,
+                        byte_length: col0_len,
+                        encoding: 0,
+                        compression: 0,
+                        row_count: 0,
+                        null_count: 4,
+                        zone_min: None,
+                        zone_max: None,
+                    },
+                    ColumnChunkMeta {
+                        column_ordinal: 1,
+                        byte_offset: col1_off,
+                        byte_length: col1_len,
+                        encoding: 0,
+                        compression: 0,
+                        row_count: 0,
+                        null_count: 4,
+                        zone_min: None,
+                        zone_max: None,
+                    },
+                    ColumnChunkMeta {
+                        column_ordinal: 2,
+                        byte_offset: col2_off,
+                        byte_length: col2_len,
+                        encoding: EncodingType::Dictionary.discriminant(),
+                        compression: 0,
+                        row_count: 4,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("click".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                ],
+            }],
+        };
+
+        let bytes = build_segment(&footer, &row_group, &dict_bytes);
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        assert_eq!(reader.dictionaries().len(), 1);
+
+        let projection = ColumnProjection::with_columns(["event_type"]);
+        let mut scan = reader.scan(&projection, None).unwrap();
+        let batch = scan.next_row_group().unwrap().unwrap();
+        let out = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ArrowStringView>()
+            .unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), "click");
+        assert_eq!(out.value(1), "view");
+        assert_eq!(out.value(2), "view");
+        assert_eq!(out.value(3), "click");
+    }
+
+    #[test]
+    fn roundtrip_bool_column_with_nulls() {
+        let schema = TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+                ColumnDef::nullable("flag", BqlType::Bool),
+            ],
+            "entity_id",
+            "ts",
+            "event_type",
+        )
+        .unwrap();
+
+        let valid = [true, false, true, true];
+        let dense_flags: Vec<bool> = vec![true, false, true];
+        let dense_array = ArrowBoolArray::from(dense_flags.clone());
+        let flag_chunk = PlainEnc.encode(&dense_array).unwrap();
+        let flag_bitmap = build_null_bitmap(&valid);
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 4,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1"; 4]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u1".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[0; 4]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(0)),
+                        zone_max: Some(PropertyValue::Timestamp(0)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view"; 4]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(flag_bitmap),
+                        encoded: flag_chunk,
+                        compression: CompressionType::None,
+                        null_count: 1,
+                        zone_min: Some(PropertyValue::Bool(false)),
+                        zone_max: Some(PropertyValue::Bool(true)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 3),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let batch = scan.next_row_group().unwrap().unwrap();
+        let flag_out = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<ArrowBoolArray>()
+            .unwrap();
+        let expected = [Some(true), None, Some(false), Some(true)];
+        for (i, exp) in expected.iter().enumerate() {
+            match exp {
+                Some(v) => {
+                    assert!(!flag_out.is_null(i));
+                    assert_eq!(flag_out.value(i), *v);
+                }
+                None => assert!(flag_out.is_null(i)),
+            }
+        }
+    }
+
+    #[test]
+    fn roundtrip_nullable_string_column_with_interleaved_nulls() {
+        // Close the last null-splicing coverage gap by exercising
+        // the `splice_string` branch with an actual interleaved
+        // null pattern (the schema-evolution test only hits the
+        // all-null backfill branch).
+        let schema = TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+                ColumnDef::nullable("label", BqlType::String),
+            ],
+            "entity_id",
+            "ts",
+            "event_type",
+        )
+        .unwrap();
+
+        // Rows: ["x", null, "y", null, "z"]
+        let valid = [true, false, true, false, true];
+        let dense_labels = ["x", "y", "z"];
+        let label_chunk = encode_plain_string(&dense_labels);
+        let label_bitmap = build_null_bitmap(&valid);
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 5,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1"; 5]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u1".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[0; 5]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(0)),
+                        zone_max: Some(PropertyValue::Timestamp(0)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view"; 5]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(label_bitmap),
+                        encoded: label_chunk,
+                        compression: CompressionType::None,
+                        null_count: 2,
+                        zone_min: Some(PropertyValue::String("x".into())),
+                        zone_max: Some(PropertyValue::String("z".into())),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 4),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let batch = scan.next_row_group().unwrap().unwrap();
+
+        let label_out = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<ArrowStringView>()
+            .unwrap();
+        assert_eq!(label_out.len(), 5);
+        let expected = [Some("x"), None, Some("y"), None, Some("z")];
+        for (i, exp) in expected.iter().enumerate() {
+            match exp {
+                Some(v) => {
+                    assert!(!label_out.is_null(i), "row {i}");
+                    assert_eq!(label_out.value(i), *v, "row {i}");
+                }
+                None => assert!(label_out.is_null(i), "row {i}"),
+            }
+        }
+    }
+
+    #[test]
+    fn row_group_zone_maps_surface_inline_min_max() {
+        let schema = roundtrip_schema();
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 3,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["a", "b", "c"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("a".into())),
+                        zone_max: Some(PropertyValue::String("c".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[10, 20, 30]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(10)),
+                        zone_max: Some(PropertyValue::Timestamp(30)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view"; 3]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true, true, true])),
+                        encoded: encode_plain_int(&[1, 2, 3]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(1)),
+                        zone_max: Some(PropertyValue::Int(3)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 2),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema).unwrap();
+        let scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let zones = scan.row_group_zone_maps(0).unwrap();
+        assert_eq!(
+            zones.get("amount").unwrap().min,
+            Some(PropertyValue::Int(1))
+        );
+        assert_eq!(
+            zones.get("amount").unwrap().max,
+            Some(PropertyValue::Int(3))
+        );
+        assert_eq!(zones.get("amount").unwrap().row_count, 3);
+        assert_eq!(
+            zones.get("entity_id").unwrap().min,
+            Some(PropertyValue::String("a".into()))
+        );
     }
 }
