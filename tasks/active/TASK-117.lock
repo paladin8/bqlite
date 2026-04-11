@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-1",
+  "task_id": "TASK-117",
+  "claimed_at": "2026-04-11T00:57:30Z",
+  "branch": "task/TASK-117",
+  "description": "Operator stubs — scan/filter/project implementing PhysicalOperator; scan drives SegmentReader::segments(); filter/project are pass-through wrappers"
+}
