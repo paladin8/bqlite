@@ -85,6 +85,15 @@ for i in $(seq 1 "$N"); do
 
       chmod -R 600 /root/.claude/* /root/.claude.json 2>/dev/null || true
 
+      # Ensure Claude Code plugins are present. The host-copy above may have
+      # left installed_plugins.json in whatever state the host has, which does
+      # not necessarily include what the fleet needs. Re-add the marketplace
+      # and (re)install; failures are tolerated so an already-present
+      # marketplace or plugin does not abort container startup.
+      claude plugin marketplace add anthropics/claude-plugins-official || true
+      claude plugin install rust-analyzer-lsp@claude-plugins-official || true
+      claude plugin install superpowers@claude-plugins-official || true
+
       # Add GitHub to known hosts
       mkdir -p /root/.ssh
       ssh-keyscan -t ed25519 github.com >> /root/.ssh/known_hosts 2>/dev/null
