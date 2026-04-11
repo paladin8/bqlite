@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-4",
   "task_id": "TASK-203",
   "claimed_at": "2026-04-11T07:01:35Z",
+  "completed_at": "2026-04-11T07:25:20Z",
   "branch": "task/TASK-203",
   "description": "[DESIGN] Parser grammar framework — hand-rolled vs generator, error recovery, span tracking, WITH option list surface; unblocks every post-stub parser task"
 }
