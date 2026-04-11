@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-2",
+  "task_id": "TASK-204",
+  "claimed_at": "2026-04-11T07:06:57Z",
+  "branch": "task/TASK-204",
+  "description": "[DESIGN] Logical plan node catalog (Wave 2 subset + forward map)"
+}
