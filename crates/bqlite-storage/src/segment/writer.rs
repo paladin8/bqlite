@@ -1148,10 +1148,7 @@ mod tests {
         let mut request = sample_request();
         // Drop one non-null value but leave the row group row_count at 3.
         request.row_groups[0].columns[0].encoded = plain_encode_string(&["u1", "u1"]);
-        assert_execution_err(
-            encode_segment(&request),
-            "parent row group row_count = 3",
-        );
+        assert_execution_err(encode_segment(&request), "parent row group row_count = 3");
     }
 
     #[test]
