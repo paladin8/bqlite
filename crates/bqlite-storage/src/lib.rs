@@ -50,6 +50,7 @@ pub mod encoding;
 pub mod ingest;
 pub mod manifest;
 pub mod segment;
+pub mod writer;
 pub mod zone_map;
 
 pub use catalog::{bootstrap_events_schema, ManifestCatalog, BOOTSTRAP_EVENTS_TABLE_NAME};
@@ -64,3 +65,4 @@ pub use manifest::{
     ColumnStats, Manifest, SegmentMeta, TableEntry, WindowManifest, DEFAULT_SHARD_COUNT,
     MANIFEST_FORMAT_VERSION,
 };
+pub use writer::{SegmentWriter, WriterConfig, DEFAULT_ROW_GROUP_SIZE};
