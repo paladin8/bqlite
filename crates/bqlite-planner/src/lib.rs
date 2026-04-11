@@ -53,7 +53,9 @@
 use bqlite_ast::{Pipeline, Statement};
 use bqlite_core::{BqliteError, Catalog, OperatorSchema, Result};
 
+pub mod expr;
 pub mod logical;
+pub use expr::{FunctionRegistry, ScalarFunctionSig, TypedExpr, TypedExprKind};
 pub use logical::{
     lower_statement, IngestFormat, InsertFromDescriptor, InsertLogicalBody, LogicalPlan,
     ProjectItem,
