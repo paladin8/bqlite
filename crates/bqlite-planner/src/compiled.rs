@@ -465,6 +465,58 @@ impl CompiledExpr {
             nullable,
         }
     }
+
+    /// Whether this compiled expression matches a shape the
+    /// storage layer can evaluate directly — the "can you push
+    /// this into the scan?" query that TASK-227's predicate
+    /// pushdown pass asks per expression-compilation.md §8.
+    ///
+    /// Wave 2 pushable shapes, per the §8 table:
+    ///
+    /// - `Compare { col, op, lit }` / `Compare { lit, op, col }`
+    ///   for any comparison op (`=`, `!=`, `<`, `<=`, `>`, `>=`).
+    /// - `IsNull { Column, .. }` with either `negated` value.
+    /// - `InLiteralSet { Column, negated: false, .. }`. `NOT IN`
+    ///   is not pushable because storage would need to materialize
+    ///   a row mask and the §8 design explicitly defers it.
+    ///
+    /// Everything else — including `And`/`Or`/`Not` at the top,
+    /// arithmetic sub-expressions, column-vs-column comparisons,
+    /// and function calls — returns `false`. TASK-227's caller is
+    /// responsible for decomposing a variadic `And` into conjuncts
+    /// and asking each conjunct individually.
+    ///
+    /// This method is pure structural pattern matching — it does
+    /// not consult storage capabilities, which is TASK-202's
+    /// runtime-side concern. The scan operator's
+    /// `Predicate::accepts_zone` / `Predicate::filter_batch`
+    /// implementations decide what to actually do with a pushed
+    /// conjunct; this method decides *whether* to hand one over
+    /// in the first place.
+    pub fn supported_pushdown_shape(&self) -> bool {
+        match &self.node {
+            CompiledNode::Compare { left, right, .. } => {
+                is_column(left) && is_literal(right) || is_literal(left) && is_column(right)
+            }
+            CompiledNode::IsNull { input, .. } => is_column(input),
+            CompiledNode::InLiteralSet {
+                input,
+                negated: false,
+                ..
+            } => is_column(input),
+            _ => false,
+        }
+    }
+}
+
+/// True if a compiled node is a direct column reference.
+fn is_column(expr: &CompiledExpr) -> bool {
+    matches!(expr.node, CompiledNode::Column { .. })
+}
+
+/// True if a compiled node is a direct literal value.
+fn is_literal(expr: &CompiledExpr) -> bool {
+    matches!(expr.node, CompiledNode::Literal(_))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1017,6 +1069,135 @@ mod tests {
     }
 
     // ── Deep pipeline — the acceptance predicate ────────────────────────────
+
+    // ── supported_pushdown_shape ────────────────────────────────────────────
+
+    #[test]
+    fn column_equals_literal_is_pushable() {
+        // `user_id = 'u1'` — classic equality against a literal.
+        let t = type_check(spanned(Expr::Compare {
+            op: CompareOp::Equal,
+            left: Box::new(col("user_id")),
+            right: Box::new(spanned(Expr::Literal(Literal::String("u1".into())))),
+        }));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(c.supported_pushdown_shape());
+    }
+
+    #[test]
+    fn literal_less_than_column_is_pushable() {
+        // `100 < amount` — literal on the left, column on the
+        // right. The pushdown query accepts either orientation so
+        // the caller doesn't have to canonicalise first.
+        let t = type_check(spanned(Expr::Compare {
+            op: CompareOp::Less,
+            left: Box::new(float_lit(100.0)),
+            right: Box::new(col("amount")),
+        }));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(c.supported_pushdown_shape());
+    }
+
+    #[test]
+    fn column_is_null_is_pushable() {
+        let t = type_check(spanned(Expr::IsNull {
+            expr: Box::new(col("amount")),
+            negated: false,
+        }));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(c.supported_pushdown_shape());
+    }
+
+    #[test]
+    fn column_is_not_null_is_pushable() {
+        let t = type_check(spanned(Expr::IsNull {
+            expr: Box::new(col("amount")),
+            negated: true,
+        }));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(c.supported_pushdown_shape());
+    }
+
+    #[test]
+    fn column_in_literal_set_is_pushable() {
+        let t = type_check(spanned(Expr::In {
+            lhs: vec![col("count")],
+            rhs: bqlite_ast::InRhs::List(vec![int_lit(1), int_lit(2)]),
+            negated: false,
+        }));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(c.supported_pushdown_shape());
+    }
+
+    #[test]
+    fn column_not_in_literal_set_is_not_pushable() {
+        // NOT IN requires materializing a row mask and is
+        // deferred per expression-compilation.md §8.
+        let t = type_check(spanned(Expr::In {
+            lhs: vec![col("count")],
+            rhs: bqlite_ast::InRhs::List(vec![int_lit(1), int_lit(2)]),
+            negated: true,
+        }));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(!c.supported_pushdown_shape());
+    }
+
+    #[test]
+    fn column_vs_column_compare_is_not_pushable() {
+        // `ts = ts` — both sides are columns. Storage needs two
+        // random column reads per row, which is not in scope for
+        // the Wave 2 pushdown protocol.
+        let t = type_check(spanned(Expr::Compare {
+            op: CompareOp::Equal,
+            left: Box::new(col("ts")),
+            right: Box::new(col("ts")),
+        }));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(!c.supported_pushdown_shape());
+    }
+
+    #[test]
+    fn and_of_comparisons_is_not_pushable_at_top_level() {
+        // The pushdown pass (TASK-227) decomposes a top-level
+        // `And` into its conjuncts and asks each one individually;
+        // this method never returns true for an `And` itself.
+        let t = type_check(spanned(Expr::And(vec![
+            spanned(Expr::Compare {
+                op: CompareOp::Equal,
+                left: Box::new(col("user_id")),
+                right: Box::new(spanned(Expr::Literal(Literal::String("u1".into())))),
+            }),
+            spanned(Expr::Compare {
+                op: CompareOp::Greater,
+                left: Box::new(col("amount")),
+                right: Box::new(float_lit(100.0)),
+            }),
+        ])));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(!c.supported_pushdown_shape());
+    }
+
+    #[test]
+    fn literal_by_itself_is_not_pushable() {
+        // A raw literal predicate like `WHERE true` is handled
+        // above the scan; we do not try to push constants.
+        let t = type_check(spanned(Expr::Literal(Literal::Bool(true))));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(!c.supported_pushdown_shape());
+    }
+
+    #[test]
+    fn function_call_like_is_not_pushable() {
+        // LIKE / REGEX lower to function calls which Wave 2
+        // evaluates above the scan.
+        let t = type_check(spanned(Expr::Like {
+            expr: Box::new(col("user_id")),
+            pattern: "u%".into(),
+            negated: false,
+        }));
+        let c = CompiledExpr::from_typed(&t);
+        assert!(!c.supported_pushdown_shape());
+    }
 
     #[test]
     fn full_acceptance_predicate_lowers_cleanly() {
