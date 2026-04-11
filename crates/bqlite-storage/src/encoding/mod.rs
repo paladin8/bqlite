@@ -45,9 +45,11 @@ use arrow::array::{Array, ArrayRef};
 use bqlite_core::{BqlType, BqliteError, Result};
 
 pub mod constant;
+pub mod lz4;
 pub mod plain;
 
 pub use constant::Constant;
+pub use lz4::{compress_lz4, decompress_lz4, CompressionType};
 pub use plain::Plain;
 
 /// On-disk encoding discriminant per `segment-format-v1.md` §9.
