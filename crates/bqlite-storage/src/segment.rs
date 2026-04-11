@@ -27,10 +27,15 @@
 //! - [`reader`] — low-level segment file reader (TASK-215). Opens a
 //!   v1 segment file, validates every rule in §15, and exposes the
 //!   parsed footer + loaded dictionaries for the scan iterator.
+//! - [`merge`] — streaming k-way merge across L0 segment scans
+//!   (TASK-219). Each Wave 2 query has to merge across every segment
+//!   in its `(shard, window)` snapshot because compaction is not
+//!   yet implemented.
 //!
-//! Both tasks build on top of [`layout`] without reshaping it — the
+//! These tasks build on top of [`layout`] without reshaping it — the
 //! on-disk format is frozen for Wave 2.
 
 pub mod layout;
+pub mod merge;
 pub mod reader;
 pub mod writer;
