@@ -35,6 +35,7 @@
 
 pub mod catalog;
 pub mod database;
+pub mod ingest;
 pub mod manifest;
 
 pub use catalog::{bootstrap_events_schema, ManifestCatalog, BOOTSTRAP_EVENTS_TABLE_NAME};
