@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-1",
   "task_id": "TASK-121",
   "claimed_at": "2026-04-11T00:25:36Z",
+  "completed_at": "2026-04-11T00:35:04Z",
   "branch": "task/TASK-121",
   "description": "[IMPL] Benchmark harness — Criterion workspace setup, per-crate bench harness pattern documented, smoke benchmark exercising the harness in CI"
 }
