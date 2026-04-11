@@ -37,6 +37,21 @@ pub enum BqliteError {
     #[error("Execution error: {0}")]
     Execution(String),
 
+    /// An on-disk structure (segment file, manifest, ...) failed
+    /// validation because its bytes are malformed, truncated, or
+    /// fail a checksum.
+    ///
+    /// Raised by the segment reader (TASK-215) when any of the
+    /// `segment-format-v1.md` §15 validation rules trip, and by any
+    /// future storage-layer surface that deserializes persistent
+    /// bytes. Distinct from [`BqliteError::Execution`] because a
+    /// corruption error is a file-integrity signal: callers can
+    /// react by quarantining the affected segment and continuing
+    /// with the rest of the manifest inventory (storage-format.md
+    /// §9.5), rather than aborting the query outright.
+    #[error("Corruption error: {0}")]
+    Corruption(String),
+
     /// The query was cancelled by the caller.
     #[error("Query cancelled")]
     Cancelled,
