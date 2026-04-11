@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-226",
+  "claimed_at": "2026-04-11T17:52:36Z",
+  "branch": "task/TASK-226",
+  "description": "Physical plan descriptors + logical → physical lowering"
+}
