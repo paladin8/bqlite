@@ -314,7 +314,7 @@ Unlocks: TASK-115 planner stub (needs `Catalog` to resolve `events`), TASK-118 e
 
 **Scope exclusions.** `DELETE` is deferred to Wave 4 alongside tombstones (TASK-404, TASK-410 territory) — the AST already models it, but without the tombstone format on disk there is nothing for the planner to lower it onto. Wave 2 parsers and planners therefore do not handle `DELETE`.
 
-**Size.** ~42 tasks.
+**Size.** ~43 tasks (TASK-242 retired during post-Wave-2 architecture reconciliation; see the task stub for rationale).
 **Parallelism.** 10-14 agents at peak.
 
 **Acceptance.** The following script runs end-to-end against a database created via `bqlite init /path/to/db` and returns the expected rows. Surface keywords match the grammar in query-language.md §26: `WHERE` for row filtering, `INSERT ... VALUES` for literal tuples, `WITH (k: v, ...)` option lists using `:` as the key/value separator.
@@ -532,7 +532,21 @@ Parser tests only — plan-time semantic validation is TASK-226 / TASK-232. `DEL
 ### TASK-231: [IMPL] Filter + Project + Limit operators
 **Output**: crates/bqlite-operators/src/{filter,project,limit}.rs
 **Depends on**: TASK-225
-**Description**: Three vectorized operators over Arrow batches. Filter evaluates a `CompiledExpr` predicate and produces a filtered batch via `arrow::compute::filter`. Project evaluates a list of output `CompiledExpr` expressions (with aliases) and assembles the output schema. Limit counts rows across batches and halts its child early once the limit is reached. All three are stateless except Limit's counter. Null-aware per three-valued logic.
+**Description**: Three vectorized stateless operators over Arrow `RecordBatch`es, replacing the Wave 1 pass-through stubs. Each operator implements `PhysicalOperator` and returns `RecordBatch` at the `next_batch()` boundary — Wave 2 does **not** implement the fused stateless push segment or the `FilteredBatch` / `SelectionVector` chain from execution-model.md §3.8. That design is the steady-state target, but it only pays off when multiple stateless kernels chain inside a fused push segment, which is a Wave 5 `[DESIGN]`/`[IMPL]` (TASK-503) concern — see the Wave 5 note at the bottom of this file. Wave 2 ships the correct-but-simpler copy-based implementation that the fusion work will later refactor.
+
+What Wave 2 does implement:
+
+- **Filter.** Evaluates a `CompiledExpr` predicate against the input batch and returns a filtered batch via `arrow::compute::filter`. **Iterates the input batch in execution tiles** (default 2,048 rows) when evaluating the predicate, for cache-friendly access per execution-model.md §3.6: the predicate kernel walks the batch in tile-sized slices (`batch.slice(start, len)`), computes a `BooleanArray` per tile, and concatenates the tile-level boolean arrays into one mask that drives a single final `arrow::compute::filter` call. The tile loop is purely for L1/L2 residency during predicate evaluation — there is no selection-vector chain across operators. Tile size is a construction-time parameter on `FilterOperator::new`, defaulted to 2,048 and clamped to `[1024, 4096]`; TASK-226's `FilterPhysical` descriptor carries the value so the bind step (TASK-232) can pass it through.
+
+  Dictionary-encoded string columns are filtered via the precomputed `DictFilterBitset` from execution-model.md §3.7: the scan hands the bitset over at construction time, and the filter's per-tile predicate evaluation does an integer bitset lookup instead of a string comparison in the hot loop.
+
+- **Project.** Evaluates a list of output `CompiledExpr` expressions (with aliases) and assembles the output schema. **String materialization always produces `StringViewArray`** (`DataType::Utf8View`), never `StringArray`, matching the execution-model.md §3.7 contract and the existing storage-layer decoders (`crates/bqlite-storage/src/encoding/dictionary.rs` already produces `StringViewArray`). If an Arrow compute kernel on the target path only has a flat-Utf8 variant, wrap it in a small adapter rather than round-tripping through `StringArray`.
+
+- **Limit.** Counts rows across batches and halts its child early once the limit is reached. Single counter, stateless beyond that.
+
+All three respect the entity-aligned batch contract (execution-model.md §3.5) — they never need to track entity boundaries. Null-aware per three-valued logic.
+
+**What is not in scope.** No `FilteredBatch`, no `SelectionVector`, no `StatelessKernel` trait, no `materialize_filtered_batch` helper, no fused push segment driver, no cross-operator selection-vector propagation. Those are Wave 5 (TASK-503 and the fusion implementation tasks it spawns), which refactors these three operators rather than replacing them.
 
 ### TASK-232: [IMPL] Engine bind step extension + DDL execution path
 **Output**: crates/bqlite-engine/src/{bind,ddl}.rs
@@ -574,6 +588,15 @@ Unit tests for every descriptor variant including the error paths (missing table
 - `acceptance` — the full 100M-row acceptance query.
 
 Each bench asserts its target from the Wave 2 performance gate table as a hard ceiling at the bench level — a single run that misses the target fails the bench in `cargo test --all-targets` (the harness pattern from TASK-121). Local reference targets are verified on the pinned reference machine before the wave is declared complete. Continuous regression comparison against the previous green main is the responsibility of TASK-241, which wires the bench subset into a dedicated CI workflow with baseline persistence and the >10% slip gate.
+
+**Bench-side metric reporting** (execution-model.md §14.1). Every bench prints, in addition to its primary throughput number, the cost-side metrics that turn "fast" into "expensive" or "cheap":
+- `gb_per_sec_scanned` — derived as `bytes_scanned / elapsed / num_cores`. The headline GB/s/core number that anchors regression triage.
+- `bytes_decoded_to_scanned` — the late-materialization signal. Lower is better.
+- `cycles_per_event` — opt-in (`bqlite query --explain-perf` mode), printed when `perf_event_open`/`kpc` is available.
+
+Selection-vector-related metrics (`selection_vector_materializations` and friends from execution-model.md §14.1) are **not** in scope for Wave 2 — they depend on the fused stateless push segment that ships in Wave 5. Wave 2 benches ignore those rows, and Wave 5 extends this bench suite when it builds out the fusion path.
+
+These are surfaced via the Criterion bench's `Throughput::Bytes` plus a custom `eprintln!` line per bench iteration. Capturing them at bench time (rather than only when running real queries) is what makes them load-bearing for the regression gate in TASK-241 — once the gate exists, slips in `bytes_decoded_to_scanned` or `cycles_per_event` count just like slips in the headline throughput numbers.
 
 ### TASK-237: [DESIGN][IMPL] INSERT FROM column-remapping language + AST extension
 **Output**: docs/design/query-language.md, crates/bqlite-ast/src/statement.rs
@@ -632,9 +655,30 @@ Without this task, the storage layer leaks disk space across crashes and the rel
 - **Opt-out.** PRs labeled `bench-skip` and draft PRs bypass the gate — for docs-only changes and similar.
 - **Reference-hardware verification stays manual.** The pinned Apple M3 Pro numbers remain verified by hand before the wave is declared complete; the CI gate uses only the relaxed CI targets.
 
+### TASK-242: [RETIRED]
+**Status**: Retired during the post-Wave-2 architecture reconciliation. Originally scoped as "FilteredBatch + SelectionVector + execution tile scaffold" after execution-model.md §3.8 introduced selection vectors as a steady-state design. Review found the selection-vector half of the task only pays off under a fused stateless push segment, which is a Wave 5 concern (TASK-503 "operator fusion" territory) — Wave 2 has no operator chain that can carry a `FilteredBatch` across operator boundaries, because the `PhysicalOperator::next_batch()` boundary is `RecordBatch`. The execution-tile half was small enough to fold into TASK-231 directly (filter operator's constructor grows a `tile_size` parameter; the tile loop is a 10-line helper). Number retired per the "numbers are never reused" rule. The full execution-model.md §3.8 design remains the implementation target for Wave 5 — see the forward reference in TASK-503.
+
+### TASK-243: [IMPL] posix_fadvise sequential-scan hint
+**Output**: crates/bqlite-storage/src/segment/reader.rs (additions), crates/bqlite-storage/src/segment/merge.rs (additions)
+**Depends on**: TASK-215, TASK-219
+**Description**: Reconciliation task added after storage-format.md §8.2 introduced explicit access-pattern hints. Wave 2's segment reader (TASK-215) and merge scan (TASK-219) shipped without `posix_fadvise` integration; this task wires in the single sequential-scan hint that is actually actionable in Wave 2.
+
+One deliverable, deliberately tiny:
+
+- **Sequential scan hint** at segment open. When `SegmentReader` is constructed for a full-segment scan (every call path in Wave 2), it issues `posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)` on Unix, no-op on other platforms. Wrapped in a tiny `posix_fadvise_compat` shim so the call is a no-op on Windows and on macOS where `posix_fadvise` is unavailable (macOS's `fcntl(F_RDADVISE)` equivalent is a separate follow-up).
+
+**Not in scope for Wave 2.**
+- `Random` hint — paired with the single-entity lookup path from storage-format.md §8.3, which Wave 2 does not ship. The hint lands alongside the lookup path in Wave 4.
+- `WillNeed` hint — paired with compaction reads, which are Wave 4 (TASK-408).
+- `memmap2::Advice` — the Wave 2 storage layer uses `pread`/BufReader, not mmap (verified: no `memmap2` imports anywhere in `crates/bqlite-storage`). The mmap path and its advice calls are a Wave 5 concern. The `memmap2::Advice` mention in storage-format.md §8.2 is kept because the doc describes the steady state; this task does not touch it.
+
+Tests: a smoke test that opens a segment and asserts `posix_fadvise` was invoked (via a test-only counter or a stubbed `libc::posix_fadvise`), plus a re-run of the existing TASK-215 reader test suite to confirm no regressions. The hint is advisory — the kernel may ignore it, so the test asserts the call, not the side effect.
+
+This task is intentionally tiny (~half a day) and exists to keep the implementation honest with storage-format.md §8.2.
+
 ### TASK-299: [IMPL] Wave 2 quality audit
 **Output**: docs/quality-score.md
-**Depends on**: TASK-235, TASK-236, TASK-237, TASK-238, TASK-239, TASK-240, TASK-241
+**Depends on**: TASK-235, TASK-236, TASK-237, TASK-238, TASK-239, TASK-240, TASK-241, TASK-243
 **Description**: Same audit pattern as TASK-199, rescored after Wave 2. Wave 2 is the first wave with a real performance gate, so the Benchmarks dimension must reflect whether the Wave 2 perf-gate targets are met on reference hardware — not merely whether benches exist. bqlite-storage (segment format, encodings, ingest), bqlite-planner (pushdown, projection pruning, EXPLAIN), and bqlite-operators (scan/filter/project/limit) will see the biggest grade movements. Any crate slipping vs. its Wave 1 grade is flagged in the commit message. Below-C grades get follow-up tasks; Wave 3 does not start until those are filed.
 
 ---
@@ -777,6 +821,8 @@ Additional Wave 4 tasks: individual encoding implementations from TASK-401 outco
 **Output**: docs/design/engine/operator-fusion.md
 **Depends on**: TASK-110
 **Description**: Which operators fuse, the fusion rewriter's place in the planner, code generation vs template strategies, DemandCapabilities integration. Risky.
+
+**Load-bearing forward reference:** execution-model.md §3.8 already specifies the steady-state stateless-segment design — `FilteredBatch`, `SelectionVector`, `StatelessKernel`, `materialize_filtered_batch`, and the three explicit materialization triggers (sparsity, push-segment boundary, aggregation hand-off — note the deliberate "materialization" terminology in §3.8.3, distinct from storage-format.md §7 "compaction"). The Wave 2 filter/project/limit operators (TASK-231) deliberately ship without that infrastructure because a fused push segment is required to make the selection-vector chain pay off. This design task is the point at which §3.8 moves from "documented target" to "implemented contract." It should produce the `[IMPL]` tasks that refactor TASK-231's operators into kernels that implement `StatelessKernel` and plug into a new fused-segment driver, **not** leave §3.8 to a later wave. See also the TASK-242 retirement stub for the history of how this design got deferred from Wave 2.
 
 ### TASK-504: [DESIGN] Cost model and statistics source
 **Output**: docs/design/planner/cost-model.md

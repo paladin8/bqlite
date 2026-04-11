@@ -97,31 +97,41 @@ Cancellation uses a shared `Arc<AtomicBool>` flag, not a method on the operator 
 
 ```rust
 pub struct QueryContext {
-    /// Set to true to cancel the query. Checked between batches.
+    /// Set to true to cancel the query. Checked between batches and between morsels.
     cancelled: Arc<AtomicBool>,
     /// Query timeout. The engine sets `cancelled` when this elapses.
     timeout: Option<Duration>,
-    /// Memory tracker for this query (shared across shard-tasks).
+    /// Memory tracker for this query (shared across all workers running this query).
     memory: Arc<MemoryTracker>,
+    /// Tile size for stateless kernels in this query, decided at plan time
+    /// (Section 3.6). Workers read this once at morsel start.
+    tile_size: usize,
 }
 ```
 
-`QueryContext` is shared across shard-tasks via `Arc`. It contains only thread-safe fields. Metrics and warnings are collected per-shard-task in thread-local structs and merged after completion:
+`QueryContext` is shared across workers via `Arc`. It contains only thread-safe fields. Per-worker mutable state lives in `WorkerContext`, which is created fresh when a worker begins draining a shard's morsels and merged into the query's totals after the worker's last morsel for that shard finishes:
 
 ```rust
-/// Per-shard-task state. Not shared across threads.
-pub struct ShardTaskContext {
+/// Per-worker state for the duration of one (worker, shard) session.
+/// Not shared across threads. A worker that processes morsels from
+/// multiple shards holds a sequence of WorkerContext instances, one per
+/// (worker, shard) pair.
+pub struct WorkerContext {
     query: Arc<QueryContext>,
+    /// Identity of the shard whose morsels this context is currently draining.
+    shard_id: u16,
     metrics: QueryMetrics,
     warnings: Vec<QueryWarning>,
 }
 ```
 
-Operators receive a reference to `QueryContext` at construction time and check `cancelled` at natural yield points (between batches, between entity sub-batches). Worst-case cancellation latency is one batch processing time.
+Aggregation is *not* held in `WorkerContext` — partial accumulators are per-shard (Section 9.5), accessed via a per-shard mutex from any worker draining that shard's morsels.
+
+Operators receive a reference to `QueryContext` at construction time and check `cancelled` at natural yield points (between batches, between entity sub-batches, between morsels). Worst-case cancellation latency is one batch processing time.
 
 ### 3.4 Query Timeout
 
-The engine spawns a lightweight timer when a query starts. If the query has a timeout (configurable per-query or via a global default), the timer sets the `cancelled` flag after the timeout elapses. The next yield point in any shard-task observes the flag and returns `Err(OperatorError::Cancelled)`. The engine maps that to `ExecutionError::Timeout` when the timeout fired, or `ExecutionError::Cancelled` for caller-initiated cancellation. This provides fast stopping without polling overhead — the flag check is a single atomic load.
+The engine spawns a lightweight timer when a query starts. If the query has a timeout (configurable per-query or via a global default), the timer sets the `cancelled` flag after the timeout elapses. The next yield point in any worker observes the flag and returns `Err(OperatorError::Cancelled)`. The engine maps that to `ExecutionError::Timeout` when the timeout fired, or `ExecutionError::Cancelled` for caller-initiated cancellation. This provides fast stopping without polling overhead — the flag check is a single atomic load.
 
 ### 3.5 Entity-Aligned Batches
 
@@ -130,14 +140,26 @@ The fundamental batch discipline: **never split an entity across batches**. Give
 - Stateless operators (filter, project) process these batches in vectorized fashion, preserving entity alignment — they never need to track entity boundaries.
 - Stateful operators can process a complete entity (or sub-batch sequence) without coordinating with other operators about entity transitions.
 
-### 3.6 Batch Size
+### 3.6 Batches and Execution Tiles
 
-Batches target **65,536 rows** (64K), the same size as storage row-groups. Note that row-groups and batches are distinct concepts — a row-group is a storage-level unit within a segment file, while a batch is an execution-level unit flowing through the pipeline. They happen to share the same size target for alignment: within a single segment, one row-group produces one batch with no splitting or buffering. Across a k-way merge of multiple segments, batches are assembled from multiple row-groups. The scan accumulates rows from the merge until either:
+The pipeline distinguishes **three** sizing concepts that used to share a single number:
 
-1. The target row count is reached **and** the current entity has ended, or
+1. **Storage row-groups (~65,536 rows).** A storage-level unit within a segment file. Sized for encoding amortization, dictionary efficiency, and zone-map selectivity. Set by the storage layer (storage-format.md §3.3) and not visible to operators directly.
+2. **`RecordBatch` (~64K rows, entity-aligned).** The unit the scan layer hands across the operator boundary in `next_batch()`. Each batch extends to the next entity boundary and may pack many small entities or hold a sub-batch slice of one large entity. The 64K target keeps batch metadata overhead low and aligns naturally with one row-group of one segment in the common single-segment case.
+3. **Execution tile (default 2,048 rows).** The inner unit that stateless vectorized kernels operate on. A `RecordBatch` is iterated in tile-sized chunks; each kernel call sees one tile of input. Tiles are never split across an entity boundary — the final tile of a batch shrinks if the next row would belong to a different entity.
+
+**Why three sizes.** A 64K row-group is good for encoding amortization but oversized for hot vectorized kernels: tight filter and arithmetic loops want their working set to fit in L1/L2, branchy filters want short selection vectors, and cancellation latency wants short yield-point intervals. DuckDB defaults to 2,048-row vectors for the same reasons. Storing in 64K chunks while *executing* in 2K tiles gets the encoding win without paying the cache cost.
+
+**Tile sizing.** Default tile size is **2,048 rows**, configurable via `QueryContext::tile_size`. The planner may select a smaller tile (1,024) for highly branchy filters or a larger tile (4,096) for trivial projections — this is a single integer in `PhysicalPlan` set during physical planning, not a runtime decision. The tile size is fixed for the duration of a single batch's traversal so operators can size scratch buffers once at batch entry. Tile sizes outside `[1024, 4096]` are rejected at plan time.
+
+**Scan layer batching rule.** The scan accumulates rows from the merge until either:
+
+1. The target batch size is reached **and** the current entity has ended, or
 2. The end of the shard's data is reached.
 
-This alignment between row-group and batch size eliminates an unnecessary boundary and simplifies the scan layer. Small entities (10-100 events) pack many per batch; a single large entity (100K+ events) is handled via sub-batch streaming (Section 5) with the same 64K batch size.
+This is unchanged from before — the scan still produces entity-aligned `RecordBatch`es. What changed is that downstream stateless operators iterate the batch in tiles rather than processing it as a single 64K chunk. Stateful entity operators continue to receive whole entity sub-batches (Section 4) — tiling is a stateless-kernel concern.
+
+**Sub-batch streaming for large entities.** A single entity with millions of events still streams across multiple `RecordBatch` calls (Section 5), and each batch is itself iterated in tiles. The entity-boundary invariant survives at both levels: no batch crosses an entity boundary, no tile crosses an entity boundary. Small entities (10–100 events) pack many per batch; a single large entity (100K+ events) is handled via sub-batch streaming (Section 5) at the **batch** level, not the tile level.
 
 ### 3.7 RecordBatch Schema Conventions
 
@@ -154,6 +176,14 @@ All `RecordBatch` values flowing through the pipeline obey a small set of conven
 The property column ordering is decided at ingest/compaction time by the storage layer (storage-format.md §3.4 encoding selection has access to per-chunk sizes), not at plan time. Smaller columns first means more columns fit in cache lines during vectorized filter and project passes.
 
 **Reference columns by name, not position.** Projection pruning removes and reorders columns between the scan and the first operator that references them, so any operator that hard-codes column indices is fragile. Every operator looks up columns by name through its `OperatorSchema`. The one exception is the `EntityOperatorAdapter`, which caches `entity_id_col_idx` once at construction.
+
+**String materialization is always Utf8View.** Whenever a string column has to be materialized as a flat (non-dictionary) array — projection output, variable binding, step property forwarding, FSST-decoded payloads, fall-through paths in operators that don't yet support dictionary input — the result is an Arrow `StringViewArray` (`DataType::Utf8View`), never a `StringArray` (`DataType::Utf8`). Three reasons:
+
+- Short strings (≤12 bytes) live inline in the view header — no offset/value buffer indirection. Event types, country codes, device names, and most categorical IDs never miss the view header.
+- The view header carries a 4-byte prefix for long strings, so equality and prefix comparisons short-circuit before touching the value buffer. Most string comparisons in the engine terminate in the first 4 bytes.
+- It composes uniformly with `DictionaryArray<Int32, Utf8View>`. The dictionary entry buffer is itself a `StringViewArray`, so dictionary materialization is a per-row code-to-view copy with no string allocation.
+
+The `bqlite-storage` decoders already produce `StringViewArray` (see `crates/bqlite-storage/src/encoding/dictionary.rs`); operators must do the same. No code path is allowed to round-trip through `StringArray` for convenience — if a kernel only exists in flat-Utf8 form, wrap it in a small adapter that keeps the storage representation as Utf8View.
 
 **Dictionary encoding preservation.** The scan layer produces columns in whatever encoding the storage provides. For string columns, this is most commonly `DictionaryArray<Int32, Utf8View>` from a single-segment read. Downstream operators must handle dictionary columns without forcing materialization:
 
@@ -177,6 +207,94 @@ The property column ordering is decided at ingest/compaction time by the storage
 
 **Null bitmaps.** Nullable columns always carry an Arrow-compatible null bitmap. Non-nullable columns (`entity_id`, `ts`, `event_type`, `__seq_id`) never do — operators skip the null check entirely on these columns, and the storage layer does not allocate bitmaps for them. The schema declares which columns are nullable; the decoder trusts the schema and does not insert defensive checks.
 
+### 3.8 Selection Vectors
+
+Filters are the most common operator in any pipeline, and naively materializing a filtered batch by copying surviving rows into fresh Arrow buffers wastes memory bandwidth on every selective predicate. bqlite makes **selection vectors a first-class output of the filter operator**. Materialization (copy-and-shrink into a contiguous `RecordBatch`) is an explicit, demand-driven decision, not the default — see §3.8.3 for the terminology distinction between this and segment-level compaction.
+
+#### 3.8.1 The `FilteredBatch` Type
+
+Stateless operators consume and produce `FilteredBatch`, not bare `RecordBatch`. The type is declared in `bqlite-operators` and is the surface every push-based stateless operator works against:
+
+```rust
+/// A view over a `RecordBatch` plus an optional selection vector.
+/// `selection == None` means "all rows", which is the cheapest, most
+/// common shape produced by the scan layer before any filter has run.
+pub struct FilteredBatch {
+    pub batch: RecordBatch,
+    pub selection: Option<SelectionVector>,
+}
+
+/// A row-index list into the parent `RecordBatch`. Sorted ascending so
+/// downstream kernels can rely on monotonic access patterns.
+pub struct SelectionVector {
+    /// Sorted, ascending row indices into `batch`. Always `<= batch.num_rows()`.
+    /// `len()` is the post-filter row count.
+    indices: Vec<u32>,
+}
+```
+
+`SelectionVector` is intentionally `Vec<u32>`, not a bitmap. Sequential indices are what the downstream Arrow kernels actually want, the size is bounded by the batch row count (so `u32` is always safe), and "sparse" selections compress naturally because most filtered batches keep contiguous runs.
+
+#### 3.8.2 Operator Contract
+
+Stateless vectorized operators implement a small extension trait over `PhysicalOperator`:
+
+```rust
+pub trait StatelessKernel {
+    /// Apply this kernel to the input view, returning a new view over the
+    /// same underlying RecordBatch (or, if the kernel rewrites columns
+    /// like `Project` does, over a freshly allocated one).
+    fn apply(&self, input: FilteredBatch) -> FilteredBatch;
+}
+```
+
+Three rules govern how kernels manipulate the selection vector:
+
+1. **Filter narrows the selection.** `Filter` evaluates its predicate against the selected rows of `input.batch`, intersects the result with `input.selection`, and returns a new `FilteredBatch` with the same `batch` reference and a narrower `selection`. No row data is copied.
+2. **Project rewrites columns, not rows.** `Project` allocates a new `RecordBatch` containing exactly the projected columns, but **at the post-selection row count** — i.e. the projection kernel walks the existing selection vector and writes only the surviving rows into the new column buffers. The output `FilteredBatch` has `selection: None` because the new batch already represents the filtered shape.
+3. **Limit truncates the selection.** `Limit` shortens the selection vector (or, when `selection == None`, slices the batch) to the remaining row budget. The underlying `batch` is left untouched.
+
+A few intentional consequences:
+
+- Adjacent filters compose cheaply: `filter(a) → filter(b)` builds a single selection vector via two passes over the predicate, never copying row data.
+- Projection is the **only** stateless kernel that allocates new column buffers in the common case. Everything else manipulates indices into the scan's batch.
+- Stateful entity operators (Section 4) do not see selection vectors. The `EntityOperatorAdapter` is responsible for materializing any pending selection into a contiguous `RecordBatch` slice before calling `process_sub_batch` — see §3.8.3.
+
+#### 3.8.3 Materialization Triggers
+
+> **Terminology.** "Materialization" here means "collapse a `FilteredBatch { batch, selection }` into a fresh contiguous `RecordBatch` containing only the selected rows." This is distinct from storage-format.md §7 "Compaction", which is segment-level LSM merging. Keeping the two concepts linguistically separated is load-bearing because they sit in different layers of the engine and both come up in benchmark/metric conversation.
+
+The selection vector is not free to carry forever. `FilteredBatch` is an *internal* shape inside a fused push segment of stateless operators; it never crosses the segment boundary. Three conditions trigger explicit materialization (a fresh `RecordBatch` containing only the selected rows is produced, and `selection` is reset to `None`):
+
+1. **Sparsity threshold.** When `selection.len() < 0.10 * batch.num_rows()`, the indirection cost on subsequent kernel passes exceeds the cost of one bulk copy. Materialization happens at the sparsity-detecting kernel's entry point, before its own work.
+2. **Push segment boundary.** The push segment that wraps a stateless kernel chain materializes at its outer `PhysicalOperator::next_batch()` boundary. The `EntityOperatorAdapter` and any other downstream `PhysicalOperator` consumer always observe a contiguous `RecordBatch` — they never see a selection vector. This keeps the public operator trait surface unchanged: `FilteredBatch` is a stateless-segment-internal type only.
+3. **Hand-off to aggregation.** When a non-fused `AggregatePhysical` follows a stateless segment, the segment boundary in (2) is what materializes; `HashAccumulator::update_batch` always sees a contiguous `RecordBatch`.
+
+Materialization is implemented once, in `bqlite-operators::materialize_filtered_batch(FilteredBatch) -> RecordBatch`, and reused at every trigger site. Operators never invent their own materialization path.
+
+#### 3.8.4 Why Not a Bitmap
+
+Arrow's `BooleanArray` is a natural-looking choice for selection. We picked `Vec<u32>` for three reasons:
+
+- The downstream pattern is "iterate the surviving rows, do work per row." Iteration over a `Vec<u32>` is one cache-line read per ~16 rows; iteration over a bitmap costs a popcount per word plus a bit-walk. The bitmap wins only at very high selectivity where materialization is cheap anyway.
+- `arrow::compute::filter` (which is the fallback path inside `materialize_filtered_batch`) takes a `BooleanArray`. We can build it from `Vec<u32>` cheaply on the rare materialization path; the reverse (bitmap → indices) is the wrong default.
+- `Vec<u32>` composes with the dictionary-filter precomputation in §3.7: a dictionary filter produces a `BitVec` over codes, then a single pass writes surviving row indices into the selection vector.
+
+#### 3.8.5 Interaction With Dictionary Pushdown
+
+The `DictFilterBitset` from §3.7 is the precomputation step; the selection vector is the result. The flow:
+
+```
+ScanOperator
+  ├─ produces RecordBatch with DictionaryArray<Int32, Utf8View>
+  ├─ FilterOperator pulls the batch
+  │   └─ uses DictFilterBitset to mark surviving codes
+  │   └─ writes surviving row indices into a SelectionVector
+  └─ FilteredBatch { batch, selection: Some(sv) } flows downstream
+```
+
+This means dictionary pushdown is no longer "filter the batch in place" — it is the canonical example of producing a selection vector without touching the underlying value buffers. The dictionary stays the dictionary, the codes stay the codes, the selection vector tells everyone downstream which rows count.
+
 ---
 
 ## 4. Entity Operator Interface
@@ -186,7 +304,7 @@ Stateful temporal operators implement a separate trait that the engine wraps ins
 ```rust
 /// Stateful per-entity operator.
 /// The operator itself is immutable (&self) — all mutable state lives in State.
-/// This makes the compiled operator safely shareable across shard-tasks.
+/// This makes the compiled operator safely shareable across workers.
 pub trait EntityOperator: Send + Sync {
     /// Per-entity mutable state. Created fresh for each entity.
     type State: Send;
@@ -204,6 +322,11 @@ pub trait EntityOperator: Send + Sync {
     ///   - all for the same entity_id,
     ///   - sorted by timestamp ascending,
     ///   - no more than SUB_BATCH_SIZE rows (configurable, default 65,536).
+    ///
+    /// `process_sub_batch` receives a whole sub-batch, not a tile. Stateful
+    /// operators that maintain per-entity state are not tile-iterated — see
+    /// Section 3.6 ("Batches and Execution Tiles"). Tiling is a stateless-
+    /// kernel optimization and stops at the `EntityOperatorAdapter` boundary.
     fn process_sub_batch(
         &self,
         state: &mut Self::State,
@@ -244,7 +367,7 @@ pub trait EntityOperator: Send + Sync {
 
 **Key design choices:**
 
-- **`&self` is immutable.** The compiled operator (NFA program, predicates, schema, configuration) is shared across all shard-tasks via `Arc`. All mutable state lives in `Self::State`, created fresh per entity by `create_state`. This is what makes `Send + Sync` sound even though each shard-task runs independently — no shard-task can mutate the operator itself.
+- **`&self` is immutable.** The compiled operator (NFA program, predicates, schema, configuration) is shared across all workers via `Arc`. All mutable state lives in `Self::State`, created fresh per entity by `create_state`. This is what makes `Send + Sync` sound even though each worker runs morsels independently — no worker can mutate the operator itself.
 - **`create_state(entity_id)` instead of `State: Default`** — allows operator configuration to influence the initial state, and gives the operator access to the entity identifier for warning attribution (`QueryWarning::EntityEventLimitExceeded`, `ActiveStateLimitExceeded`, etc.).
 - **`finish_entity()` is the sole completion signal** — no `is_last` flag on `process_sub_batch()`. The adapter calls `process_sub_batch()` for every sub-batch, then `finish_entity()` exactly once. Clean single-responsibility: `process_sub_batch` accumulates, `finish_entity` emits and consumes the state.
 - **`finish_entity()` returns `Option<RecordBatch>`** not `Option<Row>` — a single-row `RecordBatch` for operators that emit one result per entity, or a multi-row `RecordBatch` for operators like SESSIONIZE (one row per session) or windowed operators (one row per input event). Avoids an undefined `Row` type and keeps everything in Arrow's type system.
@@ -252,7 +375,7 @@ pub trait EntityOperator: Send + Sync {
 - **No `Result<...>` returns on the hot-path methods.** Errors surface through different channels to keep the inner loop branch-free:
   - **Memory pressure** is caught at the allocation site (`MemoryTracker::try_reserve` inside operator internals). Operators that cannot spill set an error flag on the shared `QueryContext` and return early from `process_sub_batch`; the adapter observes the flag between sub-batches and aborts the query.
   - **Cancellation** is checked against `QueryContext::cancelled` between sub-batches, not inside the per-event loop.
-  - **Invariant violations** panic — the engine catches panics at the shard-task boundary and surfaces them as `ExecutionError::OperatorPanic`.
+  - **Invariant violations** panic — the engine catches panics at the morsel boundary (one `catch_unwind` per worker per morsel) and surfaces them as `ExecutionError::OperatorPanic`.
 
 ### 4.1 EntityOperatorAdapter
 
@@ -378,7 +501,7 @@ By injecting the limiter early, the expensive work (stateful entity processing, 
 When the limit is triggered:
 
 1. Rows beyond the limit for that entity are dropped from the batch.
-2. A `QueryWarning::EntityEventLimitExceeded { entity_id, count }` is recorded in the shard-task's `ShardTaskContext`.
+2. A `QueryWarning::EntityEventLimitExceeded { entity_id, count }` is recorded in the worker's `WorkerContext`.
 3. Processing continues with the next entity.
 
 This is not a fatal error — the query completes with the skipped entity flagged in the result metadata.
@@ -435,7 +558,7 @@ Sequence match, sessionize, event sub-selection, attribution. Pull-based process
 
 ### Stage 4: Aggregation
 
-If not fused with Stage 3, standard hash aggregation on the output of the entity stage via `HashAccumulator` (Section 9.4). Partial aggregation per shard, final merge across shards via `Accumulator::merge`. Group cardinality is bounded by `max_groups` (default 1M); overflow produces `OperatorError::MaxGroupsExceeded`. There is no aggregation spill in v1 — see Section 10.3.
+If not fused with Stage 3, standard hash aggregation on the output of the entity stage via `HashAccumulator` (Section 9.5). Partial aggregation per shard (one accumulator per shard, fed by all the workers that drained its morsels), final merge across shards via `Accumulator::merge`. Group cardinality is bounded by `max_groups` (default 1M); overflow produces `OperatorError::MaxGroupsExceeded`. There is no aggregation spill in v1 — see Section 10.3.
 
 ### Stage 5: Output
 
@@ -443,7 +566,7 @@ Final projection, ordering (if requested), limit, result collection as Arrow `Re
 
 ### 7.1 LIMIT Pushdown
 
-When the query includes a `LIMIT N`, the pipeline short-circuits after N result rows are produced. The `cancelled` flag in `QueryContext` is set, stopping all shard-tasks at their next yield point. For queries with `ORDER BY` + `LIMIT`, all shards must complete before the final merge-sort can apply the limit — LIMIT pushdown applies only when no cross-shard ordering is required.
+When the query includes a `LIMIT N`, the pipeline short-circuits after N result rows are produced. The `cancelled` flag in `QueryContext` is set, stopping all workers at their next yield point (between morsels for the workers that aren't yet inside one, between batches for those in the middle of a morsel). For queries with `ORDER BY` + `LIMIT`, all shards must complete before the final merge-sort can apply the limit — LIMIT pushdown applies only when no cross-shard ordering is required.
 
 ### 7.2 ORDER BY Across Shards
 
@@ -557,25 +680,47 @@ The general-purpose path (full materialization + separate aggregation) must alwa
 
 ## 9. Parallelism Model
 
-### 9.1 Shard-Per-Thread
+### 9.1 Shards, Morsels, Workers
 
-One query task per shard. Each task runs the full pipeline (scan → filter → entity operator → partial aggregate) independently. No shared mutable state between tasks during execution. Partial results are merged on a coordinator thread after all shard-tasks complete.
+The parallelism model has three distinct concepts that used to be conflated under "shard-task":
 
-### 9.2 Why Shard Is the Parallelism Unit
+| Concept | Owns | Bounded by |
+|---|---|---|
+| **Shard** | A contiguous slice of entity space (`xxhash64(entity_id) % num_shards == s`) | `num_shards` (default 32, set at database init — storage-format.md §5.1) |
+| **Morsel** | A contiguous entity-id range *within* one shard, generated dynamically | The shard's segment inventory and current load |
+| **Worker** | A thread in the engine's Rayon worker pool | `num_cores` |
 
-Temporal operators need all of an entity's events across time in order. An entity's events across windows must be processed by the same thread. Since entities are hash-pinned to shards (storage-format.md Section 5.1), one thread per shard keeps entity streams intact. The k-way merge across windows happens within each shard-task.
+A query's execution proceeds as: for each shard the query touches, the engine generates morsels lazily and feeds them to the worker pool. Workers pull morsels with a work-stealing scheduler. Each worker runs the full pipeline (scan → stateless segment → entity operator → partial aggregate) on its current morsel and produces a partial result.
 
-### 9.3 Thread Pool and Query Queuing
+### 9.2 Why Three Concepts
 
-- Fixed worker thread pool sized to `num_cores` (configurable). Implemented using Rayon's thread pool for work-stealing and efficient task scheduling.
-- Default shard count: **32** (storage-format.md). With 32 shards and a pool of `num_cores` threads, shard-tasks are distributed across the pool — all cores stay busy even when `num_shards > num_cores`.
-- **Query queuing:** queries submit shard-tasks to the worker pool in FIFO order. If the pool has available threads, the query's shard-tasks start immediately. If all threads are busy (e.g., another query is running), the new query's shard-tasks queue behind the in-progress work and execute as threads become available.
-- **Concurrent queries are possible.** Multiple queries can have shard-tasks in flight simultaneously if the thread pool has capacity. The memory budget is divided across the fixed number of worker threads — each thread has a per-thread budget of `query_budget / num_worker_threads`. This is stable regardless of how many queries are active, because the number of worker threads is fixed.
-- Shard-tasks from different queries may interleave on the pool, but shard-tasks within a single query are independent (no shared mutable state between them).
+Each layer carries a different invariant:
 
-### 9.4 Partial Aggregation and Final Merge
+- **Shard = correctness boundary.** Entities are hash-pinned to shards (storage-format.md §5.1). Cross-table joins (storage-format.md §5.1, query-language.md §19) and the k-way window merge inside a shard rely on this. Shards never get split, never get reassigned at query time, and never share entities. Distributed execution will eventually use shard as the unit of distribution; this layer is the future-proofing.
+- **Morsel = execution boundary.** Behavioral data is power-law distributed: a 1% slice of entities can hold 30%+ of events. With one task per shard, the unluckiest worker bottlenecks the whole query. Morsels let the scheduler refill idle workers from busy shards without violating shard ownership. The target morsel size is **~64 row-groups (≈4M rows)** at the high end, **single-row-group** at the low end — the morsel generator picks based on the shard's segment inventory and the current query budget.
+- **Worker = scheduling boundary.** Workers are the only threads that hold operator state. The pool is fixed at `num_cores`; queries queue at the pool boundary, not at the morsel boundary.
 
-Each shard-task produces partial aggregation results. The coordinator thread performs a final merge:
+### 9.3 The Single-Entity Invariant
+
+Stateful temporal operators need all of an entity's events in timestamp order, across windows. The morsel generator preserves this by:
+
+1. **Cutting morsels on entity boundaries.** A morsel is always a half-open `[entity_lo, entity_hi)` range over the shard's sort order. The generator advances through the shard's segments (after the k-way window merge) until it has accumulated approximately the target row count, then snaps the upper bound to the next entity boundary. The next morsel begins at that boundary.
+2. **Routing all of an entity's segments to the same morsel.** Because shards are hash-pinned and window merges happen *inside* a shard, the k-way merge for an entity's events lands in exactly one morsel — the one whose entity range contains the entity's hash bucket.
+3. **Forbidding mid-entity preemption.** Once a worker starts processing a morsel, it runs the morsel to completion before checking for cancellation between morsels. Within a morsel, cancellation checks happen between batches (Section 3.3) and between sub-batches inside `EntityOperatorAdapter` (§4.1).
+
+The contract is: every entity touched by the query is fully processed by exactly one worker on exactly one morsel. No entity is split, no entity is processed twice.
+
+### 9.4 Thread Pool, Morsel Queue, Query Queuing
+
+- **Worker pool.** Fixed-size Rayon thread pool of `num_cores` workers (configurable). Used for both query work and compaction (Section 11) with active-count cooperation.
+- **Morsel queue.** Per-query lock-free MPMC queue. The morsel generator (one per `(query, shard)`) lazily produces morsels onto the queue; workers pull morsels with `try_pop`. Lazy generation keeps in-flight memory bounded by the worker pool's queue depth, not by the total morsel count for the shard.
+- **Default shard count: 32** (storage-format.md). On machines with `num_cores < 32`, multiple shards' morsels interleave on the same worker — that is the *point* of the morsel queue. On machines with `num_cores > 32`, the morsel generator can produce more morsels than there are shards, keeping all cores busy on skewed workloads.
+- **Query queuing.** Queries submit their morsel generators to the engine's query queue in FIFO order. If the worker pool has capacity, generators start immediately; otherwise the query waits for the previous query's morsels to drain. Queries do **not** preempt each other mid-morsel.
+- **Concurrent queries.** Multiple queries can have morsels in flight if the pool has capacity. The memory budget is divided across the fixed worker pool (Section 10.2), so per-worker bounds are stable regardless of how many queries are active.
+
+### 9.5 Partial Aggregation and Final Merge
+
+Each worker accumulates partial aggregation results into a thread-local accumulator owned by the morsel generator's `(query, shard)` context. Multiple morsels in the same shard merge into the same partial accumulator (one per shard, not one per morsel) — the coordinator thread then performs a final merge across shards:
 
 - `COUNT` / `SUM`: sum the partial values.
 - `MIN` / `MAX`: min/max across partials.
@@ -589,8 +734,10 @@ The `Accumulator` trait supports both incremental updates and cross-shard mergin
 
 ```rust
 /// Receives incremental updates from fused entity operators and from
-/// non-fused aggregate nodes. One accumulator per shard-task; merged
-/// across shards after execution.
+/// non-fused aggregate nodes. One accumulator per shard, shared across
+/// the morsels of that shard via per-worker handoff; merged across
+/// shards after execution. Workers serialize updates within a shard via
+/// the shard's per-shard mutex on its accumulator handle.
 pub trait Accumulator: Send {
     /// Update with the reduced values for one entity, match, session, or path.
     /// `group_key` is `None` for ungrouped aggregation. `values` contains
@@ -608,8 +755,9 @@ pub trait Accumulator: Send {
     fn update_batch(&mut self, batch: &RecordBatch);
 
     /// Merge another accumulator into this one (for cross-shard reduction).
-    /// Each shard produces one accumulator; they are merged pairwise on the
-    /// coordinator after all shard-tasks finish.
+    /// Each shard produces one accumulator (fed by all the workers that ran
+    /// morsels for that shard); they are merged pairwise on the coordinator
+    /// after every shard's last morsel finishes.
     fn merge(&mut self, other: Box<dyn Accumulator>);
 
     /// Produce the final aggregated `RecordBatch`.
@@ -677,7 +825,7 @@ pub enum SumState {
 
 **Group cardinality limit.** The limit is enforced inside `update()`: if `groups.len() >= max_groups` and the incoming `group_key` is new, the accumulator raises an error (surfaced through `QueryContext` as described in Section 4). There is no spill-to-disk for aggregation state in v1 — the combination of bounded groups + the memory budget provides a hard upper bound on accumulator memory. Spill is a v2 concern.
 
-For fused entity operators that use `finish_entity_into()`, each shard-task produces its own accumulator(s). The coordinator merges them via `Accumulator::merge()` to produce the final result.
+For fused entity operators that use `finish_entity_into()`, each shard maintains a single accumulator that all of the shard's morsels feed into via worker handoff. The coordinator merges per-shard accumulators via `Accumulator::merge()` to produce the final result. Per-shard partials are *not* further subdivided per morsel — that would force the coordinator to do `num_shards × morsels_per_shard` merges instead of `num_shards`, with no correctness benefit.
 
 ---
 
@@ -709,21 +857,26 @@ Every allocation that grows with data size — aggregation hash tables, hash set
 
 **Spill protocol.** When `try_reserve()` returns `Err`, the operator should attempt to spill some of its state to disk (Section 10.3) and retry. If the operator does not support spilling (or spilling fails to free enough memory), it propagates the `MemoryBudgetExceeded` error, which aborts the query. This means spill is the *preferred* response to memory pressure, but error is the *fallback* for operators that cannot spill.
 
-Each shard-task shares the same `MemoryTracker` instance (via `QueryContext`). The atomic counter provides contention-free tracking across threads. The tracker is hierarchical: the query budget is a child of the engine-wide budget, which is itself bounded by the configured memory limit.
+Every worker draining a morsel of this query shares the same `MemoryTracker` instance (via `QueryContext`). The atomic counter provides contention-free tracking across threads. The tracker is hierarchical: the query budget is a child of the engine-wide budget, which is itself bounded by the configured memory limit.
 
-### 10.2 Per-Shard-Task Memory
+### 10.2 Per-Worker Memory
 
-Each shard-task uses:
+Each *worker* (not each morsel, not each shard) holds the live working set for one in-flight morsel. Workers reuse the same buffers across morsels from the same shard, so the per-worker memory ceiling does not scale with morsel count:
 
-| Component | Typical size | Bound |
-|---|---|---|
-| K-way merge read buffers | k × 4 MB (k = windows) | Configurable buffer size |
-| Current batch | ~5 MB (64K rows × ~10 cols × 8 bytes) | One row-group |
-| Operator state | 10-100 bytes per entity | Compact by design |
-| Partial aggregation state | ~100 bytes per group | Hard cap at `max_groups` (default 1M); error on overflow |
-| Decoded column data | Variable | Only demanded columns decoded |
+| Component | Owner | Typical size | Bound |
+|---|---|---|---|
+| K-way merge read buffers | Worker (per active morsel) | k × 4 MB (k = windows in the morsel's shard) | Configurable buffer size |
+| Current batch | Worker | ~5 MB (64K rows × ~10 cols × 8 bytes) | One row-group |
+| Stateless tile scratch | Worker | ~32 KB (one tile worth) | `tile_size × max_columns × 8 bytes` |
+| Operator state | Worker (per active entity) | 10–100 bytes per entity | Compact by design |
+| Partial aggregation state | **Shard** (shared across that shard's workers) | ~100 bytes per group | Hard cap at `max_groups` (default 1M); error on overflow |
+| Decoded column data | Worker | Variable | Only demanded columns decoded |
 
-At most `num_cores` shard-tasks run simultaneously (the thread pool bounds concurrency). On a 16-core machine: 16 × (24 MB merge buffers + 5 MB batch) ≈ 464 MB base. On a 32-core machine: 32 × 29 MB ≈ 930 MB. Both fit within the 3 GB query budget with headroom for aggregation state. The per-thread budget (`3 GB / num_cores`) provides a stable upper bound regardless of shard count or query concurrency.
+Per-worker memory is dominated by the merge read buffers and the current batch — together ~29 MB. Multiplied by `num_cores` workers and added to the per-shard accumulator state, the working set for a query is `num_cores × 29 MB + num_shards × accumulator_bytes`, which is independent of how many morsels the query produces.
+
+On a 16-core machine: `16 × 29 MB + 32 × ~3 MB ≈ 560 MB`. On a 32-core machine: `32 × 29 MB + 32 × ~3 MB ≈ 1.0 GB`. Both fit within the 3 GB query budget with headroom for the worst-case accumulator. The per-worker budget (`3 GB / num_cores`) provides a stable upper bound regardless of how many morsels the query schedules — adding more morsels does not add to the live working set, because the worker pool's `num_cores` ceiling caps in-flight morsels at `num_cores`.
+
+Per-shard accumulator state is bounded by `max_groups × ~100 bytes ≈ 100 MB` per shard, but in practice the partial accumulators are much smaller because each shard sees only its slice of group keys.
 
 ### 10.3 Spill-to-Disk
 
@@ -738,13 +891,13 @@ When an operator's memory reservation exceeds the remaining budget, it spills in
 1. Write the hash set to a temporary on-disk hash table (sorted file with binary search).
 2. Probe the on-disk table for each entity during the outer query scan.
 
-**Aggregation: no spill in v1.** `HashAccumulator` enforces a hard cap (`max_groups`, default 1M) at `update()` time and returns an error on overflow — see Section 9.4. At ~100 bytes per group, 1M groups fit comfortably in the query budget, and analytics queries rarely exceed that. External hash aggregation is deferred to v2; the cap is the v1 backstop.
+**Aggregation: no spill in v1.** `HashAccumulator` enforces a hard cap (`max_groups`, default 1M) at `update()` time and returns an error on overflow — see Section 9.5. At ~100 bytes per group, 1M groups fit comfortably in the query budget, and analytics queries rarely exceed that. External hash aggregation is deferred to v2; the cap is the v1 backstop.
 
 Spill files (sort, IN subquery) are written to a configurable temp directory (default: the database directory). They are cleaned up when the query completes or is cancelled.
 
 ### 10.4 Aggregation State Bounds
 
-Running aggregation state is small per group (counts, sums, min/max — see `AggState` in Section 9.4). The `max_groups` hard cap (default 1M) is enforced inside `HashAccumulator::update()` and is the only defense against runaway cardinality. When the cap is hit, the query fails with `OperatorError::MaxGroupsExceeded { limit }`, not a spill. 1M groups × ~100 bytes = ~100 MB — well within the 3 GB query budget, with no spill complexity to manage.
+Running aggregation state is small per group (counts, sums, min/max — see `AggState` in Section 9.5). The `max_groups` hard cap (default 1M) is enforced inside `HashAccumulator::update()` and is the only defense against runaway cardinality. When the cap is hit, the query fails with `OperatorError::MaxGroupsExceeded { limit }`, not a spill. 1M groups × ~100 bytes = ~100 MB — well within the 3 GB query budget, with no spill complexity to manage.
 
 ---
 
@@ -823,7 +976,7 @@ pub enum QueryWarning {
 }
 ```
 
-Warnings are attached to the query result and surfaced to the caller. They do not abort the query. Each shard-task caps warnings at **1,000 entries** to prevent unbounded growth (e.g., bot-heavy datasets where many entities exceed the limit). When the cap is reached, a final `WarningsOverflow { suppressed_count }` warning is recorded.
+Warnings are attached to the query result and surfaced to the caller. They do not abort the query. Each worker caps warnings at **1,000 entries** in its `WorkerContext` to prevent unbounded growth (e.g., bot-heavy datasets where many entities exceed the limit). When the cap is reached, a final `WarningsOverflow { suppressed_count }` warning is recorded. The coordinator sums `suppressed_count` across all workers when merging final metrics, so the user sees the total number of suppressed warnings even when many workers hit the cap.
 
 ---
 
@@ -846,7 +999,7 @@ Python: db.query("MATCH(signup -> purchase) WITHIN 7d BY user_id | STATS COUNT(*
 - **Zero-copy results.** Arrow RecordBatches are returned via PyArrow's zero-copy FFI interface. No serialization/deserialization.
 - **All parallelism in Rust.** Python never sees the shard threads. The Python API is single-threaded from the caller's perspective.
 - **Results fully materialized.** The query completes and all results are collected before returning to Python. No streaming iterator — results are a single PyArrow Table. This simplifies the API and avoids GIL/lifetime complexity.
-- **Concurrent queries from Python threads.** If multiple Python threads issue queries concurrently (possible since the GIL is released during execution), queries queue in FIFO order waiting for worker threads (Section 9.3). The Python call blocks until the query completes.
+- **Concurrent queries from Python threads.** If multiple Python threads issue queries concurrently (possible since the GIL is released during execution), queries queue in FIFO order waiting for worker threads (Section 9.4). The Python call blocks until the query completes.
 
 ---
 
@@ -854,26 +1007,76 @@ Python: db.query("MATCH(signup -> purchase) WITHIN 7d BY user_id | STATS COUNT(*
 
 ### 14.1 Per-Query Metrics
 
-Collected during execution with minimal overhead (atomic counters, no allocation):
+Collected during execution with minimal overhead (counter increments per batch, no allocation). Metrics live in the per-worker `WorkerContext` (Section 3.3) and are summed across all workers at query completion.
+
+#### Throughput and shape
 
 | Metric | Scope | Description |
 |---|---|---|
-| `rows_scanned` | per shard | Total rows read from segments |
-| `rows_after_pushdown` | per shard | Rows surviving predicate pushdown |
-| `rows_after_filter` | per shard | Rows surviving stateless filters |
-| `entities_processed` | per shard | Entities fed to the entity operator |
-| `entities_matched` | per shard | Entities producing non-None results |
-| `entities_skipped` | per shard | Entities exceeding event limit |
-| `bytes_scanned` | per shard | Raw bytes read from disk |
-| `bytes_decoded` | per shard | Bytes of column data actually decoded |
-| `segments_scanned` | per shard | Number of segment files opened |
-| `segments_pruned` | per shard | Segments skipped by zone maps |
-| `spill_bytes_written` | per shard | Bytes spilled to temporary files |
-| `elapsed_ns` | per shard, total | Wall-clock time |
+| `rows_scanned` | per worker | Total rows read from segments |
+| `rows_after_pushdown` | per worker | Rows surviving predicate pushdown |
+| `rows_after_filter` | per worker | Rows surviving stateless filters |
+| `selection_vector_materializations` | per worker | Number of `materialize_filtered_batch` calls in the fused stateless segment path (§3.8.3). Zero in Wave 2 where no fused segment exists; becomes load-bearing in Wave 5. |
+| `entities_processed` | per worker | Entities fed to the entity operator |
+| `entities_matched` | per worker | Entities producing non-None results |
+| `entities_skipped` | per worker | Entities exceeding event limit |
+| `bytes_scanned` | per worker | Raw bytes read from disk |
+| `bytes_decoded` | per worker | Bytes of column data actually decoded |
+| `bytes_decoded_lazily` | per worker | Bytes of dictionary/RLE/constant columns *not* expanded (decoded count only because something downstream forced materialization) |
+| `segments_scanned` | per worker | Number of segment files opened |
+| `segments_pruned` | per worker | Segments skipped by zone maps |
+| `row_groups_pruned` | per worker | Row-groups skipped within scanned segments |
+| `marks_pruned` | per worker | Mark-level skips (when storage-format §11 marks are enabled — zero on Wave 2) |
+| `spill_bytes_written` | per worker | Bytes spilled to temporary files |
+| `elapsed_ns` | per worker, total | Wall-clock time |
+
+#### CPU-cost metrics
+
+These are the metrics that turn "is the query fast" into "is the query *expensive*." Sampled, not counted on every batch — see §14.3 for sampling protocol.
+
+| Metric | Scope | Description |
+|---|---|---|
+| `gb_per_sec_scanned` | per query, derived | `bytes_scanned_total / elapsed_ns_total / num_cores`. The headline GB/s/core throughput number. |
+| `cycles_per_event` | per query, derived | `total_cpu_cycles / events_processed`. Compares directly across hardware. |
+| `decode_to_operator_ratio` | per query, derived | Wall fraction spent inside encoding decode vs. inside operator logic. Sampled via `perf` counters or fallback wall-clock instrumentation per worker. |
+| `bytes_decoded_to_scanned` | per query, derived | `bytes_decoded / bytes_scanned`. Lower is better — late materialization is working when this is well below 1. |
+| `branch_misses` | per worker, sampled | Branch-prediction miss count from `perf_event_open` when available; zero on platforms without `PERF_COUNT_HW_BRANCH_MISSES`. |
+| `llc_misses` | per worker, sampled | Last-level cache miss count from `perf_event_open` when available; the primary signal for "are tiles too big." |
+
+#### Skew and parallelism metrics
+
+The morsel scheduler is only valuable if we can see when it works and when it doesn't.
+
+| Metric | Scope | Description |
+|---|---|---|
+| `morsels_dispatched` | per query | Total morsels generated across all shards |
+| `morsels_per_shard_max` | per query | Largest morsel count for any single shard |
+| `morsels_per_shard_min` | per query | Smallest morsel count for any single shard |
+| `worker_idle_ns_p50` / `_p99` | per query | How long workers spent waiting on `morsel_queue.pop()` — P50 and P99 across all workers |
+| `worker_busy_ns_max` / `_min` | per query | Per-worker total busy time, max and min — the spread is the skew signal |
+| `entity_event_skew_p99` | per worker | 99th-percentile event count for any entity inside this worker's morsels |
+
+#### Compaction interaction metrics
+
+| Metric | Scope | Description |
+|---|---|---|
+| `compaction_active_ns` | per query | Wall time during which any compaction was active in the worker pool — for diagnosing query/compaction interference |
+
+The full table is implemented incrementally — Wave 2 ships rows/throughput; CPU-cost and skew rows land alongside the morsel scheduler in Wave 5. Metrics that depend on a feature not yet shipped (`marks_pruned`, `morsels_*`) report zero until the feature lands.
+
+### 14.3 Sampling Protocol for CPU-Cost Metrics
+
+`branch_misses` and `llc_misses` come from `perf_event_open` on Linux and `kpc` on macOS. Both APIs have non-trivial setup cost, so they are not enabled per-batch. Instead:
+
+- The engine opens one perf-event group per worker at query start (if the query is configured to collect CPU-cost metrics — opt-in via `QueryContext::collect_cpu_metrics`).
+- The group is read once per morsel boundary, summing into the worker's `WorkerContext`.
+- On platforms without perf counters, the metrics report zero and the per-query derived numbers reflect that absence.
+
+CPU-cost metric collection adds <1% overhead per batch when enabled. It is off by default; the benchmark suite (TASK-236, TASK-507) turns it on for the bench job, and the CLI exposes it via `bqlite query --explain-perf`.
 
 ### 14.2 Collection
 
-Each shard-task maintains its own `QueryMetrics` in its `ShardTaskContext` (Section 3.3). After all shard-tasks complete, the coordinator sums metrics across shards and attaches the totals to the query result. Warnings are similarly concatenated (up to the per-shard cap). The overhead is negligible — one counter increment per batch, not per row. No atomic operations needed since each `ShardTaskContext` is thread-local.
+Each worker maintains its own `QueryMetrics` in its `WorkerContext` (Section 3.3). After all morsels complete, the coordinator sums metrics across all workers and attaches the totals to the query result. Warnings are similarly concatenated (up to the per-worker cap, with `suppressed_count` summed across workers). The overhead is negligible — one counter increment per batch, not per row. No atomic operations needed since each `WorkerContext` is thread-local.
 
 ---
 
@@ -884,6 +1087,9 @@ Each shard-task maintains its own `QueryMetrics` in its `ShardTaskContext` (Sect
 | `PhysicalOperator` trait | `bqlite-operators` | Operators implement this; `bqlite-engine` consumes it via trait object |
 | `EntityOperator` trait | `bqlite-operators` | Temporal operators implement this |
 | `EntityOperatorAdapter` | `bqlite-operators` | Wraps `EntityOperator` into `PhysicalOperator` |
+| `FilteredBatch`, `SelectionVector` | `bqlite-operators` | Stateless-segment-internal filter representation (Section 3.8) |
+| `StatelessKernel` trait | `bqlite-operators` | Extension trait stateless kernels implement on top of `PhysicalOperator` |
+| `materialize_filtered_batch` | `bqlite-operators` | Single source of truth for selection-vector → contiguous `RecordBatch` materialization |
 | `Accumulator` trait | `bqlite-operators` | Aggregation accumulator protocol |
 | `HashAccumulator`, `AggState`, `GroupKey`, `SumState` | `bqlite-operators` | Default accumulator implementation |
 | `DictFilterBitset` | `bqlite-storage` | Scan-time precomputed dictionary filter |
@@ -893,9 +1099,11 @@ Each shard-task maintains its own `QueryMetrics` in its `ShardTaskContext` (Sect
 | Parser orchestration (`Engine::query(text, db)`) | `bqlite-engine` | TASK-118 added `bqlite-parser` as a direct dep of `bqlite-engine` so the engine owns the single text-in, rows-out surface the CLI and future Python bindings call. See architecture.md "Dependency Direction" and CLAUDE.md for the updated graph (`bqlite-engine → parser, planner, operators, storage, core`). |
 | `ExecutionError` | `bqlite-engine` | Query-facing wrapper around operator failures and timeouts |
 | `QueryContext` / `QueryMetrics` | `bqlite-engine` | Execution-time state and metrics |
+| `WorkerContext` | `bqlite-engine` | Per-(worker, shard) state — metrics, warnings, current shard identity (Section 3.3) |
+| `MorselGenerator`, `MorselQueue` | `bqlite-engine` | Morsel-driven execution scheduler (Section 9.4) |
 | `MemoryTracker` | `bqlite-engine` | Memory budget enforcement |
 | Thread pool, query scheduler | `bqlite-engine` | Orchestration |
-| Shard-task coordinator | `bqlite-engine` | Parallel execution |
+| Shard-task coordinator | `bqlite-engine` | Parallel execution — drives morsel queues per shard |
 
 This follows the dependency direction in CLAUDE.md: `bqlite-engine` depends on `bqlite-parser`, `bqlite-operators`, `bqlite-planner`, `bqlite-storage`, and `bqlite-core`.
 
@@ -906,7 +1114,10 @@ This follows the dependency direction in CLAUDE.md: `bqlite-engine` depends on `
 | Question | Decision | Rationale |
 |---|---|---|
 | Execution model | Hybrid push (stateless) / pull (stateful), entity-aligned batches | Push maximizes vectorized throughput; pull suits entity-at-a-time processing |
-| Batch size | 65,536 rows (matches row-group size), entity-aligned | One row-group = one batch; no splitting overhead |
+| `RecordBatch` size | ~65,536 rows, entity-aligned, hand-off unit between operators | Aligns with one row-group of one segment in the common single-segment case |
+| Execution tile size | Default 2,048 rows, plan-time choice in `[1024, 4096]` | Cache-resident vectorized kernels; matches DuckDB's vector size for the same reasons |
+| Stateful operator input | Whole entity sub-batches, not tiles | Tiling is a stateless-kernel optimization; stateful operators see full sub-batches via `EntityOperatorAdapter` |
+| Filter output representation | Selection vector over the input batch (Section 3.8) | Avoids per-filter copy; materialization triggers when sparse or required by downstream |
 | Large entity handling | Sub-batch streaming + injected entity event limiter (10M default) | Bounded memory and CPU per entity; limiter injected early in pipeline |
 | Entity boundary detection | Inferred from entity_id column changes across and within batches | No separate signaling needed; data is sorted |
 | Entity completion signal | `finish_entity()` method (no `is_last` flag) | Single responsibility: process_sub_batch accumulates, finish_entity emits |
@@ -914,11 +1125,12 @@ This follows the dependency direction in CLAUDE.md: `bqlite-engine` depends on `
 | Operator fusion | Generic demand propagation upstream from consumer to producer | Subsumes funnel/retention optimization automatically |
 | Aggregation fusion | Incrementally computable aggregates fused into entity operator | Zero intermediate materialization; includes AVG, percentiles |
 | Type dispatch | Arrow kernels + plan-time monomorphized hot paths | Per-batch dispatch, not per-row |
-| Parallelism unit | One task per shard | Keeps entity streams intact, no cross-thread coordination |
+| Parallelism unit | Shard = ownership boundary, morsel = execution boundary, worker = scheduling boundary | Shard preserves entity-stream invariant; morsels balance load and absorb skew |
+| Morsel granularity | Entity-range slice within a shard, single entity never split | Preserves "one entity, one worker" while load-balancing across cores |
 | Thread pool | Rayon, fixed size = num_cores, queries queue FIFO | All cores utilized; concurrent queries share the pool |
-| Default shard count | 32 | One shard per core on modern hardware; thread pool handles scheduling |
+| Default shard count | 32 | Distributed-ready partitioning unit; the worker pool drains shards via morsels |
 | Compaction scheduling | Up to num_cores threads, bounded by spare capacity | Uses idle cores; scales down under query load |
-| Memory management | Hierarchical MemoryTracker; per-thread budget = query_budget / num_cores | Runtime enforcement with stable per-thread bounds |
+| Memory management | Hierarchical MemoryTracker; per-worker budget = query_budget / num_cores | Runtime enforcement with stable per-worker bounds, independent of morsel count |
 | Spill-to-disk | Sort spill and IN subquery spill only; aggregation has hard `max_groups` cap | Aggregation spill deferred to v2; hard cap keeps the v1 engine small |
 | Query timeout | Timer sets AtomicBool cancel flag; cooperative checking | Fast stopping, no polling overhead |
 | Error handling | `OperatorError` in operators, wrapped by engine `ExecutionError`; warnings for non-fatal conditions | Keeps crate boundaries clean while preserving typed failures |

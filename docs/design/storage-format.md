@@ -225,6 +225,8 @@ Each segment records the schema version it was written with (see `TableSchema.ve
 
 Each `(window, shard)` compacts independently. This means compaction is embarrassingly parallel across shards and windows.
 
+**v1 strategy: size-tiered.** Wave 4's compaction (TASK-408) ships pure size-tiered compaction within each `(window, shard)`. This is the cheapest correct strategy, optimal for hot/recent windows where ingest is still active. The roadmap to a temperature-aware hybrid strategy (cold windows compact differently from hot windows) is documented in §7.7 — bqlite is unusual because old windows become read-mostly very quickly, which is exactly where the hybrid wins.
+
 **Scheduling:** Compaction runs as a dedicated background process that activates when query and ingest load is light. It can also be triggered explicitly via API or CLI.
 
 **Trigger:** When the number of L0 segments in a `(window, shard)` exceeds a threshold (default: 4), or the total size of L0 segments exceeds a limit (default: 256 MB).
@@ -325,6 +327,53 @@ Queries acquire a reference to the current manifest at query start. Compaction p
 - Compaction waits for the old manifest's refcount to reach zero before deleting its segments.
 - No locks on the query read path.
 
+### 7.7 Temperature-Aware Hybrid Compaction
+
+Behavioral analytics workloads have a sharp temperature gradient: the current window is write-active (constant ingest, small queries), the previous N windows are read-mostly (drift queries, retention queries, dashboards), and old windows are write-cold and read-cold (occasional historical drilldowns). One compaction policy cannot be optimal for all three. The Wave 4 v1 strategy (§7.1) is uniformly size-tiered, which is the right call for hot windows but leaves performance on the table for cold windows. The temperature-aware extension below is a Wave 5+ enhancement.
+
+#### 7.7.1 Window Temperature Classification
+
+A `(window, shard)` is classified into one of three temperature buckets based on facts already in the manifest:
+
+| Bucket | Definition | Read profile | Write profile |
+|---|---|---|---|
+| **Hot** | Window contains the *current* day or has received an ingest in the past 24h | Frequent small reads | Active ingest |
+| **Warm** | Last ingest 1–30 days ago | Frequent full-window reads | Backfill only |
+| **Cold** | Last ingest > 30 days ago | Occasional reads | Effectively read-only |
+
+The classifier reads `last_ingest_at` per `(window, shard)` from the manifest (an existing-or-trivial field) and walks the active windows once per compaction cycle. The thresholds are configurable and the rules are intentionally simple — fancy temperature heuristics are not the point.
+
+#### 7.7.2 Per-Bucket Policies
+
+| Bucket | Policy | Trigger | Output shape |
+|---|---|---|---|
+| **Hot** | Size-tiered (current §7.1 behavior) | L0 file count > 4 OR L0 size > 256 MB | A new L1 segment per merge; many L1s coexist |
+| **Warm** | Overlap-bounded (leveled-ish) | Sorted-run count > 2 OR total read amplification > 1.5× the optimal | Single sorted run per `(window, shard)`; new ingest writes L0s that get rolled in on the next pass |
+| **Cold** | One-shot consolidation + cold codec promotion | Once, when the window crosses the warm→cold threshold | Single segment per shard, re-encoded with the cold compression policy (§10.7) |
+
+Triggers are *additive* to the L0 count/size triggers from §7.1 — a hot window can also be triggered by sorted-run count, just much less aggressively.
+
+#### 7.7.3 Subcompaction
+
+For very large `(window, shard)` merges (typical of cold-bucket consolidation, where the input may be hundreds of gigabytes), the compaction pass splits the work into **entity-range subcompactions** that run in parallel:
+
+1. The compaction scheduler computes the target output's row count from the input segments' manifest metadata.
+2. It picks `N = min(num_cores, byte_size / 1 GB)` entity boundaries inside the merged input that approximately equipartition the output.
+3. Each subcompaction reads its slice of the input, runs the k-way merge, and writes its output segment independently.
+4. The manifest update at the end registers all `N` subcompaction outputs atomically as the new state of the `(window, shard)`.
+
+Subcompactions never split an entity — the boundary picker snaps to the next entity-id transition, exactly like morsel boundaries in the execution model (execution-model.md §9.3). This preserves the entity-locality invariant the read path relies on.
+
+#### 7.7.4 Concurrency With Hot-Path Ingest
+
+The hot bucket continues to use the existing manifest-MVCC protocol from §7.6. Cold-bucket consolidation can take a long time per `(window, shard)`, but the window is by definition no longer receiving ingest, so manifest contention is bounded — the only contender is another query's snapshot.
+
+#### 7.7.5 Open Questions Deferred to Wave 5
+
+- The exact thresholds (24h, 30d) are placeholders. The bench suite must validate them on real workloads.
+- Whether warm-bucket compaction should also re-run encoding selection (§10.3) is open. Cold-bucket consolidation always does — it pairs naturally with the cold codec promotion in §10.7.
+- Subcompaction parallelism interacts with the query worker pool (execution-model.md §9.4). The compaction scheduler must use the same active-count cooperation as today's compaction (§11 of execution-model.md).
+
 ---
 
 ## 8. Query Read Path: K-Way Merge
@@ -345,6 +394,18 @@ windows/w_020238/shard_03  ──┘
 ### 8.2 Performance Design
 
 **Sequential access.** Each merge input stream is read front-to-back in sorted order. OS readahead works in favor of this pattern.
+
+**Explicit access-pattern hints.** Where the access pattern is statically predictable, the segment reader passes the hint through to the kernel via `memmap2::Advice` (when the segment is mmapped) or `posix_fadvise(2)` (when the segment is opened via `pread`). Three access patterns are recognized:
+
+| Pattern | When | Hint (`memmap2::Advice`) | Hint (`posix_fadvise`) |
+|---|---|---|---|
+| **Sequential scan** | The k-way merge driving an aggregate query | `Sequential` | `POSIX_FADV_SEQUENTIAL` |
+| **Random / point lookup** | Single-entity lookup path (§8.3) — read just the matching row-groups | `Random` | `POSIX_FADV_RANDOM` |
+| **Compaction read** | Compaction reading a full segment as input to a merge | `Sequential` + `WillNeed` for the upcoming row-group | `POSIX_FADV_SEQUENTIAL` + `POSIX_FADV_WILLNEED` |
+
+The hints are advisory — the kernel may ignore them, and bqlite never relies on them for correctness. They are an explicit signal that the engine knows the access pattern better than the kernel's default heuristic does. The reader applies the hint at segment open and re-applies `WillNeed` at row-group boundaries during compaction.
+
+This is a small but cheap win: `posix_fadvise` is a single syscall, the hints save the kernel from having to detect the pattern via cache misses, and the embeddable-engine constraint (Belief 5) means we cannot tune `vm.dirty_ratio` or other system-wide knobs — explicit hints are the only lever we have.
 
 **Bounded buffers.** 4 MB read buffer per merge input stream. Modern SSDs deliver peak throughput at ≥128 KB I/O sizes, but larger buffers (2-4 MB) reduce syscall overhead and amortize seek latency on spinning disks. With k=6 (30-day windows, 6-month query) and 32 shards, total buffer memory is 192 streams * 4 MB = 768 MB — within the 3 GB query budget. Note that not all shards read simultaneously — the thread pool (sized to num_cores) limits concurrency, so actual buffer usage at any instant is `num_cores * k * 4 MB`.
 
@@ -713,9 +774,31 @@ Null values are encoded as a separate null bitmap (Arrow-compatible) plus dense 
 
 ### 10.7 Compression Layer
 
-**LZ4 only for v1.** Speed over size. The code is structured to allow other options (ZSTD for cold/archival windows) later, but v1 uses a single codec to minimize complexity.
+**LZ4 is the v1 compression codec.** Speed over size. LZ4 is applied as an optional **post-encoding** compression pass. If lightweight encodings (dictionary, delta+bitpack) are already effective, LZ4 on top adds minimal value. The minimum compression threshold (Section 10.4, LZ4) prevents wasting decode cycles for marginal gains.
 
-LZ4 is applied as an optional **post-encoding** compression pass. If lightweight encodings (dictionary, delta+bitpack) are already effective, LZ4 on top adds minimal value. The minimum compression threshold (Section 10.4, LZ4) prevents wasting decode cycles for marginal gains.
+#### 10.7.1 Hot/Cold Compression Policy
+
+The codec choice is **a function of the segment's temperature bucket** (§7.7.1), not a single format-wide switch. The policy is intentionally simple:
+
+| Bucket | Post-encoding codec | Rationale |
+|---|---|---|
+| **Hot** (active ingest, < 24h) | LZ4, threshold 0.9 | Decode speed dominates; the data turns over too fast to amortize a heavier codec |
+| **Warm** (1–30 days) | LZ4, threshold 0.9 | Same as hot — warm windows still get plenty of reads, decode speed still matters |
+| **Cold** (> 30 days) | ZSTD level 3 on **varlen / high-entropy columns only**; LZ4 elsewhere | Cold windows are read-mostly and storage-bound. ZSTD at level 3 is ~2× LZ4's compression ratio at ~2.5× the decode cost — a net win when the column is rarely read |
+
+**Codec promotion happens at compaction.** A cold-bucket consolidation pass (§7.7.2) re-encodes the segment with the cold policy. There is no "background recompression" — recompression only happens when a `(window, shard)` is being merged anyway, so the I/O cost is paid once.
+
+**Why varlen-only for ZSTD.** Lightweight encodings (Dictionary, Delta, BitPacking, FOR, ALP) already produce dense, near-optimal byte streams. ZSTD on top of `Delta + BitPacking` for a sorted timestamp column buys ~3% size reduction at 2.5× the decode cost — never worth it. The wins from ZSTD are concentrated on:
+
+- Plain-encoded high-entropy strings (when the encoding selector falls back to Plain because FSST didn't help)
+- FSST-encoded long-tail strings (the FSST output is still text-like and compresses)
+- Plain-encoded random floats that didn't decompose into ALP
+
+The encoding selector knows which columns it sent down the lightweight path; the cold-bucket consolidation pass uses that record to apply ZSTD only where it pays.
+
+**No mixed-codec segments below the chunk level.** A given column chunk is either LZ4 or ZSTD, never both, never one for the dictionary and one for the codes. Mixed-codec segments would require carrying the codec choice into per-chunk metadata, which is fine, but the decoder dispatch overhead is real and uniform-codec keeps the hot path branch-free.
+
+**Forward compatibility.** Adding ZSTD to the v1 segment format requires extending `CompressionType` (§10.2). The on-disk shape is forward-compatible: an old reader sees `CompressionType::Zstd` as an unknown variant and rejects the segment with a typed `UnsupportedCompression { codec: Zstd }` error rather than corrupting data. The format version field in the segment header (§9.3) is bumped when ZSTD ships.
 
 ---
 
@@ -733,18 +816,70 @@ Per-row-group min/max metadata for key columns. Stored as `min_value`/`max_value
 
 Zone maps on all columns are stored in the segment footer metadata (Section 9.4, `min_value`/`max_value` fields).
 
-### 11.2 Bloom Filters and Roaring Bitmaps (Deferred)
+### 11.2 Secondary Index Portfolio (Prioritized)
 
-Bloom filters on `entity_id` and roaring bitmap indexes on `event_type` are deferred to v2. Zone maps on `entity_id` already provide effective segment-level and row-group-level pruning for single-entity lookups given the `(entity_id, timestamp)` sort order — each row-group covers a contiguous entity range, so min/max comparison is sufficient. Bloom filters add value only when entity distribution within segments is sparse, which is not expected after compaction.
+Bloom filters and Roaring bitmaps are not "deferred to v2" as a blanket statement. Instead, the index portfolio is **explicitly narrow** and **explicitly prioritized** — a small set of indexes that target real bqlite query shapes, in the order they earn their place. The reasoning model: cheap indexes broadly, heavy indexes only where they materially shrink the candidate set, and never an index whose unit of skipping doesn't match the execution model (no row-level bitmaps when the execution unit is a row-group or an entity range).
+
+#### 11.2.1 Tier 1 — Event-Type Roaring Bitmap
+
+**Status:** Wave 4 candidate. The first secondary index that earns its place in bqlite.
+
+- **What:** A Roaring bitmap per `(segment, event_type)` indicating which row-groups contain at least one event of that type. The bitmap is built once during segment write, stored in the segment footer, and loaded into memory at scan setup.
+- **Why first:** `event_type` is the most-filtered column in the engine. Almost every MATCH pattern, almost every STATS query, almost every funnel filters on a small subset of event types. The bitmap shrinks the candidate row-group set before the scan even starts.
+- **Skip unit:** Row-group, not row. The bitmap is on **the row-group axis** because that is the granularity at which the read path can actually skip work — pruning individual rows after the row-group has been decoded saves nothing.
+- **Cost:** ~`num_event_types × num_row_groups / 8` bytes per segment. For a segment with 20 event types and 256 row-groups, that's ~640 bytes. Negligible.
+- **When it does *not* earn its place:** If `event_type` has very high cardinality (>1000 distinct values), the bitmap stops being cheap; revert to dictionary pushdown only.
+
+#### 11.2.2 Tier 2 — Entity-Presence Bitmap for MATCH Anchor
+
+**Status:** Wave 5+ candidate, depends on MATCH operator stabilizing first.
+
+- **What:** A Roaring bitmap per `(segment, anchor_event_type)` indicating which **entity ranges** (each row-group is a contiguous entity range, so the bitmap unit is row-group) contain at least one entity that has the anchor event type.
+- **Why:** Long funnels with a rare middle or final step benefit from a pre-NFA candidate generation phase: intersect the bitmaps for the mandatory positive steps, drop entire row-groups that cannot possibly contain an entity matching the pattern, then run the NFA only on what's left.
+- **Skip unit:** Row-group (which is also an entity range under `(entity_id, timestamp)` sort order).
+- **Cost:** Same as Tier 1, but per anchor type, so the planner only registers a bitmap for event types that have actually been used as anchors recently. The bitmap registry is part of the manifest.
+- **Risk:** Semantics must stay exact. The bitmap is a *lower bound* on candidate row-groups — false positives are fine (NFA filters them out), false negatives are forbidden.
+
+#### 11.2.3 Tier 3 — Low-Cardinality Dimension Skip Indexes
+
+**Status:** Wave 5+ candidate.
+
+- **What:** Per `(segment, low_cardinality_string_column)`, a tiny "value set" — the set of distinct values that actually appear in each row-group. Stored as a list of dictionary codes, not strings.
+- **Why:** Frequently-filtered low-cardinality columns (`country`, `device`, `plan`, `region`) benefit from row-group skipping the same way `event_type` does, but they don't earn the full Roaring-bitmap treatment because the per-query cost of building one is real.
+- **Skip unit:** Row-group.
+- **Cost:** ~`cardinality × num_row_groups × 4 bytes` (one i32 per code per row-group). For a column with 200 distinct values and 256 row-groups, ~200 KB per segment. Per column. Add only when the column has been filtered on more than ~5% of recent queries — i.e. the planner must opt the column in based on query history, the writer doesn't blanket-add.
+
+#### 11.2.4 Tier 4 — Bloom Filter on High-Cardinality Strings
+
+**Status:** Wave 5+ candidate, only when necessary.
+
+- **What:** Bloom filter on `entity_id` (or another high-cardinality string column) when the sort-order correlation has weakened — i.e. entity ID ranges no longer cleanly map to row-group ranges, so the zone map fails. This can happen after partial compactions or in tables that aren't sorted by `entity_id`.
+- **Why:** Single-entity lookups against fragmented segments need a true point lookup. Bloom filters give that with controllable false-positive rate and small memory footprint.
+- **Skip unit:** Segment, not row-group. Bloom filters cannot tell you *which* row-group contains the value, only whether the segment as a whole might.
+- **When it does *not* earn its place:** If `(entity_id, ts)` sort order is intact and the zone map already prunes correctly, Bloom filters add no value. The decision is per-segment, not per-table.
+
+#### 11.2.5 Indexes That Will Not Be Built
+
+A few candidates were considered and rejected because they don't fit bqlite's execution model:
+
+| Rejected | Why |
+|---|---|
+| Per-row Roaring bitmap on every property column | The skip unit is wrong: bqlite never skips individual rows, it skips row-groups or entity ranges. A bitmap whose skip unit doesn't match the execution unit is overhead, not optimization. |
+| Inverted index on every string column ("converged index") | Rockset's converged index is powerful but is a large maintenance commitment. bqlite's workload is well-served by a much narrower portfolio. |
+| Hash index on `entity_id` | Would change the storage layout to support point lookups at the expense of full-scan performance. The dominant workload is full-scan aggregates; hash indexes are a different shape of database. |
 
 ### 11.3 v1 Index Strategy Summary
 
-| Index | Target column | Purpose |
-|---|---|---|
-| Zone maps | `entity_id` | Skip segments and row-groups for single-entity lookups |
-| Zone maps | `timestamp` | Skip entire windows |
-| Zone maps | All columns | General min/max pruning (cheap to maintain) |
-| Dictionary pushdown | `event_type`, low-cardinality strings | Filter at encoding level, skip rows |
+| Index | Target column | Skip unit | Purpose | Wave |
+|---|---|---|---|---|
+| Zone maps | `entity_id` | Segment + row-group | Skip for single-entity lookups | Wave 2 (TASK-216) |
+| Zone maps | `timestamp` | Segment + row-group | Skip entire windows | Wave 2 (TASK-216) |
+| Zone maps | All columns | Row-group | General min/max pruning (cheap to maintain) | Wave 2 (TASK-216) |
+| Dictionary pushdown | `event_type`, low-cardinality strings | Row | Filter at encoding level via bitset | Wave 2 (TASK-202) |
+| Roaring bitmap | `event_type` | Row-group | §11.2.1 Tier 1 — first secondary index | Wave 4+ |
+| Entity-presence bitmap | MATCH anchor types | Row-group | §11.2.2 Tier 2 — pre-NFA candidate filter | Wave 5+ |
+| Value-set skip index | Hot low-cardinality dimensions | Row-group | §11.2.3 Tier 3 — query-history-driven | Wave 5+ |
+| Bloom filter | `entity_id` (when sort-order weakens) | Segment | §11.2.4 Tier 4 — point-lookup fallback | Wave 5+ |
 
 ---
 
@@ -1070,12 +1205,14 @@ Encoded as three components:
 | Partitioning | Time windows (N days, default 30) | Window pruning for time-range queries; keeps merge k small |
 | Sharding | Hash on entity_id (default 32 shards) | Parallel reads/writes, entity locality across windows, one shard per core |
 | Ingestion model | Batch-only, no WAL/memtable | Eliminates recovery complexity; appropriate for analytics workload |
-| Compaction strategy | Size-tiered within (window, shard) | Simple, effective, embarrassingly parallel |
+| Compaction strategy | v1: size-tiered within (window, shard). Roadmap: temperature-aware hybrid (§7.7) — size-tiered for hot, overlap-bounded for warm, one-shot consolidation for cold | Simple to ship, embarrassingly parallel; cold windows benefit from a different policy because they are read-mostly |
+| Compaction parallelism | Subcompaction by entity range for very large `(window, shard)` merges (§7.7.3) | Parallelizes a single compaction without splitting any entity |
 | Segment format | Custom container + custom encodings | Full control over read path performance |
 | v1 encodings | Plain, Dictionary, Delta, DoubleDelta, BitPacking, RLE, Constant, FSST, FOR, PFOR, ALP, FreqEncoding, LZ4 | Comprehensive encoding suite; each encoding targets a specific data pattern |
 | Encoding selection | Multi-pass heuristics using statistics | Covers all common patterns; evolve to sampling in v2 |
-| Compression | LZ4 only | Decode speed over ratio; ZSTD deferred |
-| Index structures | Zone maps (all columns) | Nearly free; entity_id zone maps highly selective given sort order |
+| Compression | v1: LZ4. Roadmap: hot/warm = LZ4, cold = ZSTD on varlen/high-entropy columns only (§10.7.1) | Decode speed dominates for hot/warm; cold windows can trade decode CPU for size |
+| Index structures | v1: zone maps (all columns) + dictionary pushdown. Roadmap: tiered secondary-index portfolio (§11.2) — event-type Roaring bitmap → entity-presence bitmap → low-cardinality value sets → Bloom filter as last resort | Nearly free for v1; secondary indexes added in priority order tied to actual query shapes |
+| Access-pattern hints | `posix_fadvise` / `memmap2::Advice` per scan kind (§8.2) | Cheap, embeddable-friendly way to tell the kernel about sequential vs random access |
 | Manifest format | JSON per-table + `db.json` for db-wide settings, atomic rename | Human-readable, debuggable; per-table isolation avoids cross-table lock contention |
 | Manifest scope | One manifest per table (Section 12); db-wide UUID in `db.json` | Independent updates per table; tombstones stay out of metadata |
 | Checksums | xxHash64 per segment | Fast; per-row-group deferred to v2 |
