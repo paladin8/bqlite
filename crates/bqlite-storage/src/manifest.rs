@@ -64,8 +64,10 @@
 
 use std::collections::BTreeMap;
 
+use bqlite_core::error::{BqliteError, Result};
 use bqlite_core::property::PropertyValue;
 use bqlite_core::schema::TableSchema;
+use bqlite_core::time::TimeRange;
 use serde::{Deserialize, Serialize};
 
 /// Current manifest format version.
@@ -328,6 +330,184 @@ impl Manifest {
     /// engine.
     pub fn is_supported_version(&self) -> bool {
         self.format_version == MANIFEST_FORMAT_VERSION
+    }
+
+    /// Register a newly written segment in `table_name`'s inventory.
+    ///
+    /// `window_id` identifies the target time window; the window is
+    /// created lazily at the correct ascending position if this is
+    /// the first segment landing there. `shard_id` is validated
+    /// against the manifest's `shard_count`. The freshly-created
+    /// window allocates `shard_count` empty shard vecs so positional
+    /// lookups stay total.
+    ///
+    /// Windows are kept sorted by `window_id` ascending so that the
+    /// serialized manifest is deterministic and query-time iteration
+    /// visits segments in time order without a separate sort pass.
+    /// Within a `(window_id, shard_id)` cell, segments are appended
+    /// in insertion order — which equals monotonic `segment_id`
+    /// order because ingest only ever appends newer segments.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if `table_name` is not registered
+    ///   in the manifest.
+    /// - [`BqliteError::Execution`] if `shard_id >= shard_count`.
+    /// - [`BqliteError::Execution`] if a segment with the same
+    ///   `segment_id` is already present anywhere in this table's
+    ///   inventory. This is a defensive check against caller logic
+    ///   errors — the monotonic segment-id counter is managed
+    ///   outside the manifest.
+    pub fn add_segment(
+        &mut self,
+        table_name: &str,
+        window_id: u32,
+        shard_id: u32,
+        segment: SegmentMeta,
+    ) -> Result<()> {
+        if shard_id >= u32::from(self.shard_count) {
+            return Err(BqliteError::Execution(format!(
+                "add_segment: shard_id {shard_id} out of range (shard_count = {})",
+                self.shard_count
+            )));
+        }
+        let shard_count = self.shard_count;
+        let entry = self.tables.get_mut(table_name).ok_or_else(|| {
+            BqliteError::Execution(format!("add_segment: unknown table '{table_name}'"))
+        })?;
+
+        // Duplicate-id defense across every window/shard in this table.
+        if entry
+            .windows
+            .iter()
+            .flat_map(|w| w.shards.iter())
+            .flat_map(|s| s.iter())
+            .any(|s| s.segment_id == segment.segment_id)
+        {
+            return Err(BqliteError::Execution(format!(
+                "add_segment: segment_id {} already exists in table '{table_name}'",
+                segment.segment_id
+            )));
+        }
+
+        // Find the insertion position that keeps windows sorted by
+        // `window_id` ascending. Binary search is overkill at Wave 2
+        // scale (handful of windows) but matches the invariant
+        // literally and avoids a later O(n) sort.
+        let idx = match entry
+            .windows
+            .binary_search_by_key(&window_id, |w| w.window_id)
+        {
+            Ok(i) => i,
+            Err(i) => {
+                entry
+                    .windows
+                    .insert(i, WindowManifest::new(window_id, shard_count));
+                i
+            }
+        };
+
+        entry.windows[idx].shards[shard_id as usize].push(segment);
+        Ok(())
+    }
+
+    /// Remove the segment with `segment_id` from `table_name`'s
+    /// inventory and return the removed [`SegmentMeta`].
+    ///
+    /// Searches every window and shard in insertion order and stops
+    /// at the first match; the [`Manifest::add_segment`] uniqueness
+    /// invariant guarantees the search terminates after one hit. An
+    /// empty window left behind is **not** reaped — compaction and
+    /// retention decide when to drop empty windows, not the remove
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if `table_name` is not registered.
+    /// - [`BqliteError::Execution`] if no segment with the given id
+    ///   is found in this table.
+    pub fn remove_segment(&mut self, table_name: &str, segment_id: u64) -> Result<SegmentMeta> {
+        let entry = self.tables.get_mut(table_name).ok_or_else(|| {
+            BqliteError::Execution(format!("remove_segment: unknown table '{table_name}'"))
+        })?;
+        for win in &mut entry.windows {
+            for shard in &mut win.shards {
+                if let Some(pos) = shard.iter().position(|s| s.segment_id == segment_id) {
+                    return Ok(shard.remove(pos));
+                }
+            }
+        }
+        Err(BqliteError::Execution(format!(
+            "remove_segment: segment_id {segment_id} not found in table '{table_name}'"
+        )))
+    }
+
+    /// Snapshot the active segments matching `(table_name, time_range,
+    /// shard_id)` at this moment.
+    ///
+    /// Returns an owned [`Vec<SegmentMeta>`] rather than borrowing
+    /// from `self` so callers can work with the snapshot beyond the
+    /// manifest's lifetime (which matters for the eventual
+    /// `Arc<Manifest>` snapshot isolation in storage-format.md §12.3).
+    ///
+    /// A segment is considered overlapping `time_range` iff its
+    /// inclusive-inclusive `(min_ts, max_ts)` shares at least one
+    /// nanosecond with the half-open `[start, end)` interval —
+    /// concretely `max_ts >= start && min_ts < end`. An empty
+    /// `time_range` returns an empty vec.
+    ///
+    /// Segments are returned in `(window_id ascending, insertion
+    /// order within shard)` — identical to how they were added by
+    /// [`Manifest::add_segment`] — so the scan layer can consume
+    /// them in time order without a sort pass.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if `table_name` is not registered.
+    /// - [`BqliteError::Execution`] if `shard_id >= shard_count`.
+    pub fn snapshot_for_query(
+        &self,
+        table_name: &str,
+        time_range: TimeRange,
+        shard_id: u32,
+    ) -> Result<Vec<SegmentMeta>> {
+        if shard_id >= u32::from(self.shard_count) {
+            return Err(BqliteError::Execution(format!(
+                "snapshot_for_query: shard_id {shard_id} out of range (shard_count = {})",
+                self.shard_count
+            )));
+        }
+        let entry = self.tables.get(table_name).ok_or_else(|| {
+            BqliteError::Execution(format!("snapshot_for_query: unknown table '{table_name}'"))
+        })?;
+
+        if time_range.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let start = time_range.start.as_nanos();
+        let end = time_range.end.as_nanos();
+
+        let mut out = Vec::new();
+        for win in &entry.windows {
+            // Defensive: a Wave 1 TableEntry deserialized with an
+            // empty `windows` can never reach this branch, but a
+            // window that somehow carries fewer shards than the
+            // manifest's current `shard_count` (e.g. an old manifest
+            // written before a future shard-count bump) would panic
+            // on a direct index. `get` returns `None` cleanly.
+            let Some(shard) = win.shards.get(shard_id as usize) else {
+                continue;
+            };
+            for seg in shard {
+                // Inclusive (min_ts, max_ts) overlaps half-open
+                // [start, end) iff max_ts >= start && min_ts < end.
+                if seg.ts_range.1 >= start && seg.ts_range.0 < end {
+                    out.push(seg.clone());
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -664,5 +844,368 @@ mod tests {
         let bytes = serde_json::to_vec(&manifest).expect("serialize");
         let round: Manifest = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(round, manifest);
+    }
+
+    // ── add_segment / remove_segment / snapshot_for_query ──────────────────
+
+    /// Build a manifest with `shard_count` shards and a single
+    /// registered `events` table carrying an empty inventory.
+    /// Convenience for the mutation tests below.
+    fn manifest_with_events_table(shard_count: u16) -> Manifest {
+        let mut m = Manifest::new_empty(shard_count);
+        m.tables.insert(
+            "events".to_string(),
+            TableEntry {
+                schema: sample_events_schema(),
+                next_sequence_id: 0,
+                next_batch_id: 0,
+                bootstrap_events_table: false,
+                windows: Vec::new(),
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn add_segment_creates_window_on_first_insert() {
+        let mut m = manifest_with_events_table(4);
+        m.add_segment("events", 7, 2, sample_segment(1, 1, (0, 100)))
+            .expect("add_segment");
+
+        let entry = m.tables.get("events").expect("events entry");
+        assert_eq!(entry.windows.len(), 1);
+        let win = &entry.windows[0];
+        assert_eq!(win.window_id, 7);
+        assert_eq!(win.shards.len(), 4, "shard vec sized to shard_count");
+        assert_eq!(win.shards[0].len(), 0);
+        assert_eq!(win.shards[1].len(), 0);
+        assert_eq!(win.shards[2].len(), 1);
+        assert_eq!(win.shards[2][0].segment_id, 1);
+        assert_eq!(win.shards[3].len(), 0);
+    }
+
+    #[test]
+    fn add_segment_appends_within_existing_window_in_insertion_order() {
+        let mut m = manifest_with_events_table(2);
+        m.add_segment("events", 3, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        m.add_segment("events", 3, 0, sample_segment(2, 1, (10, 20)))
+            .unwrap();
+        m.add_segment("events", 3, 0, sample_segment(3, 1, (20, 30)))
+            .unwrap();
+
+        let shard = &m.tables["events"].windows[0].shards[0];
+        assert_eq!(shard.len(), 3);
+        assert_eq!(shard[0].segment_id, 1);
+        assert_eq!(shard[1].segment_id, 2);
+        assert_eq!(shard[2].segment_id, 3);
+    }
+
+    #[test]
+    fn add_segment_keeps_windows_sorted_by_window_id() {
+        // Insert windows out of order; the invariant says they must
+        // end up sorted ascending by `window_id`. Binary-search
+        // insertion guarantees this for every access pattern.
+        let mut m = manifest_with_events_table(2);
+        m.add_segment("events", 5, 0, sample_segment(1, 1, (0, 1)))
+            .unwrap();
+        m.add_segment("events", 2, 1, sample_segment(2, 1, (0, 1)))
+            .unwrap();
+        m.add_segment("events", 9, 0, sample_segment(3, 1, (0, 1)))
+            .unwrap();
+        m.add_segment("events", 3, 1, sample_segment(4, 1, (0, 1)))
+            .unwrap();
+
+        let ids: Vec<u32> = m.tables["events"]
+            .windows
+            .iter()
+            .map(|w| w.window_id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 5, 9], "windows must be ascending");
+    }
+
+    #[test]
+    fn add_segment_rejects_unknown_table() {
+        let mut m = manifest_with_events_table(4);
+        let err = m
+            .add_segment("nope", 0, 0, sample_segment(1, 1, (0, 1)))
+            .expect_err("unknown table must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("unknown table"), "got: {msg}");
+                assert!(msg.contains("nope"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_segment_rejects_shard_out_of_range() {
+        let mut m = manifest_with_events_table(4);
+        let err = m
+            .add_segment("events", 0, 4, sample_segment(1, 1, (0, 1)))
+            .expect_err("shard_id == shard_count must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("out of range"), "got: {msg}");
+                assert!(msg.contains("shard_id 4"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+        // Higher shard_ids also error — boundary test.
+        assert!(matches!(
+            m.add_segment("events", 0, 100, sample_segment(1, 1, (0, 1))),
+            Err(BqliteError::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn add_segment_rejects_duplicate_segment_id() {
+        let mut m = manifest_with_events_table(2);
+        m.add_segment("events", 0, 0, sample_segment(42, 1, (0, 10)))
+            .unwrap();
+        // Same segment id in a different window/shard still errors —
+        // the invariant is per-table, not per-cell.
+        let err = m
+            .add_segment("events", 1, 1, sample_segment(42, 1, (10, 20)))
+            .expect_err("duplicate segment_id must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("already exists"), "got: {msg}");
+                assert!(msg.contains("42"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_segment_returns_removed_meta_and_shrinks_shard() {
+        let mut m = manifest_with_events_table(2);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(2, 1, (10, 20)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(3, 1, (20, 30)))
+            .unwrap();
+
+        let removed = m.remove_segment("events", 2).expect("remove existing");
+        assert_eq!(removed.segment_id, 2);
+        assert_eq!(removed.ts_range, (10, 20));
+
+        let shard = &m.tables["events"].windows[0].shards[0];
+        let remaining_ids: Vec<u64> = shard.iter().map(|s| s.segment_id).collect();
+        assert_eq!(
+            remaining_ids,
+            vec![1, 3],
+            "the middle segment is gone, the other two keep their relative order"
+        );
+    }
+
+    #[test]
+    fn remove_segment_leaves_empty_window_in_place() {
+        // Removing the only segment in a window must not delete the
+        // window — compaction/retention owns that decision.
+        let mut m = manifest_with_events_table(2);
+        m.add_segment("events", 5, 0, sample_segment(1, 1, (0, 1)))
+            .unwrap();
+        m.remove_segment("events", 1).unwrap();
+        let entry = m.tables.get("events").unwrap();
+        assert_eq!(entry.windows.len(), 1);
+        assert_eq!(entry.windows[0].window_id, 5);
+        assert!(entry.windows[0].is_empty());
+    }
+
+    #[test]
+    fn remove_segment_rejects_unknown_table() {
+        let mut m = manifest_with_events_table(2);
+        let err = m
+            .remove_segment("missing", 1)
+            .expect_err("unknown table must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("unknown table"), "got: {msg}");
+                assert!(msg.contains("missing"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_segment_rejects_missing_id() {
+        let mut m = manifest_with_events_table(2);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 1)))
+            .unwrap();
+        let err = m
+            .remove_segment("events", 999)
+            .expect_err("missing id must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("not found"), "got: {msg}");
+                assert!(msg.contains("999"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_for_query_filters_by_shard() {
+        let mut m = manifest_with_events_table(4);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 100)))
+            .unwrap();
+        m.add_segment("events", 0, 1, sample_segment(2, 1, (0, 100)))
+            .unwrap();
+        m.add_segment("events", 0, 2, sample_segment(3, 1, (0, 100)))
+            .unwrap();
+
+        // Shard 1 sees only its own segment.
+        let got = m
+            .snapshot_for_query("events", TimeRange::unbounded(), 1)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].segment_id, 2);
+
+        // Shard 3 has nothing.
+        let got = m
+            .snapshot_for_query("events", TimeRange::unbounded(), 3)
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn snapshot_for_query_filters_by_time_range_overlap() {
+        // Seed a shard with three segments at disjoint time ranges so
+        // the overlap math is easy to reason about. All timestamps
+        // are raw nanoseconds.
+        let mut m = manifest_with_events_table(1);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 100)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(2, 1, (200, 300)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(3, 1, (400, 500)))
+            .unwrap();
+
+        let by_ids =
+            |segs: Vec<SegmentMeta>| -> Vec<u64> { segs.iter().map(|s| s.segment_id).collect() };
+
+        // Fully contained in segment 2.
+        let range = TimeRange::new(250.into(), 280.into());
+        assert_eq!(
+            by_ids(m.snapshot_for_query("events", range, 0).unwrap()),
+            vec![2]
+        );
+
+        // Straddles segments 1 and 2 (range ends at 201 so it
+        // includes segment 2's inclusive `min_ts = 200`).
+        let range = TimeRange::new(50.into(), 201.into());
+        assert_eq!(
+            by_ids(m.snapshot_for_query("events", range, 0).unwrap()),
+            vec![1, 2]
+        );
+
+        // Hits all three.
+        let range = TimeRange::new(0.into(), 501.into());
+        assert_eq!(
+            by_ids(m.snapshot_for_query("events", range, 0).unwrap()),
+            vec![1, 2, 3]
+        );
+
+        // Gap between segments — segment 1's inclusive `max_ts = 100`
+        // still falls in `[100, 200)`, so a true "gap" query must
+        // start strictly above 100 to miss it. `[101, 200)` lies
+        // entirely in the 101..=199 hole between segments 1 and 2.
+        let range = TimeRange::new(101.into(), 200.into());
+        assert!(
+            m.snapshot_for_query("events", range, 0).unwrap().is_empty(),
+            "a range strictly inside the 101..=199 gap must not match any segment"
+        );
+
+        // A query whose half-open upper bound is exactly segment 2's
+        // inclusive `min_ts = 200` does NOT touch segment 2 (since
+        // 200 is not `< 200`). So `[101, 200)` misses everything and
+        // `[101, 201)` hits segment 2 alone.
+        let range = TimeRange::new(101.into(), 201.into());
+        assert_eq!(
+            by_ids(m.snapshot_for_query("events", range, 0).unwrap()),
+            vec![2]
+        );
+
+        // Touching segment 1's inclusive `max_ts = 100` from below:
+        // `[100, 101)` hits segment 1 alone because `max_ts >= 100`.
+        let range = TimeRange::new(100.into(), 101.into());
+        assert_eq!(
+            by_ids(m.snapshot_for_query("events", range, 0).unwrap()),
+            vec![1]
+        );
+
+        // Empty range (start >= end) is a degenerate input —
+        // snapshot returns empty without consulting the inventory.
+        let range = TimeRange::new(500.into(), 0.into());
+        assert!(m.snapshot_for_query("events", range, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_for_query_returns_segments_in_window_order() {
+        // Insert windows out of order and assert the snapshot hands
+        // them back in ascending window order — the invariant
+        // promised in the module docs.
+        let mut m = manifest_with_events_table(1);
+        m.add_segment("events", 5, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        m.add_segment("events", 2, 0, sample_segment(2, 1, (0, 10)))
+            .unwrap();
+        m.add_segment("events", 9, 0, sample_segment(3, 1, (0, 10)))
+            .unwrap();
+
+        let got = m
+            .snapshot_for_query("events", TimeRange::unbounded(), 0)
+            .unwrap();
+        let ids: Vec<u64> = got.iter().map(|s| s.segment_id).collect();
+        // Windows sorted ascending by window_id: 2, 5, 9 →
+        // segment ids 2, 1, 3.
+        assert_eq!(ids, vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn snapshot_for_query_rejects_unknown_table() {
+        let m = manifest_with_events_table(2);
+        let err = m
+            .snapshot_for_query("absent", TimeRange::unbounded(), 0)
+            .expect_err("unknown table must error");
+        assert!(matches!(err, BqliteError::Execution(_)));
+    }
+
+    #[test]
+    fn snapshot_for_query_rejects_shard_out_of_range() {
+        let m = manifest_with_events_table(2);
+        let err = m
+            .snapshot_for_query("events", TimeRange::unbounded(), 2)
+            .expect_err("shard_id == shard_count must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("out of range"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_after_remove_drops_the_segment() {
+        // End-to-end: add three segments, remove one, snapshot the
+        // rest — a small integration-style test that wires the three
+        // APIs together.
+        let mut m = manifest_with_events_table(1);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 100)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(2, 1, (100, 200)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(3, 1, (200, 300)))
+            .unwrap();
+        m.remove_segment("events", 2).unwrap();
+
+        let got = m
+            .snapshot_for_query("events", TimeRange::unbounded(), 0)
+            .unwrap();
+        let ids: Vec<u64> = got.iter().map(|s| s.segment_id).collect();
+        assert_eq!(ids, vec![1, 3]);
     }
 }
