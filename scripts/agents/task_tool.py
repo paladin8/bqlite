@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_ROOT = Path(__file__).resolve().parent.parent.parent
 ROOT = Path(os.environ.get("BQLITE_TASK_TOOL_ROOT", str(DEFAULT_ROOT))).resolve()
 TASKS_MD = ROOT / "TASKS.md"
 ACTIVE_DIR = ROOT / "tasks" / "active"
@@ -360,12 +360,100 @@ def write_lock(task: Task, agent_id: str) -> dict[str, Any]:
 
 
 def ensure_task_branch(task_id: str) -> None:
+    """Check out the task branch, preserving any prior work pushed to origin.
+
+    Order of precedence:
+    1. If a local branch exists, check it out and fast-forward from the remote
+       when possible. This covers the "same container, same task resumed"
+       case.
+    2. Else if `refs/remotes/origin/task/TASK-NNN` exists, create a local
+       tracking branch from it. This covers the reclaim path where an earlier
+       agent crashed mid-task after pushing to its task branch: a fresh clone
+       has no local branch, but `sync_main()` has already fetched the remote
+       refs, so we create the local branch from the remote head so the
+       recovering agent sees the prior work instead of a clean main.
+    3. Otherwise create a fresh branch from the current checkout (main, just
+       synced and carrying the new lock commit).
+    """
     branch = f"task/{task_id}"
-    exists = git("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
-    if exists.returncode == 0:
+    local_ref = f"refs/heads/{branch}"
+    remote_ref = f"refs/remotes/origin/{branch}"
+
+    local_exists = (
+        git("show-ref", "--verify", "--quiet", local_ref, check=False).returncode == 0
+    )
+    remote_exists = (
+        git("show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0
+    )
+
+    if local_exists:
         git("checkout", branch, check=True)
+        if remote_exists:
+            git("merge", "--ff-only", f"origin/{branch}", check=False)
+    elif remote_exists:
+        git("checkout", "-b", branch, f"origin/{branch}", check=True)
     else:
         git("checkout", "-b", branch, check=True)
+
+
+def task_lock_path(task_id: str) -> Path:
+    return ACTIVE_DIR / f"{task_id}.lock"
+
+
+def task_done_path(task_id: str) -> Path:
+    return COMPLETED_DIR / f"{task_id}.done"
+
+
+def task_state_on_origin(task_id: str) -> str:
+    """Return "completed" / "lock_held" / "missing" for a task, as visible on
+    origin/main.
+
+    Used by agent_wrapper.py after a claude run exits so that a claude that
+    wrote the done marker locally but failed to push does not get counted as
+    a success. Fetches origin/main first so the check sees the latest remote
+    state without touching the working tree or the current branch.
+    """
+    git("fetch", "origin", "main", check=False)
+    done_rev = f"origin/main:tasks/completed/{task_id}.done"
+    lock_rev = f"origin/main:tasks/active/{task_id}.lock"
+    if git("cat-file", "-e", done_rev, check=False).returncode == 0:
+        return "completed"
+    if git("cat-file", "-e", lock_rev, check=False).returncode == 0:
+        return "lock_held"
+    return "missing"
+
+
+def is_wave_drained(classified: dict[str, list[Task]]) -> bool:
+    """True iff there is no remaining work in this wave/pool and nothing
+    another agent could unblock us on. Used by agent_wrapper.py to decide
+    whether to exit the fleet loop vs. continue backing off.
+    """
+    return not (
+        classified["claimable"]
+        or classified["claimable_missing_difficulty"]
+        or classified["blocked"]
+        or classified["active"]
+        or classified["other_pool_claimable"]
+    )
+
+
+def release_lock(task_id: str, agent_id: str, note: str) -> bool:
+    """Release a previously-claimed lock by removing the lock file and pushing.
+
+    Used by agent_wrapper.py when a task run exits without writing a done
+    marker, so another agent can pick the task up rather than waiting for the
+    stale-lock timer. Returns True if the release was pushed successfully,
+    False if the push lost a race (caller should re-sync and decide what to
+    do next).
+    """
+    sync_main()
+    lock_path = task_lock_path(task_id)
+    if not lock_path.exists():
+        return True
+    lock_path.unlink()
+    git("add", str(lock_path.relative_to(ROOT)), check=True)
+    commit_message = f"{task_id}: released by {agent_id} ({note})"
+    return commit_and_push(commit_message)
 
 
 def claim_next(

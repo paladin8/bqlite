@@ -34,7 +34,3 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 - **storage/reader-trait.md** — `SegmentReader` + `SegmentScan` trait surface, segment enumeration, column projection, row-group iteration, zone-map access, predicate pushdown (TASK-109, Wave 1)
 - **storage/segment-format-v1.md** — byte-level v1 segment file layout: header, row groups, column chunks, footer body, checksum, trailer; v1 encoding set (Plain, Dictionary, Delta, BitPacking, Constant) with LZ4 post-encoding compression (TASK-201, Wave 2)
 - **storage/predicate-pushdown.md** — scan-to-storage pushdown protocol: `ScanPredicate` / `ScanConjunct` shapes, pushable-conjunct taxonomy, zone-map acceptance rules, dictionary-aware filtering, post-filter fallback, Wave 2 `Predicate` trait extension (TASK-202, Wave 2)
-
-## Infrastructure
-
-7. **agent-workflow.md** -- Parallel agent containers, task locking, git workflow, cmux integration (STATUS: draft)

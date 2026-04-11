@@ -10,7 +10,7 @@ The plan will be revised as work progresses. Later waves are intentionally loose
 
 ## Formatting Contract
 
-`scripts/task_tool.py` parses this file directly, so keep task records machine-readable as well as human-readable. The parser is intentionally simple; if you need to change the format, update the script in the same change.
+`scripts/agents/task_tool.py` parses this file directly, so keep task records machine-readable as well as human-readable. The parser is intentionally simple; if you need to change the format, update the script in the same change.
 
 - Every task header must stay on one line in the form `### TASK-NNN: [TAG][TAG] Title` or `### TASK-NNN: Title`.
 - Put all tags in the header immediately after `TASK-NNN:` with no prose between them. Keep tags bracketed as `[TAG]`; do not use bullets or inline code for tags.

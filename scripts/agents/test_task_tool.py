@@ -73,5 +73,66 @@ class TaskToolTests(unittest.TestCase):
         self.assertIn("TASK-101", str(ctx.exception))
 
 
+class TaskToolPathHelperTests(unittest.TestCase):
+    def test_task_lock_path_points_to_active_dir(self) -> None:
+        path = task_tool.task_lock_path("TASK-042")
+        self.assertEqual(path.name, "TASK-042.lock")
+        self.assertEqual(path.parent.name, "active")
+
+    def test_task_done_path_points_to_completed_dir(self) -> None:
+        path = task_tool.task_done_path("TASK-042")
+        self.assertEqual(path.name, "TASK-042.done")
+        self.assertEqual(path.parent.name, "completed")
+
+    def test_is_wave_drained_when_nothing_claimable(self) -> None:
+        classified = {
+            "claimable": [],
+            "claimable_missing_difficulty": [],
+            "blocked": [],
+            "active": [],
+            "completed": [],
+            "other_pool_claimable": [],
+        }
+        self.assertTrue(task_tool.is_wave_drained(classified))
+
+    def test_is_wave_drained_false_when_blocked_work_remains(self) -> None:
+        dummy = task_tool.Task(
+            task_id="TASK-201",
+            number=201,
+            wave=2,
+            title="dep-blocked task",
+            tags=("EASY",),
+            depends_on=("TASK-200",),
+        )
+        classified = {
+            "claimable": [],
+            "claimable_missing_difficulty": [],
+            "blocked": [dummy],
+            "active": [],
+            "completed": [],
+            "other_pool_claimable": [],
+        }
+        self.assertFalse(task_tool.is_wave_drained(classified))
+
+    def test_is_wave_drained_false_when_active_work_remains(self) -> None:
+        dummy = task_tool.Task(
+            task_id="TASK-202",
+            number=202,
+            wave=2,
+            title="active task",
+            tags=("EASY",),
+            depends_on=(),
+        )
+        classified = {
+            "claimable": [],
+            "claimable_missing_difficulty": [],
+            "blocked": [],
+            "active": [dummy],
+            "completed": [],
+            "other_pool_claimable": [],
+        }
+        self.assertFalse(task_tool.is_wave_drained(classified))
+
+
 if __name__ == "__main__":
     unittest.main()

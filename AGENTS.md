@@ -1,69 +1,27 @@
 # Agent Operating Protocol
 
-Instructions for autonomous Claude Code agents building bqlite in parallel. Read this file in full before starting work.
+Instructions for an autonomous Claude Code agent executing a single bqlite task. Read this file in full before starting work.
 
 ## Identity
 
-Your agent ID is set in the `AGENT_ID` environment variable (e.g., `agent-1`). Your working directory is `/workspace`.
-The wrapper also sets `TASK_DIFFICULTY_POOL` to `EASY` or `HARD`. `EASY` agents run Sonnet at high effort and may only claim tasks tagged `[EASY]`; `HARD` agents run Opus at high effort and may only claim tasks tagged `[HARD]`.
+Your agent ID is set in the `AGENT_ID` environment variable (e.g., `agent-1`). Your working directory is `/workspace`. The `TASK_DIFFICULTY_POOL` environment variable is set to `EASY` or `HARD` — you only work on tasks tagged for your pool.
 
-## Configuration
+## Your Job
 
-```
-STALE_LOCK_TIMEOUT_MINUTES=45
-```
+You have been handed exactly one task. The lock file at `tasks/active/TASK-NNN.lock` is already yours, and you have been dropped onto the `task/TASK-NNN` branch. Your job is to take it all the way from here to a merged, marked-done state:
 
-## The Loop
+1. Read the task definition in `TASKS.md` and the relevant design doc under `docs/design/`
+2. Implement the task in small checkpoints (see *Checkpoint Discipline*)
+3. After the final checkpoint merges to `main`, mark the task complete (see *Completion Protocol*)
+4. End your turn
 
-Run this loop continuously:
-
-1. Run `python3 scripts/task_tool.py claim-next --wave "$TASK_WAVE" --difficulty "$TASK_DIFFICULTY_POOL" --agent-id "$AGENT_ID"` to sync `main`, parse `TASKS.md`, enforce wave+difficulty restrictions, detect stale locks, and atomically claim the next eligible task
-2. Interpret the script's `status` field:
-   - `"claimed"` — continue with the returned task. The response may also include `missing_difficulty_tasks`; these are informational only and do not block you, but flag them to a human if they persist across cycles.
-   - `"no_claimable"` — follow the backoff schedule.
-   - `"missing_difficulty"` — your pool has no claimable work and the only remaining wave tasks are untagged. Emit `[NEEDS INPUT]` so the task list can be fixed rather than guessing.
-3. Read the task's design doc and any relevant source files
-4. Implement in small checkpoints (see Checkpoint Discipline)
-5. After the final checkpoint, mark the task complete (see Completion Protocol)
-6. Return to step 1
-
-## Ending Your Turn
-
-You run inside a wrapper script (`scripts/agent-wrapper.sh`) that watches for control markers in your final message. You **must** end every turn with exactly one of:
-
-- `[END LOOP]` — you want a fresh context before continuing. The wrapper relaunches `claude` with a clean conversation; you will re-read AGENTS.md and rescan task state. Use this after completing a task when your context is large, or any time you judge that a fresh slate will help you reason about the next task.
-- `[WAVE COMPLETE]` — there are no more claimable tasks in your wave. Only emit this when you have actually verified one of: (a) every task in the wave has a `.done` marker in `tasks/completed/`, or (b) every remaining task is claimed by another live agent or permanently blocked, **and** you have exhausted the full backoff schedule in the next section with no progress. The wrapper exits and does not relaunch.
-- `[NEEDS INPUT]` — you need a human decision (see *When to Ask for Human Input* below). The wrapper pauses and then resumes your session with `claude --continue` so the human can reply inline with the full context preserved. Include your question in the same message as the marker.
-
-If you end a turn without one of these markers, the Stop hook blocks you and injects a message beginning with "Do not end your turn without an explicit marker…". That message is not an error — it is the normal signal to return to step 1 of the agent loop. Continue executing; do not emit `[NEEDS INPUT]` asking what happened.
-
-## Backoff When No Tasks Are Claimable
-
-If `scripts/task_tool.py claim-next` reports no unclaimed task matching your `TASK_DIFFICULTY_POOL` whose dependencies are satisfied — all remaining tasks in your pool are either claimed, completed, untagged, or blocked by unfinished dependencies — sleep and retry on the following schedule:
-
-**2 min → 5 min → 10 min → 20 min → 60 min**, then stay at 60 min indefinitely until a task becomes claimable.
-
-Reset the backoff to 2 min after successfully claiming any task. Do not exit the loop and do not report the wave as done based on a single empty scan — other agents may be mid-task and their completions will unblock more work. Dependency unblocks, newly filed non-anchor tasks, and stale-lock breaks all change what's claimable between scans.
-Do not claim a task tagged for the other pool just because your pool is empty.
-
-## Task Claiming Protocol
-
-Use `python3 scripts/task_tool.py claim-next --wave "$TASK_WAVE" --difficulty "$TASK_DIFFICULTY_POOL" --agent-id "$AGENT_ID"` instead of hand-rolling the claim steps. The script:
-
-1. Syncs `main`
-2. Parses `TASKS.md`
-3. Filters to your assigned wave and difficulty pool
-4. Verifies dependency completion from `tasks/completed/`
-5. Detects and breaks stale locks when the AGENTS.md stale-lock rules say it is safe
-6. Writes `tasks/active/TASK-NNN.lock`, commits it, pushes it to `origin/main`, and checks out `task/TASK-NNN`
-
-If the script loses a push race, it resets the temporary claim commit, restores `tasks/`, pulls `main`, and retries internally. Agents should treat the script as the source of truth for whether a task was actually claimed.
+Do not claim another task. Do not start a loop. When you finish, the wrapper will launch a fresh session for the next task.
 
 ## Completion Protocol
 
 When the task's final checkpoint is merged to main:
 
-1. Update the lock file to a done marker:
+1. Move the lock file to a done marker:
    ```bash
    git mv tasks/active/TASK-NNN.lock tasks/completed/TASK-NNN.done
    ```
@@ -80,16 +38,7 @@ When the task's final checkpoint is merged to main:
    ```
 3. `git commit -m "TASK-NNN: completed" && git push origin main`
 
-## Stale Lock Detection
-
-`scripts/task_tool.py claim-next` performs stale-lock detection before claiming a task. If you need to reason about the output or debug the script, the stale-lock rule is:
-
-A lock is stale if ALL of the following are true:
-- `claimed_at` is older than `STALE_LOCK_TIMEOUT_MINUTES`
-- The task branch (`origin/task/TASK-NNN`) either doesn't exist or has no commits in the last `STALE_LOCK_TIMEOUT_MINUTES`
-- No commits on `origin/main` reference the task ID in the last `STALE_LOCK_TIMEOUT_MINUTES`
-
-To break a stale lock: remove the lock file, commit, and push. The atomic push protocol applies — if two agents race to break the same lock, only one succeeds.
+A task is not done until the `.done` marker is on `origin/main`.
 
 ## Checkpoint Discipline
 
@@ -133,7 +82,7 @@ git checkout task/TASK-NNN
 
 ## Git Conventions
 
-- **Branch naming:** `task/TASK-NNN`
+- **Branch naming:** `task/TASK-NNN` (already checked out for you)
 - **Commit messages:** `TASK-NNN: <description>`
   ```
   TASK-042: Add hash aggregate operator stub and module registration
@@ -144,7 +93,7 @@ git checkout task/TASK-NNN
 
 ## Behavioral Requirements
 
-1. **Flag design decisions for human review.** When a task involves a significant design choice (new abstraction, interface change, performance tradeoff), document the decision and alternatives in the relevant `docs/design/` file and prefix your message with `[NEEDS INPUT]` to alert the human.
+1. **Flag design decisions for human review.** When a task involves a significant design choice (new abstraction, interface change, performance tradeoff), document the decision and alternatives in the relevant `docs/design/` file and ask a human before committing — see *When to Ask for Human Input*.
 
 2. **Document decisions before committing.** Every non-trivial decision must be captured in documentation — design docs, code comments, or CLAUDE.md updates. Update docs in the same checkpoint as the code change, not as a follow-up.
 
@@ -166,15 +115,25 @@ git checkout task/TASK-NNN
 
 ## When to Ask for Human Input
 
-End your turn with **[NEEDS INPUT]** (see *Ending Your Turn*) so the wrapper pauses and the human can reply in the resumed session:
+When you need a human decision you cannot resolve alone, end your turn with a message whose last line begins with `[NEEDS INPUT]` followed by your question on its own line. For example:
+
+```
+I've drafted two approaches for the aggregate spill strategy in TASK-412 but
+I want confirmation before committing to one.
+
+[NEEDS INPUT] Should spilled aggregate partitions be written into the segment
+directory tree alongside data segments, or into a sibling `spill/` tree? The
+tradeoffs are documented in docs/design/TASK-412.md.
+```
+
+A human will reply with one line on the cmux tab, and your next turn will resume with that reply as the user message. Keep questions specific and scoped — a one-line reply may not be enough context for an open-ended question.
+
+Good reasons to use `[NEEDS INPUT]`:
 
 - Architecture or design decisions with multiple valid approaches
 - Ambiguous acceptance criteria in a task definition
-- `task_tool.py` returns `status: "missing_difficulty"` — your pool has drained and the only remaining wave work is untagged, so a human must decide the pool routing before anyone can proceed
 - Merge conflicts you cannot resolve cleanly
 - Any situation where proceeding could waste significant work if the wrong path is chosen
-
-Include the question itself in the same message as the marker. The wrapper will resume the same session with `claude --continue` so the human sees the full context.
 
 ## Rate Limits
 

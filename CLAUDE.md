@@ -66,4 +66,4 @@ See [TASKS.md](TASKS.md) for the development roadmap and task assignments.
 
 ## Agent Coordination
 
-See [AGENTS.md](AGENTS.md) for the autonomous agent operating protocol (task claiming, checkpoints, git workflow).
+See [AGENTS.md](AGENTS.md) for the autonomous agent operating protocol (single-task execution, checkpoint discipline, git workflow). Fleet infrastructure and architecture details live in [scripts/agents/README.md](scripts/agents/README.md).

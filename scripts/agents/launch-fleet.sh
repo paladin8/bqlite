@@ -60,9 +60,10 @@ for i in $(seq 1 "$N"); do
       mkdir -p /root/.claude
       find /home/vscode/.claude-host -mindepth 1 -maxdepth 1 ! -name plugins -exec cp -r {} /root/.claude/ \; 2>/dev/null || true
 
-      # Merge bypass-permissions + cmux notification + agent-loop stop hook
-      # into settings.json (preserves host config if present)
-      PATCH='{\"skipDangerousModePermissionPrompt\":true,\"permissions\":{\"defaultMode\":\"bypassPermissions\"},\"hooks\":{\"Notification\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"/root/.claude/hooks/cmux-notify.sh\"}]}],\"Stop\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"/root/.claude/hooks/stop-agent-loop.sh\"}]}]}}'
+      # Merge bypass-permissions + cmux notification hook into settings.json
+      # (preserves host config if present). The Python agent_wrapper.py owns
+      # the fleet loop, so there is no Stop hook.
+      PATCH='{\"skipDangerousModePermissionPrompt\":true,\"permissions\":{\"defaultMode\":\"bypassPermissions\"},\"hooks\":{\"Notification\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"/root/.claude/hooks/cmux-notify.sh\"}]}]}}'
       if [ -f /root/.claude/settings.json ]; then
         jq --argjson patch \"\$PATCH\" '. + \$patch' /root/.claude/settings.json > /tmp/settings.json && mv /tmp/settings.json /root/.claude/settings.json
       else
@@ -109,8 +110,7 @@ for i in $(seq 1 "$N"); do
       git config user.name \"Jeffrey Wang\" &&
       git config user.email \"jeffreyw314159@gmail.com\" &&
       mkdir -p /root/.claude/hooks &&
-      install -m 755 /workspace/scripts/cmux-notify.sh /root/.claude/hooks/cmux-notify.sh &&
-      install -m 755 /workspace/scripts/stop-agent-loop.sh /root/.claude/hooks/stop-agent-loop.sh &&
+      install -m 755 /workspace/scripts/agents/cmux-notify.sh /root/.claude/hooks/cmux-notify.sh &&
       echo \"Container bqlite-agent-$i ready\" &&
       exec tail -f /dev/null
     "
@@ -119,4 +119,4 @@ for i in $(seq 1 "$N"); do
 done
 
 echo ""
-echo "Fleet ready. Run: scripts/attach-fleet.sh"
+echo "Fleet ready. Run: scripts/agents/attach-fleet.sh"
