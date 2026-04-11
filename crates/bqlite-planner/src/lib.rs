@@ -51,65 +51,13 @@
 //! ```
 
 use bqlite_ast::{Pipeline, Statement};
-use bqlite_core::{BqliteError, Catalog, OperatorSchema, Result, TableSchema};
+use bqlite_core::{BqliteError, Catalog, OperatorSchema, Result};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Logical plan
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A bqlite logical plan node.
-///
-/// Wave 1 exposes a single variant — [`LogicalPlan::Scan`] — because
-/// the parser only accepts a bare table reference. Wave 2's TASK-224
-/// grows this enum with `Filter`, `Project`, `Limit`, `CreateTable`,
-/// `Insert`, and `Explain` once their productions land in the parser
-/// and the expression compiler (TASK-225) is available.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogicalPlan {
-    /// Read every row from a catalog-resolved table.
-    ///
-    /// The [`TableSchema`] is the authoritative catalog entry, and the
-    /// [`OperatorSchema`] is the cached per-node output contract
-    /// required by `docs/design/planner-pipeline.md` §4.5: *every
-    /// `LogicalPlan` node exposes an `output_schema()` method; the
-    /// schema is computed once at construction time and cached on the
-    /// node itself*.
-    Scan {
-        /// The resolved catalog entry for the scanned table.
-        table: TableSchema,
-        /// Cached operator-output schema — a scan exposes the table's
-        /// declared columns plus the `__seq_id` / `__batch_id` system
-        /// columns, as produced by [`OperatorSchema::from_table`].
-        output_schema: OperatorSchema,
-    },
-}
-
-impl LogicalPlan {
-    /// Build a Wave 1 `Scan` node from a resolved [`TableSchema`].
-    ///
-    /// The output schema is materialized once here; later waves that
-    /// introduce projection pruning will update this in the same
-    /// location rather than recompute it on every traversal.
-    pub fn scan(table: TableSchema) -> Self {
-        let output_schema = OperatorSchema::from_table(&table);
-        LogicalPlan::Scan {
-            table,
-            output_schema,
-        }
-    }
-
-    /// The output schema of this logical node.
-    ///
-    /// Returning a reference is deliberate — callers of the optimizer
-    /// do repeated schema lookups during demand propagation
-    /// (`docs/design/planner-pipeline.md` §6.6) and cannot afford to
-    /// rebuild the schema per visit.
-    pub fn output_schema(&self) -> &OperatorSchema {
-        match self {
-            LogicalPlan::Scan { output_schema, .. } => output_schema,
-        }
-    }
-}
+pub mod logical;
+pub use logical::{
+    lower_statement, IngestFormat, InsertFromDescriptor, InsertLogicalBody, LogicalPlan,
+    ProjectItem,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Physical plan
@@ -234,16 +182,32 @@ fn plan_query_pipeline(pipeline: Pipeline, catalog: &dyn Catalog) -> Result<Logi
     Ok(LogicalPlan::scan(table_schema))
 }
 
-/// Logical → physical: one-to-one lowering. No optimizer passes.
+/// Logical → physical: one-to-one lowering for the Wave 1 subset.
+///
+/// Only [`LogicalPlan::Scan`] has a physical descriptor in this
+/// crate today. The full Wave 2 logical → physical lowering for
+/// Filter / Project / Limit / DDL / DML lands in TASK-226; until
+/// that task ships, `plan_query_pipeline` gates the pipelines it
+/// produces so this function only ever sees a `Scan` node.
 fn lower(logical: LogicalPlan) -> PhysicalPlan {
     match logical {
         LogicalPlan::Scan {
             table,
             output_schema,
+            ..
         } => PhysicalPlan::Scan(ScanPhysical {
             table: table.name().to_string(),
             output_schema,
         }),
+        // The Wave 1 gating in `plan_query_pipeline` (no stages, no
+        // joins, no time range) plus `build_logical`'s statement-
+        // level rejections mean every other logical variant is
+        // unreachable here. TASK-226 replaces this `lower` with a
+        // full logical → physical pass.
+        _ => unreachable!(
+            "Wave 1 `lower()` only sees Scan nodes — richer \
+             variants land in TASK-226"
+        ),
     }
 }
 
