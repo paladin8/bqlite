@@ -310,12 +310,14 @@ Unlocks: TASK-115 planner stub (needs `Catalog` to resolve `events`), TASK-118 e
 
 ## Wave 2: Scan & Filter MVP
 
-**Goal.** Real queries return real data over user-declared schemas. Segment format v1 with the full v1 encoding set, CSV ingest with column remapping, CREATE TABLE / INSERT / EXPLAIN, scan + filter + select + limit operators, predicate pushdown, projection pruning, zone-map-based row-group skipping.
+**Goal.** Real queries return real data over user-declared schemas. Segment format v1 with the full v1 encoding set, CSV ingest with column remapping, schema DDL (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE ADD COLUMN`, `DESCRIBE`), `INSERT` (both `VALUES` and `FROM`), `EXPLAIN`, explicit `bqlite init` / split `Database::open` and `Database::create`, retirement of the Wave 1 bootstrap `events` table, scan + filter + select + limit operators, predicate pushdown, projection pruning, zone-map-based row-group skipping, startup reconciliation of orphaned segment files.
 
-**Size.** ~37 tasks.
+**Scope exclusions.** `DELETE` is deferred to Wave 4 alongside tombstones (TASK-404, TASK-410 territory) — the AST already models it, but without the tombstone format on disk there is nothing for the planner to lower it onto. Wave 2 parsers and planners therefore do not handle `DELETE`.
+
+**Size.** ~42 tasks.
 **Parallelism.** 10-14 agents at peak.
 
-**Acceptance.** The following script runs end-to-end against a freshly created database and returns the expected rows:
+**Acceptance.** The following script runs end-to-end against a database created via `bqlite init /path/to/db` and returns the expected rows. Surface keywords match the grammar in query-language.md §26: `WHERE` for row filtering, `INSERT ... VALUES` for literal tuples, `WITH (k: v, ...)` option lists using `:` as the key/value separator.
 
 ```bql
 CREATE TABLE purchases (
@@ -326,19 +328,29 @@ CREATE TABLE purchases (
   country STRING
 );
 
+-- Small literal insert for REPL-style tests
+INSERT INTO purchases VALUES
+    ('u1', '2026-03-01T10:00:00Z', 'view',     12.50, 'US'),
+    ('u1', '2026-03-01T10:05:00Z', 'checkout', 120.00, 'US');
+
+-- Bulk load from file with column remapping
 INSERT INTO purchases
 FROM 'data.csv'
-WITH (format='csv', map=(uid AS user_id, time AS ts, evt AS event));
+WITH (format: 'csv', map: (uid AS user_id, time AS ts, evt AS event));
 
 purchases
-| filter event = 'checkout' AND amount > 100
+| where event = 'checkout' AND amount > 100
 | select user_id, ts, amount
 | limit 100;
 
-EXPLAIN purchases | filter event = 'checkout' | select user_id;
+EXPLAIN purchases | where event = 'checkout' | select user_id;
+
+DESCRIBE purchases;
+ALTER TABLE purchases ADD COLUMN referrer STRING;
+DROP TABLE purchases;
 ```
 
-Source columns not named in the `map` clause pass through if their name matches a table column; otherwise INSERT errors. The CLI auto-injects `LIMIT 1000` when a query has no explicit limit and prints a truncation footer; `--no-limit` and `--limit N` override.
+Source columns not named in the `map` clause pass through if their name matches a table column; otherwise INSERT errors. The CLI auto-injects `LIMIT 1000` when a query has no explicit limit and prints a truncation footer; `--no-limit` and `--limit N` override. A `bqlite query` call against a directory that does not yet contain a manifest returns a typed error pointing at `bqlite init`, not an implicit fresh database.
 
 **Performance gate** (blocks wave acceptance; verified by TASK-236 on the reference dataset):
 
@@ -355,7 +367,7 @@ Source columns not named in the `map` clause pass through if their name matches 
 | Compression ratio (segment bytes / raw CSV bytes) | **≤ 10%** |
 | Zone-map pruning effectiveness on the acceptance query | ≥ 80% of row-groups skipped |
 
-Regression gate triggers if any bench slips >10% vs. the previous green main.
+Regression gate triggers if any bench slips >10% vs. the previous green main. The bench suite itself is TASK-236; the CI job, baseline capture, and comparison machinery that enforce the gate are TASK-241.
 
 Wave 2 is where the real interfaces get decided, so design anchors are front-loaded. After the anchors land, the encoding and storage tasks form the longest parallelism vein — the 6 encoding tasks plus the writer/reader/zone-map/manifest tasks give 10+ agents work the moment the trait lands. Rule 5 applies: Wave 2 does not begin until every Wave 1 task is complete.
 
@@ -372,12 +384,12 @@ Wave 2 is where the real interfaces get decided, so design anchors are front-loa
 ### TASK-203: [DESIGN] Parser grammar framework
 **Output**: docs/design/language/grammar-framework.md
 **Depends on**: TASK-114
-**Description**: Decides hand-rolled vs parser generator (chumsky/pest/lalrpop/nom), error-recovery strategy (Wave 0 language doc pins "halt on first error" — design must confirm), span tracking for diagnostics, how new productions are added, and the surface for the CSV-remap `WITH (format=..., map=(src AS dst, ...))` clause. Unblocks every post-stub parser task across Waves 2-4.
+**Description**: Decides hand-rolled vs parser generator (chumsky/pest/lalrpop/nom), error-recovery strategy (Wave 0 language doc pins "halt on first error" — design must confirm), span tracking for diagnostics, how new productions are added, and the surface for the colon-separated WITH option list `WITH (format: 'csv', map: (src AS dst, ...))` whose AST shape is fixed by TASK-237. Unblocks every post-stub parser task across Waves 2-4.
 
 ### TASK-204: [DESIGN] Logical plan node catalog (Wave 2 subset + forward map)
 **Output**: docs/design/planner/logical-plan-nodes.md
 **Depends on**: TASK-115
-**Description**: Comprehensive enumeration of logical plan nodes expected across the project (Scan, Filter, Project, Limit, CreateTable, Insert, Explain at Wave 2 depth; Match/Funnel/Aggregate/Sessionize/Retention/Sort/Distinct/Cohort stubbed for later waves). For each: input/output schemas, which AST constructs lower to them, the rewrite rules that apply. Wave 2 implements the subset marked "Wave 2 depth"; the rest are documented so the catalog doesn't churn across waves.
+**Description**: Comprehensive enumeration of logical plan nodes expected across the project (Scan, Filter, Project, Limit, CreateTable, DropTable, AlterTableAddColumn, Describe, Insert, Explain at Wave 2 depth; Match/Funnel/Aggregate/Sessionize/Retention/Sort/Distinct/Cohort/Delete stubbed for later waves — Delete pairs with Wave 4's tombstone work). For each: input/output schemas, which AST constructs lower to them, the rewrite rules that apply. Wave 2 implements the subset marked "Wave 2 depth"; the rest are documented so the catalog doesn't churn across waves.
 
 ### TASK-205: [DESIGN] Expression compilation model
 **Output**: docs/design/planner/expression-compilation.md
@@ -459,25 +471,33 @@ Wave 2 is where the real interfaces get decided, so design anchors are front-loa
 **Depends on**: TASK-203
 **Description**: Instantiates the framework chosen in TASK-203, replaces the Wave 1 one-identifier stub, and lands the expression grammar: literals (int, float, string, bool, timestamp, duration), identifiers, property access (`table.col`), unary/binary arithmetic, comparisons, `AND`/`OR`/`NOT`, parentheses, `IS NULL` / `IS NOT NULL`. Rich span tracking for diagnostics. Halt-on-first-error per language-doc §policy. Unit tests cover every operator precedence edge.
 
-### TASK-221: [IMPL] CREATE TABLE + EXPLAIN productions
+### TASK-221: [IMPL] Schema DDL + EXPLAIN productions
 **Output**: crates/bqlite-parser/src/ddl.rs
 **Depends on**: TASK-220
-**Description**: `CREATE TABLE <name> (<col> <type> [role], ...);` where `role` ∈ `ENTITY KEY | EVENT TIME | EVENT TYPE` plus nullability. Validates that exactly one column is annotated with each role (or defers validation to the planner). `EXPLAIN <statement>` as a parser-level wrapper producing an `Explain(Box<Statement>)` AST node. Parser tests only — plan-time semantic validation is TASK-226 / TASK-232.
+**Description**: All four schema-DDL parser productions plus EXPLAIN, matching the AST shapes already in `crates/bqlite-ast/src/statement.rs`:
+
+- `CREATE TABLE <name> (<col> <type> [role] [NOT NULL] [DEFAULT <lit>], ...);` where `role` ∈ `ENTITY KEY | EVENT TIME | EVENT TYPE`. Multi-role-per-column validation is deferred to the planner.
+- `DROP TABLE <name>;` — no `IF EXISTS` modifier per query-language.md §20.4.
+- `ALTER TABLE <name> ADD COLUMN <col> <type> [NOT NULL] [DEFAULT <lit>];` — only `ADD COLUMN` in v1, lowering to the existing `AlterAction::AddColumn` AST variant.
+- `DESCRIBE <name>;` — emits the catalog schema for a table (output columns documented in query-language.md §20.5).
+- `EXPLAIN <pipeline>` — parser-level wrapper producing an `Explain(Pipeline)` AST node. Pipelines only; DDL/DML are not EXPLAIN-able in v1, matching `Statement::Explain(Pipeline)` in the AST.
+
+Parser tests only — plan-time semantic validation is TASK-226 / TASK-232. `DELETE` is intentionally out of scope (deferred to Wave 4 with tombstones).
 
 ### TASK-222: [IMPL] INSERT FROM production with column remapping
 **Output**: crates/bqlite-parser/src/dml.rs
-**Depends on**: TASK-220
-**Description**: `INSERT INTO <table> FROM <path-literal> WITH (<option>, ...)` where options include `format=<ident>` and `map=(<src> AS <dst>, ...)`. Unmapped source columns default to passthrough when the source name matches a table column. Parser tests for the happy paths and the obvious mistakes (trailing commas, duplicate source names, missing WITH, unknown format). Plan-time validation of the actual mapping against the target table schema is TASK-226.
+**Depends on**: TASK-220, TASK-237
+**Description**: `INSERT INTO <table> FROM <path-literal> WITH (<key>: <value>, ...);` matching the option syntax fixed in query-language.md §20.1 (colon-separated key/value pairs, not `=`). Recognized option keys include `format: 'csv' | 'jsonl' | 'parquet'`, `delimiter: <string>`, `header: <bool>`, and `map: (<src> AS <dst>, ...)`. The `map` clause uses the structured `(src AS dst, ...)` AST shape introduced by TASK-237 — without that prerequisite the AST cannot represent the mapping and this task will not compile. Unmapped source columns default to passthrough when the source name matches a table column. Parser tests for the happy paths and the obvious mistakes (trailing commas, duplicate source names, missing WITH, unknown format, malformed `map` entry). Plan-time validation of the actual mapping against the target table schema is TASK-226.
 
-### TASK-223: [IMPL] Pipeline + filter/select/limit productions
+### TASK-223: [IMPL] Pipeline + where/select/limit productions
 **Output**: crates/bqlite-parser/src/pipeline.rs
 **Depends on**: TASK-220
-**Description**: The `|` pipeline operator and the Wave 2 verbs: `filter <expr>`, `select <col-or-expr-with-alias>, ...`, `limit <int>`. A pipeline starts with a table reference (identifier) and chains verbs. Parser tests cover associativity, nested expressions in filter, multi-column select with `expr AS alias`, and edge cases (empty pipeline, limit without argument).
+**Description**: The `|` pipeline operator and the Wave 2 verbs, matching the BQL grammar in query-language.md §26: `where <expr>`, `select <col-or-expr-with-alias>, ...`, `limit <int>`. Keywords are case-insensitive (§29 line 1916). The AST stages these into `PipelineStage::{Where, Select, Limit}` per `crates/bqlite-ast/src/operator.rs`. A pipeline starts with a table reference (identifier) and chains verbs. Parser tests cover associativity, nested expressions in WHERE, multi-column select with `expr AS alias`, and edge cases (empty pipeline, limit without argument).
 
 ### TASK-224: [IMPL] Logical plan enum + AST → logical lowering
 **Output**: crates/bqlite-planner/src/logical.rs
 **Depends on**: TASK-204
-**Description**: Concrete `LogicalPlan` enum for Wave 2 scope: `Scan`, `Filter`, `Project`, `Limit`, `CreateTable`, `Insert`, `Explain`. Each node carries its `OperatorSchema` computed at construction time (planner-pipeline.md §5). Lowering walks an AST statement and produces the root `LogicalPlan`, resolving table names via the catalog. Schema validation happens at construction, not as a separate pass.
+**Description**: Concrete `LogicalPlan` enum for Wave 2 scope: `Scan`, `Filter`, `Project`, `Limit`, `CreateTable`, `DropTable`, `AlterTableAddColumn`, `Describe`, `Insert`, `Explain`. Each node carries its `OperatorSchema` computed at construction time (planner-pipeline.md §5) — for DDL nodes that produce no rows, the schema is an empty or single-status-column shape per query-language.md §20.4-§20.5. Lowering walks an AST statement and produces the root `LogicalPlan`, resolving table names via the catalog (and reporting `unknown table` for missing references). `Insert` lowering handles both `InsertBody::Values` and `InsertBody::From`. Schema validation happens at construction, not as a separate pass.
 
 ### TASK-225: [IMPL] Expression compilation (TypedExpr + CompiledExpr)
 **Output**: crates/bqlite-planner/src/expr.rs
@@ -487,7 +507,7 @@ Wave 2 is where the real interfaces get decided, so design anchors are front-loa
 ### TASK-226: [IMPL] Physical plan descriptors + logical → physical lowering
 **Output**: crates/bqlite-planner/src/physical.rs
 **Depends on**: TASK-224, TASK-225
-**Description**: Plain-data physical descriptors per planner-pipeline.md §15: `ScanPhysical`, `FilterPhysical`, `ProjectPhysical`, `LimitPhysical`, `CreateTablePhysical`, `InsertPhysical`, `ExplainPhysical`. No trait objects — descriptors are `Clone + Serialize`. Lowering converts each `LogicalPlan` node to its physical counterpart, invoking the expression compiler (TASK-225) to produce the `CompiledExpr` values the descriptors carry. DDL/DML nodes get simple one-to-one lowerings; real execution logic lives in the engine.
+**Description**: Plain-data physical descriptors per planner-pipeline.md §15: `ScanPhysical`, `FilterPhysical`, `ProjectPhysical`, `LimitPhysical`, `CreateTablePhysical`, `DropTablePhysical`, `AlterTableAddColumnPhysical`, `DescribePhysical`, `InsertPhysical`, `ExplainPhysical`. No trait objects — descriptors are `Clone + Serialize`. Lowering converts each `LogicalPlan` node to its physical counterpart, invoking the expression compiler (TASK-225) to produce the `CompiledExpr` values the descriptors carry. DDL/DML nodes get simple one-to-one lowerings; real execution logic lives in the engine.
 
 ### TASK-227: [IMPL] Predicate pushdown optimizer pass
 **Output**: crates/bqlite-planner/src/opt/pushdown.rs
@@ -517,12 +537,20 @@ Wave 2 is where the real interfaces get decided, so design anchors are front-loa
 ### TASK-232: [IMPL] Engine bind step extension + DDL execution path
 **Output**: crates/bqlite-engine/src/{bind,ddl}.rs
 **Depends on**: TASK-217, TASK-226, TASK-230, TASK-231
-**Description**: Extends TASK-118's bind step to materialize `Box<dyn PhysicalOperator>` from every Wave 2 physical descriptor. For data-plane nodes (`ScanPhysical`, `FilterPhysical`, `ProjectPhysical`, `LimitPhysical`), bind returns an operator tree. For DDL (`CreateTablePhysical`), bind instead invokes an execution closure that validates the schema, checks for name collision, and atomically registers the new table in the manifest via TASK-217. For `ExplainPhysical`, bind returns a closure that formats the captured `ExplainNode` tree as a single-column result batch. Unit tests for every descriptor variant.
+**Description**: Extends TASK-118's bind step to materialize `Box<dyn PhysicalOperator>` from every Wave 2 physical descriptor. For data-plane nodes (`ScanPhysical`, `FilterPhysical`, `ProjectPhysical`, `LimitPhysical`), bind returns an operator tree. DDL nodes invoke execution closures that operate directly on the manifest via TASK-217's atomic update API:
+
+- `CreateTablePhysical` — validates the schema, errors on name collision, atomically registers the new table.
+- `DropTablePhysical` — errors on missing table, atomically removes the table entry. Wave 2 also drops the table's segments from the manifest inventory; on-disk segment files are reaped by TASK-239's startup orphan-cleanup pass on the next open.
+- `AlterTableAddColumnPhysical` — errors on missing table or duplicate column name, appends the new `ColumnDef` to the schema, bumps `schema_version`, and atomically writes the manifest. The new column reads as NULL (or DEFAULT if specified) for all existing rows; no segment rewrite is needed because reads project by column name against the per-segment schema snapshot.
+- `DescribePhysical` — looks up the table, formats its column metadata as the four-column result (`name`, `type`, `nullable`, `role`) per query-language.md §20.5, returns it as a single result batch.
+- `ExplainPhysical` — formats the captured `ExplainNode` tree as a single-column result batch.
+
+Unit tests for every descriptor variant including the error paths (missing table on DROP/ALTER/DESCRIBE, duplicate column on ALTER, name collision on CREATE).
 
 ### TASK-233: [IMPL] Engine INSERT execution + CSV reader integration
 **Output**: crates/bqlite-engine/src/ingest.rs, crates/bqlite-storage/src/ingest/csv.rs
 **Depends on**: TASK-214, TASK-218, TASK-222, TASK-232
-**Description**: When the engine binds an `InsertPhysical`, it opens the source file, constructs a streaming CSV reader (format-dispatched via `WITH (format=...)`), applies the `map` clause to rename source columns, converts rows to `PropertyValue` per the target schema, and feeds the stream through the partitioner (TASK-218) into the writer (TASK-214). Source columns not in the map default to passthrough if their name matches a target column; extra source columns error. Missing required columns error. Type mismatches error with row numbers. CSV reader handles quoting, escaping, multi-line fields, and common delimiter variations.
+**Description**: When the engine binds an `InsertPhysical` carrying an `InsertBody::From`, it opens the source file, constructs a streaming CSV reader (format-dispatched via the `format` key in the `WITH (...)` option list), applies the structured `map` clause from the AST shape introduced by TASK-237 to rename source columns, converts rows to `PropertyValue` per the target schema, and feeds the stream through the partitioner (TASK-218) into the writer (TASK-214). Source columns not in the map default to passthrough if their name matches a target column; extra source columns error. Missing required columns error. Type mismatches error with row numbers. CSV reader handles quoting, escaping, multi-line fields, and common delimiter variations. The literal `InsertBody::Values` arm is handled separately by TASK-238, which feeds its own row stream through the same partitioner + writer pipeline.
 
 ### TASK-234: [IMPL] CLI `ingest` subcommand + result formatter with auto-limit
 **Output**: crates/bqlite-cli/src/{ingest,format}.rs
@@ -533,8 +561,8 @@ Wave 2 is where the real interfaces get decided, so design anchors are front-loa
 
 ### TASK-235: [IMPL] Wave 2 acceptance test + CSV fixture loader
 **Output**: tests/tests/wave2_acceptance.rs, tests/src/csv.rs (new module re-exported from `tests/src/lib.rs`)
-**Depends on**: TASK-234
-**Description**: CSV fixture loader extends the Wave 1 harness (TASK-120) — deterministic synthetic-data generator producing the `purchases` schema at parameterized scale. Integration test runs the full acceptance script (CREATE → INSERT → filter/select/limit query → EXPLAIN) at 1M-row scale against a fresh temp directory and asserts the exact result rows and the expected `ExplainNode` structure (pushed-down predicate, pruned columns). A 100M-row variant lives behind `#[ignore]` and runs in the bench job. Failure here is the Wave 2 acceptance-gate trip.
+**Depends on**: TASK-234, TASK-238, TASK-240
+**Description**: CSV fixture loader extends the Wave 1 harness (TASK-120) — deterministic synthetic-data generator producing the `purchases` schema at parameterized scale. Integration test runs the full acceptance script against a fresh temp directory: `Database::create` (or `bqlite init`), then `CREATE TABLE`, then `INSERT ... VALUES` (small literal batch), then `INSERT ... FROM` the synthetic CSV at 1M-row scale, then the `where`/`select`/`limit` pipeline query, then `EXPLAIN`, then `DESCRIBE`, `ALTER TABLE ADD COLUMN`, and `DROP TABLE`. Asserts exact result rows for the data-plane query and the expected `ExplainNode` structure (pushed-down predicate, pruned columns); for DDL paths, asserts the post-state of the manifest. A 100M-row variant lives behind `#[ignore]` and runs in the bench job. Failure here is the Wave 2 acceptance-gate trip.
 
 ### TASK-236: [IMPL] Wave 2 benchmark suite
 **Output**: benches/wave2/{scan,encoding,ingest,acceptance}.rs
@@ -545,11 +573,68 @@ Wave 2 is where the real interfaces get decided, so design anchors are front-loa
 - `ingest` — CSV ingest throughput end-to-end on the reference dataset.
 - `acceptance` — the full 100M-row acceptance query.
 
-Each bench asserts its target from the Wave 2 performance gate table as a hard ceiling. Regression CI compares against the previous green main and trips if any metric slips >10%. CI gate uses the 1.5× relaxed targets on GitHub Actions hardware; local reference targets are verified on the pinned reference machine before the wave is declared complete.
+Each bench asserts its target from the Wave 2 performance gate table as a hard ceiling at the bench level — a single run that misses the target fails the bench in `cargo test --all-targets` (the harness pattern from TASK-121). Local reference targets are verified on the pinned reference machine before the wave is declared complete. Continuous regression comparison against the previous green main is the responsibility of TASK-241, which wires the bench subset into a dedicated CI workflow with baseline persistence and the >10% slip gate.
+
+### TASK-237: [DESIGN][IMPL] INSERT FROM column-remapping language + AST extension
+**Output**: docs/design/query-language.md, crates/bqlite-ast/src/statement.rs
+**Depends on**: none
+**Description**: Merge-first AST + design-doc extension that unblocks TASK-222's parser work and TASK-233's CSV ingest path. Without this task the AST cannot represent the `map: (src AS dst, ...)` clause that the Wave 2 acceptance script and goal text both rely on.
+
+- **Language doc.** Extends query-language.md §20.1 with the `map` option for `INSERT ... FROM`: `WITH (format: 'csv', map: (uid AS user_id, time AS ts, evt AS event))`. Documents that unmapped source columns pass through by name match, that duplicate `dst` names error, and that the rule lives alongside the existing `format`/`delimiter`/`header` options.
+- **AST.** Replaces or extends the current `InsertOption { key: Name, value: Literal }` shape so the `map` clause is representable. Either (a) add a structured `map: Option<Vec<ColumnMapping>>` field on `InsertBody::From` alongside the existing flat option list, or (b) introduce an `InsertOptionValue` enum that admits both literal values and a column-mapping list. Decision recorded in this task's design note section so TASK-222 can implement against the chosen shape. Add round-trip serde tests for the new shape.
+- **No parser work.** TASK-222 still owns parsing.
+
+This is merge-first because every dependent task assumes the AST shape exists. It is intentionally pre-numbered (anchor-style) so an agent can claim it before the rest of Wave 2 starts.
+
+### TASK-238: [IMPL] INSERT VALUES end-to-end
+**Output**: crates/bqlite-parser/src/dml.rs, crates/bqlite-planner/src/{logical,physical}.rs (additions), crates/bqlite-engine/src/ingest.rs (additions)
+**Depends on**: TASK-220, TASK-224, TASK-226, TASK-232, TASK-233
+**Description**: Implements the literal-tuple form of INSERT, which the AST already models as `InsertBody::Values(Vec<Vec<Literal>>)` and which query-language.md §20.1 documents alongside `INSERT ... FROM`. Without this task the Wave 2 goal "CREATE TABLE / INSERT / EXPLAIN" only ships half of INSERT.
+
+- **Parser.** Adds the `INSERT INTO <table> VALUES (lit, lit, ...), (lit, lit, ...);` production to TASK-222's `dml.rs`. Positional only, no column list, literals only — matches the AST's `Vec<Vec<Literal>>` shape and the §20.1 v1 restriction.
+- **Planner.** `Insert` logical/physical lowering grows a `Values` arm carrying the literal tuples directly (no `CompiledExpr`, since literals don't need compilation).
+- **Engine.** When binding an `InsertPhysical { body: Values(rows) }`, the engine validates each row against the target table's `TableSchema` (arity, type coercion to `PropertyValue`, NOT NULL, role-column population), assigns a fresh `batch_id`, and feeds the rows through the same partitioner + writer pipeline TASK-233 uses for CSV. Type mismatches and NOT NULL violations error with the offending row index.
+- **Tests.** Round-trip test: `CREATE TABLE` → `INSERT VALUES` → scan the table back, assert the rows. Error tests cover wrong arity, wrong type, NULL into NOT NULL, and rejected literal kinds.
+
+### TASK-239: [IMPL] Startup orphan segment + manifest reconciliation
+**Output**: crates/bqlite-storage/src/database.rs (cleanup pass), crates/bqlite-storage/src/segment/cleanup.rs (new)
+**Depends on**: TASK-214, TASK-217
+**Description**: Implements the crash-safety contract from `docs/reliability.md` §Crash Safety and `docs/design/storage-format.md` §7.4. Today `Database::open_or_create` only sweeps `manifest.json.tmp`; once Wave 2 starts writing real segment files via TASK-213/214, every startup must reconcile on-disk segment state against the manifest:
+
+- **Sweep `.tmp` segment files.** Walk every `(window, shard)` directory under the database root. Any file ending in `.tmp` is a partially-written segment from a crash mid-ingest or mid-compaction and is unconditionally deleted.
+- **Sweep manifest-orphaned segments.** Build the set of segment file names referenced by the manifest's segment inventory. Any non-`.tmp` segment file in a `(window, shard)` directory that is not in the active set is an orphan from a deferred compaction delete and is removed. Files that *are* in the active set are left untouched.
+- **Idempotent and safe.** The pass is read-only with respect to the manifest — it only deletes files, never edits the manifest. Re-running the pass on a clean database is a no-op.
+- **Tests.** Crashed-ingest scenario (orphan `.tmp`), crashed-compaction scenario (orphan output `.tmp` and orphan input segment), happy-path open with no orphans (no deletions, manifest unchanged), and a regression test that an active segment listed in the manifest is *never* deleted even if its file looks unusual.
+
+Without this task, the storage layer leaks disk space across crashes and the reliability doc describes behavior the code does not implement.
+
+### TASK-240: [IMPL] Database open/create split + `bqlite init` + bootstrap retirement
+**Output**: crates/bqlite-storage/src/database.rs, crates/bqlite-cli/src/main.rs, tests/smoke.rs
+**Depends on**: TASK-232
+**Description**: Aligns runtime behavior with query-language.md §29 line 1911 ("Database init | CLI-only (`bqlite init`)") and retires the Wave 1 bootstrap `events` table now that real `CREATE TABLE` exists end-to-end (TASK-221 + TASK-224 + TASK-226 + TASK-232).
+
+- **API split.** `Database::open_or_create` is removed. Replaced by:
+  - `Database::create(path) -> Result<Database>` — initializes a fresh database directory, manifest, and `.lock`. Errors with `BqliteError::Execution` if the directory already contains a manifest. Implicitly opens the database it just created (callers don't need a follow-up `open` call).
+  - `Database::open(path) -> Result<Database>` — opens an existing database. Errors if the directory has no manifest, with a clear message pointing the user at `bqlite init`.
+- **Bootstrap removal.** `Database::create` does not seed the `events` table. The `bootstrap_events_table: bool` field on `TableEntry` stays in the manifest schema for read-compatibility with Wave 1 databases (so a Wave 1 database opened by Wave 2 still works), but `Database::create` never sets it.
+- **CLI.** New `bqlite init <path> [--shards N]` subcommand that calls `Database::create`. The existing `bqlite query` subcommand calls `Database::open` and surfaces a typed "database not initialized; run `bqlite init`" error when the directory is missing or empty.
+- **Test updates.** The Wave 1 smoke test (`tests/smoke.rs`, originally landed by TASK-123) is rewritten to: create the database, `CREATE TABLE events (...)`, then run `bqlite query "events"`. The integration-test fixture helper from TASK-120 grows a `TempDb::create()` constructor matching the new API; existing `TempDb::open_or_create` callers migrate.
+- **Migration note.** A short paragraph in `docs/reliability.md` documents that manifests carrying `bootstrap_events_table: true` are read-compatible but no longer produced.
+
+### TASK-241: [IMPL] Wave 2 benchmark CI job + baseline + regression gate
+**Output**: .github/workflows/bench.yml, scripts/bench-compare.sh
+**Depends on**: TASK-236
+**Description**: Wires up the regression-gate machinery promised in the Wave 2 header. Without this task the perf gate is aspirational — TASK-236 only writes the benches.
+
+- **Workflow.** New `bench.yml` GitHub Actions workflow runs the Wave 2 bench subset (`benches/wave2/*`) on `ubuntu-latest` (4 vCPU) using the **1.5×-relaxed CI targets** from the Wave 2 perf-gate table.
+- **Baseline capture on main.** On every push to `main`, the workflow runs the bench subset and uploads the Criterion `estimates.json` outputs as a workflow artifact named `bench-baseline-main`. The most recent artifact is the canonical "previous green main" baseline.
+- **Comparison on PR.** On pull requests, the workflow runs the same bench subset, downloads the latest `bench-baseline-main` artifact, and runs `scripts/bench-compare.sh` to diff each metric. If any metric slips >10% on at least 3 consecutive Criterion samples (the consecutive-sample rule protects against single noisy runs on shared hardware), the job fails and the PR is blocked.
+- **Opt-out.** PRs labeled `bench-skip` and draft PRs bypass the gate — for docs-only changes and similar.
+- **Reference-hardware verification stays manual.** The pinned Apple M3 Pro numbers remain verified by hand before the wave is declared complete; the CI gate uses only the relaxed CI targets.
 
 ### TASK-299: [IMPL] Wave 2 quality audit
 **Output**: docs/quality-score.md
-**Depends on**: TASK-235, TASK-236
+**Depends on**: TASK-235, TASK-236, TASK-237, TASK-238, TASK-239, TASK-240, TASK-241
 **Description**: Same audit pattern as TASK-199, rescored after Wave 2. Wave 2 is the first wave with a real performance gate, so the Benchmarks dimension must reflect whether the Wave 2 perf-gate targets are met on reference hardware — not merely whether benches exist. bqlite-storage (segment format, encodings, ingest), bqlite-planner (pushdown, projection pruning, EXPLAIN), and bqlite-operators (scan/filter/project/limit) will see the biggest grade movements. Any crate slipping vs. its Wave 1 grade is flagged in the commit message. Below-C grades get follow-up tasks; Wave 3 does not start until those are filed.
 
 ---
