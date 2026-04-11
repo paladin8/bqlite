@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-1",
+  "task_id": "TASK-199",
+  "claimed_at": "2026-04-11T02:02:34Z",
+  "branch": "task/TASK-199",
+  "description": "Wave 1 quality audit — score every crate on Tests/API/Docs/Benchmarks with evidence from cargo test/bench and rustdoc, assign per-cell and overall A-F grades, file follow-ups for any below-C dimension"
+}
