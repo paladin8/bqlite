@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-3",
   "task_id": "TASK-115",
   "claimed_at": "2026-04-11T01:25:27Z",
+  "completed_at": "2026-04-11T01:34:15Z",
   "branch": "task/TASK-115",
   "description": "Planner stub: AST -> logical (Scan) -> plain-data physical descriptor (ScanPhysical) via plan(statement, catalog). Resolves table via catalog, no optimizer."
 }
