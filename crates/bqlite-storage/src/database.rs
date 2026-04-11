@@ -58,14 +58,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bqlite_core::error::{BqliteError, Result};
-use bqlite_core::schema::TableSchema;
+use bqlite_core::schema::{ColumnDef, TableSchema};
 use bqlite_core::storage::{
     ColumnProjection, Predicate, SegmentHandle, SegmentReader, SegmentScan,
 };
 use bqlite_core::time::TimeRange;
 
 use crate::catalog::ManifestCatalog;
-use crate::manifest::{Manifest, SegmentMeta, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION};
+use crate::manifest::{
+    Manifest, SegmentMeta, TableEntry, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION,
+};
 
 /// Name of the advisory lock file at the database root.
 pub const LOCK_FILE_NAME: &str = ".lock";
@@ -476,6 +478,108 @@ impl Database {
             entry.next_sequence_id = next_free;
             // `count >= 1`, so `next_free - 1 >= first` is safe.
             Ok((first, next_free - 1))
+        })
+    }
+
+    // ── DDL operations ────────────────────────────────────────────
+
+    /// Atomically register a new table in the manifest.
+    ///
+    /// Errors with `BqliteError::Execution` if a table with the same
+    /// name already exists. The new entry starts with zeroed counters,
+    /// no segments, and `bootstrap_events_table: false`.
+    pub fn create_table(&mut self, name: String, schema: TableSchema) -> Result<()> {
+        self.update_manifest(|m| {
+            if m.tables.contains_key(&name) {
+                return Err(BqliteError::Execution(format!(
+                    "create_table: table '{name}' already exists"
+                )));
+            }
+            m.tables.insert(
+                name.clone(),
+                TableEntry {
+                    schema,
+                    next_sequence_id: 0,
+                    next_batch_id: 0,
+                    next_segment_id: 0,
+                    bootstrap_events_table: false,
+                    windows: Vec::new(),
+                },
+            );
+            Ok(())
+        })
+    }
+
+    /// Atomically remove a table and all its segments from the
+    /// manifest.
+    ///
+    /// On-disk segment files are **not** reaped here — that is the
+    /// responsibility of the startup orphan-cleanup pass (TASK-239).
+    /// This method only removes the manifest entry.
+    ///
+    /// Errors with `BqliteError::Execution` if the table does not
+    /// exist.
+    pub fn drop_table(&mut self, name: &str) -> Result<()> {
+        self.update_manifest(|m| {
+            if m.tables.remove(name).is_none() {
+                return Err(BqliteError::Execution(format!(
+                    "drop_table: unknown table '{name}'"
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    /// Atomically append a column to an existing table's schema.
+    ///
+    /// Bumps the schema version by one. The new column reads as NULL
+    /// (or its default) for all existing rows — no segment rewrite is
+    /// needed because reads project by column name against the
+    /// per-segment schema snapshot.
+    ///
+    /// # Errors
+    ///
+    /// - `BqliteError::Execution` if the table does not exist.
+    /// - `BqliteError::Execution` if a column with the same name
+    ///   already exists on the table.
+    pub fn alter_table_add_column(&mut self, name: &str, column: ColumnDef) -> Result<()> {
+        self.update_manifest(|m| {
+            let entry = m.tables.get_mut(name).ok_or_else(|| {
+                BqliteError::Execution(format!("alter_table_add_column: unknown table '{name}'"))
+            })?;
+
+            // Reject duplicate column names.
+            if entry.schema.column(&column.name).is_some() {
+                return Err(BqliteError::Execution(format!(
+                    "alter_table_add_column: column '{}' already exists on table '{name}'",
+                    column.name
+                )));
+            }
+
+            // Rebuild the schema with the new column appended and
+            // version bumped. We reconstruct via `TableSchema::new`
+            // so the §5.1 validation rules re-fire (defensive), then
+            // stamp the incremented version.
+            let old = &entry.schema;
+            let mut columns: Vec<ColumnDef> = old.columns().to_vec();
+            columns.push(column);
+            let new_version = old.version() + 1;
+            let new_schema = TableSchema::new(
+                old.name(),
+                columns,
+                &old.entity_key_column().name,
+                &old.timestamp_column().name,
+                &old.event_type_column().name,
+            )
+            .map_err(|e| {
+                BqliteError::Execution(format!(
+                    "alter_table_add_column: schema rebuild failed: {e}"
+                ))
+            })?
+            .with_version(new_version);
+
+            entry.schema = new_schema;
+            Ok(())
         })
     }
 

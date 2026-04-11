@@ -307,9 +307,19 @@ impl TableSchema {
     }
 
     /// Monotonically increasing schema version. Starts at 0; `ALTER
-    /// TABLE ADD COLUMN` (landed in a later wave) bumps it.
+    /// TABLE ADD COLUMN` bumps it.
     pub fn version(&self) -> u32 {
         self.version
+    }
+
+    /// Return a copy of this schema with a different version number.
+    ///
+    /// Used by `ALTER TABLE ADD COLUMN` to bump the version after
+    /// appending a column. The version is metadata-only — it does not
+    /// re-validate the column list.
+    pub fn with_version(mut self, version: u32) -> Self {
+        self.version = version;
+        self
     }
 
     /// Look up a declared column by name. System columns are not

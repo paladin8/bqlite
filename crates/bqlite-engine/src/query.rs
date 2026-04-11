@@ -2,12 +2,11 @@
 //!
 //! [`Engine::query`] is the single public surface exercised by the
 //! CLI (TASK-119), future Python bindings (Wave 6), and the
-//! end-to-end smoke test (TASK-123). It threads the Wave 1 compiler
-//! pipeline — parse → plan → bind → drive — into one opinionated
-//! function:
+//! end-to-end smoke test (TASK-123). It threads the compiler pipeline
+//! — parse → plan → bind → drive — into one opinionated function:
 //!
 //! ```text
-//! text + &Database
+//! text + &mut Database
 //!    │
 //!    ▼
 //!  bqlite_parser::parse ─▶ Statement (AST)
@@ -17,7 +16,7 @@
 //!    │
 //!    ▼
 //!  bind_physical(plan, db) ─▶ Box<dyn PhysicalOperator>
-//!    │
+//!    │                        (DDL executes during bind)
 //!    ▼
 //!  operator.open() → next_batch()* → close()
 //!    │
@@ -148,7 +147,7 @@ impl Engine {
     /// - [`BqliteError::Cancelled`] — unreachable in Wave 1 because
     ///   the engine never signals cancellation, but the error
     ///   variant is still propagated verbatim from the operators.
-    pub fn query(&self, text: &str, db: &Database) -> Result<ExecutionResult> {
+    pub fn query(&self, text: &str, db: &mut Database) -> Result<ExecutionResult> {
         // 1. Parse. The Wave 1 parser only accepts a bare table
         //    identifier, so the text is always very short; we convert
         //    its typed `ParseError` into a `BqliteError::Parse(String)`
@@ -173,9 +172,9 @@ impl Engine {
         let schema = physical.output_schema().clone();
 
         // 3. Bind the plain-data descriptor into an executable
-        //    operator tree. Wave 1 has a single arm (Scan); Wave 2's
-        //    TASK-232 extends this into the full filter / project /
-        //    limit set plus DDL execution closures.
+        //    operator tree. Handles data-plane operators (Scan,
+        //    Filter, Project, Limit), DDL (which executes during
+        //    bind), and metadata queries (Describe, Explain).
         let mut operator = bind_physical(&physical, db)?;
 
         // 4. Drive the operator tree to completion. `open` → zero or
@@ -266,10 +265,10 @@ mod tests {
         // bare identifier `events` must return an empty ExecutionResult
         // — not an error, not a panic, just zero rows.
         let scratch = Scratch::new("smoke");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let engine = Engine::new();
 
-        let result = engine.query("events", &db).expect("query must succeed");
+        let result = engine.query("events", &mut db).expect("query must succeed");
 
         assert!(result.is_empty(), "fresh database has no events");
         assert_eq!(result.row_count(), 0);
@@ -293,10 +292,12 @@ mod tests {
         // Defensive: the Wave 1 parser tolerates whitespace; the
         // engine wrapper must not over-trim or reject it.
         let scratch = Scratch::new("whitespace");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let engine = Engine::new();
 
-        let result = engine.query("  events\n", &db).expect("query must succeed");
+        let result = engine
+            .query("  events\n", &mut db)
+            .expect("query must succeed");
         assert!(result.is_empty());
     }
 
@@ -305,10 +306,10 @@ mod tests {
     #[test]
     fn empty_query_returns_parse_error() {
         let scratch = Scratch::new("empty-parse");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let engine = Engine::new();
 
-        match engine.query("", &db) {
+        match engine.query("", &mut db) {
             Err(BqliteError::Parse(msg)) => {
                 // Wave 2's parser surfaces the empty-input case as an
                 // UnexpectedEof with the hint "expected a table name" —
@@ -328,10 +329,10 @@ mod tests {
     #[test]
     fn garbage_query_returns_parse_error() {
         let scratch = Scratch::new("garbage-parse");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let engine = Engine::new();
 
-        match engine.query("42events", &db) {
+        match engine.query("42events", &mut db) {
             Err(BqliteError::Parse(_)) => {}
             other => panic!("expected Parse error, got {other:?}"),
         }
@@ -342,10 +343,10 @@ mod tests {
     #[test]
     fn unknown_table_returns_plan_error() {
         let scratch = Scratch::new("unknown-plan");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let engine = Engine::new();
 
-        match engine.query("ghost", &db) {
+        match engine.query("ghost", &mut db) {
             Err(BqliteError::Plan(msg)) => {
                 assert!(msg.contains("ghost"), "error should name the table: {msg}");
                 assert!(
@@ -374,9 +375,9 @@ mod tests {
     fn execution_result_row_count_and_is_empty_are_consistent() {
         // Empty result — row_count == 0, is_empty() true.
         let scratch = Scratch::new("rowcount");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let engine = Engine::new();
-        let result = engine.query("events", &db).expect("events must plan");
+        let result = engine.query("events", &mut db).expect("events must plan");
 
         assert_eq!(result.row_count(), 0);
         assert!(result.is_empty());

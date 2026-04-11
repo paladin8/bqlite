@@ -10,42 +10,35 @@
 //! cancellation tokens, memory budgets) that only the engine has
 //! visibility into.
 //!
-//! ## Wave 2 scope
+//! ## Wave 2 scope (TASK-232)
 //!
-//! Post TASK-226, the planner now emits the full Wave 2 descriptor
-//! set (`Scan`, `Filter`, `Project`, `Limit`, DDL, DML, `Explain`).
-//! The bind step, however, still only materializes the Wave 1 `Scan`
-//! arm — TASK-232 adds the other arms (filter/project/limit operator
-//! construction, DDL execution closures, INSERT pipeline wiring).
-//! Until TASK-232 lands, every non-`Scan` descriptor surfaces as a
-//! clean `BqliteError::Plan` naming the deferring task; callers only
-//! hit it if they drive a Wave 2 statement through `Engine::query`
-//! against a database that has not upgraded to TASK-232.
+//! The bind step handles the full Wave 2 descriptor set:
 //!
-//! The `bind_scan` arm:
-//!
-//! 1. Asks the [`Database`] for a `Box<dyn SegmentReader>` for the
-//!    resolved table name (which returns
-//!    `BqliteError::Plan(unknown table …)` if the planner's catalog
-//!    view has drifted from the storage manifest — defensive, should
-//!    be unreachable in a single-process session).
-//! 2. Converts the owned box into an `Arc<dyn SegmentReader>` so the
-//!    scan can share ownership with future parallel shard-tasks
-//!    without changing the trait surface.
-//! 3. Constructs a [`ScanOperator`] with the descriptor's
-//!    `projected_columns` / `scan_predicates` threaded through per
-//!    TASK-230. Until TASK-227 (predicate pushdown) and TASK-228
-//!    (projection pruning) populate those fields they remain empty,
-//!    and the scan operator falls back to
-//!    `ColumnProjection::all()` with no zone-map predicate — the
-//!    same shape the Wave 1 stub produced.
+//! - **Data-plane** (`Scan`, `Filter`, `Project`, `Limit`):
+//!   recursively bind children and construct the corresponding
+//!   operator from `bqlite-operators`.
+//! - **DDL** (`CreateTable`, `DropTable`, `AlterTableAddColumn`):
+//!   execute the mutation against the manifest during bind and
+//!   return an empty [`crate::ddl::ResultOperator`].
+//! - **Metadata** (`Describe`, `Explain`): compute the result
+//!   batch during bind and return a
+//!   [`crate::ddl::ResultOperator`] wrapping the batch.
+//! - **INSERT**: deferred to TASK-233.
 
 use std::sync::Arc;
 
 use bqlite_core::{BqliteError, Result, SegmentReader};
-use bqlite_operators::{CancellationToken, PhysicalOperator, ScanOperator};
+use bqlite_operators::{
+    CancellationToken, FilterOperator, LimitOperator, PhysicalOperator, ProjectOperator,
+    ScanOperator,
+};
 use bqlite_planner::{PhysicalPlan, ScanPhysical};
 use bqlite_storage::Database;
+
+use crate::ddl::{
+    build_describe_batch, build_explain_batch, execute_alter_table_add_column,
+    execute_create_table, execute_drop_table, ResultOperator,
+};
 
 /// Bind a plain-data [`PhysicalPlan`] into an executable
 /// `Box<dyn PhysicalOperator>` tree rooted at the plan's top node.
@@ -56,34 +49,90 @@ use bqlite_storage::Database;
 /// The returned operator is ready to drive with `open → next_batch* →
 /// close` per the [`PhysicalOperator`] lifecycle contract.
 ///
+/// ## Data-plane descriptors
+///
+/// `Scan`, `Filter`, `Project`, `Limit` — recursively bind children
+/// and construct the corresponding operator.
+///
+/// ## DDL descriptors
+///
+/// `CreateTable`, `DropTable`, `AlterTableAddColumn` — execute the
+/// DDL mutation against the manifest during bind and return an empty
+/// [`ResultOperator`].
+///
+/// ## Metadata descriptors
+///
+/// `Describe` — look up the table and build a four-column result
+/// batch. `Explain` — format the plan tree as a single-column batch.
+///
 /// # Errors
 ///
-/// Propagates any error from [`Database::segment_reader`] — in Wave 1
-/// the only failure mode is an unknown table name (which should be
-/// unreachable because the planner already resolved the table via the
-/// same database's catalog).
-pub fn bind_physical(plan: &PhysicalPlan, db: &Database) -> Result<Box<dyn PhysicalOperator>> {
+/// Propagates any error from operator construction, DDL execution,
+/// or catalog lookup.
+pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn PhysicalOperator>> {
     match plan {
+        // ── Data-plane operators ─────────────────────────────────
         PhysicalPlan::Scan(scan) => bind_scan(scan, db),
-        // TASK-226 emits the full Wave 2 descriptor set, but the
-        // operator-side plumbing lands in TASK-232 (filter / project /
-        // limit / DDL exec / INSERT) and TASK-229 (explain). Reject
-        // loudly with a message naming the descriptor so tests that
-        // drive a non-Scan plan through `Engine::query` before TASK-232
-        // get a localized failure instead of a panic.
-        PhysicalPlan::Filter(_)
-        | PhysicalPlan::Project(_)
-        | PhysicalPlan::Limit(_)
-        | PhysicalPlan::CreateTable(_)
-        | PhysicalPlan::DropTable(_)
-        | PhysicalPlan::AlterTableAddColumn(_)
-        | PhysicalPlan::Describe(_)
-        | PhysicalPlan::Insert(_)
-        | PhysicalPlan::Explain(_) => Err(BqliteError::Plan(
-            "engine bind: Wave 2 non-Scan descriptors are emitted by TASK-226 but \
-             executable bindings land in TASK-232 (Filter/Project/Limit/DDL/DML) \
-             and TASK-229 (Explain); no operator is available yet"
-                .into(),
+
+        PhysicalPlan::Filter(filter) => {
+            let child = bind_physical(&filter.input, db)?;
+            Ok(Box::new(FilterOperator::new(
+                child,
+                filter.predicate.clone(),
+                filter.tile_size,
+            )))
+        }
+
+        PhysicalPlan::Project(project) => {
+            let child = bind_physical(&project.input, db)?;
+            Ok(Box::new(ProjectOperator::from_physical_items(
+                child,
+                project.expressions.clone(),
+                project.output_schema.clone(),
+            )))
+        }
+
+        PhysicalPlan::Limit(limit) => {
+            let child = bind_physical(&limit.input, db)?;
+            Ok(Box::new(LimitOperator::new(child, limit.count)))
+        }
+
+        // ── DDL ──────────────────────────────────────────────────
+        PhysicalPlan::CreateTable(ct) => {
+            execute_create_table(ct, db)?;
+            Ok(Box::new(ResultOperator::empty(ct.output_schema.clone())))
+        }
+
+        PhysicalPlan::DropTable(dt) => {
+            execute_drop_table(dt, db)?;
+            Ok(Box::new(ResultOperator::empty(dt.output_schema.clone())))
+        }
+
+        PhysicalPlan::AlterTableAddColumn(alter) => {
+            execute_alter_table_add_column(alter, db)?;
+            Ok(Box::new(ResultOperator::empty(alter.output_schema.clone())))
+        }
+
+        // ── Metadata ─────────────────────────────────────────────
+        PhysicalPlan::Describe(desc) => {
+            let batch = build_describe_batch(desc, db)?;
+            Ok(Box::new(ResultOperator::new(
+                desc.output_schema.clone(),
+                vec![batch],
+            )))
+        }
+
+        PhysicalPlan::Explain(explain) => {
+            let batch = build_explain_batch(explain)?;
+            Ok(Box::new(ResultOperator::new(
+                explain.output_schema.clone(),
+                vec![batch],
+            )))
+        }
+
+        // ── Deferred to TASK-233 ────────────────────────────────
+        PhysicalPlan::Insert(_) => Err(BqliteError::Plan(
+            "engine bind: INSERT execution lands in TASK-233".into(),
         )),
     }
 }
@@ -171,10 +220,10 @@ mod tests {
     #[test]
     fn bind_scan_produces_a_drivable_operator() {
         let scratch = Scratch::new("happy");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let descriptor = bootstrap_scan_descriptor();
 
-        let mut op = bind_physical(&descriptor, &db).expect("bind must succeed");
+        let mut op = bind_physical(&descriptor, &mut db).expect("bind must succeed");
 
         // Full PhysicalOperator lifecycle — the smoke test (TASK-123)
         // will drive this exact path through `Engine::query`.
@@ -203,10 +252,10 @@ mod tests {
         // at construction. This test pins both facts explicitly so a
         // regression in either side surfaces as a clean assertion.
         let scratch = Scratch::new("schema");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let descriptor = bootstrap_scan_descriptor();
 
-        let op = bind_physical(&descriptor, &db).expect("bind must succeed");
+        let op = bind_physical(&descriptor, &mut db).expect("bind must succeed");
 
         let op_names: Vec<&str> = op
             .output_schema()
@@ -231,7 +280,7 @@ mod tests {
     #[test]
     fn bind_scan_reports_unknown_table_through_plan_error() {
         let scratch = Scratch::new("unknown");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let descriptor = PhysicalPlan::Scan(ScanPhysical {
             table: "ghost".to_string(),
             time_range: None,
@@ -240,7 +289,7 @@ mod tests {
             output_schema: OperatorSchema::from_table(&bootstrap_events_schema()),
         });
 
-        match bind_physical(&descriptor, &db) {
+        match bind_physical(&descriptor, &mut db) {
             Err(bqlite_core::BqliteError::Plan(msg)) => {
                 assert!(msg.contains("ghost"), "error should name the table: {msg}");
             }
@@ -258,12 +307,14 @@ mod tests {
         // regression in the bind step is localized to *this* file
         // rather than surfacing as a generic smoke-test failure.
         let scratch = Scratch::new("compose");
-        let db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = Database::open_or_create(scratch.path()).expect("open db");
         let stmt = bqlite_parser::parse("events").expect("parse events");
-        let catalog = db.catalog();
-        let physical = plan(stmt, &catalog).expect("plan events");
+        let physical = {
+            let catalog = db.catalog();
+            plan(stmt, &catalog).expect("plan events")
+        };
 
-        let mut op = bind_physical(&physical, &db).expect("bind succeeds");
+        let mut op = bind_physical(&physical, &mut db).expect("bind succeeds");
         op.open().unwrap();
         assert!(op.next_batch().unwrap().is_none());
         op.close().unwrap();

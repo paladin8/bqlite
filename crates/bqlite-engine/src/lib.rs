@@ -22,18 +22,19 @@
 //! forbids (`bqlite-cli` / `bqlite-ffi` only depend on
 //! `bqlite-engine`).
 //!
-//! ## Wave 1 surface
+//! ## Wave 2 surface (TASK-232)
 //!
-//! Only the happy path matters for the Wave 1 smoke test (TASK-123):
+//! [`Engine::query`] parses the text, plans it against the database's
+//! catalog, binds the resulting [`PhysicalPlan`] into a
+//! `Box<dyn PhysicalOperator>`, drives it to exhaustion, and returns
+//! an [`ExecutionResult`]. The bind step handles:
 //!
-//! 1. [`Engine::query`] parses the text, plans it against the
-//!    database's catalog, binds the resulting [`PhysicalPlan`] into a
-//!    `Box<dyn PhysicalOperator>`, drives it to exhaustion, and
-//!    returns an [`ExecutionResult`].
-//! 2. The Wave 1 planner and parser only accept a bare table
-//!    reference, so the bind step currently has a single arm
-//!    ([`ScanPhysical`]). Wave 2 extends this with filter / project /
-//!    limit via TASK-232 and friends.
+//! - **Data-plane** (`Scan`, `Filter`, `Project`, `Limit`) —
+//!   recursive operator construction.
+//! - **DDL** (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE ADD COLUMN`)
+//!   — executes during bind via atomic manifest updates.
+//! - **Metadata** (`DESCRIBE`, `EXPLAIN`) — builds a result batch
+//!   during bind.
 //!
 //! Memory management, parallelism, cancellation timers, and the
 //! metrics bridge (TASK-112) all land in later waves. The engine's
@@ -50,6 +51,7 @@
 //! without importing `bqlite-planner` directly.
 
 pub mod bind;
+pub mod ddl;
 pub mod query;
 pub mod render;
 

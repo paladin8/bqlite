@@ -250,12 +250,12 @@ fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
 fn run_query(rest: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let parsed = parse_query_args(rest)?;
 
-    let db = Database::open_or_create(&parsed.db_path)
+    let mut db = Database::open_or_create(&parsed.db_path)
         .map_err(|e| CliError::Runtime(format!("failed to open database: {e}")))?;
 
     let engine = Engine::new();
     let result = engine
-        .query(&parsed.bql, &db)
+        .query(&parsed.bql, &mut db)
         .map_err(|e| CliError::Runtime(format!("query failed: {e}")))?;
 
     let rendered = format_result_as_text(&result);
