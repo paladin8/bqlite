@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-3",
   "task_id": "TASK-118",
   "claimed_at": "2026-04-11T01:35:00Z",
+  "completed_at": "2026-04-11T01:43:35Z",
   "branch": "task/TASK-118",
   "description": "Engine stub, query API, and physical-plan bind step: Engine::query text-in rows-out. Parses via bqlite-parser, plans via bqlite-planner, binds ScanPhysical to ScanOperator, drives to ExecutionResult. Adds bqlite-parser dep to engine and updates architecture docs."
 }
