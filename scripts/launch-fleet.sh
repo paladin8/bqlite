@@ -50,9 +50,15 @@ for i in $(seq 1 "$N"); do
     -w /workspace \
     "$IMAGE" \
     bash -c "
-      # Copy auth files to writable location (container runs as root)
+      # Copy auth files to writable location (container runs as root).
+      # Exclude plugins/: known_marketplaces.json, installed_plugins.json, and
+      # the plugins/cache + plugins/marketplaces trees all carry host absolute
+      # paths (e.g. /Users/<host>/.claude/plugins/...) which break container-
+      # side 'claude plugin install' — the CLI thinks the plugin is already
+      # installed and tries to resolve a path that does not exist here. The
+      # install step below builds fresh plugin state.
       mkdir -p /root/.claude
-      cp -r /home/vscode/.claude-host/* /root/.claude/ 2>/dev/null || true
+      find /home/vscode/.claude-host -mindepth 1 -maxdepth 1 ! -name plugins -exec cp -r {} /root/.claude/ \; 2>/dev/null || true
 
       # Merge bypass-permissions + cmux notification + agent-loop stop hook
       # into settings.json (preserves host config if present)
@@ -85,11 +91,10 @@ for i in $(seq 1 "$N"); do
 
       chmod -R 600 /root/.claude/* /root/.claude.json 2>/dev/null || true
 
-      # Ensure Claude Code plugins are present. The host-copy above may have
-      # left installed_plugins.json in whatever state the host has, which does
-      # not necessarily include what the fleet needs. Re-add the marketplace
-      # and (re)install; failures are tolerated so an already-present
-      # marketplace or plugin does not abort container startup.
+      # Install Claude Code plugins from scratch. The host copy above skips
+      # plugins/, so these commands populate fresh state against container-
+      # local paths. Failures are tolerated so a transient install error does
+      # not abort container startup.
       claude plugin marketplace add anthropics/claude-plugins-official || true
       claude plugin install rust-analyzer-lsp@claude-plugins-official || true
       claude plugin install superpowers@claude-plugins-official || true

@@ -37,7 +37,7 @@ case "${DIFFICULTY_POOL_RAW^^}" in
   EASY)
     DIFFICULTY_POOL="EASY"
     DIFFICULTY_TAG="[EASY]"
-    MODEL_ALIAS="claude-sonnet-4-6[1m]"
+    MODEL_ALIAS="claude-sonnet-4-6"
     EFFORT_LEVEL="high"
     ;;
   HARD)

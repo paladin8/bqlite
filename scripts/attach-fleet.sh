@@ -94,6 +94,25 @@ if [ -n "$MAX_TASKS" ]; then
 fi
 echo "Attaching to $REQUESTED_TOTAL of $COUNT agent containers via cmux${SUFFIX}..."
 
+# launch-fleet.sh returns as soon as `docker run -d` finishes, but the
+# in-container setup (git clone, plugin install, hook install) runs in the
+# background. Attaching before that completes produces a "stat
+# /workspace/scripts/agent-wrapper.sh: no such file or directory" exec error.
+# Poll each container's /workspace for the wrapper script before proceeding.
+wait_for_ready() {
+  local container="$1"
+  local deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec "$container" test -x /workspace/scripts/agent-wrapper.sh 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "error: $container not ready after 120s — /workspace/scripts/agent-wrapper.sh never appeared" >&2
+  echo "  check 'docker logs $container' for setup failures" >&2
+  return 1
+}
+
 # Build the docker exec command for an agent container. The wrapper script
 # runs claude in a restart loop driven by the Stop hook's control markers.
 agent_cmd() {
@@ -116,6 +135,7 @@ attach_one() {
   local difficulty_pool="$2"
   local container="${CONTAINER_ARRAY[$idx]}"
   local cmd pool_label
+  wait_for_ready "$container" || exit 1
   cmd=$(agent_cmd "$container" "$difficulty_pool")
   pool_label=$(printf '%s' "$difficulty_pool" | tr '[:upper:]' '[:lower:]')
 
