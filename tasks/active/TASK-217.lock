@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-1",
+  "task_id": "TASK-217",
+  "claimed_at": "2026-04-11T07:02:25Z",
+  "branch": "task/TASK-217",
+  "description": "[IMPL] Manifest v1 segment inventory + atomic updates"
+}
