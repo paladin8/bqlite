@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import pathlib
+import pty
 import subprocess
 import sys
 from typing import Callable, Optional
@@ -147,8 +148,15 @@ def run_claude(
     resume: bool,
     env: Optional[dict[str, str]] = None,
 ) -> ClaudeRunResult:
-    """Run `claude -p --verbose` once, streaming stdout live to our own
-    stdout and capturing the full output for later scanning.
+    """Run `claude -p --verbose` once, mirroring its output to our own
+    stdout live and capturing the full output for later scanning (NEEDS INPUT
+    detection).
+
+    claude is attached to a pseudo-terminal rather than a plain pipe. With a
+    pipe, stdio in the child switches to block buffering and `--verbose`
+    output stalls in 4 KB chunks until the process exits, which leaves the
+    cmux tab looking dead for long tasks. A pty keeps the child line-buffered
+    so tool-call chatter streams as it happens.
 
     When `resume` is True, passes `-c` and omits `--append-system-prompt` (a
     resumed session inherits the prior system prompt). When False, passes the
@@ -171,22 +179,39 @@ def run_claude(
         args.extend(["--append-system-prompt", system_prompt_text])
     args.append(prompt)
 
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env if env is not None else os.environ.copy(),
-    )
-    assert proc.stdout is not None
+    master_fd, slave_fd = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            env=env if env is not None else os.environ.copy(),
+        )
+    finally:
+        # The parent does not write to the slave side; closing it here lets
+        # reads on the master return EOF cleanly once the child exits.
+        os.close(slave_fd)
 
     captured: list[str] = []
-    with proc.stdout as stream:
-        for line in stream:
-            sys.stdout.write(line)
+    try:
+        while True:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                # On Linux, reading the master after the slave closes raises
+                # EIO. macOS returns an empty bytes object. Treat both as EOF.
+                break
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", errors="replace")
+            sys.stdout.write(text)
             sys.stdout.flush()
-            captured.append(line)
+            captured.append(text)
+    finally:
+        os.close(master_fd)
+
     proc.wait()
     return ClaudeRunResult(returncode=proc.returncode, output="".join(captured))
 
@@ -368,6 +393,11 @@ def run_fleet_loop(
 
         if status == "claimed":
             task = result["task"]
+            print(
+                f"=== {agent_name}: claimed {task['task_id']} — "
+                f"{task['title']} (starting claude) ===",
+                flush=True,
+            )
             outcome = execute_task(
                 task,
                 agent_name=agent_name,
