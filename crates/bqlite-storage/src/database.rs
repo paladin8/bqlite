@@ -63,6 +63,7 @@ use bqlite_core::storage::{
     ColumnProjection, Predicate, SegmentHandle, SegmentReader, SegmentScan,
 };
 
+use crate::catalog::ManifestCatalog;
 use crate::manifest::{Manifest, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION};
 
 /// Name of the advisory lock file at the database root.
@@ -188,7 +189,22 @@ impl Database {
                 // Fresh init — write the new manifest before
                 // returning so an observer opening the same directory
                 // after this call sees a complete, versioned file.
-                let m = Manifest::new_empty(shard_count);
+                //
+                // TASK-125: seed the bootstrap `events` table so
+                // `bqlite query "events"` can parse-plan-execute
+                // against a freshly-created database without a
+                // CREATE TABLE DDL path (which does not exist in v0).
+                // See `crate::catalog` for the rationale.
+                let mut m = Manifest::new_empty(shard_count);
+                m.tables.insert(
+                    crate::catalog::BOOTSTRAP_EVENTS_TABLE_NAME.to_string(),
+                    crate::manifest::TableEntry {
+                        schema: crate::catalog::bootstrap_events_schema(),
+                        next_sequence_id: 0,
+                        next_batch_id: 0,
+                        bootstrap_events_table: true,
+                    },
+                );
                 write_manifest_atomic(&root, &m)?;
                 m
             }
@@ -218,10 +234,32 @@ impl Database {
         &self.manifest
     }
 
+    /// Return a [`Catalog`](bqlite_core::Catalog) view of this
+    /// database's tables.
+    ///
+    /// The returned [`ManifestCatalog`] borrows `self`, so it lives
+    /// only as long as the borrow. Callers that need a trait object
+    /// can coerce:
+    ///
+    /// ```ignore
+    /// let cat = db.catalog();
+    /// let dyn_cat: &dyn bqlite_core::Catalog = &cat;
+    /// planner.plan(&stmt, dyn_cat)?;
+    /// ```
+    ///
+    /// The catalog always reflects the manifest snapshot taken when
+    /// [`Database::open_or_create`] ran; Wave 1 has no mutation API,
+    /// so the snapshot is effectively static for the database's
+    /// lifetime.
+    pub fn catalog(&self) -> ManifestCatalog<'_> {
+        ManifestCatalog::new(&self.manifest)
+    }
+
     /// Open a segment reader for `table_name`.
     ///
     /// Returns [`BqliteError::Plan`] if no such table exists in the
-    /// manifest.
+    /// manifest (via [`bqlite_core::catalog::unknown_table_error`] so
+    /// the error format matches the `Catalog` trait's).
     ///
     /// The Wave 1 reader yields zero segments — real segment
     /// enumeration lands in later waves. A Wave 1 scan over the
@@ -233,7 +271,7 @@ impl Database {
             .manifest
             .tables
             .get(table_name)
-            .ok_or_else(|| BqliteError::Plan(format!("unknown table `{table_name}`")))?;
+            .ok_or_else(|| bqlite_core::catalog::unknown_table_error(table_name))?;
         Ok(Box::new(EmptySegmentReader {
             schema: entry.schema.clone(),
         }))
@@ -457,11 +495,65 @@ mod tests {
         let m = db.manifest();
         assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
         assert_eq!(m.shard_count, DEFAULT_SHARD_COUNT);
-        assert!(m.tables.is_empty(), "Wave 1 starts with no tables");
         assert!(m.segments.is_empty());
         // UUIDv4 hyphenated form: 36 chars, 4 dashes.
         assert_eq!(m.database_uuid.len(), 36);
         assert_eq!(m.database_uuid.matches('-').count(), 4);
+
+        // TASK-125: fresh init seeds a single bootstrap `events`
+        // table so the planner has something to resolve on v0
+        // databases where CREATE TABLE DDL does not yet exist.
+        assert_eq!(m.tables.len(), 1, "exactly one bootstrap table");
+        let entry = m
+            .tables
+            .get(crate::catalog::BOOTSTRAP_EVENTS_TABLE_NAME)
+            .expect("events table was seeded");
+        assert_eq!(entry.schema, crate::catalog::bootstrap_events_schema());
+        assert_eq!(entry.next_sequence_id, 0);
+        assert_eq!(entry.next_batch_id, 0);
+        assert!(
+            entry.bootstrap_events_table,
+            "bootstrap entries must carry the flag so later waves can retire the shortcut"
+        );
+    }
+
+    #[test]
+    fn fresh_init_catalog_resolves_bootstrap_events_table() {
+        // End-to-end check: the TASK-125 catalog handle handed out
+        // from the Database must return the bootstrap schema and
+        // list the events table by name.
+        use bqlite_core::Catalog;
+
+        let scratch = Scratch::new("catalog-events");
+        let db = Database::open_or_create(scratch.path()).expect("init");
+        let cat = db.catalog();
+        let schema = cat.resolve_table("events").expect("events must resolve");
+        assert_eq!(schema, crate::catalog::bootstrap_events_schema());
+        assert_eq!(cat.list_tables(), vec!["events"]);
+    }
+
+    #[test]
+    fn catalog_from_reopened_database_still_sees_bootstrap() {
+        // The bootstrap runs only on fresh init (not on reopen), but
+        // the seeded entry must survive the round-trip to disk.
+        use bqlite_core::Catalog;
+
+        let scratch = Scratch::new("catalog-reopen");
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("init");
+        }
+        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        let cat = db.catalog();
+        assert!(cat.resolve_table("events").is_ok());
+        // The flag persists across reopen — important because later
+        // waves scan for it to distinguish seeded vs user-created
+        // tables.
+        let entry = db
+            .manifest()
+            .tables
+            .get("events")
+            .expect("events entry survived reopen");
+        assert!(entry.bootstrap_events_table);
     }
 
     #[test]
@@ -658,35 +750,12 @@ mod tests {
     }
 
     #[test]
-    fn segment_reader_for_seeded_table_yields_zero_segments() {
-        // Simulate what TASK-125 will do: hand-seed a table entry
-        // into the manifest, persist it, reopen, and verify the
-        // segment_reader produces an empty iterator.
-        let scratch = Scratch::new("reader-seeded");
-
-        // Fresh init, then hand-edit the on-disk manifest to include a
-        // bootstrap events table. This test exists to prove the Wave 1
-        // segment_reader lookup path works end-to-end without waiting
-        // for TASK-125.
-        {
-            let _db = Database::open_or_create(scratch.path()).expect("init");
-        }
-        let manifest_path = scratch.path().join(MANIFEST_FILE_NAME);
-        let bytes = fs::read(&manifest_path).unwrap();
-        let mut m: Manifest = serde_json::from_slice(&bytes).unwrap();
-        m.tables.insert(
-            "events".to_string(),
-            TableEntry {
-                schema: sample_events_schema(),
-                next_sequence_id: 0,
-                next_batch_id: 0,
-                bootstrap_events_table: true,
-            },
-        );
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
-
-        let db = Database::open_or_create(scratch.path()).expect("reopen");
-        assert_eq!(db.manifest().tables.len(), 1);
+    fn segment_reader_for_bootstrap_events_table_yields_zero_segments() {
+        // With TASK-125 merged, fresh init seeds the events table
+        // automatically — this test just opens a fresh database and
+        // asks for the reader directly.
+        let scratch = Scratch::new("reader-bootstrap");
+        let db = Database::open_or_create(scratch.path()).expect("init");
         let reader = db.segment_reader("events").expect("reader for events");
         assert_eq!(reader.schema().name(), "events");
         assert_eq!(reader.segments().count(), 0);
