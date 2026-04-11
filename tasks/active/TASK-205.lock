@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-2",
+  "task_id": "TASK-205",
+  "claimed_at": "2026-04-11T07:37:00Z",
+  "branch": "task/TASK-205",
+  "description": "[DESIGN] Expression compilation model (TypedExpr + CompiledExpr)"
+}
