@@ -28,19 +28,26 @@
 //!
 //! ## Wave 1 deferrals
 //!
-//! - `DemandCapabilities` / `supported_demands` — added in TASK-110.
 //! - `finish_entity_into` + `Accumulator` — aggregation fusion, later
 //!   wave.
 //! - Metrics hooks — TASK-112.
 //! - `EntityOperatorAdapter` implementation — the adapter lands with the
 //!   first wave that ships an `EntityOperator` implementor.
+//!
+//! The `DemandCapabilities` / `supported_demands` scaffold originally
+//! listed here has landed via TASK-110: the type lives in
+//! [`bqlite_core::DemandCapabilities`], the standalone scaffold trait
+//! is [`bqlite_core::DemandPropagation`], and the defaulted
+//! [`EntityOperator::supported_demands`] method below returns
+//! `DemandCapabilities::None` for every Wave 1 implementor. The real
+//! protocol is a Wave 4+ design task.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::{EntityId, OperatorSchema, Result};
+use bqlite_core::{DemandCapabilities, EntityId, OperatorSchema, Result};
 
 // ---------------------------------------------------------------------------
 // CancellationToken
@@ -233,11 +240,15 @@ pub trait PhysicalOperator: Send {
 ///
 /// # Wave 1 deferrals
 ///
-/// - `supported_demands` returning a `DemandCapabilities` — added in
-///   TASK-110 as an additive extension.
 /// - `finish_entity_into` for fused aggregation — added when the
 ///   `Accumulator` trait lands in a later wave with a default impl so
 ///   existing implementors do not need to change.
+///
+/// The [`supported_demands`](Self::supported_demands) scaffold method
+/// has landed via TASK-110 as an additive extension; its default body
+/// returns [`DemandCapabilities::None`] so existing implementors keep
+/// compiling unchanged, and the real demand protocol is deferred to a
+/// Wave 4+ design task.
 pub trait EntityOperator: Send + Sync {
     /// Per-entity mutable state. Created fresh for each entity by
     /// [`create_state`](Self::create_state) and consumed by
@@ -281,6 +292,26 @@ pub trait EntityOperator: Send + Sync {
     /// slice means the operator is metadata-only (e.g.
     /// `COUNT(DISTINCT entity_id)`).
     fn required_columns(&self) -> &[String];
+
+    /// Advertise the demand capabilities this operator supports.
+    ///
+    /// The Wave 1 default returns [`DemandCapabilities::None`] — the
+    /// scaffold value every Wave 1 implementor uses. Operators with
+    /// real capabilities (layered extraction, fused aggregation, step
+    /// counters, ...) override this when the Wave 4+ protocol lands.
+    ///
+    /// This method is an additive extension to the trait frozen by
+    /// TASK-108. Because the default body covers the Wave 1 case,
+    /// existing implementors need no change; TASK-117's operator
+    /// stubs will likewise rely on the default until the real
+    /// protocol task decides what to advertise.
+    ///
+    /// See [`bqlite_core::demand`] for the full scoping note and for
+    /// the standalone [`DemandPropagation`](bqlite_core::DemandPropagation)
+    /// scaffold trait.
+    fn supported_demands(&self) -> DemandCapabilities {
+        DemandCapabilities::None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -610,5 +641,63 @@ mod tests {
         // that only compiles for Send + Sync types.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SumOp>();
+    }
+
+    // ── supported_demands (TASK-110 additive extension) ──────────────────
+
+    #[test]
+    fn entity_operator_default_supported_demands_is_none() {
+        // Wave 1 implementors that do not override the method — e.g.
+        // `SumOp` below — must see the defaulted `None` advertisement.
+        let op = sum_op();
+        assert_eq!(op.supported_demands(), DemandCapabilities::None);
+    }
+
+    /// Override operator that returns a non-default capability set.
+    /// Wave 1 only has the `None` variant so the override still
+    /// returns `None`, but the override surface must compile and be
+    /// observed so Wave 4+ can grow real variants without surprising
+    /// refactors.
+    ///
+    // TODO(Wave 4+): once the real `DemandCapabilities` protocol lands
+    // with additional variants, update this override to return a
+    // genuinely non-default value so the test differentiates the
+    // override path from the defaulted path.
+    struct OverrideOp {
+        schema: OperatorSchema,
+        required: Vec<String>,
+    }
+
+    impl EntityOperator for OverrideOp {
+        type State = ();
+
+        fn create_state(&self, _entity_id: &EntityId) -> Self::State {}
+
+        fn output_schema(&self) -> &OperatorSchema {
+            &self.schema
+        }
+
+        fn process_sub_batch(&self, _state: &mut Self::State, _batch: &RecordBatch) {}
+
+        fn finish_entity(&self, _state: Self::State) -> Option<RecordBatch> {
+            None
+        }
+
+        fn required_columns(&self) -> &[String] {
+            &self.required
+        }
+
+        fn supported_demands(&self) -> DemandCapabilities {
+            DemandCapabilities::none()
+        }
+    }
+
+    #[test]
+    fn entity_operator_supported_demands_override_is_observed() {
+        let op = OverrideOp {
+            schema: make_schema(),
+            required: vec![],
+        };
+        assert_eq!(op.supported_demands(), DemandCapabilities::none());
     }
 }

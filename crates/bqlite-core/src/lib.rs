@@ -42,3 +42,6 @@ pub use arrow::{
     arrow_to_bql_type, bql_type_to_arrow, column_def_to_field, property_value_to_arrow_type,
     table_schema_to_arrow,
 };
+
+pub mod demand;
+pub use demand::{DemandCapabilities, DemandPropagation};
