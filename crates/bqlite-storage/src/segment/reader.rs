@@ -142,7 +142,8 @@ impl SegmentFileReader {
     /// returned as `BqliteError::Io`; any format error is
     /// `BqliteError::Corruption`.
     pub fn open<P: AsRef<Path>>(path: P, current_schema: TableSchema) -> Result<Self> {
-        let bytes = fs::read(path)?;
+        // Path comes from the manifest (trusted internal state), not user input.
+        let bytes = fs::read(path)?; // nosemgrep
         Self::from_bytes(bytes, current_schema)
     }
 
@@ -324,8 +325,6 @@ struct ScanPlan {
 
 /// One output column's decode plan.
 struct PlannedColumn {
-    /// Output column name as seen by consumers.
-    output_name: String,
     /// Output `BqlType` — the type the Arrow field in the batch
     /// schema must match.
     output_type: BqlType,
@@ -416,7 +415,6 @@ fn build_scan_plan(
             current_col.nullable,
         ));
         entries.push(PlannedColumn {
-            output_name: current_col.name.clone(),
             output_type: current_col.bql_type.clone(),
             source,
         });
@@ -475,18 +473,24 @@ impl SegmentScan for SegmentFileScan {
             let idx = self.next_idx;
             self.next_idx += 1;
 
-            // Predicate pruning — a single "accepts_zone" pass over
-            // every projected column that has a zone map. If any
-            // column's predicate rejects its zone, the row group is
-            // guaranteed to produce zero rows and we skip it.
-            if let Some(pred) = self.predicate.clone() {
-                let zones = self.row_group_zone_maps(idx)?;
+            // Predicate pruning — walk every column the predicate
+            // declares as referenced, not the projection: a query
+            // like `WHERE amount > 100 | SELECT user_id` must still
+            // prune on `amount` even though it is not in the output.
+            // Predicates with an empty referenced-column set skip the
+            // zone-map build entirely so the default
+            // `referenced_columns() -> &[]` impl has zero cost.
+            if let Some(pred) = &self.predicate {
+                let referenced = pred.referenced_columns();
                 let mut pruned = false;
-                for entry in &self.plan.entries {
-                    if let Some(zone) = zones.get(&entry.output_name) {
-                        if !pred.accepts_zone(&entry.output_name, zone) {
-                            pruned = true;
-                            break;
+                if !referenced.is_empty() {
+                    let zones = self.row_group_zone_maps(idx)?;
+                    for col_name in referenced {
+                        if let Some(zone) = zones.get(col_name) {
+                            if !pred.accepts_zone(col_name, zone) {
+                                pruned = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -3345,10 +3349,22 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct RejectAllInts;
+    struct RejectAllInts {
+        referenced: Vec<String>,
+    }
+    impl RejectAllInts {
+        fn new() -> Self {
+            Self {
+                referenced: vec!["amount".to_string()],
+            }
+        }
+    }
     impl Predicate for RejectAllInts {
         fn accepts_zone(&self, column: &str, _zone: &CoreZoneMap) -> bool {
             column != "amount"
+        }
+        fn referenced_columns(&self) -> &[String] {
+            &self.referenced
         }
     }
 
@@ -3408,11 +3424,78 @@ mod tests {
 
         let bytes = encode_segment(&request).unwrap();
         let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
-        let predicate: Arc<dyn Predicate> = Arc::new(RejectAllInts);
+        let predicate: Arc<dyn Predicate> = Arc::new(RejectAllInts::new());
         let mut scan = reader
             .scan(&ColumnProjection::all(), Some(predicate))
             .unwrap();
         // The only row group should be pruned — next_row_group returns None.
+        assert!(scan.next_row_group().unwrap().is_none());
+    }
+
+    #[test]
+    fn predicate_prunes_row_group_even_when_column_not_projected() {
+        // Zone-map pruning must be driven by the predicate's own
+        // referenced columns, not the scan's projection — otherwise
+        // `WHERE amount > 100 | SELECT user_id` silently loses
+        // pruning on `amount`.
+        let schema = roundtrip_schema();
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 2,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1", "u2"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u2".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[0, 0]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(0)),
+                        zone_max: Some(PropertyValue::Timestamp(0)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view", "view"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true, true])),
+                        encoded: encode_plain_int(&[1, 2]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(1)),
+                        zone_max: Some(PropertyValue::Int(2)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 1),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let predicate: Arc<dyn Predicate> = Arc::new(RejectAllInts::new());
+        // Projection excludes `amount`; the predicate still references it.
+        let projection = ColumnProjection::with_columns(["entity_id"]);
+        let mut scan = reader.scan(&projection, Some(predicate)).unwrap();
         assert!(scan.next_row_group().unwrap().is_none());
     }
 

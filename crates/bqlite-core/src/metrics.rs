@@ -240,11 +240,12 @@ impl Metrics for NoopMetrics {
 ///
 /// ```rust
 /// # use std::sync::Arc;
+/// # use std::time::Duration;
 /// # use bqlite_core::metrics::{AtomicMetrics, Metrics, MetricsTimer};
 /// let metrics: Arc<dyn Metrics> = Arc::new(AtomicMetrics::new());
 /// {
 ///     let _timer = MetricsTimer::new(&*metrics);
-///     // ... work the operator wants to time ...
+///     std::thread::sleep(Duration::from_micros(1));
 /// } // timer drops here, elapsed ns is recorded on `metrics`
 /// assert!(metrics.snapshot().elapsed_ns > 0);
 /// ```

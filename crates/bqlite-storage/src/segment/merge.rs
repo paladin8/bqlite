@@ -67,7 +67,7 @@ use std::sync::Arc;
 
 use ::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray};
 use ::arrow::compute::interleave;
-use ::arrow::datatypes::{DataType, Schema as ArrowSchema};
+use ::arrow::datatypes::{DataType, Schema as ArrowSchema, TimeUnit};
 
 use bqlite_core::storage::SegmentScan;
 use bqlite_core::{BqliteError, Result};
@@ -436,9 +436,16 @@ fn validate_key_types(schema: &ArrowSchema, entity_key_col: usize, ts_col: usize
         }
     }
     let ts_type = schema.field(ts_col).data_type();
-    if !matches!(ts_type, DataType::Timestamp(_, _)) {
+    // The merge's hot-loop comparator downcasts unconditionally to
+    // `TimestampNanosecondArray`; accepting any other `TimeUnit` here
+    // would turn a mismatch into a panic. The storage reader always
+    // materialises `ts` as `Timestamp(Nanosecond, _)` (see module
+    // docs), so tightening validation to nanosecond only matches the
+    // real upstream and keeps the comparator's invariant explicit.
+    if !matches!(ts_type, DataType::Timestamp(TimeUnit::Nanosecond, _)) {
         return Err(BqliteError::Execution(format!(
-            "k-way merge: ts column has unsupported type {ts_type:?} — expected Timestamp"
+            "k-way merge: ts column has unsupported type {ts_type:?} — \
+             expected Timestamp(Nanosecond, _)"
         )));
     }
     Ok(())
@@ -651,6 +658,28 @@ mod tests {
         let err = KWayMergeScan::new(vec![], schema, 0, 1).unwrap_err();
         match err {
             BqliteError::Execution(msg) => assert!(msg.contains("Timestamp"), "got: {msg}"),
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_rejects_non_nanosecond_timestamp_ts_column() {
+        // The comparator downcasts unconditionally to
+        // `TimestampNanosecondArray`; a `Microsecond` ts must be
+        // rejected up front rather than panicking in the hot loop.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("entity_id", DataType::Utf8View, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let err = KWayMergeScan::new(vec![], schema, 0, 1).unwrap_err();
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("Nanosecond"), "got: {msg}");
+            }
             other => panic!("expected Execution, got {other:?}"),
         }
     }

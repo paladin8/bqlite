@@ -246,11 +246,25 @@ pub trait Predicate: Send + Sync + std::fmt::Debug {
     /// implementations may always return `true`; this disables
     /// zone-map pruning but is always safe.
     ///
-    /// `column` is the fully-qualified column name from the
-    /// projection, not a position. Readers call this method once per
-    /// row-group per referenced column; implementations must be
-    /// cheap.
+    /// `column` is the fully-qualified column name the caller is
+    /// asking about, not a position. Readers call this method once
+    /// per row-group per [`referenced_columns`](Self::referenced_columns)
+    /// entry; implementations must be cheap.
     fn accepts_zone(&self, column: &str, zone: &ZoneMap) -> bool;
+
+    /// Columns whose zone maps the reader should feed into
+    /// [`accepts_zone`](Self::accepts_zone).
+    ///
+    /// Pruning is driven from this list, **not** the scan's
+    /// projection — a predicate on a column that the scan does not
+    /// otherwise read (e.g. `WHERE amount > 100 | SELECT user_id`)
+    /// must still get the chance to prune row groups. The default
+    /// implementation returns an empty slice, which disables
+    /// zone-map pruning for the predicate (always safe, just slow).
+    fn referenced_columns(&self) -> &[String] {
+        const EMPTY: &[String] = &[];
+        EMPTY
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

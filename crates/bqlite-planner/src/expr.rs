@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use bqlite_ast::expr::{BinaryOp, CompareOp, Expr, InRhs, Literal, Spanned, UnaryOp};
 use bqlite_ast::span::Span;
-use bqlite_core::{BqlType, BqliteError, OperatorSchema, PropertyValue, Result};
+use bqlite_core::{BqlType, BqliteError, ColumnDef, OperatorSchema, PropertyValue, Result};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TypedExpr
@@ -288,6 +288,20 @@ fn compatible_arg_type(expected: &BqlType, actual: &BqlType) -> bool {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl TypedExpr {
+    /// Build a [`TypedExprKind::Column`] reference for `col` at
+    /// `column_index`, inheriting the column's type and nullability.
+    pub fn column(column_index: usize, col: &ColumnDef, span: Span) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::Column {
+                column_index,
+                name: col.name.clone(),
+            },
+            result_type: col.bql_type.clone(),
+            nullable: col.nullable,
+            span,
+        }
+    }
+
     /// Type-check an AST expression against `schema`, resolving
     /// function calls through `registry`.
     ///
@@ -309,15 +323,7 @@ impl TypedExpr {
                 let (column_index, col_def) = schema
                     .column(&name.text)
                     .ok_or_else(|| unknown_column(&name.text, expr.span))?;
-                Ok(TypedExpr {
-                    kind: TypedExprKind::Column {
-                        column_index,
-                        name: name.text.clone(),
-                    },
-                    result_type: col_def.bql_type.clone(),
-                    nullable: col_def.nullable,
-                    span: expr.span,
-                })
+                Ok(TypedExpr::column(column_index, col_def, expr.span))
             }
 
             Expr::Qualified { .. } => Err(unsupported(

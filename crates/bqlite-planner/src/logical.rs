@@ -51,7 +51,7 @@ use bqlite_core::{
     BqlType, BqliteError, Catalog, ColumnDef, OperatorSchema, PropertyValue, Result, TableSchema,
 };
 
-use crate::expr::{FunctionRegistry, TypedExpr, TypedExprKind};
+use crate::expr::{FunctionRegistry, TypedExpr};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The logical plan enum
@@ -572,46 +572,21 @@ fn lower_select(
         ));
     }
 
-    // A wildcard is only legal as the sole item (query-language.md §10).
-    let has_wildcard = items.iter().any(|it| {
-        matches!(
-            it.kind,
-            SelectItemKind::Wildcard | SelectItemKind::QualifiedWildcard(_)
-        )
-    });
-    if has_wildcard && items.len() > 1 {
-        return Err(BqliteError::Plan(
-            "`*` wildcard must be the sole item in a SELECT — mixing `*` with other items is \
-             not supported"
-                .into(),
-        ));
-    }
-
     let input_schema = acc.output_schema().clone();
     let mut project_items: Vec<ProjectItem> = Vec::new();
 
     for (idx, item) in items.into_iter().enumerate() {
         match item.kind {
             SelectItemKind::Wildcard => {
-                // Expand to one item per input column, preserving
-                // the input's order. Each expanded item builds a
-                // synthetic `TypedExpr::Column` at the position of
-                // the column in the input schema. System columns
-                // (`__seq_id`, `__batch_id`) are included because
-                // query-language.md §10 says `SELECT *` means every
-                // visible column.
+                // `SELECT *` excludes the implicit `__seq_id` /
+                // `__batch_id` system columns per query-language.md
+                // §10 — they remain accessible when named explicitly.
                 for (column_index, col) in input_schema.columns().iter().enumerate() {
-                    let typed = TypedExpr {
-                        kind: TypedExprKind::Column {
-                            column_index,
-                            name: col.name.clone(),
-                        },
-                        result_type: col.bql_type.clone(),
-                        nullable: col.nullable,
-                        span: item.span,
-                    };
+                    if col.is_system() {
+                        continue;
+                    }
                     project_items.push(ProjectItem {
-                        expr: typed,
+                        expr: TypedExpr::column(column_index, col, item.span),
                         output_name: col.name.clone(),
                     });
                 }
@@ -1388,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn select_wildcard_expands_to_all_input_columns() {
+    fn select_wildcard_expands_to_non_system_input_columns() {
         let cat = InMemoryCatalog::default().with(purchases_schema());
         let pipeline = pipeline_with_stages(
             "purchases",
@@ -1406,20 +1381,9 @@ mod tests {
         match &plan {
             LogicalPlan::Project { expressions, .. } => {
                 let names: Vec<&str> = expressions.iter().map(|i| i.output_name.as_str()).collect();
-                // Wildcard expands to the input's full schema
-                // including system columns.
-                assert_eq!(
-                    names,
-                    vec![
-                        "user_id",
-                        "ts",
-                        "event",
-                        "amount",
-                        "country",
-                        "__seq_id",
-                        "__batch_id"
-                    ]
-                );
+                // Per query-language.md §10, `SELECT *` excludes the
+                // implicit `__seq_id` / `__batch_id` system columns.
+                assert_eq!(names, vec!["user_id", "ts", "event", "amount", "country"]);
             }
             other => panic!("expected Project, got {other:?}"),
         }
@@ -1614,7 +1578,11 @@ mod tests {
     }
 
     #[test]
-    fn select_wildcard_mixed_with_items_is_rejected() {
+    fn select_wildcard_mixed_with_computed_expands_inline() {
+        // `SELECT *, amount * 1.1 AS adjusted` — per
+        // query-language.md §10 the wildcard expands to every
+        // non-system input column and the computed expression
+        // is appended in declaration order.
         let cat = InMemoryCatalog::default().with(purchases_schema());
         let pipeline = pipeline_with_stages(
             "purchases",
@@ -1626,15 +1594,37 @@ mod tests {
                         alias: None,
                         span: Span::EMPTY,
                     },
-                    select_bare_column("user_id"),
+                    SelectItem {
+                        kind: SelectItemKind::Expr(Spanned::new(
+                            Expr::Binary {
+                                op: bqlite_ast::BinaryOp::Multiply,
+                                left: Box::new(column_expr("amount")),
+                                right: Box::new(Spanned::new(
+                                    Expr::Literal(Literal::Float(1.1)),
+                                    Span::EMPTY,
+                                )),
+                            },
+                            Span::EMPTY,
+                        )),
+                        alias: Some(Name::synthetic("adjusted")),
+                        span: Span::EMPTY,
+                    },
                 ],
                 span: Span::EMPTY,
             }],
         );
-        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
-        match err {
-            BqliteError::Plan(msg) => assert!(msg.contains("sole item")),
-            other => panic!("expected Plan error, got {other:?}"),
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::Project { expressions, .. } => {
+                let names: Vec<&str> = expressions.iter().map(|i| i.output_name.as_str()).collect();
+                assert_eq!(
+                    names,
+                    vec!["user_id", "ts", "event", "amount", "country", "adjusted"]
+                );
+                let adjusted = expressions.last().unwrap();
+                assert_eq!(adjusted.expr.result_type, BqlType::Float);
+            }
+            other => panic!("expected Project, got {other:?}"),
         }
     }
 
