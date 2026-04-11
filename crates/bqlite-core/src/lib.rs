@@ -48,7 +48,8 @@ pub use demand::{DemandCapabilities, DemandPropagation};
 
 pub mod storage;
 pub use storage::{
-    ColumnProjection, Predicate, SegmentHandle, SegmentReader, SegmentScan, ZoneMap,
+    ColumnProjection, DictRewrite, DictionaryIndex, Predicate, RangeOp, ScanConjunct,
+    ScanPredicate, SegmentHandle, SegmentReader, SegmentScan, ZoneMap,
 };
 
 pub mod catalog;

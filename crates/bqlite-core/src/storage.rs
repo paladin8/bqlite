@@ -223,17 +223,329 @@ impl ColumnProjection {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Scan predicate IR
+//
+// The concrete pushdown IR consumed by the storage layer. `ScanPredicate`
+// is a flat conjunction of `ScanConjunct`s — each conjunct is one
+// column/operator/literal triple the planner has already validated as
+// pushable. See `docs/design/storage/predicate-pushdown.md` §5 for the
+// placement rationale (why these types live in `bqlite-core` instead of
+// in the optimizer crate) and §6 for the per-conjunct zone-map
+// acceptance rules implemented in `ScanConjunct::accepts_zone` below.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Comparison operator for a [`ScanConjunct::Range`] predicate.
+///
+/// The planner normalises every range comparison into one of these
+/// four forms; `=` and `!=` are separate variants so dictionary
+/// rewriting (predicate-pushdown.md §7) can dispatch on the variant
+/// rather than parsing an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeOp {
+    /// `col < value`.
+    Lt,
+    /// `col <= value`.
+    Le,
+    /// `col > value`.
+    Gt,
+    /// `col >= value`.
+    Ge,
+}
+
+/// One conjunct in a [`ScanPredicate`] — a single pushable predicate
+/// of the shape `column <op> literal(s)`.
+///
+/// The flat shape — no nested boolean tree — is deliberate:
+/// predicate-pushdown.md §5 pins this representation, and the
+/// predicate pushdown optimizer pass (TASK-227) is responsible for
+/// collapsing nested `AND`s before building a `ScanPredicate`. The
+/// storage layer never sees a boolean expression tree.
+///
+/// Marked `#[non_exhaustive]` so Wave 4+ can add new variants (bloom
+/// filter hooks, pattern matchers, compare-column-to-column) without
+/// a breaking change to any crate that matches on a `ScanConjunct`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScanConjunct {
+    /// `column = value`. Dictionary-rewritable (predicate-pushdown.md §7).
+    Equal {
+        /// Column this conjunct filters on.
+        column: String,
+        /// Pre-resolved literal the column is compared to.
+        value: PropertyValue,
+    },
+    /// `column != value`.
+    NotEqual {
+        /// Column this conjunct filters on.
+        column: String,
+        /// Pre-resolved literal the column is compared to.
+        value: PropertyValue,
+    },
+    /// `column <op> value` for `<`, `<=`, `>`, `>=`.
+    Range {
+        /// Column this conjunct filters on.
+        column: String,
+        /// Range comparison operator.
+        op: RangeOp,
+        /// Pre-resolved literal the column is compared to.
+        value: PropertyValue,
+    },
+    /// `column IN (v1, v2, ..., vk)`. `values` is always non-empty —
+    /// empty `IN` lists are collapsed to a constant `false` by the
+    /// optimizer (TASK-227) and never reach storage.
+    /// Dictionary-rewritable (predicate-pushdown.md §7).
+    InSet {
+        /// Column this conjunct filters on.
+        column: String,
+        /// Non-empty set of literals to match against.
+        values: Vec<PropertyValue>,
+    },
+    /// `column IS NULL`.
+    IsNull {
+        /// Column this conjunct filters on.
+        column: String,
+    },
+    /// `column IS NOT NULL`.
+    IsNotNull {
+        /// Column this conjunct filters on.
+        column: String,
+    },
+}
+
+impl ScanConjunct {
+    /// Column name this conjunct filters on. Private accessor used by
+    /// [`ScanPredicate::accepts_zone_group`] and the dictionary
+    /// rewriter to group conjuncts by their target column without
+    /// exposing the match machinery to callers.
+    pub(crate) fn column(&self) -> &str {
+        match self {
+            ScanConjunct::Equal { column, .. }
+            | ScanConjunct::NotEqual { column, .. }
+            | ScanConjunct::Range { column, .. }
+            | ScanConjunct::InSet { column, .. }
+            | ScanConjunct::IsNull { column }
+            | ScanConjunct::IsNotNull { column } => column,
+        }
+    }
+
+    /// Per-conjunct zone-map acceptance — implements the Wave 2 rule
+    /// table from `docs/design/storage/predicate-pushdown.md` §6.
+    ///
+    /// Returns `true` iff the row-group described by `zone` **might**
+    /// contain at least one row that satisfies this conjunct. The
+    /// "might" is load-bearing: zone maps are a coarse summary, so a
+    /// row-group that passes this check is still re-evaluated row-by-
+    /// row by the filter operator above the scan. A row-group that
+    /// **fails** this check is unconditionally skipped — the no-false-
+    /// negatives invariant (no matching row is ever pruned) is what
+    /// makes the pruning correct. Every per-variant branch below is
+    /// conservative: when in doubt, it accepts.
+    pub(crate) fn accepts_zone(&self, zone: &ZoneMap) -> bool {
+        let nulls = zone.null_count;
+        let rows = zone.row_count;
+        match self {
+            // `Equal`: need at least one non-null row, and the literal
+            // must lie within [min, max] when the bounds are populated.
+            // `is_none_or` accepts conservatively when the writer did
+            // not populate one of the bounds (v1 writers always do, but
+            // the rule stays correct for a future partial-bound writer).
+            ScanConjunct::Equal { value, .. } => {
+                nulls < rows
+                    && zone.min.as_ref().is_none_or(|m| m <= value)
+                    && zone.max.as_ref().is_none_or(|x| value <= x)
+            }
+            // `NotEqual`: reject only when every non-null row equals
+            // `value` AND there are zero nulls. A row-group with
+            // `min == max == value && nulls > 0` still has null rows,
+            // but those rows produce `UNKNOWN` under `!=` three-valued
+            // logic and are dropped by the filter operator — so the
+            // correct answer is still "reject", but we only know the
+            // exact count from the writer when `nulls == 0`.
+            ScanConjunct::NotEqual { value, .. } => {
+                !(nulls == 0
+                    && zone.min.as_ref() == Some(value)
+                    && zone.max.as_ref() == Some(value))
+            }
+            // `Range`: the bound check differs per operator. A
+            // row-group with only nulls rejects immediately because
+            // every non-null value is needed to satisfy the range.
+            ScanConjunct::Range { op, value, .. } => match op {
+                RangeOp::Lt => nulls < rows && zone.min.as_ref().is_some_and(|m| m < value),
+                RangeOp::Le => nulls < rows && zone.min.as_ref().is_some_and(|m| m <= value),
+                RangeOp::Gt => nulls < rows && zone.max.as_ref().is_some_and(|x| value < x),
+                RangeOp::Ge => nulls < rows && zone.max.as_ref().is_some_and(|x| value <= x),
+            },
+            // `InSet`: accept if any literal could fall within the
+            // row-group's [min, max] range. Linear over `values` —
+            // parsed `IN (...)` lists are bounded and small.
+            ScanConjunct::InSet { values, .. } => {
+                nulls < rows
+                    && values.iter().any(|v| {
+                        zone.min.as_ref().is_none_or(|m| m <= v)
+                            && zone.max.as_ref().is_none_or(|x| v <= x)
+                    })
+            }
+            // `IS NULL`: accept if the row-group has at least one null.
+            ScanConjunct::IsNull { .. } => nulls > 0,
+            // `IS NOT NULL`: accept if the row-group has at least one
+            // non-null row.
+            ScanConjunct::IsNotNull { .. } => nulls < rows,
+        }
+    }
+}
+
+/// A conjunctive (AND) set of pushable scan predicates in the flat
+/// shape the storage layer can evaluate directly.
+///
+/// Constructed by the scan operator (TASK-230) from its
+/// `scan_predicates: Vec<CompiledExpr>` and handed to storage via the
+/// `Option<Arc<dyn Predicate>>` parameter on `open_segment`. The
+/// storage reader loops this predicate's `conjuncts` at row-group
+/// boundaries to decide which row groups to decode.
+///
+/// An empty `conjuncts` vec is legal and means "no pushdown" — the
+/// scan returns every row the projection produces and leaves all
+/// filtering to the filter operator above. This is the pre-pushdown
+/// baseline.
+///
+/// `ScanPredicate` is `Clone`-cheap because the struct is a single
+/// heap allocation for each vector — the intention is that scan
+/// operators construct exactly one per query and share it across
+/// every segment they open via `Arc<dyn Predicate>`.
+#[derive(Debug, Clone, Default)]
+pub struct ScanPredicate {
+    /// Conjuncts, in the order the storage layer will evaluate them.
+    /// Acceptance is short-circuit `AND`, so the first conjunct that
+    /// rejects a row-group terminates evaluation — the optimizer can
+    /// hint pruning order by sorting this vec (not exploited in
+    /// Wave 2; see predicate-pushdown.md §6.1).
+    pub conjuncts: Vec<ScanConjunct>,
+    /// Cached set of columns referenced by any conjunct, in first-
+    /// occurrence order, with duplicates removed. Populated at
+    /// construction so [`Predicate::referenced_columns`] can return a
+    /// borrowed slice without re-walking `conjuncts` on every call.
+    referenced: Vec<String>,
+}
+
+impl ScanPredicate {
+    /// Construct a `ScanPredicate` from a flat conjunct list.
+    ///
+    /// Populates the internal `referenced_columns` cache by walking
+    /// the conjuncts once. Callers building from a `Vec<CompiledExpr>`
+    /// (TASK-230 scan operator) build the conjunct list first and
+    /// hand it off in one call — no conjunct is ever added or removed
+    /// after construction.
+    pub fn new(conjuncts: Vec<ScanConjunct>) -> Self {
+        let mut referenced: Vec<String> = Vec::new();
+        for c in &conjuncts {
+            let col = c.column();
+            if !referenced.iter().any(|r| r == col) {
+                referenced.push(col.to_string());
+            }
+        }
+        Self {
+            conjuncts,
+            referenced,
+        }
+    }
+
+    /// True when this predicate has no conjuncts — equivalent to "no
+    /// pushdown" on the storage side. Scan operators may short-circuit
+    /// the `Option<Arc<dyn Predicate>>` argument to `None` in this
+    /// case to avoid an extra `Arc` clone; either form is correct.
+    pub fn is_empty(&self) -> bool {
+        self.conjuncts.is_empty()
+    }
+
+    /// Number of conjuncts — exposed primarily for benches and
+    /// `Debug`-time assertions.
+    pub fn len(&self) -> usize {
+        self.conjuncts.len()
+    }
+}
+
+/// Outcome of a dictionary rewrite for a single column
+/// (predicate-pushdown.md §7 / §10). Returned from
+/// [`Predicate::resolve_dictionary_codes`].
+///
+/// The reader calls the hook once per dictionary-encoded projected
+/// column and dispatches on the returned shape:
+///
+/// - `NoRewrite`: no dict-rewritable conjunct on this column; proceed
+///   as if the method had not been called (range conjuncts and post-
+///   filter still apply).
+/// - `EmptySet`: at least one dict-rewritable conjunct exists, and
+///   **none** of its literals resolved. The row-group yields zero
+///   rows for that conjunct — the reader short-circuits to an empty
+///   batch without decoding the remaining columns.
+/// - `Codes(codes)`: at least one literal resolved. The reader builds
+///   a bitmask against the row-group's bit-packed code stream and
+///   uses it to filter during decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DictRewrite {
+    /// No dict-rewritable conjunct on this column — proceed as if the
+    /// method had not been called.
+    NoRewrite,
+    /// At least one dict-rewritable conjunct exists, but none of its
+    /// literals resolved to codes in the segment dictionary — the
+    /// row-group yields zero matching rows for this conjunct.
+    EmptySet,
+    /// Resolved code set. Non-empty by construction; duplicate codes
+    /// are legal and handled by the reader's mask-construction loop.
+    Codes(Vec<u32>),
+}
+
+/// Read-only view over a segment-level dictionary, handed to
+/// [`Predicate::resolve_dictionary_codes`] so the trait implementer
+/// can rewrite `Equal`/`InSet` literals into the segment's code space
+/// without depending on the storage crate's dictionary internals.
+///
+/// The shape — a slice of sorted distinct values — matches the
+/// on-disk layout specified by storage-format.md §11.1 (Wave 2
+/// dictionary footer: sorted distinct values, code is the position).
+#[derive(Debug)]
+pub struct DictionaryIndex<'a> {
+    /// Sorted distinct dictionary values. The value at index `i` is
+    /// assigned code `i` (0-based, `u32`).
+    pub values: &'a [PropertyValue],
+}
+
+impl DictionaryIndex<'_> {
+    /// Resolve a literal to its dictionary code via binary search.
+    ///
+    /// Returns `None` when the literal is absent from the dictionary —
+    /// the storage reader treats such a literal as "never matches"
+    /// for the purposes of the bitmask rewrite.
+    pub fn code_of(&self, value: &PropertyValue) -> Option<u32> {
+        self.values.binary_search(value).ok().map(|i| i as u32)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Predicate
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Predicate pushdown hook consumed by [`SegmentReader::open_segment`].
 ///
-/// The Wave 1 surface is deliberately one method wide. A real
-/// predicate IR — with whole-batch evaluation, dictionary-aware
-/// filtering, and fusion with the scan operator — is a Wave 2
-/// `[DESIGN]` task. Extending this trait then is additive: readers
-/// that only honour `accepts_zone` keep working, readers that opt
-/// into the richer surface get more pruning.
+/// The Wave 2 surface is four methods wide:
+///
+/// 1. [`accepts_zone`](Self::accepts_zone) — single-column zone-map
+///    acceptance, retained from Wave 1 for back-compat.
+/// 2. [`accepts_zone_group`](Self::accepts_zone_group) — whole-row-
+///    group acceptance taking the complete `column → ZoneMap` map.
+///    `ScanPredicate` overrides the default body to respect conjuncts
+///    on columns absent from `zones`.
+/// 3. [`referenced_columns`](Self::referenced_columns) — columns the
+///    pruning loop should feed into the acceptance methods.
+/// 4. [`resolve_dictionary_codes`](Self::resolve_dictionary_codes) —
+///    dictionary rewrite hook for `Equal`/`InSet` conjuncts on
+///    dictionary-encoded columns, per predicate-pushdown.md §7.
+///
+/// The trait stays object-safe (`Arc<dyn Predicate>`) — none of the
+/// methods return `Self` or use generics. The Wave 2 extension is
+/// additive: every new method has a default body that preserves the
+/// Wave 1 "conservative accept" behaviour, so existing `Predicate`
+/// impls keep compiling without touching them.
 ///
 /// Implementations are held behind `Arc` so many `SegmentScan`s can
 /// share a single predicate without per-scan cloning.
@@ -250,20 +562,136 @@ pub trait Predicate: Send + Sync + std::fmt::Debug {
     /// asking about, not a position. Readers call this method once
     /// per row-group per [`referenced_columns`](Self::referenced_columns)
     /// entry; implementations must be cheap.
+    ///
+    /// For multi-column predicates, this method answers **about
+    /// `column` in isolation** — conjuncts on other columns are not
+    /// consulted. Callers that have access to the complete
+    /// `column → ZoneMap` map should prefer
+    /// [`accepts_zone_group`](Self::accepts_zone_group).
     fn accepts_zone(&self, column: &str, zone: &ZoneMap) -> bool;
 
+    /// Whole-row-group zone-map acceptance.
+    ///
+    /// The caller supplies the complete `column → ZoneMap` dictionary
+    /// from [`SegmentScan::row_group_zone_maps`]. The implementer
+    /// returns `true` iff at least one row in the row-group **might**
+    /// satisfy every conjunct. Conjuncts that reference a column
+    /// absent from `zones` are treated **conservatively** — they
+    /// accept unconditionally (the reader must not prune a row-group
+    /// just because a zone was not recorded, per
+    /// `docs/design/storage/reader-trait.md` §5.1).
+    ///
+    /// The default body iterates `zones` and calls `accepts_zone`
+    /// per entry — a correct fallback for Wave 1 impls that only
+    /// meaningfully answer per-column, but one that misses conjuncts
+    /// on columns absent from the map. Multi-column predicates
+    /// ([`ScanPredicate`] in particular) override this to walk their
+    /// own conjuncts instead.
+    fn accepts_zone_group(&self, zones: &HashMap<String, ZoneMap>) -> bool {
+        zones.iter().all(|(col, zone)| self.accepts_zone(col, zone))
+    }
+
     /// Columns whose zone maps the reader should feed into
-    /// [`accepts_zone`](Self::accepts_zone).
+    /// [`accepts_zone`](Self::accepts_zone) or
+    /// [`accepts_zone_group`](Self::accepts_zone_group).
     ///
     /// Pruning is driven from this list, **not** the scan's
     /// projection — a predicate on a column that the scan does not
     /// otherwise read (e.g. `WHERE amount > 100 | SELECT user_id`)
     /// must still get the chance to prune row groups. The default
-    /// implementation returns an empty slice, which disables
-    /// zone-map pruning for the predicate (always safe, just slow).
+    /// implementation returns an empty slice, which disables zone-map
+    /// pruning for the predicate (always safe, just slow).
     fn referenced_columns(&self) -> &[String] {
         const EMPTY: &[String] = &[];
         EMPTY
+    }
+
+    /// Dictionary rewrite hook for `Equal` / `InSet` conjuncts on a
+    /// dictionary-encoded column (predicate-pushdown.md §7).
+    ///
+    /// The reader calls this once per projected column whose column
+    /// chunk uses Dictionary encoding and hands over a view of the
+    /// segment-level dictionary. The implementer inspects its own
+    /// conjuncts on `column` and returns a [`DictRewrite`] describing
+    /// how the reader should use the bit-packed code stream.
+    ///
+    /// The default body returns [`DictRewrite::NoRewrite`], so Wave 1
+    /// `Predicate` impls (and any future impl that does not care
+    /// about dictionary rewriting) are unaffected.
+    fn resolve_dictionary_codes(&self, _column: &str, _dict: &DictionaryIndex<'_>) -> DictRewrite {
+        DictRewrite::NoRewrite
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ScanPredicate: Predicate impl
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl Predicate for ScanPredicate {
+    fn accepts_zone(&self, column: &str, zone: &ZoneMap) -> bool {
+        // Only the conjuncts that reference `column` have anything to
+        // say about this zone — conjuncts on other columns are not
+        // consulted here, per the single-column contract. Callers
+        // that need the full row-group decision (the reader's
+        // pruning loop is one) call `accepts_zone_group` instead.
+        self.conjuncts
+            .iter()
+            .filter(|c| c.column() == column)
+            .all(|c| c.accepts_zone(zone))
+    }
+
+    fn accepts_zone_group(&self, zones: &HashMap<String, ZoneMap>) -> bool {
+        // Walk our conjuncts (not `zones`) so conjuncts on columns
+        // absent from `zones` conservatively accept — the default
+        // body iterates `zones` and would silently miss them.
+        self.conjuncts.iter().all(|c| match zones.get(c.column()) {
+            Some(zone) => c.accepts_zone(zone),
+            None => true,
+        })
+    }
+
+    fn referenced_columns(&self) -> &[String] {
+        &self.referenced
+    }
+
+    fn resolve_dictionary_codes(&self, column: &str, dict: &DictionaryIndex<'_>) -> DictRewrite {
+        // Walk conjuncts on `column`, collecting resolved codes from
+        // every Equal / InSet. Range, NotEqual, IsNull, IsNotNull are
+        // never dictionary-rewritable — they fall through to zone-map
+        // pruning plus post-filter. If every literal fails to resolve,
+        // the conjunct definitely-rejects every row in the segment.
+        let mut any_rewritable = false;
+        let mut codes: Vec<u32> = Vec::new();
+        for conj in &self.conjuncts {
+            if conj.column() != column {
+                continue;
+            }
+            match conj {
+                ScanConjunct::Equal { value, .. } => {
+                    any_rewritable = true;
+                    if let Some(code) = dict.code_of(value) {
+                        codes.push(code);
+                    }
+                }
+                ScanConjunct::InSet { values, .. } => {
+                    any_rewritable = true;
+                    for v in values {
+                        if let Some(code) = dict.code_of(v) {
+                            codes.push(code);
+                        }
+                    }
+                }
+                _ => {
+                    // Range / NotEqual / IsNull / IsNotNull — not
+                    // dict-rewritable; post-filter handles them.
+                }
+            }
+        }
+        match (any_rewritable, codes.is_empty()) {
+            (false, _) => DictRewrite::NoRewrite,
+            (true, true) => DictRewrite::EmptySet,
+            (true, false) => DictRewrite::Codes(codes),
+        }
     }
 }
 
@@ -918,5 +1346,459 @@ mod tests {
         assert!(p.accepts_zone("b", &z));
         let other: Arc<dyn Predicate> = Arc::clone(&p);
         assert!(other.accepts_zone("c", &z));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Scan predicate IR — ScanConjunct / ScanPredicate / DictRewrite tests
+    //
+    // Every row of the acceptance table in
+    // `docs/design/storage/predicate-pushdown.md` §6 is covered below:
+    // a rejecting case, an accepting case, and the all-null /
+    // null-present edges where they matter. The tests double as the
+    // executable form of the rule table.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a zone map with integer bounds — the shape used by most
+    /// rule-table tests. `nulls = 0` unless a test overrides it.
+    fn int_zone(min: i64, max: i64, rows: u64) -> ZoneMap {
+        ZoneMap {
+            min: Some(PropertyValue::Int(min)),
+            max: Some(PropertyValue::Int(max)),
+            null_count: 0,
+            row_count: rows,
+        }
+    }
+
+    fn int_zone_with_nulls(min: i64, max: i64, nulls: u64, rows: u64) -> ZoneMap {
+        ZoneMap {
+            min: Some(PropertyValue::Int(min)),
+            max: Some(PropertyValue::Int(max)),
+            null_count: nulls,
+            row_count: rows,
+        }
+    }
+
+    // ── Equal ────────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_conjunct_equal_accepts_when_value_in_range() {
+        let conj = ScanConjunct::Equal {
+            column: "amount".into(),
+            value: PropertyValue::Int(50),
+        };
+        assert!(conj.accepts_zone(&int_zone(1, 100, 64)));
+        // Boundary values accept on both sides.
+        assert!(conj.accepts_zone(&int_zone(50, 50, 64)));
+        assert!(conj.accepts_zone(&int_zone(50, 100, 64)));
+        assert!(conj.accepts_zone(&int_zone(1, 50, 64)));
+    }
+
+    #[test]
+    fn scan_conjunct_equal_rejects_when_value_out_of_range() {
+        let conj = ScanConjunct::Equal {
+            column: "amount".into(),
+            value: PropertyValue::Int(200),
+        };
+        assert!(!conj.accepts_zone(&int_zone(1, 100, 64)));
+        let below = ScanConjunct::Equal {
+            column: "amount".into(),
+            value: PropertyValue::Int(-5),
+        };
+        assert!(!below.accepts_zone(&int_zone(1, 100, 64)));
+    }
+
+    #[test]
+    fn scan_conjunct_equal_rejects_all_null_row_group() {
+        let conj = ScanConjunct::Equal {
+            column: "amount".into(),
+            value: PropertyValue::Int(5),
+        };
+        assert!(!conj.accepts_zone(&ZoneMap::all_null(64)));
+    }
+
+    // ── NotEqual ─────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_conjunct_not_equal_rejects_only_degenerate_case() {
+        let conj = ScanConjunct::NotEqual {
+            column: "event".into(),
+            value: PropertyValue::Int(5),
+        };
+        // Every non-null row equals 5, no nulls — definitely empty.
+        assert!(!conj.accepts_zone(&int_zone(5, 5, 64)));
+        // Mixed range — some rows may not equal 5.
+        assert!(conj.accepts_zone(&int_zone(1, 10, 64)));
+        // Single-value range with nulls — writer's "exact" info is
+        // the (min, max) pair, which is still == value; the rule's
+        // `nulls == 0` guard keeps us conservative when nulls exist.
+        assert!(conj.accepts_zone(&int_zone_with_nulls(5, 5, 10, 64)));
+        // All-null row-group: min == max == None, nulls == rows > 0.
+        // Conservatively accept — every row is NULL, every row
+        // produces UNKNOWN under `!=`, and the filter operator above
+        // the scan drops them. Accept keeps the rule well-typed
+        // against `Option<PropertyValue>` bounds.
+        assert!(conj.accepts_zone(&ZoneMap::all_null(64)));
+    }
+
+    // ── Range ────────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_conjunct_range_lt_accepts_when_min_below_value() {
+        let conj = ScanConjunct::Range {
+            column: "amount".into(),
+            op: RangeOp::Lt,
+            value: PropertyValue::Int(100),
+        };
+        assert!(conj.accepts_zone(&int_zone(1, 99, 64)));
+        assert!(conj.accepts_zone(&int_zone(50, 150, 64))); // some rows < 100
+                                                            // min == value fails Lt (needs strict <)
+        assert!(!conj.accepts_zone(&int_zone(100, 200, 64)));
+        assert!(!conj.accepts_zone(&int_zone(101, 200, 64)));
+    }
+
+    #[test]
+    fn scan_conjunct_range_le_accepts_on_equality() {
+        let conj = ScanConjunct::Range {
+            column: "amount".into(),
+            op: RangeOp::Le,
+            value: PropertyValue::Int(100),
+        };
+        assert!(conj.accepts_zone(&int_zone(100, 200, 64))); // min == value
+        assert!(!conj.accepts_zone(&int_zone(101, 200, 64)));
+    }
+
+    #[test]
+    fn scan_conjunct_range_gt_accepts_when_max_above_value() {
+        let conj = ScanConjunct::Range {
+            column: "amount".into(),
+            op: RangeOp::Gt,
+            value: PropertyValue::Int(100),
+        };
+        assert!(conj.accepts_zone(&int_zone(1, 101, 64)));
+        assert!(conj.accepts_zone(&int_zone(50, 200, 64)));
+        // max == value fails Gt (needs strict >)
+        assert!(!conj.accepts_zone(&int_zone(1, 100, 64)));
+    }
+
+    #[test]
+    fn scan_conjunct_range_ge_accepts_on_equality() {
+        let conj = ScanConjunct::Range {
+            column: "amount".into(),
+            op: RangeOp::Ge,
+            value: PropertyValue::Int(100),
+        };
+        assert!(conj.accepts_zone(&int_zone(1, 100, 64))); // max == value
+        assert!(!conj.accepts_zone(&int_zone(1, 99, 64)));
+    }
+
+    #[test]
+    fn scan_conjunct_range_rejects_all_null_row_group() {
+        let conj = ScanConjunct::Range {
+            column: "amount".into(),
+            op: RangeOp::Gt,
+            value: PropertyValue::Int(0),
+        };
+        assert!(!conj.accepts_zone(&ZoneMap::all_null(64)));
+    }
+
+    // ── InSet ────────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_conjunct_in_set_accepts_when_any_value_in_range() {
+        let conj = ScanConjunct::InSet {
+            column: "status".into(),
+            values: vec![
+                PropertyValue::Int(1),
+                PropertyValue::Int(50),
+                PropertyValue::Int(9999),
+            ],
+        };
+        // 50 falls in [1, 100].
+        assert!(conj.accepts_zone(&int_zone(1, 100, 64)));
+    }
+
+    #[test]
+    fn scan_conjunct_in_set_rejects_when_all_values_out_of_range() {
+        let conj = ScanConjunct::InSet {
+            column: "status".into(),
+            values: vec![PropertyValue::Int(200), PropertyValue::Int(300)],
+        };
+        assert!(!conj.accepts_zone(&int_zone(1, 100, 64)));
+    }
+
+    #[test]
+    fn scan_conjunct_in_set_rejects_all_null_row_group() {
+        let conj = ScanConjunct::InSet {
+            column: "status".into(),
+            values: vec![PropertyValue::Int(50)],
+        };
+        assert!(!conj.accepts_zone(&ZoneMap::all_null(64)));
+    }
+
+    // ── IsNull / IsNotNull ───────────────────────────────────────────
+
+    #[test]
+    fn scan_conjunct_is_null_requires_any_null() {
+        let conj = ScanConjunct::IsNull {
+            column: "amount".into(),
+        };
+        assert!(!conj.accepts_zone(&int_zone(1, 100, 64))); // nulls == 0
+        assert!(conj.accepts_zone(&int_zone_with_nulls(1, 100, 5, 64)));
+        assert!(conj.accepts_zone(&ZoneMap::all_null(64)));
+    }
+
+    #[test]
+    fn scan_conjunct_is_not_null_requires_any_non_null() {
+        let conj = ScanConjunct::IsNotNull {
+            column: "amount".into(),
+        };
+        assert!(conj.accepts_zone(&int_zone(1, 100, 64)));
+        assert!(conj.accepts_zone(&int_zone_with_nulls(1, 100, 5, 64)));
+        assert!(!conj.accepts_zone(&ZoneMap::all_null(64)));
+    }
+
+    // ── ScanPredicate ────────────────────────────────────────────────
+
+    #[test]
+    fn scan_predicate_new_populates_referenced_dedup_ordered() {
+        let pred = ScanPredicate::new(vec![
+            ScanConjunct::Range {
+                column: "amount".into(),
+                op: RangeOp::Gt,
+                value: PropertyValue::Int(100),
+            },
+            ScanConjunct::Equal {
+                column: "event".into(),
+                value: PropertyValue::String("checkout".into()),
+            },
+            // Second reference to "amount" — must not duplicate.
+            ScanConjunct::Range {
+                column: "amount".into(),
+                op: RangeOp::Le,
+                value: PropertyValue::Int(1000),
+            },
+        ]);
+        assert_eq!(pred.referenced_columns(), &["amount", "event"]);
+    }
+
+    #[test]
+    fn scan_predicate_is_empty_accepts_everything() {
+        let pred = ScanPredicate::default();
+        assert!(pred.is_empty());
+        assert_eq!(pred.len(), 0);
+        let zones: HashMap<String, ZoneMap> = HashMap::new();
+        assert!(pred.accepts_zone_group(&zones));
+    }
+
+    #[test]
+    fn scan_predicate_accepts_zone_group_rejects_when_any_conjunct_rejects() {
+        let pred = ScanPredicate::new(vec![
+            ScanConjunct::Range {
+                column: "amount".into(),
+                op: RangeOp::Gt,
+                value: PropertyValue::Int(100),
+            },
+            ScanConjunct::Equal {
+                column: "event".into(),
+                value: PropertyValue::Int(5),
+            },
+        ]);
+        let mut zones: HashMap<String, ZoneMap> = HashMap::new();
+        zones.insert("amount".into(), int_zone(1, 50, 64)); // rejects Gt 100
+        zones.insert("event".into(), int_zone(1, 10, 64)); // would accept Equal 5
+        assert!(!pred.accepts_zone_group(&zones));
+    }
+
+    #[test]
+    fn scan_predicate_accepts_zone_group_missing_column_is_conservative() {
+        // A conjunct on a column absent from `zones` must NOT cause
+        // the row-group to be pruned. This is the core invariant
+        // from predicate-pushdown.md §6.
+        let pred = ScanPredicate::new(vec![ScanConjunct::Range {
+            column: "amount".into(),
+            op: RangeOp::Gt,
+            value: PropertyValue::Int(100),
+        }]);
+        let zones: HashMap<String, ZoneMap> = HashMap::new(); // empty
+        assert!(pred.accepts_zone_group(&zones));
+    }
+
+    #[test]
+    fn scan_predicate_single_column_accepts_zone_only_checks_that_column() {
+        // The single-column form answers in isolation — a conjunct on
+        // a different column must not affect the answer.
+        let pred = ScanPredicate::new(vec![
+            ScanConjunct::Equal {
+                column: "event".into(),
+                value: PropertyValue::Int(5),
+            },
+            // `amount` conjunct that would reject its zone, but we're
+            // asking about `event`.
+            ScanConjunct::Range {
+                column: "amount".into(),
+                op: RangeOp::Gt,
+                value: PropertyValue::Int(1000),
+            },
+        ]);
+        assert!(pred.accepts_zone("event", &int_zone(1, 10, 64)));
+    }
+
+    #[test]
+    fn scan_predicate_accepts_zone_group_all_accept() {
+        let pred = ScanPredicate::new(vec![ScanConjunct::Range {
+            column: "amount".into(),
+            op: RangeOp::Gt,
+            value: PropertyValue::Int(50),
+        }]);
+        let mut zones: HashMap<String, ZoneMap> = HashMap::new();
+        zones.insert("amount".into(), int_zone(1, 100, 64));
+        assert!(pred.accepts_zone_group(&zones));
+    }
+
+    // ── DictionaryIndex / resolve_dictionary_codes ───────────────────
+
+    #[test]
+    fn dictionary_index_code_of_binary_searches_sorted_values() {
+        let values = vec![
+            PropertyValue::String("apple".into()),
+            PropertyValue::String("banana".into()),
+            PropertyValue::String("cherry".into()),
+        ];
+        let dict = DictionaryIndex { values: &values };
+        assert_eq!(
+            dict.code_of(&PropertyValue::String("apple".into())),
+            Some(0)
+        );
+        assert_eq!(
+            dict.code_of(&PropertyValue::String("banana".into())),
+            Some(1)
+        );
+        assert_eq!(
+            dict.code_of(&PropertyValue::String("cherry".into())),
+            Some(2)
+        );
+        assert_eq!(dict.code_of(&PropertyValue::String("durian".into())), None);
+    }
+
+    #[test]
+    fn scan_predicate_resolve_dictionary_codes_no_rewrite_when_no_equal_in_set() {
+        let values = vec![PropertyValue::String("apple".into())];
+        let dict = DictionaryIndex { values: &values };
+        let pred = ScanPredicate::new(vec![ScanConjunct::Range {
+            column: "fruit".into(),
+            op: RangeOp::Gt,
+            value: PropertyValue::String("apple".into()),
+        }]);
+        assert_eq!(
+            pred.resolve_dictionary_codes("fruit", &dict),
+            DictRewrite::NoRewrite
+        );
+    }
+
+    #[test]
+    fn scan_predicate_resolve_dictionary_codes_empty_set_when_nothing_resolves() {
+        let values = vec![
+            PropertyValue::String("apple".into()),
+            PropertyValue::String("banana".into()),
+        ];
+        let dict = DictionaryIndex { values: &values };
+        let pred = ScanPredicate::new(vec![ScanConjunct::Equal {
+            column: "fruit".into(),
+            value: PropertyValue::String("durian".into()), // not in dict
+        }]);
+        assert_eq!(
+            pred.resolve_dictionary_codes("fruit", &dict),
+            DictRewrite::EmptySet
+        );
+    }
+
+    #[test]
+    fn scan_predicate_resolve_dictionary_codes_returns_codes_from_equal() {
+        let values = vec![
+            PropertyValue::String("apple".into()),
+            PropertyValue::String("banana".into()),
+        ];
+        let dict = DictionaryIndex { values: &values };
+        let pred = ScanPredicate::new(vec![ScanConjunct::Equal {
+            column: "fruit".into(),
+            value: PropertyValue::String("banana".into()),
+        }]);
+        assert_eq!(
+            pred.resolve_dictionary_codes("fruit", &dict),
+            DictRewrite::Codes(vec![1])
+        );
+    }
+
+    #[test]
+    fn scan_predicate_resolve_dictionary_codes_keeps_partial_resolutions_in_set() {
+        // `InSet` with some literals missing from the dict: the missing
+        // literals can't match anyway, so dropping them preserves the
+        // no-false-negatives invariant.
+        let values = vec![
+            PropertyValue::String("apple".into()),
+            PropertyValue::String("banana".into()),
+            PropertyValue::String("cherry".into()),
+        ];
+        let dict = DictionaryIndex { values: &values };
+        let pred = ScanPredicate::new(vec![ScanConjunct::InSet {
+            column: "fruit".into(),
+            values: vec![
+                PropertyValue::String("banana".into()),
+                PropertyValue::String("durian".into()), // missing
+                PropertyValue::String("cherry".into()),
+            ],
+        }]);
+        let rewrite = pred.resolve_dictionary_codes("fruit", &dict);
+        match rewrite {
+            DictRewrite::Codes(mut codes) => {
+                codes.sort_unstable();
+                assert_eq!(codes, vec![1, 2]);
+            }
+            other => panic!("expected Codes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_predicate_resolve_dictionary_codes_wrong_column_is_no_rewrite() {
+        let values = vec![PropertyValue::String("apple".into())];
+        let dict = DictionaryIndex { values: &values };
+        let pred = ScanPredicate::new(vec![ScanConjunct::Equal {
+            column: "other".into(),
+            value: PropertyValue::String("apple".into()),
+        }]);
+        // Asking about "fruit" — the conjunct is on "other", so no
+        // rewrite applies to "fruit".
+        assert_eq!(
+            pred.resolve_dictionary_codes("fruit", &dict),
+            DictRewrite::NoRewrite
+        );
+    }
+
+    // ── Trait-level back-compat: Wave 1 impls keep working ──────────
+
+    #[test]
+    fn wave1_predicate_impls_keep_compiling_via_default_bodies() {
+        // A Wave 1 `Predicate` impl that only implements `accepts_zone`
+        // (no `referenced_columns`, no `accepts_zone_group`, no
+        // `resolve_dictionary_codes`) must still compile and be
+        // usable. This test is the executable proof of the "additive
+        // extension" promise in the trait docs.
+        #[derive(Debug)]
+        struct Wave1Only;
+        impl Predicate for Wave1Only {
+            fn accepts_zone(&self, _column: &str, _zone: &ZoneMap) -> bool {
+                true
+            }
+        }
+        let p: Arc<dyn Predicate> = Arc::new(Wave1Only);
+        let zones: HashMap<String, ZoneMap> = HashMap::new();
+        assert!(p.accepts_zone_group(&zones));
+        assert!(p.referenced_columns().is_empty());
+        let values: Vec<PropertyValue> = Vec::new();
+        let dict = DictionaryIndex { values: &values };
+        assert_eq!(
+            p.resolve_dictionary_codes("any", &dict),
+            DictRewrite::NoRewrite
+        );
     }
 }
