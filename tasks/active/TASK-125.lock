@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-2",
+  "task_id": "TASK-125",
+  "claimed_at": "2026-04-11T01:14:45Z",
+  "branch": "task/TASK-125",
+  "description": "Catalog trait in bqlite-core and manifest-backed impl in bqlite-storage; Database::open_or_create seeds a bootstrap `events` table on fresh init"
+}
