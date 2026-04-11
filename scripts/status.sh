@@ -21,13 +21,17 @@ fi
 echo ""
 echo "=== Completed Tasks ==="
 DONE_COUNT=0
-for done in "$TMPDIR"/tasks/completed/*.done; do
-  [ -f "$done" ] || continue
-  DONE_COUNT=$((DONE_COUNT + 1))
-  jq -r '"\(.task_id)  \(.description)  (completed \(.completed_at // "unknown"))"' "$done"
-done
+shopt -s nullglob
+DONE_FILES=("$TMPDIR"/tasks/completed/*.done)
+shopt -u nullglob
+DONE_COUNT=${#DONE_FILES[@]}
 if [ "$DONE_COUNT" -eq 0 ]; then
   echo "  (none)"
+else
+  if [ "$DONE_COUNT" -gt 10 ]; then
+    echo "  (showing last 10 of $DONE_COUNT)"
+  fi
+  jq -s -r 'sort_by(.completed_at // "") | .[-10:] | .[] | "\(.task_id)  \(.description)  (completed \(.completed_at // "unknown"))"' "${DONE_FILES[@]}"
 fi
 
 echo ""
