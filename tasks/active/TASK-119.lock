@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-4",
+  "task_id": "TASK-119",
+  "claimed_at": "2026-04-11T01:45:10Z",
+  "branch": "task/TASK-119",
+  "description": "[IMPL] CLI stub — bqlite query \"<bql>\" --db <path> subcommand. Opens database via bqlite_engine::Database::open_or_create, calls engine.query(text, &db), prints ExecutionResult as simple text table. Initializes tracing subscriber from TASK-122."
+}
