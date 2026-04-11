@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-3",
+  "task_id": "TASK-209",
+  "claimed_at": "2026-04-11T07:49:20Z",
+  "branch": "task/TASK-209",
+  "description": "[IMPL] BitPacking encoding"
+}
