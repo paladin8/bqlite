@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-4",
   "task_id": "TASK-220",
   "claimed_at": "2026-04-11T07:26:38Z",
+  "completed_at": "2026-04-11T07:55:00Z",
   "branch": "task/TASK-220",
   "description": "[IMPL] Parser framework bootstrap + expression grammar — instantiate TASK-203 framework, replace Wave 1 single-identifier stub, land expression grammar with span tracking and halt-on-first-error policy"
 }
