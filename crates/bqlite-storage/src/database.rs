@@ -1,0 +1,694 @@
+//! Database — the Wave 1 storage bootstrap entry point.
+//!
+//! [`Database::open_or_create`] implements the v0 database-open
+//! contract from `docs/design/storage-format.md` §5 + §12 + §14 and
+//! `docs/reliability.md`: it creates the directory layout, acquires
+//! an exclusive lock, and reads or initializes the manifest atomically.
+//!
+//! # On-disk layout (Wave 1)
+//!
+//! ```text
+//! <root>/
+//!   .lock                ← exclusive flock, held for the lifetime of Database
+//!   manifest.json        ← serialized [`crate::manifest::Manifest`]
+//!   manifest.json.tmp    ← (transient) written-and-fsynced during atomic update
+//! ```
+//!
+//! Wave 1 consolidates what `storage-format.md` §5.2 + §12.1 split
+//! into `db.json` plus per-table `<table>/manifest.json` into a single
+//! top-level `manifest.json`. No segments are ever written yet.
+//! [`crate::manifest`] documents the split and the forward-compat
+//! plan.
+//!
+//! # Atomicity
+//!
+//! `manifest.json` updates follow `storage-format.md` §12.3: write to
+//! `manifest.json.tmp`, `fsync` the file, `rename` over the old
+//! manifest, then best-effort `fsync` the parent directory so the
+//! rename is durable. The rename is atomic on POSIX (`rename(2)`),
+//! which is the only target platform for v1.
+//!
+//! On open, any stray `manifest.json.tmp` from a crash mid-rename is
+//! deleted as a best-effort cleanup — the rename's atomicity
+//! guarantees that either the old or the new manifest is fully
+//! present, so the stale temp file carries no information.
+//!
+//! # Concurrency
+//!
+//! [`Database::open_or_create`] acquires an exclusive lock on
+//! `<root>/.lock` via `std::fs::File::try_lock` (stabilized in Rust
+//! 1.89). A second concurrent open from the same process or from a
+//! different process returns [`BqliteError::Execution`] with a clear
+//! message. The lock releases when the owning [`Database`] is
+//! dropped. See `storage-format.md` §14.1.
+//!
+//! # Future extensions
+//!
+//! - Per-table manifests (later wave) — the open path learns to walk
+//!   a `tables/` subdirectory instead of the single `manifest.json`.
+//! - Real segment I/O — [`Database::segment_reader`] currently hands
+//!   out an empty reader; later waves return a snapshot of the live
+//!   segment inventory (`storage-format.md` §7.6).
+//! - Format-version migration — a later wave reads older manifests
+//!   and upgrades them in-place.
+
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use bqlite_core::error::{BqliteError, Result};
+use bqlite_core::schema::TableSchema;
+use bqlite_core::storage::{
+    ColumnProjection, Predicate, SegmentHandle, SegmentReader, SegmentScan,
+};
+
+use crate::manifest::{Manifest, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION};
+
+/// Name of the advisory lock file at the database root.
+pub const LOCK_FILE_NAME: &str = ".lock";
+
+/// Name of the serialized manifest file at the database root.
+pub const MANIFEST_FILE_NAME: &str = "manifest.json";
+
+/// Name of the transient file written during an atomic manifest update.
+pub const MANIFEST_TMP_FILE_NAME: &str = "manifest.json.tmp";
+
+/// An open bqlite database.
+///
+/// Owns the exclusive advisory lock on the database directory and
+/// holds an in-memory snapshot of the manifest. The manifest can be
+/// read back via [`Database::manifest`]; Wave 1 does not expose a
+/// mutation API — later waves will wire ingest and compaction into an
+/// atomic `update_manifest` helper.
+///
+/// Dropping a `Database` releases the lock so a subsequent open (in
+/// the same process or another) can succeed.
+#[derive(Debug)]
+pub struct Database {
+    root: PathBuf,
+    manifest: Manifest,
+    /// Exclusive advisory lock on `<root>/.lock`. The field is
+    /// prefixed with `_` because nothing reads it directly — its only
+    /// job is to hold the lock for the lifetime of the `Database`.
+    _lock: File,
+}
+
+impl Database {
+    /// Open an existing database, or initialize a fresh one if `path`
+    /// does not yet contain a manifest.
+    ///
+    /// Equivalent to [`Database::open_or_create_with_shards`] with
+    /// [`DEFAULT_SHARD_COUNT`]. The shard count is honoured only on a
+    /// fresh init — reopening an existing database preserves the
+    /// manifest's recorded value.
+    pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_or_create_with_shards(path, DEFAULT_SHARD_COUNT)
+    }
+
+    /// Open an existing database, or initialize a fresh one with the
+    /// specified shard count.
+    ///
+    /// # Arguments
+    ///
+    /// - `path` — database root directory. Created (recursively) if
+    ///   it does not yet exist.
+    /// - `shard_count` — number of hash shards to stamp into the
+    ///   manifest on a fresh init. Honoured only on init: reopening
+    ///   an existing database ignores this argument and uses the
+    ///   manifest's recorded value, because shard count is fixed for
+    ///   the lifetime of a database (see
+    ///   `docs/design/storage-format.md` §5.1).
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Schema`] if `shard_count == 0`.
+    /// - [`BqliteError::Io`] on I/O failures creating the directory,
+    ///   opening the lock file, or writing the manifest.
+    /// - [`BqliteError::Execution`] if the database is already open
+    ///   by another process (lock held), or if the existing manifest
+    ///   is corrupt or has an unsupported `format_version`.
+    pub fn open_or_create_with_shards(path: impl AsRef<Path>, shard_count: u16) -> Result<Self> {
+        if shard_count == 0 {
+            return Err(BqliteError::Schema("shard_count must be at least 1".into()));
+        }
+
+        let root = path.as_ref().to_path_buf();
+        // `create_dir_all` is idempotent. If two processes race on a
+        // brand-new directory, both may observe success here, but only
+        // one will win `try_lock` below; the loser gets a clean
+        // `Execution("already open")` error.
+        fs::create_dir_all(&root).map_err(|e| io_ctx("create database directory", &root, e))?;
+
+        // Acquire the exclusive lock first, so any subsequent manifest
+        // read/write is serialized across processes on this directory.
+        let lock = acquire_lock(&root)?;
+
+        // Clean up any stale `manifest.json.tmp` left over from a
+        // crash during a prior atomic update. The rename in
+        // `write_manifest_atomic` is atomic, so a stale temp file
+        // necessarily belongs to an aborted update whose target
+        // manifest is either still the old contents or has already
+        // been replaced by the new contents — either way, the temp
+        // file is orphaned and safe to delete. Unconditional
+        // `remove_file` plus ignoring `NotFound` is one syscall fewer
+        // than the check-then-remove dance.
+        let tmp_path = root.join(MANIFEST_TMP_FILE_NAME);
+        match fs::remove_file(&tmp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                // Best-effort: a stale tmp file we can't delete is
+                // harmless — the next atomic write will overwrite it.
+            }
+        }
+
+        // Read or initialize the manifest.
+        let manifest_path = root.join(MANIFEST_FILE_NAME);
+        let manifest = match fs::read(&manifest_path) {
+            Ok(bytes) => {
+                let m: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
+                    BqliteError::Execution(format!(
+                        "corrupted manifest at {}: {}",
+                        manifest_path.display(),
+                        e
+                    ))
+                })?;
+                if !m.is_supported_version() {
+                    return Err(BqliteError::Execution(format!(
+                        "manifest at {} has unsupported format_version {} (this build reads format_version {})",
+                        manifest_path.display(),
+                        m.format_version,
+                        MANIFEST_FORMAT_VERSION
+                    )));
+                }
+                m
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Fresh init — write the new manifest before
+                // returning so an observer opening the same directory
+                // after this call sees a complete, versioned file.
+                let m = Manifest::new_empty(shard_count);
+                write_manifest_atomic(&root, &m)?;
+                m
+            }
+            Err(e) => {
+                return Err(io_ctx("read manifest", &manifest_path, e));
+            }
+        };
+
+        Ok(Self {
+            root,
+            manifest,
+            _lock: lock,
+        })
+    }
+
+    /// Absolute path of the database root directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// In-memory snapshot of the current manifest.
+    ///
+    /// The returned reference is stable for the lifetime of
+    /// [`Database`] — Wave 1 is read-only, so there is no mutation
+    /// API yet.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// Open a segment reader for `table_name`.
+    ///
+    /// Returns [`BqliteError::Plan`] if no such table exists in the
+    /// manifest.
+    ///
+    /// The Wave 1 reader yields zero segments — real segment
+    /// enumeration lands in later waves. A Wave 1 scan over the
+    /// default bootstrap `events` table (seeded by TASK-125) therefore
+    /// produces an empty result, which is exactly what the Wave 1
+    /// smoke test (TASK-123) expects.
+    pub fn segment_reader(&self, table_name: &str) -> Result<Box<dyn SegmentReader>> {
+        let entry = self
+            .manifest
+            .tables
+            .get(table_name)
+            .ok_or_else(|| BqliteError::Plan(format!("unknown table `{table_name}`")))?;
+        Ok(Box::new(EmptySegmentReader {
+            schema: entry.schema.clone(),
+        }))
+    }
+}
+
+/// Construct an empty [`SegmentReader`] for a standalone schema.
+///
+/// Wave 1 convenience for operator tests (TASK-117) and callers that
+/// need a reader before any table has been seeded into the manifest
+/// (TASK-125). Returns a reader that knows `schema` and yields zero
+/// segments.
+pub fn empty_segment_reader(schema: TableSchema) -> Box<dyn SegmentReader> {
+    Box::new(EmptySegmentReader { schema })
+}
+
+/// Acquire the exclusive advisory lock on `<root>/.lock`.
+///
+/// A fresh empty file is created if necessary. On success, the
+/// returned [`File`] holds the lock until it is dropped. If another
+/// process already holds the lock, returns
+/// [`BqliteError::Execution`] with a message naming the directory.
+fn acquire_lock(root: &Path) -> Result<File> {
+    let lock_path = root.join(LOCK_FILE_NAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| io_ctx("open database lock file", &lock_path, e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(BqliteError::Execution(format!(
+            "database at {} is already open by another process",
+            root.display()
+        ))),
+        Err(TryLockError::Error(e)) => Err(io_ctx("acquire database lock", &lock_path, e)),
+    }
+}
+
+/// Write `manifest` to `<root>/manifest.json` atomically.
+///
+/// Sequence per `storage-format.md` §12.3:
+///
+/// 1. Serialize to JSON.
+/// 2. Create `manifest.json.tmp`, write bytes, `fsync` the file.
+/// 3. `rename` over `manifest.json` — atomic on POSIX.
+/// 4. Best-effort `fsync` the parent directory so the rename is durable.
+///
+/// The final directory fsync is best-effort because it is not
+/// supported on every filesystem; skipping it weakens durability
+/// against an immediate power loss but does not affect correctness
+/// under process crashes.
+fn write_manifest_atomic(root: &Path, manifest: &Manifest) -> Result<()> {
+    let final_path = root.join(MANIFEST_FILE_NAME);
+    let tmp_path = root.join(MANIFEST_TMP_FILE_NAME);
+
+    let body = serde_json::to_vec_pretty(manifest)
+        .map_err(|e| BqliteError::Execution(format!("failed to serialize manifest: {e}")))?;
+
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| io_ctx("create manifest.tmp", &tmp_path, e))?;
+        f.write_all(&body)
+            .map_err(|e| io_ctx("write manifest.tmp", &tmp_path, e))?;
+        f.sync_all()
+            .map_err(|e| io_ctx("fsync manifest.tmp", &tmp_path, e))?;
+    }
+
+    fs::rename(&tmp_path, &final_path)
+        .map_err(|e| io_ctx("rename manifest.tmp to manifest", &tmp_path, e))?;
+
+    if let Ok(dir) = File::open(root) {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
+}
+
+/// Wrap an `io::Error` with a path-and-action context message while
+/// preserving the original `ErrorKind` so callers can still pattern-
+/// match on it.
+fn io_ctx(action: &str, path: &Path, err: io::Error) -> BqliteError {
+    BqliteError::Io(io::Error::new(
+        err.kind(),
+        format!("{action} {}: {err}", path.display()),
+    ))
+}
+
+/// `SegmentReader` implementation that owns a schema but yields no
+/// segments. Used by Wave 1 for both [`Database::segment_reader`] and
+/// the standalone [`empty_segment_reader`] constructor.
+struct EmptySegmentReader {
+    schema: TableSchema,
+}
+
+impl SegmentReader for EmptySegmentReader {
+    fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    fn segments(&self) -> Box<dyn Iterator<Item = Result<SegmentHandle>> + Send + '_> {
+        Box::new(std::iter::empty())
+    }
+
+    fn open_segment(
+        &self,
+        _handle: &SegmentHandle,
+        _projection: &ColumnProjection,
+        _predicate: Option<Arc<dyn Predicate>>,
+    ) -> Result<Box<dyn SegmentScan>> {
+        // segments() returns an empty iterator, so a caller cannot
+        // legitimately supply a handle this reader produced; any
+        // handle we see here is stale or foreign. The trait docs
+        // specify `BqliteError::Execution` for exactly this case.
+        Err(BqliteError::Execution(
+            "no segments are visible in the Wave 1 empty segment reader".into(),
+        ))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use bqlite_core::property::BqlType;
+    use bqlite_core::schema::{ColumnDef, TableSchema};
+
+    use super::*;
+    use crate::manifest::TableEntry;
+
+    // Per-test unique temp directory. We avoid pulling in `tempfile`
+    // as a dev-dep and mirror the minimal approach used by
+    // `tests/common/mod.rs::TempDb`. Process PID plus a monotonic
+    // counter is sufficient for in-process uniqueness.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let mut path = std::env::temp_dir();
+            path.push(format!("bqlite-storage-db-{label}-{pid}-{seq}"));
+            // We explicitly do NOT create the directory here — the
+            // open_or_create path must be able to create it itself.
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn sample_events_schema() -> TableSchema {
+        TableSchema::new(
+            "events",
+            vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+            ],
+            "entity_id",
+            "ts",
+            "event_type",
+        )
+        .expect("minimal schema")
+    }
+
+    // ── Fresh init ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn open_or_create_creates_missing_directory() {
+        let scratch = Scratch::new("creates-dir");
+        assert!(
+            !scratch.path().exists(),
+            "precondition: scratch directory should not yet exist"
+        );
+
+        let db = Database::open_or_create(scratch.path()).expect("init");
+        assert!(scratch.path().is_dir(), "root dir was created");
+        assert!(
+            scratch.path().join(LOCK_FILE_NAME).is_file(),
+            ".lock file was created"
+        );
+        assert!(
+            scratch.path().join(MANIFEST_FILE_NAME).is_file(),
+            "manifest.json was created"
+        );
+        assert!(
+            !scratch.path().join(MANIFEST_TMP_FILE_NAME).exists(),
+            "manifest.json.tmp is absent after atomic init"
+        );
+        drop(db);
+    }
+
+    #[test]
+    fn fresh_manifest_has_default_shape() {
+        let scratch = Scratch::new("default-shape");
+        let db = Database::open_or_create(scratch.path()).expect("init");
+        let m = db.manifest();
+        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(m.shard_count, DEFAULT_SHARD_COUNT);
+        assert!(m.tables.is_empty(), "Wave 1 starts with no tables");
+        assert!(m.segments.is_empty());
+        // UUIDv4 hyphenated form: 36 chars, 4 dashes.
+        assert_eq!(m.database_uuid.len(), 36);
+        assert_eq!(m.database_uuid.matches('-').count(), 4);
+    }
+
+    #[test]
+    fn fresh_init_honours_custom_shard_count() {
+        let scratch = Scratch::new("custom-shards");
+        let db = Database::open_or_create_with_shards(scratch.path(), 16).expect("init");
+        assert_eq!(db.manifest().shard_count, 16);
+    }
+
+    #[test]
+    fn zero_shard_count_is_rejected() {
+        let scratch = Scratch::new("zero-shards");
+        let err = Database::open_or_create_with_shards(scratch.path(), 0)
+            .expect_err("zero shards must be rejected");
+        assert!(matches!(err, BqliteError::Schema(_)), "got {err:?}");
+    }
+
+    // ── Reopen semantics ────────────────────────────────────────────────────
+
+    #[test]
+    fn reopening_preserves_database_uuid() {
+        let scratch = Scratch::new("uuid-stable");
+        let original_uuid = {
+            let db = Database::open_or_create(scratch.path()).expect("init");
+            db.manifest().database_uuid.clone()
+        };
+        let db2 = Database::open_or_create(scratch.path()).expect("reopen");
+        assert_eq!(db2.manifest().database_uuid, original_uuid);
+    }
+
+    #[test]
+    fn reopening_ignores_shard_count_override() {
+        let scratch = Scratch::new("shards-fixed");
+        {
+            let _db = Database::open_or_create_with_shards(scratch.path(), 4)
+                .expect("init with 4 shards");
+        }
+        let db2 = Database::open_or_create_with_shards(scratch.path(), 99).expect("reopen");
+        assert_eq!(
+            db2.manifest().shard_count,
+            4,
+            "reopen must honour the manifest's recorded shard count"
+        );
+    }
+
+    // ── Atomicity and cleanup ───────────────────────────────────────────────
+
+    #[test]
+    fn stale_manifest_tmp_is_cleaned_up_on_open() {
+        let scratch = Scratch::new("stale-tmp");
+        // Initialize a real manifest so the open path doesn't treat
+        // this directory as fresh.
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("init");
+        }
+        // Simulate a crash mid-update: leave a stale tmp file behind.
+        let tmp_path = scratch.path().join(MANIFEST_TMP_FILE_NAME);
+        fs::write(&tmp_path, b"garbage left behind by a prior crash").unwrap();
+        assert!(tmp_path.exists());
+
+        let _db = Database::open_or_create(scratch.path()).expect("reopen");
+        assert!(
+            !tmp_path.exists(),
+            "stale manifest.json.tmp should be cleaned up on open"
+        );
+    }
+
+    // ── Error paths ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn corrupted_manifest_returns_execution_error() {
+        let scratch = Scratch::new("corrupt");
+        fs::create_dir_all(scratch.path()).unwrap();
+        fs::write(
+            scratch.path().join(MANIFEST_FILE_NAME),
+            b"this is not valid json",
+        )
+        .unwrap();
+        let err =
+            Database::open_or_create(scratch.path()).expect_err("corrupted manifest must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("corrupted manifest"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_format_version_is_rejected() {
+        let scratch = Scratch::new("bad-version");
+        fs::create_dir_all(scratch.path()).unwrap();
+        // Hand-write a manifest with a future format_version.
+        let future = format!(
+            r#"{{"format_version":{},"database_uuid":"00000000-0000-4000-8000-000000000000","shard_count":32,"tables":{{}},"segments":[]}}"#,
+            MANIFEST_FORMAT_VERSION + 1
+        );
+        fs::write(scratch.path().join(MANIFEST_FILE_NAME), future).unwrap();
+
+        let err = Database::open_or_create(scratch.path())
+            .expect_err("unsupported format_version must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("unsupported format_version"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    // ── Lock file ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn second_open_in_same_process_is_blocked() {
+        let scratch = Scratch::new("lock-blocked");
+        let first = Database::open_or_create(scratch.path()).expect("first open");
+        let err =
+            Database::open_or_create(scratch.path()).expect_err("second concurrent open must fail");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("already open"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+        drop(first);
+    }
+
+    #[test]
+    fn lock_is_released_on_drop() {
+        let scratch = Scratch::new("lock-released");
+        {
+            let _first = Database::open_or_create(scratch.path()).expect("first open");
+        }
+        // After drop, a fresh open must succeed.
+        let _second = Database::open_or_create(scratch.path()).expect("reopen after drop");
+    }
+
+    // ── SegmentReader stub ──────────────────────────────────────────────────
+
+    #[test]
+    fn segment_reader_unknown_table_returns_plan_error() {
+        let scratch = Scratch::new("reader-unknown");
+        let db = Database::open_or_create(scratch.path()).expect("init");
+        // `Box<dyn SegmentReader>` is not Debug, so we can't use
+        // `expect_err` here — pattern-match the Result directly.
+        match db.segment_reader("nope") {
+            Err(BqliteError::Plan(msg)) => {
+                assert!(msg.contains("nope"), "got: {msg}");
+            }
+            Err(other) => panic!("expected Plan error, got {other:?}"),
+            Ok(_) => panic!("expected an error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn empty_segment_reader_helper_yields_zero_segments() {
+        let schema = sample_events_schema();
+        let reader = empty_segment_reader(schema.clone());
+        assert_eq!(reader.schema(), &schema);
+        let count = reader.segments().count();
+        assert_eq!(count, 0, "empty reader yields no segments");
+    }
+
+    #[test]
+    fn seeded_table_counters_survive_reopen() {
+        // Persisted `next_sequence_id` / `next_batch_id` monotonicity
+        // across restarts is the whole point of storing them in the
+        // manifest (storage-format.md §6.2 + §12.3). Even though Wave 1
+        // never bumps them, exercising the round-trip here proves the
+        // TableEntry fields are wired through serde and the atomic
+        // write path correctly.
+        let scratch = Scratch::new("counter-roundtrip");
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("init");
+        }
+        let manifest_path = scratch.path().join(MANIFEST_FILE_NAME);
+        let bytes = fs::read(&manifest_path).unwrap();
+        let mut m: Manifest = serde_json::from_slice(&bytes).unwrap();
+        m.tables.insert(
+            "events".to_string(),
+            TableEntry {
+                schema: sample_events_schema(),
+                next_sequence_id: 123_456,
+                next_batch_id: 78,
+                bootstrap_events_table: true,
+            },
+        );
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+
+        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        let entry = db.manifest().tables.get("events").expect("events entry");
+        assert_eq!(entry.next_sequence_id, 123_456);
+        assert_eq!(entry.next_batch_id, 78);
+        assert!(entry.bootstrap_events_table);
+    }
+
+    #[test]
+    fn segment_reader_for_seeded_table_yields_zero_segments() {
+        // Simulate what TASK-125 will do: hand-seed a table entry
+        // into the manifest, persist it, reopen, and verify the
+        // segment_reader produces an empty iterator.
+        let scratch = Scratch::new("reader-seeded");
+
+        // Fresh init, then hand-edit the on-disk manifest to include a
+        // bootstrap events table. This test exists to prove the Wave 1
+        // segment_reader lookup path works end-to-end without waiting
+        // for TASK-125.
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("init");
+        }
+        let manifest_path = scratch.path().join(MANIFEST_FILE_NAME);
+        let bytes = fs::read(&manifest_path).unwrap();
+        let mut m: Manifest = serde_json::from_slice(&bytes).unwrap();
+        m.tables.insert(
+            "events".to_string(),
+            TableEntry {
+                schema: sample_events_schema(),
+                next_sequence_id: 0,
+                next_batch_id: 0,
+                bootstrap_events_table: true,
+            },
+        );
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+
+        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        assert_eq!(db.manifest().tables.len(), 1);
+        let reader = db.segment_reader("events").expect("reader for events");
+        assert_eq!(reader.schema().name(), "events");
+        assert_eq!(reader.segments().count(), 0);
+    }
+}
