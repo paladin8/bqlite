@@ -29,7 +29,7 @@ bqlite-storage       → core
 bqlite-parser        → ast
 bqlite-planner       → ast, core
 bqlite-operators     → core, storage, planner
-bqlite-engine        → planner, operators, storage, core
+bqlite-engine        → parser, planner, operators, storage, core
 bqlite-cli           → engine
 bqlite-ffi           → engine
 bqlite (top-level)   → core, ast, parser, engine

@@ -30,7 +30,7 @@ allowed_deps() {
         bqlite-parser)    echo "bqlite-ast" ;;
         bqlite-planner)   echo "bqlite-ast bqlite-core" ;;
         bqlite-operators) echo "bqlite-core bqlite-storage bqlite-planner" ;;
-        bqlite-engine)    echo "bqlite-core bqlite-storage bqlite-planner bqlite-operators" ;;
+        bqlite-engine)    echo "bqlite-core bqlite-storage bqlite-parser bqlite-planner bqlite-operators" ;;
         bqlite-cli)       echo "bqlite-engine" ;;
         bqlite-ffi)       echo "bqlite-engine" ;;
         bqlite)           echo "bqlite-core bqlite-ast bqlite-parser bqlite-engine" ;;

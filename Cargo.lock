@@ -361,6 +361,7 @@ dependencies = [
  "arrow",
  "bqlite-core",
  "bqlite-operators",
+ "bqlite-parser",
  "bqlite-planner",
  "bqlite-storage",
  "thiserror",

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 bqlite-core = { workspace = true }
 bqlite-storage = { workspace = true }
+bqlite-parser = { workspace = true }
 bqlite-planner = { workspace = true }
 bqlite-operators = { workspace = true }
 arrow = { workspace = true }
