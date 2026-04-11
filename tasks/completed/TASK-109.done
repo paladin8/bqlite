@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-4",
   "task_id": "TASK-109",
   "claimed_at": "2026-04-11T00:33:08Z",
+  "completed_at": "2026-04-11T00:50:23Z",
   "branch": "task/TASK-109",
   "description": "[DESIGN][TRAIT] SegmentReader trait — storage API consumed by scan operators; design note + trait impl"
 }
