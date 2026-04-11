@@ -873,18 +873,19 @@ Compaction publishes new manifests by atomically swapping the `Arc`. Old manifes
 
 **next_sequence_id / next_batch_id.** Both counters are persisted in the manifest so that ingest after a process restart still produces monotonically increasing IDs. They are loaded from the manifest on startup, incremented atomically during ingest, and persisted on the next manifest update.
 
-**Wave 1 scaffold format.** The shape above is the Wave 2+ target. Until segments are being written, TASK-116 freezes a simpler **single consolidated database-wide manifest** at `<db_root>/manifest.json` that holds both the `db.json` properties and an empty `tables` map. The on-disk shape is:
+**Wave 1/2 scaffold format.** The shape above is the fully-split per-table target. Until the per-table split lands, TASK-116 froze a simpler **single consolidated database-wide manifest** at `<db_root>/manifest.json`. TASK-217 (Wave 2) extends that scaffold with the real per-`(window, shard)` segment inventory inside each `TableEntry` so ingest can land segments — the per-table split is deferred to a later wave and is orthogonal to where segments live. The current on-disk shape is:
 
 ```rust
-/// Consolidated Wave 1 manifest. Written to <db_root>/manifest.json and
-/// updated atomically (manifest.json.tmp → fsync → rename).
+/// Consolidated Wave 1/2 manifest. Written to <db_root>/manifest.json
+/// and updated atomically (manifest.json.tmp → fsync → rename).
 #[derive(Serialize, Deserialize)]
 pub struct Manifest {
     /// On-disk shape version per `docs/reliability.md` §Versioning.
     /// This is the **file-format** version — distinct from the
     /// monotonically-incrementing per-update `version: u64` counter
-    /// above, which Wave 1 does not yet ship. Wave 1 writes `1`; the
-    /// open path rejects any other value.
+    /// above, which the scaffold does not yet ship. Wave 1 wrote `1`
+    /// and Wave 2 continues to write `1` because the Wave 2 extension
+    /// is strictly additive; the open path rejects any other value.
     pub format_version: u32,
 
     /// Stable UUIDv4 stamped at init, never rotates (§5.1). Migrates
@@ -897,17 +898,12 @@ pub struct Manifest {
     /// there.
     pub shard_count: u16,
 
-    /// Declared tables, keyed by name. Wave 1 starts empty and TASK-125
-    /// seeds a default `events` entry (see `bootstrap_events_table`
-    /// below). When the per-table split happens, each entry moves into
-    /// its own `<db_root>/<table>/manifest.json` and this field is
-    /// removed.
+    /// Declared tables, keyed by name. Wave 1 started this empty;
+    /// TASK-125 seeds a default `events` entry (see
+    /// `bootstrap_events_table` below). When the per-table split
+    /// happens, each entry moves into its own
+    /// `<db_root>/<table>/manifest.json` and this field is removed.
     pub tables: BTreeMap<String, TableEntry>,
-
-    /// Segment inventory placeholder — always empty in Wave 1.
-    /// Pre-reserved so the JSON shape is stable across Wave 1 and the
-    /// first Wave 2 writes before the per-table split lands.
-    pub segments: Vec<SegmentEntry>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -931,12 +927,25 @@ pub struct TableEntry {
     /// `events` entry so no manifest ever ends up in an unlabeled state.
     /// See TASK-125 and query-language.md §29 for the retirement plan.
     pub bootstrap_events_table: bool,
+
+    /// Active segment inventory, bucketed by time window. Added by
+    /// Wave 2 TASK-217 to replace the Wave 1 top-level `segments`
+    /// placeholder. Sorted by `window_id` ascending; every window's
+    /// `shards.len()` equals the manifest's `shard_count`. Empty on a
+    /// fresh database, and `#[serde(default)]` so Wave 1 manifests
+    /// (which omitted the field entirely) deserialize cleanly.
+    pub windows: Vec<WindowManifest>,
 }
 ```
 
-**Mapping to the Wave 2+ target:**
+`WindowManifest`, `SegmentMeta`, and `ColumnStats` have the exact shape defined in the main §12.3 code block above — the scaffold does not redefine them. The one substitution: the scaffold uses `bqlite_core::PropertyValue` in every field typed as `ScalarValue` in the canonical block (`SegmentMeta.entity_range`, `ColumnStats.min`/`max`), because `PropertyValue` is the concrete scalar type shared with the `bqlite-core::storage::ZoneMap` surface.
 
-| Wave 1 scaffold field | Wave 2+ target location |
+**Wave 1 → Wave 2 compatibility.** Wave 1 manifests carried a top-level `segments: Vec<SegmentEntry>` placeholder that held no data. Wave 2 removed the field. Serde's default "ignore unknown fields" means a Wave 1 manifest on disk still deserializes into a Wave 2 `Manifest` — the `segments` array is read, confirmed empty, and discarded. TableEntry's new `windows` field is `#[serde(default)]`, so Wave 1 entries without a `windows` key deserialize into an empty segment inventory. The compatibility test lives in `crates/bqlite-storage/src/manifest.rs` (`wave1_manifest_with_stale_segments_placeholder_still_deserializes`,
+`wave1_table_entry_without_windows_defaults_to_empty_inventory`).
+
+**Mapping to the fully-split per-table target:**
+
+| Scaffold field | Per-table target location |
 |---|---|
 | `format_version` | Retained as the file-format version in every future shape; bumped if the on-disk container changes incompatibly. |
 | `database_uuid` | Moves into `db.json`. |
@@ -945,9 +954,9 @@ pub struct TableEntry {
 | `TableEntry.schema` | Becomes the per-table `Manifest.schema`. |
 | `TableEntry.next_sequence_id` / `next_batch_id` | Become the per-table `Manifest.next_sequence_id` / `next_batch_id`. |
 | `TableEntry.bootstrap_events_table` | Discarded once the user's first `CREATE TABLE events` replaces the seeded entry; the flag exists only for the retirement check. |
-| `segments: Vec<SegmentEntry>` | Replaced by the per-table `Manifest.windows: Vec<WindowManifest>`. The Wave 1 placeholder `SegmentEntry {}` carries no fields yet; serde compatibility lets it evolve without breaking old files. |
+| `TableEntry.windows: Vec<WindowManifest>` | Moves verbatim onto the per-table `Manifest.windows` field; the nested `WindowManifest` / `SegmentMeta` / `ColumnStats` shapes do not change. |
 
-Concrete reference: see `crates/bqlite-storage/src/manifest.rs` (`Manifest`, `TableEntry`, `SegmentEntry`, `MANIFEST_FORMAT_VERSION`, `DEFAULT_SHARD_COUNT`). The consolidated shape is a conscious Wave 1 shortcut, not forward-looking guidance — Wave 2+ work should extend the target shape above, not the scaffold.
+Concrete reference: see `crates/bqlite-storage/src/manifest.rs` (`Manifest`, `TableEntry`, `WindowManifest`, `SegmentMeta`, `ColumnStats`, `MANIFEST_FORMAT_VERSION`, `DEFAULT_SHARD_COUNT`). The consolidated shape is a conscious scaffold, not forward-looking guidance — future per-table-split work should extend the target shape above, not the scaffold.
 
 ### 12.4 Tombstones Are Not in the Manifest
 

@@ -203,6 +203,7 @@ impl Database {
                         next_sequence_id: 0,
                         next_batch_id: 0,
                         bootstrap_events_table: true,
+                        windows: Vec::new(),
                     },
                 );
                 write_manifest_atomic(&root, &m)?;
@@ -495,7 +496,6 @@ mod tests {
         let m = db.manifest();
         assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
         assert_eq!(m.shard_count, DEFAULT_SHARD_COUNT);
-        assert!(m.segments.is_empty());
         // UUIDv4 hyphenated form: 36 chars, 4 dashes.
         assert_eq!(m.database_uuid.len(), 36);
         assert_eq!(m.database_uuid.matches('-').count(), 4);
@@ -738,6 +738,7 @@ mod tests {
                 next_sequence_id: 123_456,
                 next_batch_id: 78,
                 bootstrap_events_table: true,
+                windows: Vec::new(),
             },
         );
         fs::write(&manifest_path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();

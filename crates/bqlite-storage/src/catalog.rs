@@ -172,6 +172,7 @@ mod tests {
                 next_sequence_id: 0,
                 next_batch_id: 0,
                 bootstrap_events_table: true,
+                windows: Vec::new(),
             },
         );
         m
@@ -225,6 +226,7 @@ mod tests {
                 next_sequence_id: 0,
                 next_batch_id: 0,
                 bootstrap_events_table: false,
+                windows: Vec::new(),
             },
         );
 

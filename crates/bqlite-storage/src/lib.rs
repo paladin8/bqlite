@@ -42,5 +42,6 @@ pub use database::{
     empty_segment_reader, Database, LOCK_FILE_NAME, MANIFEST_FILE_NAME, MANIFEST_TMP_FILE_NAME,
 };
 pub use manifest::{
-    Manifest, SegmentEntry, TableEntry, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION,
+    ColumnStats, Manifest, SegmentMeta, TableEntry, WindowManifest, DEFAULT_SHARD_COUNT,
+    MANIFEST_FORMAT_VERSION,
 };
