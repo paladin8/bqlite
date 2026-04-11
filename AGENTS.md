@@ -140,6 +140,8 @@ git checkout task/TASK-NNN
 
 3. **Write thorough tests.** Test every code path including edge cases: empty inputs, single-event entities, entity event limits, segment boundary crossings. Add benchmarks for performance-critical paths.
 
+   **When to reach for property tests (`proptest`):** when the code under test has a large input state space and at least one output invariant you can state without re-implementing the code. Good candidates: parser/printer roundtrips, encoder/decoder symmetry, optimizer rewrites preserving result equivalence, k-way merge stability across input orderings, compaction preserving the logical row set, sequence matchers matching the spec on arbitrary event streams. Heuristic: if you can say *"for any X, Y must hold"*, write a property test. If the only invariants you can express are *"on this specific input, produce this specific output"*, example tests are sufficient. One or two well-chosen properties beat dozens of shallow unit cases. See Core Belief #11.
+
 4. **Code review via subagent — mandatory before every commit.** Before every commit (not just complex changes), spawn a subagent to review the staged diff for: correctness, performance, API ergonomics, error handling, documentation, and test coverage. If the reviewer raises any blocking issue, address it and re-review before committing.
 
 5. **Always validate before committing.** No commit without:
