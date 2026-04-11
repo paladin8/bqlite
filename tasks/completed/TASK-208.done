@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-2",
   "task_id": "TASK-208",
   "claimed_at": "2026-04-11T07:58:30Z",
+  "completed_at": "2026-04-11T08:07:45Z",
   "branch": "task/TASK-208",
   "description": "[IMPL] Delta encoding"
 }
