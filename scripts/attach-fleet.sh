@@ -62,7 +62,7 @@ agent_cmd() {
   local system_prompt="You are ${container}, an autonomous agent building bqlite. Read AGENTS.md for your complete operating protocol."
   local initial="Begin the agent loop now."
   if [ -n "$WAVE" ]; then
-    initial="${initial} Only claim tasks in Wave ${WAVE} (${WAVE_RANGE}); skip any task outside that range and treat the wave as done when no Wave ${WAVE} tasks remain claimable."
+    initial="${initial} Only claim tasks in Wave ${WAVE} (${WAVE_RANGE}); skip any task outside that range."
   fi
   if [ -n "$MAX_TASKS" ]; then
     initial="${initial} Stop after completing ${MAX_TASKS} task(s): exit the loop and report done instead of claiming another task."

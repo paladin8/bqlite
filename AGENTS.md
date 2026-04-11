@@ -25,6 +25,14 @@ Run this loop continuously:
 7. After the final checkpoint, mark the task complete (see Completion Protocol)
 8. Return to step 1
 
+## Backoff When No Tasks Are Claimable
+
+If step 3 finds no unclaimed task whose dependencies are satisfied — all remaining tasks are either claimed, completed, or blocked by unfinished dependencies — sleep and retry on the following schedule:
+
+**2 min → 5 min → 10 min → 20 min → 60 min**, then stay at 60 min indefinitely until a task becomes claimable.
+
+Reset the backoff to 2 min after successfully claiming any task. Do not exit the loop and do not report the wave as done based on a single empty scan — other agents may be mid-task and their completions will unblock more work. Dependency unblocks, newly filed non-anchor tasks, and stale-lock breaks all change what's claimable between scans.
+
 ## Task Claiming Protocol
 
 1. Create `tasks/active/TASK-NNN.lock` with this JSON content:
