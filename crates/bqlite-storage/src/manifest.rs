@@ -152,6 +152,19 @@ pub struct TableEntry {
     #[serde(default)]
     pub next_batch_id: u64,
 
+    /// Next segment ID to assign to a freshly-written segment (persisted
+    /// so segment filenames stay globally unique across restarts —
+    /// storage-format.md §5.2 "Segments" names segments
+    /// `segment_<segment_id>.seg` and sources the id from "the
+    /// manifest's monotonically-increasing counter"). Per-table so two
+    /// tables can allocate in parallel without contending on a single
+    /// counter; uniqueness of `segment_id` is required within a table,
+    /// not across tables. `#[serde(default)]` keeps Wave 1 manifests
+    /// (which predate the counter) readable — they'll start from 0 the
+    /// first time Wave 2 ingest lands a segment.
+    #[serde(default)]
+    pub next_segment_id: u64,
+
     /// `true` when this entry was seeded by the TASK-125 default-table
     /// bootstrap rather than user DDL. Later waves can retire the
     /// shortcut cleanly by scanning for this flag; Wave 1 writes it
@@ -625,6 +638,7 @@ mod tests {
                 schema: sample_events_schema(),
                 next_sequence_id: 0,
                 next_batch_id: 0,
+                next_segment_id: 0,
                 bootstrap_events_table: true,
                 windows: Vec::new(),
             },
@@ -649,6 +663,7 @@ mod tests {
                 schema: sample_events_schema(),
                 next_sequence_id: 17,
                 next_batch_id: 3,
+                next_segment_id: 11,
                 bootstrap_events_table: false,
                 windows: vec![win],
             },
@@ -702,6 +717,7 @@ mod tests {
                         schema: sample_events_schema(),
                         next_sequence_id: 0,
                         next_batch_id: 0,
+                        next_segment_id: 0,
                         bootstrap_events_table: false,
                         windows: Vec::new(),
                     },
@@ -770,6 +786,7 @@ mod tests {
                 schema: sample_events_schema(),
                 next_sequence_id: 5,
                 next_batch_id: 2,
+                next_segment_id: 0,
                 bootstrap_events_table: true,
                 windows: Vec::new(),
             },
@@ -836,6 +853,7 @@ mod tests {
                 schema: sample_events_schema(),
                 next_sequence_id: 0,
                 next_batch_id: 0,
+                next_segment_id: 0,
                 bootstrap_events_table: false,
                 windows: vec![win],
             },
@@ -859,6 +877,7 @@ mod tests {
                 schema: sample_events_schema(),
                 next_sequence_id: 0,
                 next_batch_id: 0,
+                next_segment_id: 0,
                 bootstrap_events_table: false,
                 windows: Vec::new(),
             },

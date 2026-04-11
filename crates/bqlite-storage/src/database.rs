@@ -206,6 +206,7 @@ impl Database {
                         schema: crate::catalog::bootstrap_events_schema(),
                         next_sequence_id: 0,
                         next_batch_id: 0,
+                        next_segment_id: 0,
                         bootstrap_events_table: true,
                         windows: Vec::new(),
                     },
@@ -374,6 +375,107 @@ impl Database {
                 ))
             })?;
             Ok(issued)
+        })
+    }
+
+    /// Atomically reserve a fresh `segment_id` for a segment about to
+    /// land on `table_name`.
+    ///
+    /// Bumps the table entry's persisted `next_segment_id` counter by
+    /// one and returns the value the counter held *before* the bump —
+    /// i.e. the id the caller should stamp onto the file it is about
+    /// to write. `segment_<segment_id>.seg` is the filename format per
+    /// `docs/design/storage-format.md` §5.2; uniqueness within a table
+    /// is required, which this counter guarantees.
+    ///
+    /// Like [`Self::allocate_batch_id`], a counter bump that is
+    /// followed by a failed write simply retires the id — a gap in
+    /// the segment-id sequence is acceptable per §6.2's gap-tolerance
+    /// rule.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if `table_name` is not registered
+    ///   in the manifest.
+    /// - [`BqliteError::Execution`] if the counter would overflow
+    ///   `u64::MAX` — astronomically unreachable at realistic ingest
+    ///   rates, but guarded for completeness.
+    /// - Any I/O error from the atomic manifest write propagates
+    ///   unchanged.
+    pub fn allocate_segment_id(&mut self, table_name: &str) -> Result<u64> {
+        self.update_manifest(|m| {
+            let entry = m.tables.get_mut(table_name).ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "allocate_segment_id: unknown table '{table_name}'"
+                ))
+            })?;
+            let issued = entry.next_segment_id;
+            entry.next_segment_id = issued.checked_add(1).ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "allocate_segment_id: segment_id counter for table '{table_name}' would overflow u64"
+                ))
+            })?;
+            Ok(issued)
+        })
+    }
+
+    /// Atomically reserve a contiguous range of `count` sequence IDs
+    /// for a segment about to land on `table_name`.
+    ///
+    /// Returns `(first_inclusive, last_inclusive)` — the closed
+    /// interval of `__seq_id` values the caller may stamp onto its
+    /// rows. Per `docs/design/storage-format.md` §6.2 every row in an
+    /// ingest batch gets a monotonically increasing 64-bit sequence
+    /// ID. §6.2 describes the bump as "per batch", but Wave 2 ingest
+    /// produces exactly one segment per `(window, shard)` bucket per
+    /// batch — so per-segment reservation is the correct unit at this
+    /// layer, and the segment footer's `seq_id_range` field becomes a
+    /// direct slice of the per-table counter.
+    ///
+    /// A `count` of zero is an error — a zero-row segment is illegal
+    /// per the segment-format §6 invariants, and reserving a zero
+    /// range would produce a meaningless pair.
+    ///
+    /// Like the other `allocate_*` helpers, a reserved range that is
+    /// followed by a failed write retires cleanly (gaps in
+    /// `__seq_id` are allowed).
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if `table_name` is not registered
+    ///   in the manifest.
+    /// - [`BqliteError::Execution`] if `count == 0`.
+    /// - [`BqliteError::Execution`] if the reservation would push the
+    ///   counter past `u64::MAX`.
+    /// - Any I/O error from the atomic manifest write propagates
+    ///   unchanged.
+    pub fn allocate_sequence_id_range(
+        &mut self,
+        table_name: &str,
+        count: u64,
+    ) -> Result<(u64, u64)> {
+        if count == 0 {
+            return Err(BqliteError::Execution(
+                "allocate_sequence_id_range: count must be greater than 0".into(),
+            ));
+        }
+        self.update_manifest(|m| {
+            let entry = m.tables.get_mut(table_name).ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "allocate_sequence_id_range: unknown table '{table_name}'"
+                ))
+            })?;
+            let first = entry.next_sequence_id;
+            // `first + count` is the next free id after the reserved
+            // block; `last` is the last id *inside* the block.
+            let next_free = first.checked_add(count).ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "allocate_sequence_id_range: reserving {count} ids for table '{table_name}' would overflow u64 (next_sequence_id = {first})"
+                ))
+            })?;
+            entry.next_sequence_id = next_free;
+            // `count >= 1`, so `next_free - 1 >= first` is safe.
+            Ok((first, next_free - 1))
         })
     }
 
@@ -864,6 +966,7 @@ mod tests {
                 schema: sample_events_schema(),
                 next_sequence_id: 123_456,
                 next_batch_id: 78,
+                next_segment_id: 9,
                 bootstrap_events_table: true,
                 windows: Vec::new(),
             },
@@ -1143,5 +1246,172 @@ mod tests {
         assert_eq!(&before_mem, db.manifest());
         let after_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
         assert_eq!(before_disk, after_disk);
+    }
+
+    // ── allocate_segment_id ────────────────────────────────────────────────
+
+    #[test]
+    fn allocate_segment_id_returns_monotonic_values_and_persists() {
+        let scratch = Scratch::new("segment-id-persist");
+        {
+            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            let first = db.allocate_segment_id("events").expect("alloc 1");
+            let second = db.allocate_segment_id("events").expect("alloc 2");
+            let third = db.allocate_segment_id("events").expect("alloc 3");
+            assert_eq!(first, 0);
+            assert_eq!(second, 1);
+            assert_eq!(third, 2);
+            assert_eq!(db.manifest().tables["events"].next_segment_id, 3);
+        }
+        // Counter survives reopen — §5.2 requires `segment_id` to be
+        // unique within a table, so its counter must be durable
+        // across restarts.
+        let mut db = Database::open_or_create(scratch.path()).expect("reopen");
+        assert_eq!(db.manifest().tables["events"].next_segment_id, 3);
+        let fourth = db.allocate_segment_id("events").expect("alloc 4");
+        assert_eq!(fourth, 3);
+        assert_eq!(db.manifest().tables["events"].next_segment_id, 4);
+    }
+
+    #[test]
+    fn allocate_segment_id_unknown_table_leaves_state_untouched() {
+        let scratch = Scratch::new("segment-id-unknown");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let before_mem = db.manifest().clone();
+        let before_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+
+        let err = db
+            .allocate_segment_id("missing")
+            .expect_err("unknown table must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("unknown table"), "got: {msg}");
+                assert!(msg.contains("missing"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+
+        assert_eq!(&before_mem, db.manifest());
+        let after_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(before_disk, after_disk);
+    }
+
+    #[test]
+    fn allocate_segment_id_is_independent_of_batch_id_counter() {
+        // The two counters live side-by-side on TableEntry and must
+        // not share state; bumping one must not observe the other.
+        let scratch = Scratch::new("segment-id-vs-batch-id");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+
+        let batch0 = db.allocate_batch_id("events").unwrap();
+        let seg0 = db.allocate_segment_id("events").unwrap();
+        let batch1 = db.allocate_batch_id("events").unwrap();
+        let seg1 = db.allocate_segment_id("events").unwrap();
+
+        assert_eq!(batch0, 0);
+        assert_eq!(batch1, 1);
+        assert_eq!(seg0, 0);
+        assert_eq!(seg1, 1);
+    }
+
+    // ── allocate_sequence_id_range ─────────────────────────────────────────
+
+    #[test]
+    fn allocate_sequence_id_range_reserves_contiguous_block_and_persists() {
+        let scratch = Scratch::new("seq-range-persist");
+        {
+            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            let (lo, hi) = db.allocate_sequence_id_range("events", 10).unwrap();
+            assert_eq!(lo, 0);
+            assert_eq!(hi, 9);
+            assert_eq!(db.manifest().tables["events"].next_sequence_id, 10);
+
+            // Second call picks up from the next free id.
+            let (lo2, hi2) = db.allocate_sequence_id_range("events", 5).unwrap();
+            assert_eq!(lo2, 10);
+            assert_eq!(hi2, 14);
+            assert_eq!(db.manifest().tables["events"].next_sequence_id, 15);
+        }
+        // Reopen and verify the counter persisted through fsync.
+        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        assert_eq!(db.manifest().tables["events"].next_sequence_id, 15);
+    }
+
+    #[test]
+    fn allocate_sequence_id_range_single_row_reservation() {
+        // A one-row segment still produces a well-defined inclusive
+        // range where `lo == hi`.
+        let scratch = Scratch::new("seq-range-one");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let (lo, hi) = db.allocate_sequence_id_range("events", 1).unwrap();
+        assert_eq!(lo, 0);
+        assert_eq!(hi, 0);
+        assert_eq!(db.manifest().tables["events"].next_sequence_id, 1);
+    }
+
+    #[test]
+    fn allocate_sequence_id_range_zero_count_is_rejected() {
+        let scratch = Scratch::new("seq-range-zero");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let err = db
+            .allocate_sequence_id_range("events", 0)
+            .expect_err("zero count must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("count must be greater than 0"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+        // Nothing changed.
+        assert_eq!(db.manifest().tables["events"].next_sequence_id, 0);
+    }
+
+    #[test]
+    fn allocate_sequence_id_range_unknown_table_leaves_state_untouched() {
+        let scratch = Scratch::new("seq-range-unknown");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let before_mem = db.manifest().clone();
+        let before_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+
+        let err = db
+            .allocate_sequence_id_range("missing", 10)
+            .expect_err("unknown table must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("unknown table"), "got: {msg}");
+                assert!(msg.contains("missing"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+
+        assert_eq!(&before_mem, db.manifest());
+        let after_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(before_disk, after_disk);
+    }
+
+    #[test]
+    fn allocate_sequence_id_range_overflow_is_rejected() {
+        // Pre-load the counter to near-MAX by hand-writing the
+        // manifest, then attempt a reservation that would overflow.
+        let scratch = Scratch::new("seq-range-overflow");
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("init");
+        }
+        let manifest_path = scratch.path().join(MANIFEST_FILE_NAME);
+        let bytes = fs::read(&manifest_path).unwrap();
+        let mut m: Manifest = serde_json::from_slice(&bytes).unwrap();
+        m.tables.get_mut("events").unwrap().next_sequence_id = u64::MAX - 5;
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+
+        let mut db = Database::open_or_create(scratch.path()).expect("reopen");
+        // Reserving exactly 5 is fine (yields [MAX-5, MAX-1]).
+        let (lo, hi) = db.allocate_sequence_id_range("events", 5).unwrap();
+        assert_eq!(lo, u64::MAX - 5);
+        assert_eq!(hi, u64::MAX - 1);
+        // Reserving 2 more overflows the counter (next_free = MAX + 1).
+        let err = db
+            .allocate_sequence_id_range("events", 2)
+            .expect_err("overflow must error");
+        assert!(matches!(err, BqliteError::Execution(_)));
     }
 }
