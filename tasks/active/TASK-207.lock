@@ -1,7 +1,0 @@
-{
-  "agent_id": "bqlite-agent-2",
-  "task_id": "TASK-207",
-  "claimed_at": "2026-04-11T07:54:00Z",
-  "branch": "task/TASK-207",
-  "description": "[IMPL] Dictionary encoding"
-}
