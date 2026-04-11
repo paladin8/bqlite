@@ -9,17 +9,18 @@
 #   needs-input sentinel   -> resume with --continue so the human can reply.
 #   (no sentinel)          -> relaunch claude with a fresh context.
 #
-# Usage: agent-wrapper.sh <wave> [max_tasks]
+# Usage: agent-wrapper.sh <wave> <difficulty_pool> [max_tasks]
 
 set -uo pipefail
 
-if [ "$#" -lt 1 ]; then
-  echo "usage: $0 <wave> [max_tasks]" >&2
+if [ "$#" -lt 2 ]; then
+  echo "usage: $0 <wave> <difficulty_pool> [max_tasks]" >&2
   exit 1
 fi
 
 WAVE="$1"
-MAX_TASKS="${2:-}"
+DIFFICULTY_POOL_RAW="$2"
+MAX_TASKS="${3:-}"
 
 if ! [[ "$WAVE" =~ ^[0-9]+$ ]]; then
   echo "error: wave must be a non-negative integer, got '$WAVE'" >&2
@@ -32,6 +33,28 @@ else
   WAVE_RANGE="TASK-${WAVE}00 through TASK-${WAVE}99"
 fi
 
+case "${DIFFICULTY_POOL_RAW^^}" in
+  EASY)
+    DIFFICULTY_POOL="EASY"
+    DIFFICULTY_TAG="[EASY]"
+    MODEL_ALIAS="claude-sonnet-4-6[1m]"
+    EFFORT_LEVEL="high"
+    ;;
+  HARD)
+    DIFFICULTY_POOL="HARD"
+    DIFFICULTY_TAG="[HARD]"
+    MODEL_ALIAS="claude-opus-4-6[1m]"
+    EFFORT_LEVEL="high"
+    ;;
+  *)
+    echo "error: difficulty_pool must be EASY or HARD, got '${DIFFICULTY_POOL_RAW}'" >&2
+    exit 1
+    ;;
+esac
+
+export TASK_DIFFICULTY_POOL="$DIFFICULTY_POOL"
+export TASK_WAVE="$WAVE"
+
 SENTINEL_DIR="/tmp/bqlite-fleet"
 mkdir -p "$SENTINEL_DIR"
 # Clear sentinels on startup so a re-attach after a completed wave restarts
@@ -42,10 +65,10 @@ mkdir -p "$SENTINEL_DIR"
 rm -f "$SENTINEL_DIR/wave-complete" "$SENTINEL_DIR/needs-input"
 
 AGENT_NAME="${AGENT_ID:-agent}"
-SYSTEM_PROMPT="You are ${AGENT_NAME}, an autonomous agent building bqlite. Read AGENTS.md for your complete operating protocol."
+SYSTEM_PROMPT="You are ${AGENT_NAME}, an autonomous agent building bqlite. Read AGENTS.md for your complete operating protocol. Your assigned difficulty pool is ${DIFFICULTY_POOL}; only claim tasks tagged ${DIFFICULTY_TAG} unless a human explicitly changes your assignment. Use scripts/task_tool.py rather than hand-rolling task selection or lock-file git workflows."
 
 initial_prompt() {
-  local msg="Begin the agent loop now. Only claim tasks in Wave ${WAVE} (${WAVE_RANGE}); skip any task outside that range."
+  local msg="Begin the agent loop now. Use \`python3 scripts/task_tool.py claim-next --wave ${WAVE} --difficulty ${DIFFICULTY_POOL} --agent-id \$AGENT_ID\` to select and claim work instead of manually writing locks or doing the claim git flow. Only claim tasks in Wave ${WAVE} (${WAVE_RANGE}) that are tagged ${DIFFICULTY_TAG}; skip tasks outside that range or with any other difficulty tag. If the script reports status: missing_difficulty (your pool has no claimable work and the only remaining wave tasks lack an [EASY]/[HARD] tag), emit [NEEDS INPUT] rather than guessing. If it reports status: no_claimable, follow the AGENTS.md backoff schedule instead of claiming a mismatched task."
   if [ -n "$MAX_TASKS" ]; then
     msg="${msg} Stop after completing ${MAX_TASKS} task(s) by emitting [END LOOP] instead of claiming another task."
   fi
@@ -53,8 +76,8 @@ initial_prompt() {
 }
 
 run_fresh() {
-  claude --model 'claude-opus-4-6[1m]' \
-         --effort high \
+  claude --model "$MODEL_ALIAS" \
+         --effort "$EFFORT_LEVEL" \
          --permission-mode bypassPermissions \
          --append-system-prompt "$SYSTEM_PROMPT" \
          "$(initial_prompt)"
@@ -63,8 +86,8 @@ run_fresh() {
 # No --append-system-prompt here: --continue inherits the system prompt from
 # the resumed session, so re-applying it would double-stack the instructions.
 run_resume() {
-  claude --model 'claude-opus-4-6[1m]' \
-         --effort high \
+  claude --model "$MODEL_ALIAS" \
+         --effort "$EFFORT_LEVEL" \
          --permission-mode bypassPermissions \
          --continue
 }
@@ -93,12 +116,12 @@ while true; do
   start=$(date +%s)
   if [ -f "$SENTINEL_DIR/needs-input" ]; then
     echo ""
-    echo "=== [NEEDS INPUT] ${AGENT_NAME} is waiting on you. Resuming last session with --continue. ==="
+    echo "=== [NEEDS INPUT] ${AGENT_NAME} (${DIFFICULTY_POOL} pool) is waiting on you. Resuming last session with --continue. ==="
     rm -f "$SENTINEL_DIR/needs-input"
     run_resume || true
   else
     echo ""
-    echo "=== [$(date -u +%FT%TZ)] ${AGENT_NAME} launching fresh claude session on Wave ${WAVE} ==="
+    echo "=== [$(date -u +%FT%TZ)] ${AGENT_NAME} launching fresh claude session on Wave ${WAVE} (${DIFFICULTY_POOL} pool -> ${MODEL_ALIAS} ${EFFORT_LEVEL}) ==="
     run_fresh || true
   fi
   end=$(date +%s)

@@ -5,6 +5,7 @@ Instructions for autonomous Claude Code agents building bqlite in parallel. Read
 ## Identity
 
 Your agent ID is set in the `AGENT_ID` environment variable (e.g., `agent-1`). Your working directory is `/workspace`.
+The wrapper also sets `TASK_DIFFICULTY_POOL` to `EASY` or `HARD`. `EASY` agents run Sonnet at high effort and may only claim tasks tagged `[EASY]`; `HARD` agents run Opus at high effort and may only claim tasks tagged `[HARD]`.
 
 ## Configuration
 
@@ -16,14 +17,15 @@ STALE_LOCK_TIMEOUT_MINUTES=45
 
 Run this loop continuously:
 
-1. `git fetch origin && git pull origin main` (fetch all refs so task branch info is current)
-2. Scan `tasks/active/` for existing lock files and `tasks/completed/` for done markers
-3. Read `TASKS.md` — select an unclaimed task whose **Depends on** tasks all have `.done` markers in `tasks/completed/`
-4. Claim the task (see Task Claiming Protocol)
-5. Read the task's design doc and any relevant source files
-6. Implement in small checkpoints (see Checkpoint Discipline)
-7. After the final checkpoint, mark the task complete (see Completion Protocol)
-8. Return to step 1
+1. Run `python3 scripts/task_tool.py claim-next --wave "$TASK_WAVE" --difficulty "$TASK_DIFFICULTY_POOL" --agent-id "$AGENT_ID"` to sync `main`, parse `TASKS.md`, enforce wave+difficulty restrictions, detect stale locks, and atomically claim the next eligible task
+2. Interpret the script's `status` field:
+   - `"claimed"` — continue with the returned task. The response may also include `missing_difficulty_tasks`; these are informational only and do not block you, but flag them to a human if they persist across cycles.
+   - `"no_claimable"` — follow the backoff schedule.
+   - `"missing_difficulty"` — your pool has no claimable work and the only remaining wave tasks are untagged. Emit `[NEEDS INPUT]` so the task list can be fixed rather than guessing.
+3. Read the task's design doc and any relevant source files
+4. Implement in small checkpoints (see Checkpoint Discipline)
+5. After the final checkpoint, mark the task complete (see Completion Protocol)
+6. Return to step 1
 
 ## Ending Your Turn
 
@@ -37,36 +39,25 @@ If you end a turn without one of these markers, the Stop hook blocks you and inj
 
 ## Backoff When No Tasks Are Claimable
 
-If step 3 finds no unclaimed task whose dependencies are satisfied — all remaining tasks are either claimed, completed, or blocked by unfinished dependencies — sleep and retry on the following schedule:
+If `scripts/task_tool.py claim-next` reports no unclaimed task matching your `TASK_DIFFICULTY_POOL` whose dependencies are satisfied — all remaining tasks in your pool are either claimed, completed, untagged, or blocked by unfinished dependencies — sleep and retry on the following schedule:
 
 **2 min → 5 min → 10 min → 20 min → 60 min**, then stay at 60 min indefinitely until a task becomes claimable.
 
 Reset the backoff to 2 min after successfully claiming any task. Do not exit the loop and do not report the wave as done based on a single empty scan — other agents may be mid-task and their completions will unblock more work. Dependency unblocks, newly filed non-anchor tasks, and stale-lock breaks all change what's claimable between scans.
+Do not claim a task tagged for the other pool just because your pool is empty.
 
 ## Task Claiming Protocol
 
-1. Create `tasks/active/TASK-NNN.lock` with this JSON content:
-   ```json
-   {
-     "agent_id": "<your AGENT_ID>",
-     "task_id": "TASK-NNN",
-     "claimed_at": "<current UTC ISO-8601 timestamp>",
-     "branch": "task/TASK-NNN",
-     "description": "<task description from TASKS.md>"
-   }
-   ```
-2. `git add tasks/active/TASK-NNN.lock && git commit -m "TASK-NNN: claimed by <agent_id>" && git push origin main`
-3. **If push fails**: another agent committed concurrently. Run:
-   ```bash
-   git reset HEAD~1
-   git checkout -- tasks/
-   git pull origin main
-   ```
-   Then go back to the loop and pick a different task.
-4. After a successful push, create your working branch:
-   ```bash
-   git checkout -b task/TASK-NNN
-   ```
+Use `python3 scripts/task_tool.py claim-next --wave "$TASK_WAVE" --difficulty "$TASK_DIFFICULTY_POOL" --agent-id "$AGENT_ID"` instead of hand-rolling the claim steps. The script:
+
+1. Syncs `main`
+2. Parses `TASKS.md`
+3. Filters to your assigned wave and difficulty pool
+4. Verifies dependency completion from `tasks/completed/`
+5. Detects and breaks stale locks when the AGENTS.md stale-lock rules say it is safe
+6. Writes `tasks/active/TASK-NNN.lock`, commits it, pushes it to `origin/main`, and checks out `task/TASK-NNN`
+
+If the script loses a push race, it resets the temporary claim commit, restores `tasks/`, pulls `main`, and retries internally. Agents should treat the script as the source of truth for whether a task was actually claimed.
 
 ## Completion Protocol
 
@@ -91,7 +82,7 @@ When the task's final checkpoint is merged to main:
 
 ## Stale Lock Detection
 
-Before claiming a task, check all lock files in `tasks/active/`:
+`scripts/task_tool.py claim-next` performs stale-lock detection before claiming a task. If you need to reason about the output or debug the script, the stale-lock rule is:
 
 A lock is stale if ALL of the following are true:
 - `claimed_at` is older than `STALE_LOCK_TIMEOUT_MINUTES`
@@ -179,6 +170,7 @@ End your turn with **[NEEDS INPUT]** (see *Ending Your Turn*) so the wrapper pau
 
 - Architecture or design decisions with multiple valid approaches
 - Ambiguous acceptance criteria in a task definition
+- `task_tool.py` returns `status: "missing_difficulty"` — your pool has drained and the only remaining wave work is untagged, so a human must decide the pool routing before anyone can proceed
 - Merge conflicts you cannot resolve cleanly
 - Any situation where proceeding could waste significant work if the wrong path is chosen
 
