@@ -23,6 +23,9 @@ pub use time::{duration, TimeRange, Timestamp};
 pub mod memory;
 pub use memory::{MemoryBudget, MemoryReservation, SpillNotification, UnboundedMemory};
 
+pub mod metrics;
+pub use metrics::{AtomicMetrics, Metrics, MetricsSnapshot, MetricsTimer, NoopMetrics};
+
 pub mod property;
 pub use property::{BqlType, PropertyValue};
 
