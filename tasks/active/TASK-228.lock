@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-228",
+  "claimed_at": "2026-04-11T20:36:39Z",
+  "branch": "task/TASK-228",
+  "description": "Projection pruning optimizer pass"
+}
