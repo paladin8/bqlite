@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-5",
+  "task_id": "TASK-231",
+  "claimed_at": "2026-04-11T17:53:15Z",
+  "branch": "task/TASK-231",
+  "description": "[IMPL] Filter + Project + Limit operators"
+}
