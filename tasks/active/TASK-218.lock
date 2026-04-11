@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-1",
+  "task_id": "TASK-218",
+  "claimed_at": "2026-04-11T07:26:40Z",
+  "branch": "task/TASK-218",
+  "description": "[IMPL] Ingest partitioner"
+}
