@@ -3447,6 +3447,103 @@ mod tests {
     }
 
     #[test]
+    fn scan_predicate_prunes_row_group_via_zone_map_module() {
+        // End-to-end test pinning the `ScanPredicate` -> `zone_map`
+        // module -> real segment reader path. The row group has
+        // amount in [10, 40]; a `ScanPredicate` that requires
+        // `amount > 100` must prune it via `accepts_zone_group`
+        // without touching any other column's decoder.
+        use bqlite_core::storage::{RangeOp, ScanConjunct, ScanPredicate};
+
+        let schema = roundtrip_schema();
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 2,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1", "u2"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u2".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[0, 0]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(0)),
+                        zone_max: Some(PropertyValue::Timestamp(0)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view", "view"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true, true])),
+                        encoded: encode_plain_int(&[10, 40]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(10)),
+                        zone_max: Some(PropertyValue::Int(40)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 1),
+            batch_id: 0,
+            compaction_level: 0,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+
+        // Pruning predicate: amount > 100 — must prune the single
+        // row group (max=40 is below the threshold).
+        let prune_pred: Arc<dyn Predicate> =
+            Arc::new(ScanPredicate::new(vec![ScanConjunct::Range {
+                column: "amount".into(),
+                op: RangeOp::Gt,
+                value: PropertyValue::Int(100),
+            }]));
+        let mut scan = reader
+            .scan(&ColumnProjection::all(), Some(prune_pred))
+            .unwrap();
+        assert!(
+            scan.next_row_group().unwrap().is_none(),
+            "ScanPredicate `amount > 100` failed to prune row group with max=40"
+        );
+
+        // Accepting predicate: amount >= 10 — the row group has
+        // max=40 > 10, so it survives and the reader materializes
+        // both rows.
+        let accept_pred: Arc<dyn Predicate> =
+            Arc::new(ScanPredicate::new(vec![ScanConjunct::Range {
+                column: "amount".into(),
+                op: RangeOp::Ge,
+                value: PropertyValue::Int(10),
+            }]));
+        let mut scan = reader
+            .scan(&ColumnProjection::all(), Some(accept_pred))
+            .unwrap();
+        let batch = scan.next_row_group().unwrap().expect("one row group");
+        assert_eq!(batch.num_rows(), 2);
+        assert!(scan.next_row_group().unwrap().is_none());
+    }
+
+    #[test]
     fn predicate_prunes_row_group_even_when_column_not_projected() {
         // Zone-map pruning must be driven by the predicate's own
         // referenced columns, not the scan's projection — otherwise

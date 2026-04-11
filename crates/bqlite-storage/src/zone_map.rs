@@ -631,4 +631,143 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // False-positive rate sanity — synthetic partitioned workloads
+    //
+    // The no-false-negatives tests above prove correctness: any
+    // matching row is preserved. These tests prove *effectiveness*:
+    // on realistic synthetic workloads, the pruning decision actually
+    // eliminates most non-matching row groups (so the reader isn't
+    // paying I/O to decode row groups it can't use).
+    //
+    // The Wave 2 perf gate requires ≥80% row-group pruning on the
+    // acceptance query (`event = 'checkout' AND amount > 100`) —
+    // that's a benchmark-level assertion owned by TASK-236/TASK-241
+    // on the 100M-row reference dataset. These unit tests pin the
+    // same property on tiny synthetic workloads so regressions in
+    // the decision rules trip immediately, without waiting for the
+    // bench suite.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pruning_rate_exceeds_threshold_on_partitioned_range_workload() {
+        // 100 row groups, each holding 100 values in a disjoint
+        // window: rg k has values in [k*100, k*100+99]. Predicate
+        // `x > 9000` can match only rg 90..=99 — 10 row groups.
+        // Every other row group has `max < threshold` and must be
+        // pruned. Expected prune rate: 90%.
+        let scan = FakeScan {
+            zones_per_rg: (0..100)
+                .map(|k: i64| zones_for("x", int_zone(k * 100, k * 100 + 99, 0, 100)))
+                .collect(),
+        };
+        let pred = ScanPredicate::new(vec![ScanConjunct::Range {
+            column: "x".into(),
+            op: RangeOp::Gt,
+            value: PropertyValue::Int(9000),
+        }]);
+        let survivors = surviving_row_groups(&scan, Some(&pred)).unwrap();
+        // Exact count: rg 90..=99 survive (rg 90 has max=9099 > 9000,
+        // rg 89 has max=8999 < 9000 → prune). 10 survivors, 90 pruned.
+        assert_eq!(
+            survivors.len(),
+            10,
+            "expected 10 survivors, got {survivors:?}"
+        );
+        let prune_rate = 1.0 - (survivors.len() as f64 / 100.0);
+        assert!(
+            prune_rate >= 0.80,
+            "prune rate {prune_rate:.2} below 80% threshold on partitioned range workload"
+        );
+    }
+
+    #[test]
+    fn pruning_rate_exceeds_threshold_on_equality_workload() {
+        // 100 row groups, each holding values in a disjoint integer
+        // window (rg k spans [k*10, k*10+9]). Predicate `x = 503`
+        // can match only rg 50 (values 500..509). Expected prune
+        // rate: 99%.
+        let scan = FakeScan {
+            zones_per_rg: (0..100)
+                .map(|k: i64| zones_for("x", int_zone(k * 10, k * 10 + 9, 0, 10)))
+                .collect(),
+        };
+        let pred = ScanPredicate::new(vec![ScanConjunct::Equal {
+            column: "x".into(),
+            value: PropertyValue::Int(503),
+        }]);
+        let survivors = surviving_row_groups(&scan, Some(&pred)).unwrap();
+        assert_eq!(survivors, vec![50]);
+        let prune_rate = 1.0 - (survivors.len() as f64 / 100.0);
+        assert!(
+            prune_rate >= 0.95,
+            "prune rate {prune_rate:.2} below 95% threshold on equality workload"
+        );
+    }
+
+    #[test]
+    fn pruning_rate_on_multi_conjunct_predicate_is_stronger_than_either_alone() {
+        // Multi-column workload: each row group has a (category,
+        // amount) zone map pair. The conjunction `category = 'B'
+        // AND amount > 100` should prune strictly more than either
+        // conjunct alone — this is the claim the Wave 2 acceptance
+        // query relies on.
+        //
+        // Workload shape:
+        //   rg 0..25:  category in {A}, amount in [0, 50]       ← both reject
+        //   rg 25..50: category in {A}, amount in [150, 200]    ← category rejects
+        //   rg 50..75: category in {B}, amount in [0, 50]       ← amount rejects
+        //   rg 75..100: category in {B}, amount in [150, 200]   ← both accept
+        let mut zones_per_rg: Vec<HashMap<String, ZoneMap>> = Vec::with_capacity(100);
+        for k in 0..100 {
+            let category = if k < 50 { "A" } else { "B" };
+            let (amt_min, amt_max) = if k % 50 < 25 { (0, 50) } else { (150, 200) };
+            let mut m = HashMap::new();
+            m.insert(
+                "category".to_string(),
+                ZoneMap {
+                    min: Some(PropertyValue::String(category.into())),
+                    max: Some(PropertyValue::String(category.into())),
+                    null_count: 0,
+                    row_count: 100,
+                },
+            );
+            m.insert("amount".to_string(), int_zone(amt_min, amt_max, 0, 100));
+            zones_per_rg.push(m);
+        }
+        let scan = FakeScan { zones_per_rg };
+
+        let category_only = ScanPredicate::new(vec![ScanConjunct::Equal {
+            column: "category".into(),
+            value: PropertyValue::String("B".into()),
+        }]);
+        let amount_only = ScanPredicate::new(vec![ScanConjunct::Range {
+            column: "amount".into(),
+            op: RangeOp::Gt,
+            value: PropertyValue::Int(100),
+        }]);
+        let both = ScanPredicate::new(vec![
+            ScanConjunct::Equal {
+                column: "category".into(),
+                value: PropertyValue::String("B".into()),
+            },
+            ScanConjunct::Range {
+                column: "amount".into(),
+                op: RangeOp::Gt,
+                value: PropertyValue::Int(100),
+            },
+        ]);
+
+        let category_surv = surviving_row_groups(&scan, Some(&category_only)).unwrap();
+        let amount_surv = surviving_row_groups(&scan, Some(&amount_only)).unwrap();
+        let both_surv = surviving_row_groups(&scan, Some(&both)).unwrap();
+
+        assert_eq!(category_surv.len(), 50); // rg 50..100
+        assert_eq!(amount_surv.len(), 50); // rg 25..50 + rg 75..100
+        assert_eq!(both_surv.len(), 25); // rg 75..100 only
+                                         // Conjunction must be a subset of either conjunct alone.
+        assert!(both_surv.iter().all(|i| category_surv.contains(i)));
+        assert!(both_surv.iter().all(|i| amount_surv.contains(i)));
+    }
 }
