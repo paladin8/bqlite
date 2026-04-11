@@ -22,37 +22,25 @@
 //!
 //! ## Where expression typing lives
 //!
-//! TASK-204 §1 says: *"Per-node fields that carry expressions are
-//! typed as `TypedExpr` here without further elaboration."* The full
-//! `TypedExpr` compiler lands in TASK-225 (depends on TASK-205). This
-//! module is TASK-224, which depends only on TASK-204 — so the
-//! Filter/Project nodes store raw [`bqlite_ast::expr::Spanned<Expr>`]
-//! values for now, with the following split of responsibilities:
+//! Post TASK-225: every expression-carrying field on a logical plan
+//! node is a [`TypedExpr`] — a schema-resolved, type-checked
+//! expression built via [`TypedExpr::from_ast`]. Filter's
+//! `predicate`, `Project`'s `ProjectItem::expr`, and `Scan`'s
+//! optimizer-populated `scan_predicates` all use the typed form,
+//! which means the logical-plan construction invariant — "holding a
+//! value implies the plan is well-typed" — extends all the way
+//! down to the expression level.
 //!
-//! - **Project output schema** (where typing *must* exist so the
-//!   schema-at-construction invariant holds) handles the bare
-//!   column-reference and wildcard cases directly by consulting the
-//!   input schema. These are the only forms the Wave 2 acceptance
-//!   query (§acceptance in TASKS.md) produces on the `SELECT` side.
-//! - **Any other expression in Project** — arithmetic, function
-//!   calls, comparisons — is rejected at lowering time with a
-//!   `Plan` error that names TASK-225 as the task that will lift the
-//!   restriction. This is honest to TASK-224's scope (logical plan
-//!   enum, not expression compiler) and does not pretend to support
-//!   forms the Wave 2 acceptance gate does not need.
-//! - **Filter predicates** are stored verbatim. Filter's output
-//!   schema equals its input's, so no typing happens at construction
-//!   and the raw `Spanned<Expr>` is enough for TASK-227's predicate
-//!   pushdown pass to operate on (which re-walks the expression
-//!   against the scan's advertised `CompiledExpr` shape anyway —
-//!   docs/design/planner/expression-compilation.md).
-//!
-//! When TASK-225 lands, these `Spanned<Expr>` fields move to
-//! `TypedExpr` values produced by its schema-resolving walker.
+//! Lowering obtains a single [`FunctionRegistry`] per query
+//! (constructed via [`FunctionRegistry::with_builtins`]) and
+//! threads it into every `TypedExpr::from_ast` call made during
+//! pipeline-stage folding. Later waves that need query-scoped
+//! custom functions can plumb a caller-owned registry through this
+//! same API surface without reshaping the fold.
 
 use std::collections::HashSet;
 
-use bqlite_ast::expr::{Expr, Literal, Spanned};
+use bqlite_ast::expr::{Expr, Literal};
 use bqlite_ast::pipeline::{Pipeline, TimeRange};
 use bqlite_ast::{
     AlterAction, AlterTableStmt, ColumnDef as AstColumnDef, ColumnRole, CreateTableStmt,
@@ -62,6 +50,8 @@ use bqlite_ast::{
 use bqlite_core::{
     BqlType, BqliteError, Catalog, ColumnDef, OperatorSchema, PropertyValue, Result, TableSchema,
 };
+
+use crate::expr::{FunctionRegistry, TypedExpr, TypedExprKind};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The logical plan enum
@@ -90,10 +80,11 @@ pub enum LogicalPlan {
         /// `JOIN <table>` tables. Empty in Wave 2; populated by Wave 4.
         joined_tables: Vec<TableSchema>,
         /// Scan-level predicates populated by TASK-227's predicate
-        /// pushdown pass. Stored as raw `Spanned<Expr>` until TASK-225
-        /// migrates them to `TypedExpr`. Always empty when this node
-        /// is first constructed by lowering.
-        scan_predicates: Vec<Spanned<Expr>>,
+        /// pushdown pass. Always empty when this node is first
+        /// constructed by lowering; TASK-227 rewrites the plan tree
+        /// to move pushable conjuncts from a parent `Filter` into
+        /// this vec.
+        scan_predicates: Vec<TypedExpr>,
         /// Declared-column names the scan actually reads, populated
         /// by TASK-228's projection pruning pass. Empty means
         /// "read all columns" — the pruning pass replaces the empty
@@ -106,9 +97,11 @@ pub enum LogicalPlan {
 
     /// `| WHERE <predicate>` — row filter. §4.2.
     Filter {
-        /// The predicate expression. Stored raw for Wave 2; TASK-225
-        /// migrates to `TypedExpr`.
-        predicate: Spanned<Expr>,
+        /// The predicate expression. Type-checked against
+        /// `input.output_schema()` at construction time; the
+        /// constructor rejects predicates whose `result_type` is
+        /// not [`BqlType::Bool`].
+        predicate: TypedExpr,
         input: Box<LogicalPlan>,
         /// Identical to `input.output_schema()` — filter never
         /// changes the column shape.
@@ -198,26 +191,21 @@ pub enum LogicalPlan {
 
 /// A single output item in a `LogicalPlan::Project`.
 ///
-/// The struct stores both the untyped source expression (for
-/// downstream passes that need to re-walk it, e.g. predicate
-/// pushdown that inlines project expressions into filter residuals)
-/// and the cached output name + type that feed
-/// `OperatorSchema::new`.
+/// Post-TASK-225, the item carries a fully [`TypedExpr`] and a
+/// planner-assigned output name. The result type and nullability
+/// the project's `output_schema` needs at construction time are
+/// already cached on the [`TypedExpr`] — there is no separate
+/// `bql_type` / `nullable` field.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectItem {
-    /// The source expression — stored raw for Wave 2 (see module
-    /// docs). TASK-225 replaces this with `TypedExpr`.
-    pub expr: Spanned<Expr>,
+    /// The typed output expression. Type-checked against the
+    /// project's input schema at construction time; the expression
+    /// compiler (TASK-225) resolves column references, infers
+    /// result types, and rejects unsupported expression shapes.
+    pub expr: TypedExpr,
     /// Output column name — either the user's `AS alias`, the bare
     /// column's own name, or a planner-assigned synthetic name.
     pub output_name: String,
-    /// Cached output type — computed from the input schema during
-    /// lowering so the project's `output_schema` can be built at
-    /// construction time.
-    pub bql_type: BqlType,
-    /// Whether the output column is nullable. For bare column
-    /// references this is the input column's `nullable` flag.
-    pub nullable: bool,
 }
 
 /// Resolved body of a `LogicalPlan::Insert`.
@@ -332,27 +320,36 @@ impl LogicalPlan {
         }
     }
 
-    /// Wrap `input` in a `Filter` whose output schema equals
-    /// `input.output_schema()`.
-    pub fn filter(predicate: Spanned<Expr>, input: LogicalPlan) -> Self {
+    /// Wrap `input` in a `Filter`. The predicate must already be
+    /// type-checked against `input.output_schema()`; its
+    /// `result_type` must be [`BqlType::Bool`], otherwise
+    /// construction returns a plan error.
+    pub fn filter(predicate: TypedExpr, input: LogicalPlan) -> Result<Self> {
+        if predicate.result_type != BqlType::Bool {
+            return Err(BqliteError::Plan(format!(
+                "filter predicate must have type `Bool`, got `{}`",
+                predicate.result_type
+            )));
+        }
         let output_schema = input.output_schema().clone();
-        LogicalPlan::Filter {
+        Ok(LogicalPlan::Filter {
             predicate,
             input: Box::new(input),
             output_schema,
-        }
+        })
     }
 
     /// Wrap `input` in a `Project` with the given items. Builds the
-    /// output schema from `expressions` and enforces
-    /// `OperatorSchema`'s duplicate-name rule.
+    /// output schema from each item's [`TypedExpr::result_type`]
+    /// and [`TypedExpr::nullable`], then runs it through
+    /// [`OperatorSchema::new`]'s duplicate-name check.
     pub fn project(expressions: Vec<ProjectItem>, input: LogicalPlan) -> Result<Self> {
         let cols: Vec<ColumnDef> = expressions
             .iter()
             .map(|item| ColumnDef {
                 name: item.output_name.clone(),
-                bql_type: item.bql_type.clone(),
-                nullable: item.nullable,
+                bql_type: item.expr.result_type.clone(),
+                nullable: item.expr.nullable,
                 default_value: None,
             })
             .collect();
@@ -477,19 +474,31 @@ fn lower_query_pipeline(pipeline: Pipeline, catalog: &dyn Catalog) -> Result<Log
     // into `(String, String)` (query-language.md §16).
     let mut plan = LogicalPlan::scan_with_time_range(table_schema, pipeline.source.time_range);
 
+    // Function registry for expression-level type checking. Wave 2
+    // ships the built-in set (`like`, `regex`); later waves extend
+    // via the registry's `register` API.
+    let registry = FunctionRegistry::with_builtins();
+
     // Fold pipeline stages in order. Each stage wraps `plan` in a
     // new logical node whose input is the previous `plan`.
     for stage in pipeline.stages {
-        plan = fold_stage(stage, plan)?;
+        plan = fold_stage(stage, plan, &registry)?;
     }
 
     Ok(plan)
 }
 
 /// Fold a single AST pipeline stage into the accumulated plan.
-fn fold_stage(stage: PipelineStage, acc: LogicalPlan) -> Result<LogicalPlan> {
+fn fold_stage(
+    stage: PipelineStage,
+    acc: LogicalPlan,
+    registry: &FunctionRegistry,
+) -> Result<LogicalPlan> {
     match stage {
-        PipelineStage::Where { predicate, .. } => Ok(LogicalPlan::filter(predicate, acc)),
+        PipelineStage::Where { predicate, .. } => {
+            let typed = TypedExpr::from_ast(&predicate, acc.output_schema(), registry)?;
+            LogicalPlan::filter(typed, acc)
+        }
 
         PipelineStage::Select {
             distinct, items, ..
@@ -501,7 +510,7 @@ fn fold_stage(stage: PipelineStage, acc: LogicalPlan) -> Result<LogicalPlan> {
                         .into(),
                 ));
             }
-            lower_select(items, acc)
+            lower_select(items, acc, registry)
         }
 
         PipelineStage::Limit { count, .. } => Ok(LogicalPlan::limit(count, acc)),
@@ -539,19 +548,24 @@ fn stage_kind_name(stage: &PipelineStage) -> &'static str {
 
 /// Lower a `SELECT` stage into a `Project` node.
 ///
-/// Wave 2 handles the shapes the acceptance query (TASKS.md Wave 2
-/// acceptance block) and its obvious neighbours produce:
+/// Every expression in the items list is type-checked against the
+/// input schema via [`TypedExpr::from_ast`], which fully supports
+/// Wave 2's expression surface (arithmetic, comparisons, function
+/// calls, etc). The `*` wildcard expands to one item per input
+/// column; qualified wildcards and qualified column references
+/// remain deferred to Wave 4 joins.
 ///
-/// - Bare column references, optionally aliased.
-/// - `*` wildcards, which expand to one `ProjectItem` per input
-///   column.
-///
-/// Every other expression form is rejected with a clear "TASK-225
-/// will lift this" error rather than silently emitting a wrong-typed
-/// schema. This keeps the Wave 2 contract honest: the logical-plan
-/// task ships the plan tree; the expression-compiler task ships
-/// typed expressions on top of it.
-fn lower_select(items: Vec<SelectItem>, acc: LogicalPlan) -> Result<LogicalPlan> {
+/// Output naming per §4.3:
+/// - Explicit alias (`expr AS name`) → `name`.
+/// - Bare column reference → the column's own name.
+/// - Computed expression without an alias → parser error (caught
+///   upstream), but if one slips through we fall back to a
+///   planner-synthetic `expr_<idx>` label to avoid crashing.
+fn lower_select(
+    items: Vec<SelectItem>,
+    acc: LogicalPlan,
+    registry: &FunctionRegistry,
+) -> Result<LogicalPlan> {
     if items.is_empty() {
         return Err(BqliteError::Plan(
             "SELECT must have at least one output item".into(),
@@ -576,25 +590,29 @@ fn lower_select(items: Vec<SelectItem>, acc: LogicalPlan) -> Result<LogicalPlan>
     let input_schema = acc.output_schema().clone();
     let mut project_items: Vec<ProjectItem> = Vec::new();
 
-    for item in items {
+    for (idx, item) in items.into_iter().enumerate() {
         match item.kind {
             SelectItemKind::Wildcard => {
-                // Expand to one item per input column, preserving the
-                // input's order. Each expanded item stores a
-                // synthetic `Expr::Column` so TASK-225's compiler has
-                // an expression to operate on if it re-walks the
-                // project. System columns (`__seq_id`, `__batch_id`)
-                // are included because query-language.md §10 says
-                // `SELECT *` means every visible column.
-                for col in input_schema.columns() {
-                    project_items.push(ProjectItem {
-                        expr: Spanned::new(
-                            Expr::Column(bqlite_ast::Name::synthetic(&col.name)),
-                            item.span,
-                        ),
-                        output_name: col.name.clone(),
-                        bql_type: col.bql_type.clone(),
+                // Expand to one item per input column, preserving
+                // the input's order. Each expanded item builds a
+                // synthetic `TypedExpr::Column` at the position of
+                // the column in the input schema. System columns
+                // (`__seq_id`, `__batch_id`) are included because
+                // query-language.md §10 says `SELECT *` means every
+                // visible column.
+                for (column_index, col) in input_schema.columns().iter().enumerate() {
+                    let typed = TypedExpr {
+                        kind: TypedExprKind::Column {
+                            column_index,
+                            name: col.name.clone(),
+                        },
+                        result_type: col.bql_type.clone(),
                         nullable: col.nullable,
+                        span: item.span,
+                    };
+                    project_items.push(ProjectItem {
+                        expr: typed,
+                        output_name: col.name.clone(),
                     });
                 }
             }
@@ -606,45 +624,26 @@ fn lower_select(items: Vec<SelectItem>, acc: LogicalPlan) -> Result<LogicalPlan>
             }
 
             SelectItemKind::Expr(expr) => {
-                // Wave 2 scope: only bare column references (with or
-                // without an alias) are schema-typeable here; TASK-225
-                // lifts this for arbitrary expressions.
-                match &expr.node {
-                    Expr::Column(name) => {
-                        let column_name = name.text.clone();
-                        let (_, col_def) = input_schema.column(&column_name).ok_or_else(|| {
-                            BqliteError::Plan(format!(
-                                "SELECT: unknown column `{column_name}` in input schema"
-                            ))
-                        })?;
-                        let output_name = item
-                            .alias
-                            .map(|a| a.text)
-                            .unwrap_or_else(|| column_name.clone());
-                        project_items.push(ProjectItem {
-                            expr,
-                            output_name,
-                            bql_type: col_def.bql_type.clone(),
-                            nullable: col_def.nullable,
-                        });
+                // Derive the output name from the alias if present,
+                // or from a bare column reference, or fall back to a
+                // synthetic label.
+                let output_name = if let Some(alias) = item.alias.clone() {
+                    alias.text
+                } else {
+                    match &expr.node {
+                        Expr::Column(name) => name.text.clone(),
+                        Expr::Paren(inner) => match &inner.node {
+                            Expr::Column(name) => name.text.clone(),
+                            _ => format!("expr_{idx}"),
+                        },
+                        _ => format!("expr_{idx}"),
                     }
-                    Expr::Qualified { .. } => {
-                        return Err(BqliteError::Plan(
-                            "qualified column references `table.col` are deferred to Wave 4 \
-                             joins (TASK-407)"
-                                .into(),
-                        ));
-                    }
-                    _ => {
-                        return Err(BqliteError::Plan(
-                            "SELECT on computed expressions (arithmetic, function calls, \
-                             comparisons, ...) requires the expression compiler landing in \
-                             TASK-225; Wave 2 TASK-224 supports bare column references and \
-                             `*` wildcards only"
-                                .into(),
-                        ));
-                    }
-                }
+                };
+                let typed = TypedExpr::from_ast(&expr, &input_schema, registry)?;
+                project_items.push(ProjectItem {
+                    expr: typed,
+                    output_name,
+                });
             }
         }
     }
@@ -1351,8 +1350,8 @@ mod tests {
                     .iter()
                     .find(|i| i.output_name == "amount")
                     .unwrap();
-                assert_eq!(amount_item.bql_type, BqlType::Float);
-                assert!(amount_item.nullable);
+                assert_eq!(amount_item.expr.result_type, BqlType::Float);
+                assert!(amount_item.expr.nullable);
 
                 // Output schema column order matches the items.
                 let schema_names: Vec<&str> = output_schema
@@ -1382,7 +1381,7 @@ mod tests {
             LogicalPlan::Project { expressions, .. } => {
                 assert_eq!(expressions.len(), 1);
                 assert_eq!(expressions[0].output_name, "total");
-                assert_eq!(expressions[0].bql_type, BqlType::Float);
+                assert_eq!(expressions[0].expr.result_type, BqlType::Float);
             }
             other => panic!("expected Project, got {other:?}"),
         }
@@ -1466,9 +1465,50 @@ mod tests {
     }
 
     #[test]
-    fn select_computed_expression_rejected_until_task_225() {
-        // `SELECT user_id + 1` — arithmetic on a column. Cannot be
-        // schema-typed without the expression compiler.
+    fn select_computed_expression_lowers_through_type_checker() {
+        // `SELECT amount * 2 AS doubled` — arithmetic on a Float
+        // column. Post TASK-225 the type checker handles this and
+        // the project's output schema reflects the computed type.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Select {
+                distinct: false,
+                items: vec![SelectItem {
+                    kind: SelectItemKind::Expr(Spanned::new(
+                        Expr::Binary {
+                            op: bqlite_ast::BinaryOp::Multiply,
+                            left: Box::new(column_expr("amount")),
+                            right: Box::new(Spanned::new(
+                                Expr::Literal(Literal::Int(2)),
+                                Span::EMPTY,
+                            )),
+                        },
+                        Span::EMPTY,
+                    )),
+                    alias: Some(Name::synthetic("doubled")),
+                    span: Span::EMPTY,
+                }],
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::Project { expressions, .. } => {
+                assert_eq!(expressions.len(), 1);
+                assert_eq!(expressions[0].output_name, "doubled");
+                assert_eq!(expressions[0].expr.result_type, BqlType::Float);
+                // amount is nullable, so the result carries that.
+                assert!(expressions[0].expr.nullable);
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_type_mismatched_arith_is_rejected_by_type_checker() {
+        // `SELECT user_id + 1` — arithmetic on a String column is
+        // a type mismatch caught by the expression compiler.
         let cat = InMemoryCatalog::default().with(purchases_schema());
         let pipeline = pipeline_with_stages(
             "purchases",
@@ -1486,7 +1526,7 @@ mod tests {
                         },
                         Span::EMPTY,
                     )),
-                    alias: Some(Name::synthetic("adjusted")),
+                    alias: Some(Name::synthetic("bad")),
                     span: Span::EMPTY,
                 }],
                 span: Span::EMPTY,
@@ -1494,9 +1534,81 @@ mod tests {
         );
         let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
         match err {
-            BqliteError::Plan(msg) => {
-                assert!(msg.contains("TASK-225"));
+            BqliteError::Plan(msg) => assert!(msg.contains("type mismatch")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn where_with_typed_predicate_produces_filter() {
+        // `| WHERE event = 'checkout' AND amount > 100` — mirrors
+        // the Wave 2 acceptance query's predicate. Verifies that
+        // the type checker wires up properly inside fold_stage.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let predicate = Spanned::new(
+            Expr::And(vec![
+                Spanned::new(
+                    Expr::Compare {
+                        op: bqlite_ast::CompareOp::Equal,
+                        left: Box::new(column_expr("event")),
+                        right: Box::new(Spanned::new(
+                            Expr::Literal(Literal::String("checkout".into())),
+                            Span::EMPTY,
+                        )),
+                    },
+                    Span::EMPTY,
+                ),
+                Spanned::new(
+                    Expr::Compare {
+                        op: bqlite_ast::CompareOp::Greater,
+                        left: Box::new(column_expr("amount")),
+                        right: Box::new(Spanned::new(
+                            Expr::Literal(Literal::Int(100)),
+                            Span::EMPTY,
+                        )),
+                    },
+                    Span::EMPTY,
+                ),
+            ]),
+            Span::EMPTY,
+        );
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate,
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::Filter {
+                predicate,
+                output_schema,
+                ..
+            } => {
+                assert_eq!(predicate.result_type, BqlType::Bool);
+                // Output schema equals the scan's (identity Filter).
+                assert_eq!(output_schema.len(), 7); // 5 declared + 2 system cols
             }
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn where_with_non_bool_predicate_is_rejected() {
+        // A Filter whose predicate is an Int literal is a type
+        // mismatch caught at construction time.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: Spanned::new(Expr::Literal(Literal::Int(7)), Span::EMPTY),
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("Bool")),
             other => panic!("expected Plan error, got {other:?}"),
         }
     }
