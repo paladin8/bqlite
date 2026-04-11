@@ -1,7 +1,0 @@
-{
-  "agent_id": "bqlite-agent-3",
-  "task_id": "TASK-225",
-  "claimed_at": "2026-04-11T15:19:30Z",
-  "branch": "task/TASK-225",
-  "description": "Expression compilation (TypedExpr + CompiledExpr) in bqlite-planner"
-}
