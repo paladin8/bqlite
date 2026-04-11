@@ -17,7 +17,7 @@
 // grow this module.
 #![allow(dead_code)]
 
-use bqlite_core::{BqlType, PropertyValue};
+use bqlite_core::{BqlType, PropertyValue, TimeRange, Timestamp};
 use proptest::prelude::*;
 
 /// Maximum depth for recursive `PropertyValue` variants (list/map).
@@ -94,5 +94,50 @@ pub fn arb_scalar_bql_type() -> impl Strategy<Value = BqlType> {
         Just(BqlType::Float),
         Just(BqlType::String),
         Just(BqlType::Timestamp),
+    ]
+}
+
+/// Strategy producing an arbitrary [`BqlType`] including nested `List` and
+/// `Map` variants up to [`DEFAULT_RECURSION_DEPTH`]. Both nested types are
+/// unary, so each recursive step adds exactly one child.
+pub fn arb_bql_type() -> impl Strategy<Value = BqlType> {
+    arb_scalar_bql_type().prop_recursive(DEFAULT_RECURSION_DEPTH, 16, 1, |inner| {
+        prop_oneof![
+            inner.clone().prop_map(|t| BqlType::List(Box::new(t))),
+            inner.prop_map(|t| BqlType::Map(Box::new(t))),
+        ]
+    })
+}
+
+/// Strategy producing any [`Timestamp`] value across the full `i64`
+/// nanosecond range.
+pub fn arb_timestamp() -> impl Strategy<Value = Timestamp> {
+    any::<i64>().prop_map(Timestamp::from_nanos)
+}
+
+/// Strategy producing any [`TimeRange`].
+///
+/// Mixes two sub-strategies so both branches of `is_empty`-aware code paths
+/// are exercised reliably:
+///
+/// 1. an unconstrained `(start, end)` pair, which is empty roughly half the
+///    time (for `start >= end`), and
+/// 2. a `(start, length)` pair with `length >= 1`, which is non-empty
+///    everywhere except at `start == i64::MAX`, where the saturating add
+///    collapses to `[MAX, MAX)`. The single empty corner case is harmless;
+///    the rest of the second branch reliably tilts the distribution toward
+///    non-empty ranges.
+///
+/// Without the second branch, properties that depend on a non-empty
+/// intersection — `prop_intersect_idempotent`, the contained-in-both check,
+/// and so on — would only fire on lucky draws.
+pub fn arb_time_range() -> impl Strategy<Value = TimeRange> {
+    prop_oneof![
+        (any::<i64>(), any::<i64>())
+            .prop_map(|(a, b)| TimeRange::new(Timestamp::from_nanos(a), Timestamp::from_nanos(b))),
+        (any::<i64>(), 1_i64..=i64::MAX).prop_map(|(start, len)| {
+            let end = start.saturating_add(len);
+            TimeRange::new(Timestamp::from_nanos(start), Timestamp::from_nanos(end))
+        }),
     ]
 }

@@ -19,6 +19,14 @@ autobenches = false
 name = "prop_property_value"
 path = "prop/property_value.rs"
 
+[[test]]
+name = "prop_time"
+path = "prop/time.rs"
+
+[[test]]
+name = "prop_arrow"
+path = "prop/arrow.rs"
+
 # Self-test for the helpers in `tests/common/mod.rs` — doubles as the
 # canonical `#[path]`-include template for every future test file under
 # `tests/` (TASK-120).
