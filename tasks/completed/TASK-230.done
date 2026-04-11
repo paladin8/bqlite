@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-230",
   "claimed_at": "2026-04-11T20:25:48Z",
+  "completed_at": "2026-04-11T21:01:31Z",
   "branch": "task/TASK-230",
   "description": "Entity-sorted scan operator"
 }
