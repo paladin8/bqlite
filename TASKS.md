@@ -6,6 +6,8 @@ This file is the authoritative plan for bqlite. It lists every wave and every kn
 
 The plan will be revised as work progresses. Later waves are intentionally loose; they get fleshed out as earlier waves ship and we learn what was actually needed.
 
+> **Structural rule: waves are flat task lists, never sub-organized.** Do not group tasks within a wave under "phases", "tracks", "milestones", or any other sub-heading. Each task stands alone with its `Depends on:` set — that's the only structure. Agents pick work by scanning for unclaimed tasks whose dependencies are satisfied; any extra hierarchy gets in the way of that scan and invites drift between the grouping and the real dependency graph. When a wave starts to feel like it needs sub-sections, that's a signal to either (a) split it into two waves or (b) trust the dependency edges to do the organizing.
+
 ---
 
 ## How We Plan and Execute Work
@@ -22,6 +24,7 @@ Every wave satisfies:
 2. **Substantial.** Tens of tasks. A wave with fewer than ~15 tasks is probably a subset of another wave and should be merged.
 3. **Parallelizable.** At least 4 independent tasks must be claimable at wave start. Most waves support 8-15 concurrent agents.
 4. **Unblocking.** A wave is *done* when its capability ships — not when every possible ancillary task in its subsystems is complete. Remaining refinements roll into later waves.
+5. **Sequential across waves.** A wave does not begin until the previous wave is fully complete — every task in the prior wave has a `.done` marker in `tasks/completed/` and the wave's acceptance gate has been verified. This serializes inter-wave dependencies, makes acceptance gates meaningful, and prevents agents from claiming tasks whose upstream foundations are still in flight. Within a wave, tasks parallelize freely subject to their own `Depends on:` sets.
 
 ### Tasks
 
@@ -188,7 +191,7 @@ Both types are foundational: TableSchema is what the catalog (TASK-125) returns,
 ### TASK-108: [DESIGN][TRAIT] PhysicalOperator + EntityOperator traits
 **Output**: docs/design/operators/operator-traits.md, crates/bqlite-operators/src/operator.rs
 **Depends on**: TASK-105, TASK-106
-**Description**: The core execution contract. Design note first checkpoint covers: pull-based iterator protocol, `OperatorSchema` propagation, open/next/close lifecycle, error propagation, cancellation hook, the entity-aligned batching layer `EntityOperator` adds on top, and sub-batch streaming. Impl second checkpoint lands the trait definitions in `bqlite-operators` per docs/design/execution-model.md §13.2 module map — the trait cannot live in `bqlite-engine` because `bqlite-operators` does not depend on `bqlite-engine`, so placing the trait in engine would block operator impls (TASK-117) from implementing it. Also file a follow-up doc task to correct docs/design/planner-pipeline.md §15 line 1397 which inconsistently lists the trait in `bqlite-engine`. Merge-first — later Phase D tasks depend on this.
+**Description**: The core execution contract. Design note first checkpoint covers: pull-based iterator protocol, `OperatorSchema` propagation, open/next/close lifecycle, error propagation, cancellation hook, the entity-aligned batching layer `EntityOperator` adds on top, and sub-batch streaming. Impl second checkpoint lands the trait definitions in `bqlite-operators` per docs/design/execution-model.md §13.2 module map — the trait cannot live in `bqlite-engine` because `bqlite-operators` does not depend on `bqlite-engine`, so placing the trait in engine would block operator impls (TASK-117) from implementing it. Also file a follow-up doc task to correct docs/design/planner-pipeline.md §15 line 1397 which inconsistently lists the trait in `bqlite-engine`. Merge-first — downstream operator, planner, and engine tasks depend on this.
 
 ### TASK-109: [DESIGN][TRAIT] SegmentReader trait
 **Output**: docs/design/storage/reader-trait.md, crates/bqlite-core/src/storage.rs
@@ -302,54 +305,242 @@ Unlocks: TASK-115 planner stub (needs `Catalog` to resolve `events`), TASK-118 e
 
 ## Wave 2: Scan & Filter MVP
 
-**Goal.** Real queries return real data. Segment format v1, CSV ingest, scan + filter + project, minimal logical and physical planner.
-**Size.** ~28-34 tasks.
-**Parallelism.** 8-12 agents.
-**Acceptance.** `bqlite query "events | filter event_type = 'click'"` against an ingested CSV returns correct rows.
+**Goal.** Real queries return real data over user-declared schemas. Segment format v1 with the full v1 encoding set, CSV ingest with column remapping, CREATE TABLE / INSERT / EXPLAIN, scan + filter + select + limit operators, predicate pushdown, projection pruning, zone-map-based row-group skipping.
 
-Anchors below are deliberately front-loaded with design tasks — Wave 2 is where the real interfaces get decided. Non-anchor tasks (individual encodings, individual parser productions, additional logical nodes, CSV edge cases, etc.) are added as the wave kicks off and as these anchors resolve.
+**Size.** ~36 tasks.
+**Parallelism.** 10-14 agents at peak.
+
+**Acceptance.** The following script runs end-to-end against a freshly created database and returns the expected rows:
+
+```bql
+CREATE TABLE purchases (
+  user_id STRING ENTITY KEY,
+  ts TIMESTAMP EVENT TIME,
+  event STRING EVENT TYPE,
+  amount FLOAT,
+  country STRING
+);
+
+INSERT INTO purchases
+FROM 'data.csv'
+WITH (format='csv', map=(uid AS user_id, time AS ts, evt AS event));
+
+purchases
+| filter event = 'checkout' AND amount > 100
+| select user_id, ts, amount
+| limit 100;
+
+EXPLAIN purchases | filter event = 'checkout' | select user_id;
+```
+
+Source columns not named in the `map` clause pass through if their name matches a table column; otherwise INSERT errors. The CLI auto-injects `LIMIT 1000` when a query has no explicit limit and prints a truncation footer; `--no-limit` and `--limit N` override.
+
+**Performance gate** (blocks wave acceptance; verified by TASK-236 on the reference dataset):
+
+*Reference dataset:* 100M-row synthetic `purchases` stream — 10k distinct `user_id`, 20 distinct `event` types, timestamps spanning 90 days monotonic-within-entity, 7 property columns of mixed types (ints, floats, low-cardinality strings), materialized as CSV on local NVMe.
+
+*Reference hardware:* Apple M3 Pro, 36GB RAM, macOS 14+, release build (`cargo bench --profile=release-lto`), `/tmp` on APFS SSD. CI gate runs on GitHub Actions `ubuntu-latest` (4 vCPU) with a **1.5× relaxed target** across all numbers below.
+
+| Metric | Target |
+|---|---|
+| End-to-end acceptance query (cold cache, single thread) | **< 1 s** |
+| Columnar scan decode, int64, no predicate | ≥ 200M rows/sec |
+| Filter with pushed-down equality on dictionary-encoded column | ≥ 500M rows/sec effective |
+| CSV ingest throughput (parse → sort → encode → write) | ≥ 100 MB/s |
+| Compression ratio (segment bytes / raw CSV bytes) | **≤ 10%** |
+| Zone-map pruning effectiveness on the acceptance query | ≥ 80% of row-groups skipped |
+
+Regression gate triggers if any bench slips >10% vs. the previous green main.
+
+Wave 2 is where the real interfaces get decided, so design anchors are front-loaded. After the anchors land, the encoding and storage tasks form the longest parallelism vein — the 6 encoding tasks plus the writer/reader/zone-map/manifest tasks give 10+ agents work the moment the trait lands. Rule 5 applies: Wave 2 does not begin until every Wave 1 task is complete.
 
 ### TASK-201: [DESIGN] Segment format v1
 **Output**: docs/design/storage/segment-format-v1.md
 **Depends on**: TASK-109
-**Description**: V1 scope only: dictionary, delta, bitpacking, LZ4, constant. No ALP/FSST/PFOR (those are Wave 4). Defines the on-disk layout, column encoding descriptor, zone map block, row-group index, and file footer. Unblocks every other Wave 2 storage task.
+**Description**: Finalize the byte-level v1 layout per storage-format.md §9: file header (magic + version), row-group size (65,536 rows), column chunk header (encoding descriptor, compression, null bitmap, row count, byte range), zone-map block (min/max per column per row-group), footer (schema, row-group index, dictionaries, checksum, footer length, trailing magic). Encoding set is frozen at **Plain, Dictionary, Delta, BitPacking, Constant** with **LZ4** as the post-encoding compression layer. No FSST/ALP/PFOR/FOR/DoubleDelta/RLE/Frequency — those are Wave 4. Unblocks every other Wave 2 storage task.
 
 ### TASK-202: [DESIGN] Scan interface and predicate pushdown protocol
 **Output**: docs/design/storage/predicate-pushdown.md
 **Depends on**: TASK-109, TASK-201
-**Description**: How the scan operator asks the storage layer to push down equality, range, and set predicates. Zone-map evaluation order, fallback to post-filter, cost/benefit heuristics. Cross-cutting between storage, operators, and planner — risky.
+**Description**: How the scan operator asks the storage layer to push down equality, range, and set predicates. Scan-side capability advertisement (which `CompiledExpr` shapes a scan accepts), zone-map evaluation order, fallback to post-filter when a predicate can't be pushed, interaction with dictionary-encoded columns (predicate rewritten against the dictionary). Cross-cutting between storage, operators, and planner — risky.
 
 ### TASK-203: [DESIGN] Parser grammar framework
 **Output**: docs/design/language/grammar-framework.md
 **Depends on**: TASK-114
-**Description**: Decides hand-rolled vs parser generator (chumsky/pest/lalrpop/nom), error-recovery strategy, span tracking for diagnostics, how new productions are added. Unblocks every post-stub parser task across Waves 2-4.
+**Description**: Decides hand-rolled vs parser generator (chumsky/pest/lalrpop/nom), error-recovery strategy (Wave 0 language doc pins "halt on first error" — design must confirm), span tracking for diagnostics, how new productions are added, and the surface for the CSV-remap `WITH (format=..., map=(src AS dst, ...))` clause. Unblocks every post-stub parser task across Waves 2-4.
 
-### TASK-204: [DESIGN] Logical plan node catalog
+### TASK-204: [DESIGN] Logical plan node catalog (Wave 2 subset + forward map)
 **Output**: docs/design/planner/logical-plan-nodes.md
 **Depends on**: TASK-115
-**Description**: Comprehensive enumeration of every logical plan node expected across the project (Scan, Filter, Project, Match, Funnel, Aggregate, Sessionize, Retention, Limit, Sort, Distinct, Cohort, etc.), their input/output schemas, the AST constructs that lower to them, and the rewrites that apply to them. Aims to be comprehensive but will be revised as later waves reveal missing pieces.
+**Description**: Comprehensive enumeration of logical plan nodes expected across the project (Scan, Filter, Project, Limit, CreateTable, Insert, Explain at Wave 2 depth; Match/Funnel/Aggregate/Sessionize/Retention/Sort/Distinct/Cohort stubbed for later waves). For each: input/output schemas, which AST constructs lower to them, the rewrite rules that apply. Wave 2 implements the subset marked "Wave 2 depth"; the rest are documented so the catalog doesn't churn across waves.
 
-### TASK-205: [IMPL] Encoding trait + dictionary + delta reference implementations
-**Output**: crates/bqlite-storage/src/encoding/{mod,dictionary,delta}.rs
+### TASK-205: [DESIGN] Expression compilation model
+**Output**: docs/design/planner/expression-compilation.md
+**Depends on**: TASK-115, TASK-204
+**Description**: AST expression → `TypedExpr` (schema-resolved, type-checked per type-system.md §10) → `CompiledExpr` (runtime-evaluable over Arrow batches). Defines the `CompiledExpr` struct that ScanPhysical/FilterPhysical/ProjectPhysical all carry. Compilation-target selection between Arrow compute kernels and monomorphized hot paths, null propagation under three-valued logic, and how compiled predicates are surfaced to the pushdown protocol from TASK-202. Unblocks TASK-225 and everything downstream of the expression compiler.
+
+### TASK-206: [IMPL] Encoding trait + Plain reference impl + property-test pattern
+**Output**: crates/bqlite-storage/src/encoding/{mod,plain}.rs
 **Depends on**: TASK-201
-**Description**: The encoding trait + two reference implementations. Establishes the pattern that every other encoding in Waves 2 and 4 follows. Includes property tests (via TASK-124 harness) for encode/decode round trips.
+**Description**: The `Encoding` trait (encode/decode/estimate_size/applicable_to), the Plain reference implementation covering every primitive type the v1 format supports, and the round-trip property-test pattern (via the TASK-124 harness) that every subsequent encoding task copies. Establishes the pattern that every other encoding in Wave 2 and in Wave 4's advanced-encoding work follows. No selector logic — that's TASK-212.
 
-### TASK-206: [IMPL] Entity-sorted segment writer v1
-**Output**: crates/bqlite-storage/src/writer.rs
-**Depends on**: TASK-201, TASK-205
-**Description**: Accepts a sorted stream of events, groups by entity, encodes columns per the v1 format, writes segments to disk, updates the manifest. Pairs with TASK-201.
-
-### TASK-207: [IMPL] Entity-sorted scan operator
-**Output**: crates/bqlite-operators/src/scan.rs (replaces Wave 1 stub)
-**Depends on**: TASK-202, TASK-206
-**Description**: Full entity-sorted scan over real segments. Pushdown hook wired. Foundation for every temporal operator in later waves.
-
-### TASK-208: [IMPL] CSV ingest pipeline
-**Output**: crates/bqlite-storage/src/ingest/csv.rs
+### TASK-207: [IMPL] Dictionary encoding
+**Output**: crates/bqlite-storage/src/encoding/dictionary.rs
 **Depends on**: TASK-206
-**Description**: Stream a CSV file, map columns to a declared schema, sort by (entity_id, timestamp), emit batches into the segment writer. Handles schema mismatch errors cleanly.
+**Description**: Per-column-chunk dictionary + bit-packed code stream. Handles strings and low-cardinality ints. Round-trip property tests per the TASK-206 pattern. Surfaces dictionary to segment footer so predicates can be rewritten against codes at pushdown time (TASK-202).
 
-Additional Wave 2 tasks (individual parser productions, individual logical plan nodes, individual optimizer-free physical lowerings, zone map implementation, manifest format, additional encodings, filter expression evaluator, projection implementation, error-recovery paths, CSV edge cases, CLI ingest subcommand, etc.) will be added as the anchors resolve and implementation reveals the specifics. Target total: 28-34 tasks.
+### TASK-208: [IMPL] Delta encoding
+**Output**: crates/bqlite-storage/src/encoding/delta.rs
+**Depends on**: TASK-206
+**Description**: First-value + bit-packed deltas. Primarily for monotonic-ish timestamps within an entity. Handles signed overflow. Round-trip property tests.
+
+### TASK-209: [IMPL] BitPacking encoding
+**Output**: crates/bqlite-storage/src/encoding/bitpacking.rs
+**Depends on**: TASK-206
+**Description**: Variable-width bit packing for small integer ranges. Width derived from min/max of the chunk. Round-trip property tests including all-zero, single-value, and full-width edge cases.
+
+### TASK-210: [IMPL] Constant encoding
+**Output**: crates/bqlite-storage/src/encoding/constant.rs
+**Depends on**: TASK-206
+**Description**: Zero-data encoding for chunks where every non-null value is identical. Stores the constant in the chunk header. Null mask handled separately. Round-trip property tests.
+
+### TASK-211: [IMPL] LZ4 compression wrapper
+**Output**: crates/bqlite-storage/src/encoding/lz4.rs
+**Depends on**: TASK-206
+**Description**: Post-encoding compression layer applied to the encoded byte stream of any encoding. Uses `lz4_flex`. Configurable acceleration, defaults tuned for small chunks. Round-trip tests.
+
+### TASK-212: [IMPL] Encoding selector heuristic
+**Output**: crates/bqlite-storage/src/encoding/selector.rs
+**Depends on**: TASK-207, TASK-208, TASK-209, TASK-210, TASK-211
+**Description**: Per storage-format.md §10.3: sample a chunk, score each applicable encoding (encoded size + decode cost estimate), pick the lowest-bytes encoding with ties broken by decode cost. Decides whether to apply the LZ4 wrapper. Unit tests cover every encoding-pick path plus the degenerate "Plain is always a legal fallback" invariant.
+
+### TASK-213: [IMPL] Segment file format writer (low-level)
+**Output**: crates/bqlite-storage/src/segment/writer.rs
+**Depends on**: TASK-201, TASK-206
+**Description**: Takes encoded column chunks + chunk metadata and emits v1 on-disk bytes: file header, row groups, zone-map block, footer, trailing checksum + magic. Pure byte-layout code — no encoding selection, no sorting, no manifest interaction. Atomic via temp-file + rename. Unit tests assert byte-exact layout for a small hand-crafted row group.
+
+### TASK-214: [IMPL] Entity-sorted segment writer orchestration
+**Output**: crates/bqlite-storage/src/writer.rs
+**Depends on**: TASK-212, TASK-213, TASK-217, TASK-218
+**Description**: High-level writer — accepts a sorted `(entity_id, ts)` event stream from the partitioner (TASK-218), groups into row groups respecting entity boundaries, selects per-column encodings via TASK-212, emits bytes via TASK-213, and atomically registers the new segment in the manifest (TASK-217). Honors the entity-boundary invariant from storage-format.md §7.2 (no entity straddles a row-group unless it exceeds row-group size, in which case it occupies consecutive row groups within a segment). Integration tests validate round-trip through a real reader.
+
+### TASK-215: [IMPL] Segment file reader + row-group iterator
+**Output**: crates/bqlite-storage/src/segment/reader.rs
+**Depends on**: TASK-201, TASK-206
+**Description**: Parses a segment file's footer (schema, row-group index, dictionaries, zone maps), validates checksum + magic, and exposes a lazy row-group iterator that materializes column chunks on demand. Decodes chunks back to Arrow arrays via the encoding trait. Zero-copy where the encoding permits. Implements the `SegmentReader` trait from TASK-109.
+
+### TASK-216: [IMPL] Zone map write + read + predicate pruning
+**Output**: crates/bqlite-storage/src/zone_map.rs
+**Depends on**: TASK-202, TASK-213, TASK-215
+**Description**: Writer extracts per-column min/max per row group during encoding and emits them into the zone-map block in the footer. Reader loads zone maps eagerly at segment open (they're small). Pruning evaluator accepts a pushed-down `CompiledExpr` and returns the set of row groups that cannot be skipped. Correctness tests assert no false negatives (a row that would match must never be pruned) and measure false-positive rate against synthetic workloads.
+
+### TASK-217: [IMPL] Manifest v1 segment inventory + atomic updates
+**Output**: crates/bqlite-storage/src/manifest.rs
+**Depends on**: TASK-116
+**Description**: Extends TASK-116's bootstrap manifest to track segments per `(table, window, shard)` with full `SegmentMeta` per storage-format.md §12.3 (segment_id, level, schema_version, row_count, byte_size, ts_range, entity_range, per-column stats, created_at, batch_id). Atomic updates via `manifest.json.tmp` → `fsync` → `rename`. Read-write API: `add_segment`, `remove_segment`, `snapshot_for_query(table, time_range, shard)`. Concurrency controlled by the existing `flock` guard.
+
+### TASK-218: [IMPL] Ingest partitioner
+**Output**: crates/bqlite-storage/src/ingest/partitioner.rs
+**Depends on**: TASK-217
+**Description**: Routes incoming events to the correct `(shard, window)` bucket: `shard = xxhash64(entity_id) % shard_count` from the manifest config, `window = floor(ts / window_size)`. Buffers and sorts each bucket by `(entity_id, ts)` before handing the sorted stream to the writer (TASK-214). Memory-bounded — spills to an on-disk external sort when the buffer exceeds a configurable budget (stub: just error loudly for Wave 2; real spill is Wave 5). Assigns each ingest call a fresh `batch_id` from the manifest counter.
+
+### TASK-219: [IMPL] K-way merge scan across L0 segments
+**Output**: crates/bqlite-storage/src/segment/merge.rs
+**Depends on**: TASK-215, TASK-217
+**Description**: Given a shard and a time range, asks the manifest for all matching L0 segments and produces a merged `(entity_id, ts)`-ordered event stream across them. Loser-tree or binary-heap k-way merge; streaming, not materializing. Critical for Wave 2 because there's no compaction yet — every ingest produces a new L0 segment and queries must merge across all of them.
+
+### TASK-220: [IMPL] Parser framework bootstrap + expression grammar
+**Output**: crates/bqlite-parser/src/{lib,expr}.rs
+**Depends on**: TASK-203
+**Description**: Instantiates the framework chosen in TASK-203, replaces the Wave 1 one-identifier stub, and lands the expression grammar: literals (int, float, string, bool, timestamp, duration), identifiers, property access (`table.col`), unary/binary arithmetic, comparisons, `AND`/`OR`/`NOT`, parentheses, `IS NULL` / `IS NOT NULL`. Rich span tracking for diagnostics. Halt-on-first-error per language-doc §policy. Unit tests cover every operator precedence edge.
+
+### TASK-221: [IMPL] CREATE TABLE + EXPLAIN productions
+**Output**: crates/bqlite-parser/src/ddl.rs
+**Depends on**: TASK-220
+**Description**: `CREATE TABLE <name> (<col> <type> [role], ...);` where `role` ∈ `ENTITY KEY | EVENT TIME | EVENT TYPE` plus nullability. Validates that exactly one column is annotated with each role (or defers validation to the planner). `EXPLAIN <statement>` as a parser-level wrapper producing an `Explain(Box<Statement>)` AST node. Parser tests only — plan-time semantic validation is TASK-226 / TASK-232.
+
+### TASK-222: [IMPL] INSERT FROM production with column remapping
+**Output**: crates/bqlite-parser/src/dml.rs
+**Depends on**: TASK-220
+**Description**: `INSERT INTO <table> FROM <path-literal> WITH (<option>, ...)` where options include `format=<ident>` and `map=(<src> AS <dst>, ...)`. Unmapped source columns default to passthrough when the source name matches a table column. Parser tests for the happy paths and the obvious mistakes (trailing commas, duplicate source names, missing WITH, unknown format). Plan-time validation of the actual mapping against the target table schema is TASK-226.
+
+### TASK-223: [IMPL] Pipeline + filter/select/limit productions
+**Output**: crates/bqlite-parser/src/pipeline.rs
+**Depends on**: TASK-220
+**Description**: The `|` pipeline operator and the Wave 2 verbs: `filter <expr>`, `select <col-or-expr-with-alias>, ...`, `limit <int>`. A pipeline starts with a table reference (identifier) and chains verbs. Parser tests cover associativity, nested expressions in filter, multi-column select with `expr AS alias`, and edge cases (empty pipeline, limit without argument).
+
+### TASK-224: [IMPL] Logical plan enum + AST → logical lowering
+**Output**: crates/bqlite-planner/src/logical.rs
+**Depends on**: TASK-204
+**Description**: Concrete `LogicalPlan` enum for Wave 2 scope: `Scan`, `Filter`, `Project`, `Limit`, `CreateTable`, `Insert`, `Explain`. Each node carries its `OperatorSchema` computed at construction time (planner-pipeline.md §5). Lowering walks an AST statement and produces the root `LogicalPlan`, resolving table names via the catalog. Schema validation happens at construction, not as a separate pass.
+
+### TASK-225: [IMPL] Expression compilation (TypedExpr + CompiledExpr)
+**Output**: crates/bqlite-planner/src/expr.rs
+**Depends on**: TASK-205
+**Description**: Implements TASK-205's design: schema-resolved `TypedExpr` construction with type checking against the scalar-function catalog, and compilation into `CompiledExpr` (the runtime form carried by physical operators). Dispatches between Arrow compute kernels and monomorphized hot paths. Handles three-valued-logic null propagation. Surfaces a `supported_pushdown_shape()` query so the pushdown pass (TASK-227) can ask "can storage evaluate this?".
+
+### TASK-226: [IMPL] Physical plan descriptors + logical → physical lowering
+**Output**: crates/bqlite-planner/src/physical.rs
+**Depends on**: TASK-224, TASK-225
+**Description**: Plain-data physical descriptors per planner-pipeline.md §15: `ScanPhysical`, `FilterPhysical`, `ProjectPhysical`, `LimitPhysical`, `CreateTablePhysical`, `InsertPhysical`, `ExplainPhysical`. No trait objects — descriptors are `Clone + Serialize`. Lowering converts each `LogicalPlan` node to its physical counterpart, invoking the expression compiler (TASK-225) to produce the `CompiledExpr` values the descriptors carry. DDL/DML nodes get simple one-to-one lowerings; real execution logic lives in the engine.
+
+### TASK-227: [IMPL] Predicate pushdown optimizer pass
+**Output**: crates/bqlite-planner/src/opt/pushdown.rs
+**Depends on**: TASK-202, TASK-226
+**Description**: Walks the physical plan looking for `FilterPhysical` directly above a `ScanPhysical`. For each conjunct, asks TASK-202's protocol "can the scan evaluate this?". Pushable conjuncts move into `ScanPhysical.scan_predicates`; the residue stays in `FilterPhysical` (which is elided if nothing remains). Does not mutate trees where selectivity is unknown — conservative per Wave 2 scope. Unit tests include the zero-residue, full-residue, and partial-pushdown cases.
+
+### TASK-228: [IMPL] Projection pruning optimizer pass
+**Output**: crates/bqlite-planner/src/opt/prune.rs
+**Depends on**: TASK-226
+**Description**: Backward demand-set collection per planner-pipeline.md §6.6 Pass 4. Walks the physical plan bottom-up, accumulating the set of columns each operator needs, forwarding demand through operators that pass columns through. At `ScanPhysical`, the accumulated demand becomes `projected_columns`. Unit tests verify that a query selecting 2 columns from a 10-column table results in a scan reading exactly 2 columns.
+
+### TASK-229: [IMPL] EXPLAIN tree builder + text formatter
+**Output**: crates/bqlite-planner/src/explain.rs
+**Depends on**: TASK-227, TASK-228
+**Description**: When planning an `Explain` node, capture the plan tree after every optimizer pass and build a structured `ExplainNode` tree annotating: logical nodes, optimizer rewrites (pushed-down predicates, pruned columns), and the final physical descriptors. Text formatter renders the tree as indented plain text — no Unicode polish. Used by the CLI and by tests to verify optimizer behavior declaratively.
+
+### TASK-230: [IMPL] Entity-sorted scan operator
+**Output**: crates/bqlite-operators/src/scan.rs (replaces Wave 1 stub)
+**Depends on**: TASK-202, TASK-216, TASK-219, TASK-225
+**Description**: Full entity-sorted scan over real segments. Consults the manifest for matching segments, opens them via TASK-215's reader, merges across segments via TASK-219's k-way merge, applies zone-map pruning via TASK-216, and evaluates pushed-down `CompiledExpr` predicates against materialized row groups. Respects `projected_columns` so only demanded columns are decoded. Foundation for every temporal operator in later waves.
+
+### TASK-231: [IMPL] Filter + Project + Limit operators
+**Output**: crates/bqlite-operators/src/{filter,project,limit}.rs
+**Depends on**: TASK-225
+**Description**: Three vectorized operators over Arrow batches. Filter evaluates a `CompiledExpr` predicate and produces a filtered batch via `arrow::compute::filter`. Project evaluates a list of output `CompiledExpr` expressions (with aliases) and assembles the output schema. Limit counts rows across batches and halts its child early once the limit is reached. All three are stateless except Limit's counter. Null-aware per three-valued logic.
+
+### TASK-232: [IMPL] Engine bind step extension + DDL execution path
+**Output**: crates/bqlite-engine/src/{bind,ddl}.rs
+**Depends on**: TASK-217, TASK-226, TASK-230, TASK-231
+**Description**: Extends TASK-118's bind step to materialize `Box<dyn PhysicalOperator>` from every Wave 2 physical descriptor. For data-plane nodes (`ScanPhysical`, `FilterPhysical`, `ProjectPhysical`, `LimitPhysical`), bind returns an operator tree. For DDL (`CreateTablePhysical`), bind instead invokes an execution closure that validates the schema, checks for name collision, and atomically registers the new table in the manifest via TASK-217. For `ExplainPhysical`, bind returns a closure that formats the captured `ExplainNode` tree as a single-column result batch. Unit tests for every descriptor variant.
+
+### TASK-233: [IMPL] Engine INSERT execution + CSV reader integration
+**Output**: crates/bqlite-engine/src/ingest.rs, crates/bqlite-storage/src/ingest/csv.rs
+**Depends on**: TASK-214, TASK-218, TASK-222, TASK-232
+**Description**: When the engine binds an `InsertPhysical`, it opens the source file, constructs a streaming CSV reader (format-dispatched via `WITH (format=...)`), applies the `map` clause to rename source columns, converts rows to `PropertyValue` per the target schema, and feeds the stream through the partitioner (TASK-218) into the writer (TASK-214). Source columns not in the map default to passthrough if their name matches a target column; extra source columns error. Missing required columns error. Type mismatches error with row numbers. CSV reader handles quoting, escaping, multi-line fields, and common delimiter variations.
+
+### TASK-234: [IMPL] CLI `ingest` subcommand + result formatter with auto-limit
+**Output**: crates/bqlite-cli/src/{ingest,format}.rs
+**Depends on**: TASK-233
+**Description**: Two independent CLI extensions landing in one task because both are small:
+- `bqlite ingest <path> --table <name> [--format csv|json|parquet] [--map "src=dst,..."]` — a thin wrapper that constructs the equivalent `INSERT INTO ... FROM ... WITH (...)` statement and hands it to `Engine::query`, so the CLI never touches parser/planner directly.
+- Result formatter that, for any query with no explicit `| limit`, injects `LIMIT 1000` at the CLI boundary (not inside the engine) and prints a truncation footer like `... 49,999,000 rows omitted (use --limit N or --no-limit)`. Explicit `| limit` in the query suppresses auto-injection. `--no-limit` disables truncation; `--limit N` overrides the default.
+
+### TASK-235: [IMPL] Wave 2 acceptance test + CSV fixture loader
+**Output**: tests/wave2_acceptance.rs, tests/common/csv.rs
+**Depends on**: TASK-234
+**Description**: CSV fixture loader extends the Wave 1 harness (TASK-120) — deterministic synthetic-data generator producing the `purchases` schema at parameterized scale. Integration test runs the full acceptance script (CREATE → INSERT → filter/select/limit query → EXPLAIN) at 1M-row scale against a fresh temp directory and asserts the exact result rows and the expected `ExplainNode` structure (pushed-down predicate, pruned columns). A 100M-row variant lives behind `#[ignore]` and runs in the bench job. Failure here is the Wave 2 acceptance-gate trip.
+
+### TASK-236: [IMPL] Wave 2 benchmark suite
+**Output**: benches/wave2/{scan,encoding,ingest,acceptance}.rs
+**Depends on**: TASK-214, TASK-215, TASK-230, TASK-231
+**Description**: Criterion benches covering the Wave 2 performance gate:
+- `scan` — columnar decode throughput, int64 / string / float, with and without zone-map pruning.
+- `encoding` — per-encoding encode/decode microbenches for Plain, Dictionary, Delta, BitPacking, Constant, and the LZ4 wrapper overhead.
+- `ingest` — CSV ingest throughput end-to-end on the reference dataset.
+- `acceptance` — the full 100M-row acceptance query.
+
+Each bench asserts its target from the Wave 2 performance gate table as a hard ceiling. Regression CI compares against the previous green main and trips if any metric slips >10%. CI gate uses the 1.5× relaxed targets on GitHub Actions hardware; local reference targets are verified on the pinned reference machine before the wave is declared complete.
 
 ---
 
@@ -362,7 +553,7 @@ Additional Wave 2 tasks (individual parser productions, individual logical plan 
 
 ### TASK-301: [DESIGN] MATCH operator architecture
 **Output**: docs/design/operators/match-operator.md
-**Depends on**: TASK-204, TASK-207
+**Depends on**: TASK-204, TASK-230
 **Description**: Connects the Wave 0 sequence-matching direction to an actual operator implementation. Operator state, input expectations, output schema, how bindings are surfaced, EMIT ALL semantics. Risky.
 
 ### TASK-302: [DESIGN] Sequence matcher strategy selection
@@ -392,7 +583,7 @@ Additional Wave 2 tasks (individual parser productions, individual logical plan 
 
 ### TASK-307: [IMPL] Hash aggregate operator
 **Output**: crates/bqlite-operators/src/aggregate.rs
-**Depends on**: TASK-108, TASK-207
+**Depends on**: TASK-108, TASK-230
 **Description**: Foundational operator for funnel output and most analytics queries. count/sum/avg/min/max/distinct_count. Works on columnar batches.
 
 Additional Wave 3 tasks: individual pattern grammar productions, limit/sort operators, EMIT ALL output assembly, MATCH lowering in the planner, matcher microbenchmarks, integration tests for common funnel shapes.
@@ -453,8 +644,8 @@ Additional Wave 3 tasks: individual pattern grammar productions, limit/sort oper
 
 ### TASK-410: [IMPL] JSON and Parquet ingest paths
 **Output**: crates/bqlite-storage/src/ingest/{json,parquet}.rs
-**Depends on**: TASK-208
-**Description**: Follows the CSV ingest pattern. Parquet path reuses Arrow decode; JSON path handles nested property objects.
+**Depends on**: TASK-233
+**Description**: Follows the CSV ingest pattern established in Wave 2 (TASK-233). Parquet path reuses Arrow decode; JSON path handles nested property objects.
 
 Additional Wave 4 tasks: individual encoding implementations from TASK-401 outcomes, SESSIONIZE impl, retention operator, attribution impl, cohort grammar productions, alias binding in planner, FUNNEL and RETENTION syntactic sugar, tombstone writer, tombstone-aware merge scan, compaction microbenchmarks, integration tests for each new feature.
 
