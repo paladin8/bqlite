@@ -24,25 +24,32 @@
 //! integration (see `crates/bqlite-engine/src/query.rs`) keeps working
 //! without changes.
 //!
-//! ## Wave 2 CP1 status
+//! ## Wave 2 TASK-220 status
 //!
-//! This checkpoint lands the lexer, error types, and parser cursor —
-//! the full framework scaffolding pinned by TASK-203 — and replaces
-//! the Wave 1 single-identifier stub with a new implementation routed
-//! through the framework. The statement dispatcher recognizes the
-//! Wave 1 surface exactly (a bare source name, producing an empty
-//! pipeline) so the smoke test and engine integration keep passing.
+//! TASK-220 lands the framework scaffolding (lexer, error types,
+//! parser cursor) and the expression grammar covering every precedence
+//! level from §26's `or_expr → and_expr → not_expr → comparison →
+//! addition → multiplication → unary → primary` ladder for the
+//! literal / column / paren / unary / binary / compare / IS NULL /
+//! AND / OR / NOT subset. The expression parser is reachable
+//! internally via [`crate::expr::parse_expression`]; the top-level
+//! statement dispatcher still recognizes the Wave 1 surface exactly
+//! (a bare source name) because wiring WHERE/SELECT/LIMIT into the
+//! pipeline is TASK-223's job.
 //!
-//! The expression grammar, DDL productions, DML productions, and the
-//! pipeline-stage dispatcher all land in later checkpoints / tasks:
+//! Later wave tasks add the remaining productions:
 //!
-//! - **TASK-220 CP2** — Pratt expression grammar in `expr.rs`.
 //! - **TASK-221** — DDL (`CREATE`, `ALTER`, `DROP`, `DESCRIBE`, `EXPLAIN`).
 //! - **TASK-222** — `INSERT ... FROM` with the `WITH (...)` option list.
 //! - **TASK-223** — Pipeline `|` and the `WHERE` / `SELECT` / `LIMIT` verbs.
 //! - **TASK-238** — `INSERT ... VALUES`.
+//!
+//! Expression features deferred to later tasks: function calls,
+//! `CAST`, `CASE`, `BETWEEN`, `LIKE`, `~=`, `CONTAINS`, `IN` / `NOT
+//! IN`, and `@`-prefixed timestamp literals.
 
 mod error;
+mod expr;
 mod lex;
 mod parser;
 

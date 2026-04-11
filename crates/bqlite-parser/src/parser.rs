@@ -115,6 +115,22 @@ impl<'s> Parser<'s> {
         }
     }
 
+    /// Require a punctuation token of the given discriminant. The
+    /// `punct_label` describes the expected token for error messages
+    /// (e.g. `")"`, `","`, `"."`).
+    #[allow(dead_code)] // Used by CP2 expression grammar and later.
+    pub(crate) fn expect_punct(
+        &mut self,
+        kind: &TokenKind,
+        punct_label: &'static str,
+    ) -> Result<Token, ParseError> {
+        if let Some(t) = self.try_kind(kind) {
+            Ok(t)
+        } else {
+            Err(self.error_unexpected(Expected::Punct(punct_label), None))
+        }
+    }
+
     /// Require a bare identifier (not a keyword, not a quoted name).
     /// Used for grammar positions where a quoted identifier would not
     /// be valid (e.g., `$identifier` variable references, alias names).
