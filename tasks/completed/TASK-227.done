@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-227",
   "claimed_at": "2026-04-11T20:24:44Z",
+  "completed_at": "2026-04-11T20:47:00Z",
   "branch": "task/TASK-227",
   "description": "Predicate pushdown optimizer pass"
 }
