@@ -398,9 +398,11 @@ dependencies = [
 name = "bqlite-tests"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "bqlite-core",
  "proptest",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]

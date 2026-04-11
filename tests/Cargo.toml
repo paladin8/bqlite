@@ -19,7 +19,16 @@ autobenches = false
 name = "prop_property_value"
 path = "prop/property_value.rs"
 
+# Self-test for the helpers in `tests/common/mod.rs` — doubles as the
+# canonical `#[path]`-include template for every future test file under
+# `tests/` (TASK-120).
+[[test]]
+name = "common_smoke"
+path = "common_smoke.rs"
+
 [dev-dependencies]
 bqlite-core = { workspace = true }
+arrow = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
