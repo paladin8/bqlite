@@ -1,0 +1,146 @@
+name: Bench
+
+# Wave 2 benchmark CI job (TASK-241).
+#
+# Two jobs:
+#   bench-baseline  — runs on every push to main, captures Criterion
+#                     estimates as the "bench-baseline-main" artifact.
+#   bench-gate      — runs on non-draft, non-bench-skip PRs; downloads the
+#                     latest baseline and calls scripts/bench-compare.sh.
+#                     Fails the PR if any metric regresses >10% on 3+
+#                     consecutive Criterion samples (see bench-compare.sh).
+#
+# Reference-hardware (Apple M3 Pro) verification remains manual; the CI gate
+# uses the 1.5×-relaxed targets that are achievable on ubuntu-latest 4 vCPU.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'tasks/**'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - 'tasks/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Baseline capture (main only) ────────────────────────────────────────────
+  bench-baseline:
+    name: Capture bench baseline
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Run Wave 2 benchmarks
+        run: >
+          cargo bench -p bqlite-benches
+          --bench scan
+          --bench encoding
+          --bench ingest
+          --bench acceptance
+
+      # Upload the entire Criterion output tree so bench-compare.sh can walk
+      # it and match estimates.json / sample.json files by relative path.
+      # The artifact is overwritten on every successful main push; the most
+      # recent upload is always the canonical "previous green main" baseline.
+      #
+      # NOTE: upload-artifact and download-artifact are referenced by version
+      # tag here because their commit SHAs change frequently with patch releases
+      # and we do not yet have an automated SHA-pinning workflow. Operator:
+      # replace @v4 with a pinned commit SHA from the releases page before
+      # deploying to a security-sensitive environment.
+      - name: Upload baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-baseline-main
+          path: target/criterion/
+          retention-days: 90
+          if-no-files-found: error
+
+  # ── Regression gate (PRs only) ──────────────────────────────────────────────
+  bench-gate:
+    name: Bench regression gate
+    # Skip on draft PRs and PRs labelled bench-skip (docs-only changes, etc.).
+    if: >
+      github.event_name == 'pull_request' &&
+      !github.event.pull_request.draft &&
+      !contains(github.event.pull_request.labels.*.name, 'bench-skip')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read   # query workflow runs and download artifacts cross-run
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Run Wave 2 benchmarks
+        run: >
+          cargo bench -p bqlite-benches
+          --bench scan
+          --bench encoding
+          --bench ingest
+          --bench acceptance
+
+      # Find the most-recent workflow run on main where the bench-baseline job
+      # specifically succeeded.  We check the job list for each candidate run
+      # rather than trusting the workflow-level success status alone — that
+      # guards against future jobs being added to this workflow that could
+      # succeed while bench-baseline is skipped or failed.
+      - name: Find latest baseline run
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=""
+          for candidate in $(gh api \
+              "repos/${{ github.repository }}/actions/workflows/bench.yml/runs?branch=main&status=success&per_page=10" \
+              --jq '.workflow_runs[].id' 2>/dev/null || true); do
+            job_ok=$(gh api \
+                "repos/${{ github.repository }}/actions/runs/${candidate}/jobs" \
+                --jq '[.jobs[] | select(.name == "Capture bench baseline" and .conclusion == "success")] | length' \
+                2>/dev/null || echo "0")
+            if [[ "${job_ok}" -gt 0 ]]; then
+              run_id="${candidate}"
+              break
+            fi
+          done
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          if [[ -n "${run_id}" ]]; then
+            echo "Using baseline from run ${run_id}"
+          else
+            echo "No successful bench-baseline run found on main; will skip regression check."
+          fi
+
+      - name: Download baseline artifact
+        if: steps.baseline.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-baseline-main
+          run-id: ${{ steps.baseline.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: bench-baseline/
+
+      # The regression gate: any metric with 3+ consecutive samples exceeding
+      # 110% of baseline fails the PR.  bench-compare.sh exits 1 on regression.
+      - name: Compare benchmarks (regression gate)
+        if: steps.baseline.outputs.run_id != ''
+        run: scripts/bench-compare.sh bench-baseline/ target/criterion/
+
+      - name: No baseline available
+        if: steps.baseline.outputs.run_id == ''
+        run: |
+          echo "Skipping regression gate — no bench-baseline-main artifact"
+          echo "found on main yet. The gate will be active once a baseline"
+          echo "has been captured by a push to main."
