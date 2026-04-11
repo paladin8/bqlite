@@ -50,6 +50,7 @@ pub mod database;
 pub mod encoding;
 pub mod ingest;
 pub mod manifest;
+pub mod segment;
 
 pub use catalog::{bootstrap_events_schema, ManifestCatalog, BOOTSTRAP_EVENTS_TABLE_NAME};
 pub use database::{
