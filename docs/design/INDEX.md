@@ -12,6 +12,14 @@ Deep-dive design documents for bqlite. These cover the detailed technical decisi
 
 6. **planner-pipeline.md** -- Logical plan nodes, AST lowering, optimizer rules, physical planning, DemandCapabilities, schema validation (STATUS: draft)
 
+## Per-subsystem implementation notes
+
+Implementation-level design notes that refine a Wave 0 direction doc for a specific task or wave. Organized by subsystem.
+
+### Operators
+
+- **operators/operator-traits.md** — `PhysicalOperator` + `EntityOperator` trait surface, lifecycle, cancellation, sub-batch streaming (TASK-108, Wave 1)
+
 ## Infrastructure
 
 7. **agent-workflow.md** -- Parallel agent containers, task locking, git workflow, cmux integration (STATUS: draft)
