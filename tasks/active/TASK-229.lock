@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-229",
+  "claimed_at": "2026-04-11T20:48:00Z",
+  "branch": "task/TASK-229",
+  "description": "EXPLAIN tree builder + text formatter"
+}
