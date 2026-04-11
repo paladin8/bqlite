@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-4",
+  "task_id": "TASK-224",
+  "claimed_at": "2026-04-11T14:55:58Z",
+  "branch": "task/TASK-224",
+  "description": "Logical plan enum + AST → logical lowering for Wave 2 scope"
+}
