@@ -11,6 +11,11 @@
 //! Authoring guidance for individual property tests lives in the
 //! `bqlite-tests` crate-level docstring at `tests/src/lib.rs`.
 
+use std::sync::Arc;
+
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringViewArray, TimestampNanosecondArray,
+};
 use bqlite_core::{BqlType, PropertyValue, TimeRange, Timestamp};
 use proptest::prelude::*;
 
@@ -144,5 +149,102 @@ pub fn arb_time_range() -> impl Strategy<Value = TimeRange> {
             let end = start.saturating_add(len);
             TimeRange::new(Timestamp::from_nanos(start), Timestamp::from_nanos(end))
         }),
+    ]
+}
+
+// ── Arrow array strategies ─────────────────────────────────────────────────
+//
+// The strategies below produce **dense** (null-free) Arrow arrays, one
+// variant per primitive [`BqlType`]. They are the building block for
+// encoding property tests — every Wave 2 encoding impl ships a
+// `tests/tests/prop_encoding_<name>.rs` file whose round-trip tests
+// pull an array from one of these strategies, feed it through the
+// encoding's `encode → decode` pipeline, and assert equality.
+//
+// Size caps are tuned to keep shrinking fast (small counter-examples
+// are readable) while still covering the common byte-boundary cases:
+// Bool's `ceil(len / 8)` bit packing, variable-length string offsets,
+// and single-element / empty edges.
+
+/// Default per-array size range for the encoding property-test
+/// strategies. Large enough to cross Bool's 8-row byte boundary, small
+/// enough that shrinking reports one-or-two-element counter-examples.
+pub const ENCODING_ARRAY_SIZE_RANGE: std::ops::RangeInclusive<usize> = 0..=32;
+
+/// Strategy producing a dense [`BooleanArray`] of 0..=32 values.
+///
+/// "Dense" means `null_count() == 0`. The encoding layer's contract
+/// is that the writer strips nulls before feeding dense values into
+/// `bqlite_storage::Encoding::encode`, so every round-trip property
+/// test uses dense arrays.
+pub fn arb_bool_array() -> impl Strategy<Value = ArrayRef> {
+    prop::collection::vec(any::<bool>(), ENCODING_ARRAY_SIZE_RANGE)
+        .prop_map(|v| Arc::new(BooleanArray::from(v)) as ArrayRef)
+}
+
+/// Strategy producing a dense [`Int64Array`] of 0..=32 values
+/// covering the full i64 domain.
+pub fn arb_int64_array() -> impl Strategy<Value = ArrayRef> {
+    prop::collection::vec(any::<i64>(), ENCODING_ARRAY_SIZE_RANGE)
+        .prop_map(|v| Arc::new(Int64Array::from(v)) as ArrayRef)
+}
+
+/// Strategy producing a dense [`Float64Array`] of 0..=32 values.
+///
+/// Uses [`arb_finite_f64`] so that every value bit-exact round-trips
+/// through decimal text formats (JSON, RFC 3339 etc). Encodings that
+/// round-trip via raw IEEE 754 bytes (including `Plain`) are
+/// indifferent to non-finite values, but standardizing on
+/// `arb_finite_f64` keeps the strategy compatible with tests that
+/// *later* want to compose it with a JSON assertion. Tests that
+/// specifically need the full f64 domain (NaN, ±∞, subnormals)
+/// should define a local strategy — same pattern
+/// `prop_property_value.rs` uses for its ordering laws.
+pub fn arb_float64_array() -> impl Strategy<Value = ArrayRef> {
+    prop::collection::vec(arb_finite_f64(), ENCODING_ARRAY_SIZE_RANGE)
+        .prop_map(|v| Arc::new(Float64Array::from(v)) as ArrayRef)
+}
+
+/// Strategy producing a dense [`TimestampNanosecondArray`] with the
+/// canonical `"UTC"` timezone stamp. Values cover the Timestamp-safe
+/// range `[i64::MIN, i64::MAX)` — [`Timestamp::MAX`] is reserved as
+/// an exclusive upper-bound sentinel and excluded, matching
+/// [`arb_timestamp`].
+pub fn arb_timestamp_array() -> impl Strategy<Value = ArrayRef> {
+    prop::collection::vec(i64::MIN..i64::MAX, ENCODING_ARRAY_SIZE_RANGE)
+        .prop_map(|v| Arc::new(TimestampNanosecondArray::from(v).with_timezone("UTC")) as ArrayRef)
+}
+
+/// Strategy producing a dense [`StringViewArray`] of 0..=32 values.
+///
+/// Uses `StringViewArray` (Arrow `Utf8View`) because that is the
+/// schema-canonical type for `BqlType::String` per
+/// `bqlite_core::arrow::bql_type_to_arrow`. Encoding property tests
+/// that feed the output of this strategy through `encode → decode`
+/// compare arrays of the same Arrow shape, avoiding cross-type
+/// equality gotchas.
+///
+/// The per-value alphabet matches the scalar `PropertyValue` strategy:
+/// short ASCII alphanumerics plus space and underscore. This keeps
+/// counter-examples readable. Tests that specifically cover UTF-8
+/// edge cases (multi-byte code points, lone surrogates, etc.) should
+/// define a local strategy.
+pub fn arb_string_array() -> impl Strategy<Value = ArrayRef> {
+    prop::collection::vec("[a-zA-Z0-9 _]{0,16}", ENCODING_ARRAY_SIZE_RANGE)
+        .prop_map(|v| Arc::new(StringViewArray::from(v)) as ArrayRef)
+}
+
+/// Strategy producing a `(BqlType, ArrayRef)` pair — one of the five
+/// primitive types Plain v1 supports, paired with a matching dense
+/// array. Every Wave 2 encoding property test can use this to exercise
+/// "this encoding round-trips through every type it claims to handle"
+/// without writing five near-identical test functions.
+pub fn arb_primitive_array_with_type() -> impl Strategy<Value = (BqlType, ArrayRef)> {
+    prop_oneof![
+        arb_bool_array().prop_map(|a| (BqlType::Bool, a)),
+        arb_int64_array().prop_map(|a| (BqlType::Int, a)),
+        arb_float64_array().prop_map(|a| (BqlType::Float, a)),
+        arb_string_array().prop_map(|a| (BqlType::String, a)),
+        arb_timestamp_array().prop_map(|a| (BqlType::Timestamp, a)),
     ]
 }

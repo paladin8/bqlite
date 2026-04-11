@@ -44,6 +44,25 @@ zero `Cargo.toml` edits required when a new file lands.
 If a new test introduces data types worth reusing, add a `pub fn arb_<type>()`
 strategy to `src/strategies.rs` so the next test can pull it directly.
 
+## Encoding property-test template
+
+The `bqlite_storage::encoding` layer has its own template file —
+`tests/tests/prop_encoding_plain.rs` — that every subsequent Wave 2
+encoding task copies. The pattern:
+
+1. Pull dense-Arrow-array strategies from `bqlite_tests::strategies`
+   (`arb_bool_array`, `arb_int64_array`, …, or the combined
+   `arb_primitive_array_with_type`).
+2. Wrap each property in a `proptest!` block, starting with the
+   round-trip invariant `decode(encode(x)) == x`.
+3. Copy the file to `tests/tests/prop_encoding_<name>.rs`, swap the
+   encoding type, and extend with encoding-specific invariants
+   (e.g. Dictionary code-range or Delta residual-overflow bounds).
+
+The round-trip invariant is the load-bearing one: it catches any
+drift between the encoding impl and the byte layout pinned in
+`docs/design/storage/segment-format-v1.md` §9.
+
 ## Property-test guidelines
 
 - **One invariant per `#[test]` function.** Shrinking reports one failing

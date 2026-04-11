@@ -423,6 +423,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bqlite-core",
+ "bqlite-storage",
  "proptest",
  "serde_json",
  "thiserror",
