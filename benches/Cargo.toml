@@ -14,8 +14,12 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
-[dev-dependencies]
+[dependencies]
+bqlite-core = { workspace = true }
+bqlite-storage = { workspace = true }
+arrow = { workspace = true }
 criterion = { workspace = true }
+serde_json = { workspace = true }
 
 # Wave 1 smoke benchmark — exercises the Criterion harness in CI so that
 # later waves can drop microbenchmarks in without rediscovering the
@@ -24,4 +28,26 @@ criterion = { workspace = true }
 # `harness = false` so Criterion drives execution instead of libtest.
 [[bench]]
 name = "smoke"
+harness = false
+
+# Wave 2 benchmark suite (TASK-236). Four benches covering the Wave 2
+# performance gate targets from TASKS.md.
+[[bench]]
+name = "encoding"
+path = "wave2/encoding.rs"
+harness = false
+
+[[bench]]
+name = "scan"
+path = "wave2/scan.rs"
+harness = false
+
+[[bench]]
+name = "ingest"
+path = "wave2/ingest.rs"
+harness = false
+
+[[bench]]
+name = "acceptance"
+path = "wave2/acceptance.rs"
 harness = false
