@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-1",
+  "task_id": "TASK-219",
+  "claimed_at": "2026-04-11T15:31:54Z",
+  "branch": "task/TASK-219",
+  "description": "[IMPL] K-way merge scan across L0 segments"
+}
