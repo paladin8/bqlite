@@ -46,11 +46,13 @@ use bqlite_core::{BqlType, BqliteError, Result};
 
 pub mod bitpacking;
 pub mod constant;
+pub mod delta;
 pub mod lz4;
 pub mod plain;
 
 pub use bitpacking::BitPacking;
 pub use constant::Constant;
+pub use delta::Delta;
 pub use lz4::{compress_lz4, decompress_lz4, CompressionType};
 pub use plain::Plain;
 
