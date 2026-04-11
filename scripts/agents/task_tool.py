@@ -109,11 +109,20 @@ def sync_main() -> None:
 
 
 def cleanup_after_failed_push() -> None:
-    head_exists = run(["git", "rev-parse", "--verify", "HEAD"], check=False)
-    if head_exists.returncode == 0:
-        git("reset", "--mixed", "HEAD~1", check=True)
-    git("restore", "--worktree", "--staged", "tasks", check=True)
-    git("pull", "--ff-only", "origin", "main", check=True)
+    """Recover from a push race by discarding the in-flight local commit and
+    resyncing the worktree to match origin/main exactly.
+
+    The old implementation did `reset --mixed HEAD~1` + `restore tasks/` +
+    `pull --ff-only origin main`, which could legitimately fail (local out of
+    sync, transient network blip, non-ff because an earlier iteration left
+    an extra commit behind) and bubble all the way up through claim_next,
+    killing the wrapper. At this point we do not care about any local
+    commits beyond what is on origin — we only called this because our push
+    failed — so a hard reset to origin/main is both simpler and strictly
+    more robust than trying to fast-forward.
+    """
+    git("fetch", "origin", "main", check=True)
+    git("reset", "--hard", "origin/main", check=True)
 
 
 def commit_and_push(commit_message: str) -> bool:

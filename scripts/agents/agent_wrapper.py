@@ -583,88 +583,112 @@ def run_fleet_loop(
             )
             return "too_many_failures"
 
-        result = claim_next(
-            wave=config.wave,
-            difficulty=config.difficulty_pool,
-            agent_id=agent_name,
-            no_sync=False,
-            max_attempts=5,
-        )
-        status = result.get("status")
+        try:
+            result = claim_next(
+                wave=config.wave,
+                difficulty=config.difficulty_pool,
+                agent_id=agent_name,
+                no_sync=False,
+                max_attempts=5,
+            )
+            status = result.get("status")
 
-        if status == "claimed":
-            task = result["task"]
-            print(
-                f"=== {agent_name}: claimed {task['task_id']} — "
-                f"{task['title']} (starting claude) ===",
-                flush=True,
-            )
-            outcome = execute_task(
-                task,
-                agent_name=agent_name,
-                model=config.model,
-                effort=config.effort,
-                claude_runner=run_claude,
-                read_human_reply=read_human_reply,
-            )
-            if outcome == "completed":
-                completed += 1
-                consecutive_failures = 0
-                backoff_idx = 0
-                continue
-            print(
-                f"=== {agent_name}: {task['task_id']} did not complete "
-                f"(outcome={outcome}); releasing lock ===",
-                flush=True,
-            )
-            release_lock(task["task_id"], agent_name, f"outcome={outcome}")
-            consecutive_failures += 1
-            continue
-
-        if status == "no_claimable":
-            if _classified_is_drained(result):
+            if status == "claimed":
+                task = result["task"]
                 print(
-                    f"=== {agent_name}: wave {config.wave} drained for pool "
-                    f"{config.difficulty_pool}. Exiting. ===",
+                    f"=== {agent_name}: claimed {task['task_id']} — "
+                    f"{task['title']} (starting claude) ===",
                     flush=True,
                 )
-                return "wave_complete"
-            delay = BACKOFF_SCHEDULE_SECONDS[
-                min(backoff_idx, len(BACKOFF_SCHEDULE_SECONDS) - 1)
-            ]
-            print(
-                f"=== {agent_name}: no claimable tasks, sleeping {delay}s ===",
-                flush=True,
-            )
-            sleep(delay)
-            backoff_idx += 1
-            continue
+                outcome = execute_task(
+                    task,
+                    agent_name=agent_name,
+                    model=config.model,
+                    effort=config.effort,
+                    claude_runner=run_claude,
+                    read_human_reply=read_human_reply,
+                )
+                if outcome == "completed":
+                    completed += 1
+                    consecutive_failures = 0
+                    backoff_idx = 0
+                    continue
+                print(
+                    f"=== {agent_name}: {task['task_id']} did not complete "
+                    f"(outcome={outcome}); releasing lock ===",
+                    flush=True,
+                )
+                release_lock(task["task_id"], agent_name, f"outcome={outcome}")
+                consecutive_failures += 1
+                continue
 
-        if status == "missing_difficulty":
+            if status == "no_claimable":
+                if _classified_is_drained(result):
+                    print(
+                        f"=== {agent_name}: wave {config.wave} drained for pool "
+                        f"{config.difficulty_pool}. Exiting. ===",
+                        flush=True,
+                    )
+                    return "wave_complete"
+                delay = BACKOFF_SCHEDULE_SECONDS[
+                    min(backoff_idx, len(BACKOFF_SCHEDULE_SECONDS) - 1)
+                ]
+                print(
+                    f"=== {agent_name}: no claimable tasks, sleeping {delay}s ===",
+                    flush=True,
+                )
+                sleep(delay)
+                backoff_idx += 1
+                continue
+
+            if status == "missing_difficulty":
+                print(
+                    f"=== {agent_name}: [NEEDS INPUT] wave {config.wave} has "
+                    f"untagged claimable tasks; please tag or retire them. Retrying "
+                    f"in 60s. ===",
+                    flush=True,
+                )
+                sleep(60)
+                continue
+
+            if status == "error":
+                print(
+                    f"=== {agent_name}: task_tool error: {result.get('error')}. "
+                    f"Retrying in 60s. ===",
+                    flush=True,
+                )
+                sleep(60)
+                continue
+
             print(
-                f"=== {agent_name}: [NEEDS INPUT] wave {config.wave} has "
-                f"untagged claimable tasks; please tag or retire them. Retrying "
-                f"in 60s. ===",
+                f"=== {agent_name}: unexpected claim_next status {status!r}; "
+                f"sleeping 60s then retrying ===",
                 flush=True,
             )
             sleep(60)
-            continue
-
-        if status == "error":
+        except subprocess.CalledProcessError as exc:
+            # A git command under task_tool blew up mid-iteration. Typical
+            # causes: a concurrent push left us in a weird state that
+            # cleanup_after_failed_push could not recover from, a transient
+            # network error on fetch/push, or a genuinely broken repo. Log
+            # with as much detail as we have, count this against the
+            # consecutive-failure cap, and back off so the next pass has a
+            # chance to recover instead of crashing the wrapper.
+            stderr = (exc.stderr or "").strip()
+            stdout = (exc.stdout or "").strip()
+            cmd = " ".join(exc.cmd) if isinstance(exc.cmd, (list, tuple)) else str(exc.cmd)
             print(
-                f"=== {agent_name}: task_tool error: {result.get('error')}. "
-                f"Retrying in 60s. ===",
+                f"=== {agent_name}: git command failed mid-iteration: "
+                f"{cmd} (exit {exc.returncode}) ===",
                 flush=True,
             )
+            if stderr:
+                print(f"    stderr: {stderr[:500]}", flush=True)
+            if stdout:
+                print(f"    stdout: {stdout[:500]}", flush=True)
+            consecutive_failures += 1
             sleep(60)
             continue
-
-        print(
-            f"=== {agent_name}: unexpected claim_next status {status!r}; "
-            f"sleeping 60s then retrying ===",
-            flush=True,
-        )
-        sleep(60)
 
 
 def read_human_reply() -> str:

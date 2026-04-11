@@ -539,6 +539,64 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
         self.assertEqual(outcome, "batch_complete")
         self.assertEqual(sleeps, [120])  # first step of 2/5/10/20/60-min ladder
 
+    def test_run_fleet_loop_recovers_from_called_process_error(self) -> None:
+        """A git command exploding under claim_next must not crash the
+        wrapper. It should log, count against the consecutive-failure cap,
+        back off 60s, and retry on the next pass."""
+        config = agent_wrapper.parse_args(["1", "EASY", "1"])
+        test_self = self
+        call_count = [0]
+
+        def fake_claim_next(**kwargs) -> dict:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise subprocess.CalledProcessError(
+                    returncode=1,
+                    cmd=["git", "pull", "--ff-only", "origin", "main"],
+                    output="",
+                    stderr="fatal: refusing to merge unrelated histories",
+                )
+            return {
+                "status": "claimed",
+                "task": test_self._make_task("TASK-101"),
+            }
+
+        sleeps: list[float] = []
+        outcome = agent_wrapper.run_fleet_loop(
+            config,
+            agent_name="agent-1",
+            claim_next=fake_claim_next,
+            execute_task=lambda *a, **k: "completed",
+            release_lock=lambda *a, **k: True,
+            sleep=lambda s: sleeps.append(s),
+        )
+        self.assertEqual(outcome, "batch_complete")
+        self.assertEqual(call_count[0], 2)  # retried once after the error
+        self.assertEqual(sleeps, [60])  # 60s error backoff, no no_claimable ladder
+
+    def test_run_fleet_loop_bails_after_repeated_called_process_errors(self) -> None:
+        """The consecutive-failure cap catches repeated git errors so a
+        genuinely broken repo exits cleanly instead of looping forever."""
+        config = agent_wrapper.parse_args(["1", "EASY"])  # no quota
+
+        def always_explode(**kwargs) -> dict:
+            raise subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["git", "fetch", "origin", "main"],
+                output="",
+                stderr="fatal: unable to access repo",
+            )
+
+        outcome = agent_wrapper.run_fleet_loop(
+            config,
+            agent_name="agent-1",
+            claim_next=always_explode,
+            execute_task=lambda *a, **k: "completed",
+            release_lock=lambda *a, **k: True,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(outcome, "too_many_failures")
+
 
 class AgentWrapperPromptTests(unittest.TestCase):
     def _sample_task(self) -> dict:

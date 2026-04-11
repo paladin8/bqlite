@@ -207,6 +207,69 @@ class TaskToolIntegrationTests(unittest.TestCase):
         self.assertEqual(log_subjects[0], "TASK-101: claimed by agent-test")
         self.assertEqual(log_subjects[1], "TASK-101: break stale lock")
 
+    def test_cleanup_after_failed_push_resyncs_to_origin(self) -> None:
+        """cleanup_after_failed_push must recover even when local and origin
+        have diverged (the scenario that used to crash claim_next with
+        `git pull --ff-only` failing). After cleanup, the worktree should
+        match origin/main exactly with no local-only commits or files."""
+        repo = self.make_repo(
+            """
+            ### TASK-101: [EASY][IMPL] Dummy
+            **Depends on**: none
+            """
+        )
+
+        origin_path = repo.parent / "origin.git"
+
+        # Second clone races against the first, pushing its own commit.
+        other = repo.parent / "other"
+        run_git(repo.parent, "clone", str(origin_path), other.name)
+        run_git(other, "config", "user.name", "Other")
+        run_git(other, "config", "user.email", "other@example.com")
+        (other / "other_file.txt").write_text("from other agent\n")
+        run_git(other, "add", "other_file.txt")
+        run_git(other, "commit", "-m", "other agent's commit")
+        run_git(other, "push", "origin", "main")
+
+        # Main clone makes a different commit locally and does NOT push.
+        # This mirrors the state of an agent mid-claim when its push loses
+        # a race: local HEAD has the claim commit, origin/main has moved
+        # ahead with someone else's commit, and `pull --ff-only` would fail
+        # because the branches have diverged.
+        (repo / "my_claim.txt").write_text("my in-flight claim\n")
+        run_git(repo, "add", "my_claim.txt")
+        run_git(repo, "commit", "-m", "my aborted claim commit")
+
+        env = os.environ.copy()
+        env["BQLITE_TASK_TOOL_ROOT"] = str(repo)
+        script = (
+            f"import sys; sys.path.insert(0, {str(SCRIPT_PATH.parent)!r}); "
+            "import task_tool; "
+            "task_tool.cleanup_after_failed_push()"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            self.fail(
+                f"cleanup_after_failed_push failed ({result.returncode}):\n"
+                f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+            )
+
+        # After cleanup, HEAD must match origin/main exactly: the other
+        # agent's commit is present, our own aborted commit is gone, and
+        # our in-flight file is gone too.
+        run_git(repo, "fetch", "origin")
+        local_head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        origin_head = run_git(repo, "rev-parse", "origin/main").stdout.strip()
+        self.assertEqual(local_head, origin_head)
+        self.assertTrue((repo / "other_file.txt").exists())
+        self.assertFalse((repo / "my_claim.txt").exists())
+
     def test_claim_next_reclaims_prior_task_branch_state(self) -> None:
         """Reclaiming a stale-locked task must check out the existing
         task/TASK-NNN branch from origin, not create a fresh branch off main.
