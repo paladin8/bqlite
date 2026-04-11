@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-236",
   "claimed_at": "2026-04-11T23:06:11Z",
+  "completed_at": "2026-04-12T00:15:00Z",
   "branch": "task/TASK-236",
   "description": "Wave 2 benchmark suite"
 }
