@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-216",
+  "claimed_at": "2026-04-11T17:52:29Z",
+  "branch": "task/TASK-216",
+  "description": "Zone map write + read + predicate pruning"
+}
