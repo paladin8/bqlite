@@ -54,9 +54,9 @@ for i in $(seq 1 "$N"); do
       mkdir -p /root/.claude
       cp -r /home/vscode/.claude-host/* /root/.claude/ 2>/dev/null || true
 
-      # Merge bypass-permissions + cmux notification hook into settings.json
-      # (preserves host config if present)
-      PATCH='{\"skipDangerousModePermissionPrompt\":true,\"permissions\":{\"defaultMode\":\"bypassPermissions\"},\"hooks\":{\"Notification\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"/root/.claude/hooks/cmux-notify.sh\"}]}]}}'
+      # Merge bypass-permissions + cmux notification + agent-loop stop hook
+      # into settings.json (preserves host config if present)
+      PATCH='{\"skipDangerousModePermissionPrompt\":true,\"permissions\":{\"defaultMode\":\"bypassPermissions\"},\"hooks\":{\"Notification\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"/root/.claude/hooks/cmux-notify.sh\"}]}],\"Stop\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"/root/.claude/hooks/stop-agent-loop.sh\"}]}]}}'
       if [ -f /root/.claude/settings.json ]; then
         jq --argjson patch \"\$PATCH\" '. + \$patch' /root/.claude/settings.json > /tmp/settings.json && mv /tmp/settings.json /root/.claude/settings.json
       else
@@ -105,6 +105,7 @@ for i in $(seq 1 "$N"); do
       git config user.email \"jeffreyw314159@gmail.com\" &&
       mkdir -p /root/.claude/hooks &&
       install -m 755 /workspace/scripts/cmux-notify.sh /root/.claude/hooks/cmux-notify.sh &&
+      install -m 755 /workspace/scripts/stop-agent-loop.sh /root/.claude/hooks/stop-agent-loop.sh &&
       echo \"Container bqlite-agent-$i ready\" &&
       exec tail -f /dev/null
     "

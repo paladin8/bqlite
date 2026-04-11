@@ -5,9 +5,9 @@ MAX_TASKS=""
 WAVE=""
 
 usage() {
-  echo "Usage: $0 [-n MAX_TASKS] [-w WAVE]"
+  echo "Usage: $0 -w WAVE [-n MAX_TASKS]"
+  echo "  -w WAVE       Wave number (required) - agents only claim tasks in this wave"
   echo "  -n MAX_TASKS  Stop each agent after completing this many tasks (default: unlimited)"
-  echo "  -w WAVE       Restrict agents to tasks in the given wave (default: any wave)"
   exit 1
 }
 
@@ -20,22 +20,19 @@ while getopts ":n:w:h" opt; do
   esac
 done
 
-if [ -n "$MAX_TASKS" ] && ! [[ "$MAX_TASKS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "error: -n must be a positive integer" >&2
-  exit 1
+if [ -z "$WAVE" ]; then
+  echo "error: -w WAVE is required" >&2
+  usage
 fi
 
-if [ -n "$WAVE" ] && ! [[ "$WAVE" =~ ^[0-9]+$ ]]; then
+if ! [[ "$WAVE" =~ ^[0-9]+$ ]]; then
   echo "error: -w must be a non-negative integer" >&2
   exit 1
 fi
 
-if [ -n "$WAVE" ]; then
-  if [ "$WAVE" -eq 0 ]; then
-    WAVE_RANGE="TASK-001 through TASK-099"
-  else
-    WAVE_RANGE="TASK-${WAVE}00 through TASK-${WAVE}99"
-  fi
+if [ -n "$MAX_TASKS" ] && ! [[ "$MAX_TASKS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: -n must be a positive integer" >&2
+  exit 1
 fi
 
 CONTAINERS=$(docker ps --filter "name=^bqlite-agent-[0-9]+$" --format "{{.Names}}" | sort -V)
@@ -47,27 +44,21 @@ if [ -z "$CONTAINERS" ]; then
 fi
 
 COUNT=$(echo "$CONTAINERS" | wc -l | tr -d ' ')
-SUFFIX=""
+SUFFIX=" (Wave ${WAVE} only)"
 if [ -n "$MAX_TASKS" ]; then
-  SUFFIX=" (max $MAX_TASKS task(s) per agent)"
-fi
-if [ -n "$WAVE" ]; then
-  SUFFIX="${SUFFIX} (Wave ${WAVE} only)"
+  SUFFIX="${SUFFIX} (max $MAX_TASKS task(s) per agent)"
 fi
 echo "Attaching to $COUNT agent containers via cmux${SUFFIX}..."
 
-# Build the docker exec command for an agent container
+# Build the docker exec command for an agent container. The wrapper script
+# runs claude in a restart loop driven by the Stop hook's control markers.
 agent_cmd() {
   local container="$1"
-  local system_prompt="You are ${container}, an autonomous agent building bqlite. Read AGENTS.md for your complete operating protocol."
-  local initial="Begin the agent loop now."
-  if [ -n "$WAVE" ]; then
-    initial="${initial} Only claim tasks in Wave ${WAVE} (${WAVE_RANGE}); skip any task outside that range."
-  fi
+  local args="${WAVE}"
   if [ -n "$MAX_TASKS" ]; then
-    initial="${initial} Stop after completing ${MAX_TASKS} task(s): exit the loop and report done instead of claiming another task."
+    args="${args} ${MAX_TASKS}"
   fi
-  echo "docker exec -it -e IS_SANDBOX=1 -w /workspace ${container} claude --model 'claude-opus-4-6[1m]' --effort high --permission-mode bypassPermissions --append-system-prompt '${system_prompt}' '${initial}'"
+  echo "docker exec -it -e IS_SANDBOX=1 -w /workspace ${container} /workspace/scripts/agent-wrapper.sh ${args}"
 }
 
 FIRST=true

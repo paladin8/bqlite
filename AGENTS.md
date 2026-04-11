@@ -25,6 +25,16 @@ Run this loop continuously:
 7. After the final checkpoint, mark the task complete (see Completion Protocol)
 8. Return to step 1
 
+## Ending Your Turn
+
+You run inside a wrapper script (`scripts/agent-wrapper.sh`) that watches for control markers in your final message. You **must** end every turn with exactly one of:
+
+- `[END LOOP]` — you want a fresh context before continuing. The wrapper relaunches `claude` with a clean conversation; you will re-read AGENTS.md and rescan task state. Use this after completing a task when your context is large, or any time you judge that a fresh slate will help you reason about the next task.
+- `[WAVE COMPLETE]` — there are no more claimable tasks in your wave. Only emit this when you have actually verified one of: (a) every task in the wave has a `.done` marker in `tasks/completed/`, or (b) every remaining task is claimed by another live agent or permanently blocked, **and** you have exhausted the full backoff schedule in the next section with no progress. The wrapper exits and does not relaunch.
+- `[NEEDS INPUT]` — you need a human decision (see *When to Ask for Human Input* below). The wrapper pauses and then resumes your session with `claude --continue` so the human can reply inline with the full context preserved. Include your question in the same message as the marker.
+
+If you end a turn without one of these markers, the Stop hook blocks you and injects a message beginning with "Do not end your turn without an explicit marker…". That message is not an error — it is the normal signal to return to step 1 of the agent loop. Continue executing; do not emit `[NEEDS INPUT]` asking what happened.
+
 ## Backoff When No Tasks Are Claimable
 
 If step 3 finds no unclaimed task whose dependencies are satisfied — all remaining tasks are either claimed, completed, or blocked by unfinished dependencies — sleep and retry on the following schedule:
@@ -96,7 +106,8 @@ Break every task into the smallest self-contained units of progress. Each checkp
 
 1. Pass `scripts/local-ci.sh` (mirrors `.github/workflows/ci.yml`: fmt, dep-direction, clippy, build, test)
 2. Pass a subagent code review of the staged changes (see Behavioral Requirement #4)
-3. Be merged to main immediately — do not accumulate checkpoints
+3. Be reconciled against the task's design doc in `docs/design/`. Re-read the design doc and confirm the staged changes match it. Any drift must be resolved before merging — either correct the implementation, or update the design doc in the same checkpoint to reflect a deliberate change (and note the reason in the commit message). Never merge code that silently diverges from the spec.
+4. Be merged to main immediately — do not accumulate checkpoints
 
 **Merge protocol for each checkpoint:**
 
@@ -155,6 +166,7 @@ git checkout task/TASK-NNN
 5. **Always validate before committing.** No commit without:
    - `scripts/local-ci.sh` passing end-to-end (mirrors the GitHub Actions CI)
    - Subagent code review completed with no blocking findings (see #4)
+   - Implementation reconciled against the task's design doc in `docs/design/` — if the design changed, update the doc in the same checkpoint
    - Documentation updated in the same checkpoint as the code change
 
 6. **Consider refactoring.** After completing a task, evaluate whether the code benefits from refactoring. Small, focused refactoring is encouraged. Large refactors should be filed as separate tasks.
@@ -163,14 +175,14 @@ git checkout task/TASK-NNN
 
 ## When to Ask for Human Input
 
-Prefix your message with **[NEEDS INPUT]** so the human can spot it in their cmux tabs:
+End your turn with **[NEEDS INPUT]** (see *Ending Your Turn*) so the wrapper pauses and the human can reply in the resumed session:
 
 - Architecture or design decisions with multiple valid approaches
 - Ambiguous acceptance criteria in a task definition
 - Merge conflicts you cannot resolve cleanly
 - Any situation where proceeding could waste significant work if the wrong path is chosen
 
-Wait for a response in the interactive session before proceeding.
+Include the question itself in the same message as the marker. The wrapper will resume the same session with `claude --continue` so the human sees the full context.
 
 ## Rate Limits
 
