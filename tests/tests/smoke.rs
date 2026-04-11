@@ -59,13 +59,10 @@
 //! every binary as a prerequisite, so this fallback message only
 //! matters for developers running the test crate in isolation.
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::path::PathBuf;
 use std::process::Command;
 
-use common::TempDb;
+use bqlite_tests::common::TempDb;
 
 /// Platform-specific name of the compiled bqlite CLI binary.
 #[cfg(windows)]

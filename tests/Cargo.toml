@@ -28,16 +28,5 @@ bqlite-core = { workspace = true }
 proptest = { workspace = true }
 thiserror = { workspace = true }
 
-# Wave 1 end-to-end smoke test (TASK-123). Spawns the compiled
-# `bqlite` binary as a subprocess and exercises the full parse →
-# plan → bind → drive pipeline plus the CLI's arg parser, tracing
-# init, and text renderer. This is the Wave 1 acceptance gate —
-# `cargo test --all-targets` is what local-ci.sh runs, and that
-# command builds the CLI binary as a prerequisite so the subprocess
-# always finds it under `target/<profile>/`.
-[[test]]
-name = "smoke"
-path = "smoke.rs"
-
 [dev-dependencies]
 serde_json = { workspace = true }
