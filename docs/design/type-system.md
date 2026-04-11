@@ -56,6 +56,8 @@ pub enum BqlType {
 
 **Timestamp is always UTC nanoseconds.** The bootstrap spec requires nanosecond precision and i64 epoch nanos. Storing as UTC avoids timezone ambiguity in temporal comparisons, which is critical for correct pattern matching. Arrow mapping uses `Timestamp(Nanosecond, Some("UTC"))`. Display-time timezone conversion is a formatting concern, not a type concern.
 
+**`Timestamp::MAX` is a reserved exclusive-bound sentinel, not a valid event time.** `bqlite` uses half-open `[start, end)` intervals for every `TimeRange`, including the "unbounded" range `[MIN, MAX)` returned by `TimeRange::unbounded`. To keep the exclusive upper bound representable without widening the stored integer, the maximum `i64` nanosecond value (`Timestamp::MAX`) is reserved: no event, ingest path, or test fixture may produce it. The maximum *valid* event timestamp is `Timestamp::MAX_VALID = Timestamp(i64::MAX - 1)`. Construction APIs whose semantics break at the sentinel — for example `TimeRange::instant(ts)`, which would need `ts + 1` as the exclusive end — return `Option<TimeRange>` and refuse the boundary input rather than silently collapsing to an empty range. In practice, `i64::MAX` nanoseconds is approximately the year 2262, so reserving this value has no effect on real workloads; the rule exists so the half-open math elsewhere in the engine stays clean.
+
 **No Duration type.** Durations (e.g., `match_duration`, `session_duration`, timestamp differences) are represented as `Int` — nanoseconds as i64. In a domain-specific temporal query engine, the context makes durations unambiguous. A separate Duration type would add a variant to every type-dispatch site, complicate coercion and aggregate return-type rules, and provide marginal safety in a domain where every i64 from timestamp arithmetic is obviously a duration. Duration literals like `7d` and `30m` parse to i64 nanosecond values at plan time. Duration-specific display formatting (e.g., "2h 15m") belongs in the presentation layer, not the type system.
 
 **List is homogeneously typed.** `List(BqlType)` requires all elements to share a type. This is mandated by Arrow's List type and is sufficient for the domain: a user-declared column like `tags` is `List(String)`, `page_views_per_session` could be `List(Int)`, and so on. **BQL has no `Struct` type**, so there is no `List(Struct)`. This is intentional — adding Struct would multiply every coercion, schema-validation, and Arrow-mapping rule to handle nested-field access. The operators that would otherwise need heterogeneously-typed list elements (notably ATTRIBUTE — see Section 6.14) auto-unnest into flat rows instead, which keeps the type system small without losing expressiveness.
@@ -162,12 +164,12 @@ CAST(expression AS type)
 | `Bool` | `Int` | `TRUE -> 1`, `FALSE -> 0`, `NULL -> NULL` |
 | `String` | `Int` | Parses decimal integer; `NULL` on failure |
 | `String` | `Float` | Parses decimal float; `NULL` on failure |
-| `String` | `Timestamp` | Parses ISO-8601; `NULL` on failure |
+| `String` | `Timestamp` | Parses RFC 3339 / ISO-8601 via `chrono::DateTime::parse_from_rfc3339`. Surrounding whitespace is trimmed. Non-UTC offsets (e.g. `+05:30`) are accepted and converted to UTC nanoseconds. Returns `NULL` on parse failure *or* if the parsed instant falls outside the nanosecond-representable range (~1677-09-21 .. 2262-04-11). |
 | `String` | `Bool` | `"true"`/`"false"` case-insensitive; `NULL` otherwise |
 | `Int` | `String` | Decimal string representation |
 | `Float` | `String` | Standard float formatting |
 | `Bool` | `String` | `"true"` / `"false"` |
-| `Timestamp` | `String` | ISO-8601 UTC format |
+| `Timestamp` | `String` | RFC 3339 / ISO-8601 UTC with trailing `Z`, formatted via `chrono::DateTime::<Utc>::to_rfc3339_opts(SecondsFormat::AutoSi, true)` — e.g. `2023-11-14T22:13:20Z` for whole seconds or `2023-11-14T22:13:20.123456789Z` with nanosecond precision. Output is round-trip stable: `CAST(CAST(ts AS STRING) AS TIMESTAMP) = ts` for every valid `Timestamp`. |
 | `Timestamp` | `Int` | Epoch nanoseconds as i64 |
 | `Int` | `Timestamp` | Interprets as epoch nanoseconds |
 

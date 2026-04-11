@@ -103,10 +103,19 @@ pub fn arb_bql_type() -> impl Strategy<Value = BqlType> {
     })
 }
 
-/// Strategy producing any [`Timestamp`] value across the full `i64`
-/// nanosecond range.
+/// Strategy producing any **valid** [`Timestamp`] value — every `i64`
+/// nanosecond below the reserved sentinel.
+///
+/// The generated range is `[i64::MIN, i64::MAX)`. [`Timestamp::MAX`] is
+/// reserved as an exclusive upper-bound sentinel in `bqlite` and must not
+/// appear in event data or test fixtures (see the `Timestamp::MAX` doc
+/// comment in `crates/bqlite-core/src/time.rs`). Excluding it here keeps
+/// downstream property tests honest: any `Timestamp` they see was already
+/// an allowed event value, so assertions like
+/// `TimeRange::instant(ts).is_some()` are unconditional instead of
+/// threading an `Option` through every claim.
 pub fn arb_timestamp() -> impl Strategy<Value = Timestamp> {
-    any::<i64>().prop_map(Timestamp::from_nanos)
+    (i64::MIN..i64::MAX).prop_map(Timestamp::from_nanos)
 }
 
 /// Strategy producing any [`TimeRange`].
@@ -116,20 +125,22 @@ pub fn arb_timestamp() -> impl Strategy<Value = Timestamp> {
 ///
 /// 1. an unconstrained `(start, end)` pair, which is empty roughly half the
 ///    time (for `start >= end`), and
-/// 2. a `(start, length)` pair with `length >= 1`, which is non-empty
-///    everywhere except at `start == i64::MAX`, where the saturating add
-///    collapses to `[MAX, MAX)`. The single empty corner case is harmless;
-///    the rest of the second branch reliably tilts the distribution toward
-///    non-empty ranges.
+/// 2. a `(start, length)` pair with `length >= 1`. With the reserved
+///    `Timestamp::MAX` sentinel, `start` is drawn from `[MIN, MAX)` and the
+///    saturating add clamps `end` at `MAX` — the resulting range is
+///    non-empty everywhere except at the narrow degenerate edge where
+///    `start == MAX - 1` and `len == 1`, which produces the legitimate
+///    one-nanosecond range `[MAX - 1, MAX)`. The distribution still tilts
+///    heavily toward non-empty ranges, which is what matters for
+///    `prop_intersect_idempotent`, the contained-in-both check, and so on.
 ///
 /// Without the second branch, properties that depend on a non-empty
-/// intersection — `prop_intersect_idempotent`, the contained-in-both check,
-/// and so on — would only fire on lucky draws.
+/// intersection would only fire on lucky draws.
 pub fn arb_time_range() -> impl Strategy<Value = TimeRange> {
     prop_oneof![
         (any::<i64>(), any::<i64>())
             .prop_map(|(a, b)| TimeRange::new(Timestamp::from_nanos(a), Timestamp::from_nanos(b))),
-        (any::<i64>(), 1_i64..=i64::MAX).prop_map(|(start, len)| {
+        ((i64::MIN..i64::MAX), 1_i64..=i64::MAX).prop_map(|(start, len)| {
             let end = start.saturating_add(len);
             TimeRange::new(Timestamp::from_nanos(start), Timestamp::from_nanos(end))
         }),

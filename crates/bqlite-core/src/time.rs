@@ -26,8 +26,34 @@ impl Timestamp {
     /// The minimum representable timestamp (most negative nanosecond value).
     pub const MIN: Self = Self(i64::MIN);
 
-    /// The maximum representable timestamp (most positive nanosecond value).
+    /// **Reserved exclusive upper-bound sentinel — not a valid event timestamp.**
+    ///
+    /// `bqlite` uses half-open `[start, end)` intervals everywhere (see
+    /// [`TimeRange`]). To let [`TimeRange::unbounded`] cleanly represent
+    /// "every valid timestamp" without needing a wider integer type for
+    /// the exclusive upper bound, `Timestamp::MAX` is reserved as the
+    /// all-ones exclusive-bound sentinel and is **not** a value any event,
+    /// ingest path, or test fixture should ever produce. The highest
+    /// permitted event-data timestamp is [`Timestamp::MAX_VALID`].
+    ///
+    /// Operators that receive a `Timestamp` at the boundary (for instance
+    /// [`TimeRange::instant`]) treat `MAX` as an invalid input and refuse
+    /// to construct a one-nanosecond range at it — there is no
+    /// representable `MAX + 1` to use as the exclusive end.
+    ///
+    /// In practice, `i64::MAX` nanoseconds is approximately the year 2262,
+    /// so reserving this value costs nothing for the behavioral-analytics
+    /// workloads bqlite targets. The rule is nevertheless enforced so that
+    /// the half-open math elsewhere in the engine stays clean.
     pub const MAX: Self = Self(i64::MAX);
+
+    /// The largest timestamp that can appear in event data.
+    ///
+    /// Equal to `Timestamp(i64::MAX - 1)`. This is the value callers
+    /// should reach for when they need "the maximum valid event time"
+    /// — [`Timestamp::MAX`] is reserved as an exclusive-bound sentinel;
+    /// see its doc comment.
+    pub const MAX_VALID: Self = Self(i64::MAX - 1);
 
     /// Create a `Timestamp` from raw nanoseconds since the Unix epoch.
     #[inline]
@@ -105,15 +131,29 @@ impl TimeRange {
     }
 
     /// Create a range spanning a single nanosecond: `[ts, ts+1)`.
+    ///
+    /// Returns `None` when `ts == Timestamp::MAX` — see the
+    /// [`Timestamp::MAX`] doc comment for the reserved-sentinel contract.
+    /// There is no representable `MAX + 1` to use as the exclusive upper
+    /// bound, so the boundary input is refused at construction time
+    /// rather than silently collapsing to an empty range.
+    ///
+    /// Every other input produces `Some([ts, ts+1))`.
     #[inline]
-    pub fn instant(ts: Timestamp) -> Self {
-        Self {
+    pub fn instant(ts: Timestamp) -> Option<Self> {
+        let end = ts.0.checked_add(1)?;
+        Some(Self {
             start: ts,
-            end: Timestamp(ts.0.saturating_add(1)),
-        }
+            end: Timestamp(end),
+        })
     }
 
-    /// Create an unbounded range that contains every possible timestamp.
+    /// Create an unbounded range that contains every **valid** timestamp.
+    ///
+    /// The returned range is `[Timestamp::MIN, Timestamp::MAX)`. Because
+    /// `Timestamp::MAX` is reserved as an exclusive-bound sentinel and is
+    /// not a valid event timestamp (see [`Timestamp::MAX`]), this range
+    /// contains every value that event data can actually carry.
     #[inline]
     pub fn unbounded() -> Self {
         Self {
@@ -310,10 +350,42 @@ mod tests {
     #[test]
     fn range_instant() {
         let ts = Timestamp(42);
-        let r = TimeRange::instant(ts);
+        let r = TimeRange::instant(ts).expect("42 is not the MAX sentinel");
         assert!(r.contains(Timestamp(42)));
         assert!(!r.contains(Timestamp(43)));
         assert_eq!(r.duration_nanos(), Some(1));
+    }
+
+    #[test]
+    fn range_instant_at_max_is_none() {
+        // Timestamp::MAX is reserved as an exclusive-bound sentinel, so
+        // `instant(MAX)` refuses to construct a range rather than silently
+        // collapsing to `[MAX, MAX)` as the pre-Wave-1 implementation did.
+        assert_eq!(TimeRange::instant(Timestamp::MAX), None);
+    }
+
+    #[test]
+    fn range_instant_at_max_valid_is_last_representable_range() {
+        // `instant(MAX_VALID)` is the last representable instant range;
+        // it is `[MAX_VALID, MAX)` and lives exactly one nanosecond below
+        // the sentinel.
+        let r = TimeRange::instant(Timestamp::MAX_VALID).expect("MAX_VALID is valid");
+        assert_eq!(r.start, Timestamp::MAX_VALID);
+        assert_eq!(r.end, Timestamp::MAX);
+        assert!(r.contains(Timestamp::MAX_VALID));
+        assert!(!r.contains(Timestamp::MAX));
+        assert_eq!(r.duration_nanos(), Some(1));
+    }
+
+    #[test]
+    fn unbounded_contains_every_valid_timestamp() {
+        let u = TimeRange::unbounded();
+        assert!(u.contains(Timestamp::MIN));
+        assert!(u.contains(Timestamp::EPOCH));
+        assert!(u.contains(Timestamp::MAX_VALID));
+        // The sentinel itself is explicitly not contained — that's the
+        // whole point of reserving it.
+        assert!(!u.contains(Timestamp::MAX));
     }
 
     #[test]

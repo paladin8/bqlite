@@ -141,6 +141,17 @@ db_root/
 
 Orphaned files (present on disk but not referenced by the manifest) are candidates for GC on startup and after compaction (Section 7.4).
 
+**Wave 1 scaffold layout.** Until real segments start being written, `Database::open_or_create` (TASK-116) creates only the minimum subset of this layout needed to satisfy the "versioned, UUID-stamped, concurrency-safe database directory" contract:
+
+```
+db_root/
+  .lock                              ← exclusive flock for the lifetime of the Database handle
+  manifest.json                      ← single consolidated manifest — see §12.3 "Wave 1 scaffold"
+  manifest.json.tmp                  ← transient, during atomic updates only
+```
+
+There are no `table_name/`, `windows/`, or `shard_NN/` subdirectories yet — Wave 1 has no segments to put in them. The single `manifest.json` holds both the database-wide state that §12.1 targets at `db.json` *and* the per-table state that §12.1 targets at `<table>/manifest.json`. The split happens in Wave 2 when real segments start being written and per-table contention on the manifest becomes real; until then, consolidating keeps the `open_or_create` contract easy to reason about and the test surface tight. See the module-level doc in `crates/bqlite-storage/src/manifest.rs` for the implementation-side record of this consolidation.
+
 ### 5.3 Benefits
 
 **Parallel writes.** Each shard's ingestion path is independent — no cross-shard coordination or locking.
@@ -745,6 +756,8 @@ Each **table** has its own manifest file at `<db_root>/<table_name>/manifest.jso
 
 A database also has a small `<db_root>/db.json` holding truly database-wide properties (database UUID, engine version), alongside the `.lock` file. Per-table configuration like shard count is stored in each table's manifest (Section 12.3), and is required to be identical across all tables in the database so that cross-table joins can rely on shard alignment (Section 5.1).
 
+**Wave 1 scaffold (consolidation).** Wave 1 ships before any segments are written, so the split between `db.json` and per-table `<table>/manifest.json` is deferred — both live in a single `<db_root>/manifest.json` with `format_version: 1`. The consolidated shape and retirement plan are described in §12.3 under "Wave 1 scaffold format". The split reactivates when segments start being produced in Wave 2 and per-table lock contention on the manifest becomes real.
+
 Per-table isolation has two important consequences:
 
 - **Independent updates.** Ingest and compaction for table `A` never touch table `B`'s manifest, so there is no cross-table contention on the manifest lock.
@@ -859,6 +872,82 @@ let manifest: Arc<Manifest> = table.current_manifest();   // atomic load
 Compaction publishes new manifests by atomically swapping the `Arc`. Old manifests stay alive as long as any running query holds a snapshot. A background GC pass checks for orphaned segment files not referenced by the current manifest and not held by any active query's manifest snapshot, and deletes them once the refcount drops (Section 7.6).
 
 **next_sequence_id / next_batch_id.** Both counters are persisted in the manifest so that ingest after a process restart still produces monotonically increasing IDs. They are loaded from the manifest on startup, incremented atomically during ingest, and persisted on the next manifest update.
+
+**Wave 1 scaffold format.** The shape above is the Wave 2+ target. Until segments are being written, TASK-116 freezes a simpler **single consolidated database-wide manifest** at `<db_root>/manifest.json` that holds both the `db.json` properties and an empty `tables` map. The on-disk shape is:
+
+```rust
+/// Consolidated Wave 1 manifest. Written to <db_root>/manifest.json and
+/// updated atomically (manifest.json.tmp → fsync → rename).
+#[derive(Serialize, Deserialize)]
+pub struct Manifest {
+    /// On-disk shape version per `docs/reliability.md` §Versioning.
+    /// This is the **file-format** version — distinct from the
+    /// monotonically-incrementing per-update `version: u64` counter
+    /// above, which Wave 1 does not yet ship. Wave 1 writes `1`; the
+    /// open path rejects any other value.
+    pub format_version: u32,
+
+    /// Stable UUIDv4 stamped at init, never rotates (§5.1). Migrates
+    /// into `db.json` when the per-table split happens.
+    pub database_uuid: String,
+
+    /// Database-wide shard count (§5.1). Default 32. Migrates into
+    /// `TableConfig.num_shards` when the per-table split happens;
+    /// the invariant that all tables share the same value is enforced
+    /// there.
+    pub shard_count: u16,
+
+    /// Declared tables, keyed by name. Wave 1 starts empty and TASK-125
+    /// seeds a default `events` entry (see `bootstrap_events_table`
+    /// below). When the per-table split happens, each entry moves into
+    /// its own `<db_root>/<table>/manifest.json` and this field is
+    /// removed.
+    pub tables: BTreeMap<String, TableEntry>,
+
+    /// Segment inventory placeholder — always empty in Wave 1.
+    /// Pre-reserved so the JSON shape is stable across Wave 1 and the
+    /// first Wave 2 writes before the per-table split lands.
+    pub segments: Vec<SegmentEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TableEntry {
+    /// Authoritative current schema for this table.
+    pub schema: TableSchema,
+
+    /// Per-table sequence-ID counter (§6.2). Same semantics as the
+    /// `next_sequence_id` field on the per-table `Manifest` above.
+    pub next_sequence_id: u64,
+
+    /// Per-table batch-ID counter (§6.2). Same semantics as the
+    /// `next_batch_id` field on the per-table `Manifest` above.
+    pub next_batch_id: u64,
+
+    /// `true` when this entry was seeded by the TASK-125 default-table
+    /// bootstrap rather than user DDL. Lets later waves scan for seeded
+    /// entries and retire them once the first user `CREATE TABLE events`
+    /// arrives, without accidentally clobbering a user-owned table of
+    /// the same name. Wave 1 sets this unconditionally on the default
+    /// `events` entry so no manifest ever ends up in an unlabeled state.
+    /// See TASK-125 and query-language.md §29 for the retirement plan.
+    pub bootstrap_events_table: bool,
+}
+```
+
+**Mapping to the Wave 2+ target:**
+
+| Wave 1 scaffold field | Wave 2+ target location |
+|---|---|
+| `format_version` | Retained as the file-format version in every future shape; bumped if the on-disk container changes incompatibly. |
+| `database_uuid` | Moves into `db.json`. |
+| `shard_count` | Moves into `TableConfig.num_shards` on each per-table manifest (invariant enforced database-wide). |
+| `tables: BTreeMap<String, TableEntry>` | Split: each entry becomes its own `<db_root>/<table>/manifest.json`. |
+| `TableEntry.schema` | Becomes the per-table `Manifest.schema`. |
+| `TableEntry.next_sequence_id` / `next_batch_id` | Become the per-table `Manifest.next_sequence_id` / `next_batch_id`. |
+| `TableEntry.bootstrap_events_table` | Discarded once the user's first `CREATE TABLE events` replaces the seeded entry; the flag exists only for the retirement check. |
+| `segments: Vec<SegmentEntry>` | Replaced by the per-table `Manifest.windows: Vec<WindowManifest>`. The Wave 1 placeholder `SegmentEntry {}` carries no fields yet; serde compatibility lets it evolve without breaking old files. |
+
+Concrete reference: see `crates/bqlite-storage/src/manifest.rs` (`Manifest`, `TableEntry`, `SegmentEntry`, `MANIFEST_FORMAT_VERSION`, `DEFAULT_SHARD_COUNT`). The consolidated shape is a conscious Wave 1 shortcut, not forward-looking guidance — Wave 2+ work should extend the target shape above, not the scaffold.
 
 ### 12.4 Tombstones Are Not in the Manifest
 

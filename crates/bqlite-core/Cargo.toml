@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
+chrono = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }

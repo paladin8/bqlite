@@ -318,6 +318,27 @@ When an alias is used as a subquery (`entity_id IN alias_name`) or inlined into 
 
 The planner detects alias cycles (`alias A references alias B references A`) during resolution and raises `TypeError::AliasCycle { path: "A -> B -> A" }` (type-system.md §12). Depth is bounded to prevent pathological nesting.
 
+### 4.9 Catalog Resolution
+
+§4.1 calls for a `Catalog` handle without naming it. TASK-125 froze the Wave 1 surface; this subsection records it so Wave 2+ planner work has a stable reference.
+
+**Trait.** `bqlite_core::catalog::Catalog`:
+
+```rust
+pub trait Catalog {
+    fn resolve_table(&self, name: &str) -> Result<TableSchema, BqliteError>;
+    fn list_tables(&self) -> Vec<&str>;
+}
+```
+
+The planner takes `&dyn Catalog` at plan time via the `plan(statement, catalog)` entry point and uses it exclusively for the "resolve source" step of §4.7. Unknown tables become `BqliteError::Plan` with the table name in the message.
+
+**Crate placement.** The trait lives in `bqlite-core` — below `bqlite-planner` in the dependency order — so `bqlite-planner` can reference it without depending on `bqlite-storage`. This preserves the `bqlite-planner → ast, core` rule from CLAUDE.md "Dependency Direction". The only production impl is `bqlite_storage::catalog::ManifestCatalog`, constructed by `bqlite_storage::Database` and handed back through `Database::catalog() -> &dyn Catalog`. `Engine::query(text, db)` threads that reference into the planner.
+
+**Wave 1 bootstrap shortcut.** To unblock the Wave 1 smoke test before `CREATE TABLE` DDL exists (query-language.md §29), `Database::open_or_create` seeds a default `events` table into the manifest on fresh init. `ManifestCatalog::resolve_table("events")` returns the minimum §5.1 schema required by type-system.md: `entity_id STRING NOT NULL (ENTITY KEY)`, `ts TIMESTAMP NOT NULL (EVENT TIME)`, `event_type STRING NOT NULL (EVENT TYPE)`. Seeded entries carry a `TableEntry.bootstrap_events_table: true` flag (storage-format.md §12.3) so later waves can distinguish seeded state from user DDL state and retire the shortcut cleanly. See TASK-125.
+
+**Forward evolution.** The trait surface is intentionally minimal — only what the Wave 1 scan-only planner needs. Column-level resolution, DDL mutation (`create_table`, `drop_table`, `alter_table`), and schema-version lookups are additive extensions that the Wave 2 DDL work will append. No existing callers should break.
+
 ---
 
 ## 5. Logical Plan Node Catalog

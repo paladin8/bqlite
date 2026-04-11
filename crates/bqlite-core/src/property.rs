@@ -166,12 +166,18 @@ impl PropertyValue {
             // Float → String.
             (PV::Float(f), BqlType::String) => Some(PV::String(f.to_string())),
 
-            // Timestamp → String (ISO-8601 UTC).
+            // Timestamp → String (RFC 3339 / ISO-8601 UTC).
+            //
+            // Canonical form is `YYYY-MM-DDTHH:MM:SS(.fraction)?Z` with
+            // `chrono::SecondsFormat::AutoSi` — trailing zero fractional
+            // digits are trimmed, so `1_700_000_000_000_000_000` ns renders
+            // as `2023-11-14T22:13:20Z` rather than `...22:13:20.000000000Z`.
+            // The output always parses back via the `String → Timestamp`
+            // arm below; see `docs/design/type-system.md §4.2`.
             (PV::Timestamp(ns), BqlType::String) => {
-                // Format as seconds + fractional nanoseconds for readability.
-                let secs = ns / 1_000_000_000;
-                let nanos = (ns % 1_000_000_000).unsigned_abs();
-                Some(PV::String(format!("{secs}.{nanos:09}s (epoch nanos)")))
+                use chrono::{DateTime, SecondsFormat, Utc};
+                let dt: DateTime<Utc> = DateTime::from_timestamp_nanos(*ns);
+                Some(PV::String(dt.to_rfc3339_opts(SecondsFormat::AutoSi, true)))
             }
 
             // Timestamp → Int (epoch nanos).
@@ -179,6 +185,23 @@ impl PropertyValue {
 
             // Int → Timestamp (interpret as epoch nanos).
             (PV::Int(n), BqlType::Timestamp) => Some(PV::Timestamp(*n)),
+
+            // String → Timestamp (RFC 3339 / ISO-8601).
+            //
+            // Accepts any RFC 3339 form — UTC `Z`, fractional seconds at
+            // any precision, or non-UTC offsets (e.g. `+05:30`) which are
+            // normalized to UTC nanoseconds. Returns `None` on parse failure
+            // *or* if the parsed instant falls outside the nanosecond-
+            // representable range (chrono's `timestamp_nanos_opt` returns
+            // `None` outside ~1677-09-21 .. 2262-04-11). Both failure modes
+            // collapse to `NULL` per TRY_CAST semantics in type-system.md §4.2.
+            (PV::String(s), BqlType::Timestamp) => {
+                use chrono::DateTime;
+                DateTime::parse_from_rfc3339(s.trim())
+                    .ok()
+                    .and_then(|dt| dt.timestamp_nanos_opt())
+                    .map(PV::Timestamp)
+            }
 
             // String → Int.
             (PV::String(s), BqlType::Int) => s.trim().parse::<i64>().ok().map(PV::Int),
@@ -498,6 +521,105 @@ mod tests {
         assert_eq!(as_int, PropertyValue::Int(ns));
         let back = as_int.coerce_to(&BqlType::Timestamp).unwrap();
         assert_eq!(back, PropertyValue::Timestamp(ns));
+    }
+
+    // ── Timestamp ↔ String casts (type-system.md §4.2) ────────────────────────
+
+    #[test]
+    fn coerce_timestamp_to_string_emits_rfc3339_utc() {
+        // Whole seconds — AutoSi trims trailing zero fractional digits.
+        assert_eq!(
+            PropertyValue::Timestamp(1_700_000_000_000_000_000_i64).coerce_to(&BqlType::String),
+            Some(PropertyValue::String("2023-11-14T22:13:20Z".into()))
+        );
+        // Epoch.
+        assert_eq!(
+            PropertyValue::Timestamp(0).coerce_to(&BqlType::String),
+            Some(PropertyValue::String("1970-01-01T00:00:00Z".into()))
+        );
+        // Pre-epoch.
+        assert_eq!(
+            PropertyValue::Timestamp(-1_000_000_000).coerce_to(&BqlType::String),
+            Some(PropertyValue::String("1969-12-31T23:59:59Z".into()))
+        );
+        // Nanosecond precision survives in the rendered form.
+        assert_eq!(
+            PropertyValue::Timestamp(1_700_000_000_123_456_789_i64).coerce_to(&BqlType::String),
+            Some(PropertyValue::String(
+                "2023-11-14T22:13:20.123456789Z".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn coerce_string_to_timestamp_parses_rfc3339() {
+        assert_eq!(
+            PropertyValue::String("2023-11-14T22:13:20Z".into()).coerce_to(&BqlType::Timestamp),
+            Some(PropertyValue::Timestamp(1_700_000_000_000_000_000_i64))
+        );
+        // Nanosecond-precision fractional seconds.
+        assert_eq!(
+            PropertyValue::String("2023-11-14T22:13:20.123456789Z".into())
+                .coerce_to(&BqlType::Timestamp),
+            Some(PropertyValue::Timestamp(1_700_000_000_123_456_789_i64))
+        );
+        // Surrounding whitespace is trimmed, matching the sibling String→Int /
+        // String→Float arms above.
+        assert_eq!(
+            PropertyValue::String("  1970-01-01T00:00:00Z  ".into()).coerce_to(&BqlType::Timestamp),
+            Some(PropertyValue::Timestamp(0))
+        );
+    }
+
+    #[test]
+    fn coerce_string_to_timestamp_normalizes_non_utc_offset_to_utc() {
+        // Midnight in +05:30 is 18:30 the previous day in UTC. Both forms
+        // must resolve to the same UTC nanosecond instant.
+        let utc =
+            PropertyValue::String("2024-01-01T18:30:00Z".into()).coerce_to(&BqlType::Timestamp);
+        let local = PropertyValue::String("2024-01-02T00:00:00+05:30".into())
+            .coerce_to(&BqlType::Timestamp);
+        assert_eq!(utc, local);
+        assert!(matches!(utc, Some(PropertyValue::Timestamp(_))));
+    }
+
+    #[test]
+    fn coerce_string_to_timestamp_returns_none_on_parse_failure() {
+        for malformed in [
+            "",
+            "not a date",
+            "2024-01-01",          // RFC 3339 requires the time component
+            "2024-01-01 12:00:00", // space separator not accepted by RFC 3339 strict parser
+            "garbage",
+        ] {
+            assert_eq!(
+                PropertyValue::String(malformed.into()).coerce_to(&BqlType::Timestamp),
+                None,
+                "malformed input should return None: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coerce_timestamp_string_roundtrip_preserves_nanos() {
+        // The chrono AutoSi formatter emits enough precision to round-trip.
+        for ns in [
+            0_i64,
+            1_000_000_000,             // 1 second
+            -1_000_000_000,            // 1 second before epoch
+            1_700_000_000_000_000_000, // 2023-ish
+            1_700_000_000_123_456_789, // with nanos
+        ] {
+            let as_str = PropertyValue::Timestamp(ns)
+                .coerce_to(&BqlType::String)
+                .expect("ts → string");
+            let back = as_str.coerce_to(&BqlType::Timestamp).expect("string → ts");
+            assert_eq!(
+                back,
+                PropertyValue::Timestamp(ns),
+                "round trip failed for ns={ns}"
+            );
+        }
     }
 
     // ── equality ─────────────────────────────────────────────────────────────

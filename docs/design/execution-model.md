@@ -889,14 +889,15 @@ Each shard-task maintains its own `QueryMetrics` in its `ShardTaskContext` (Sect
 | `DictFilterBitset` | `bqlite-storage` | Scan-time precomputed dictionary filter |
 | `TypedKernel` | `bqlite-operators` | Monomorphized vectorized kernels |
 | `OperatorError` | `bqlite-operators` | Operator-facing execution failures |
-| `DemandSet` / `DemandCapabilities` | `bqlite-planner` | Plan-time demand propagation |
+| `DemandSet` / `DemandCapabilities` | `bqlite-planner` | Plan-time demand propagation. **Wave 1 scaffold note:** TASK-110 shipped `DemandCapabilities` in `bqlite-core` instead so that both `bqlite-operators` and `bqlite-planner` can reference it without adding a new crate edge while the real protocol is still in design. The final home is still `bqlite-planner`; the scaffold relocates when the Wave 4+ demand-protocol `[DESIGN]` task lands. See `crates/bqlite-core/src/demand.rs` for the module-level note. |
+| Parser orchestration (`Engine::query(text, db)`) | `bqlite-engine` | TASK-118 added `bqlite-parser` as a direct dep of `bqlite-engine` so the engine owns the single text-in, rows-out surface the CLI and future Python bindings call. See architecture.md "Dependency Direction" and CLAUDE.md for the updated graph (`bqlite-engine → parser, planner, operators, storage, core`). |
 | `ExecutionError` | `bqlite-engine` | Query-facing wrapper around operator failures and timeouts |
 | `QueryContext` / `QueryMetrics` | `bqlite-engine` | Execution-time state and metrics |
 | `MemoryTracker` | `bqlite-engine` | Memory budget enforcement |
 | Thread pool, query scheduler | `bqlite-engine` | Orchestration |
 | Shard-task coordinator | `bqlite-engine` | Parallel execution |
 
-This follows the dependency direction in CLAUDE.md: `bqlite-engine` depends on `bqlite-operators`, `bqlite-planner`, `bqlite-storage`, and `bqlite-core`.
+This follows the dependency direction in CLAUDE.md: `bqlite-engine` depends on `bqlite-parser`, `bqlite-operators`, `bqlite-planner`, `bqlite-storage`, and `bqlite-core`.
 
 ---
 

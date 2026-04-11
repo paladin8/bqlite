@@ -52,16 +52,18 @@ proptest! {
         }
     }
 
-    /// `r.contains(ts)` is equivalent to `r ∩ [ts, ts+1) ≠ ∅`. The
-    /// equivalence holds even at `ts == i64::MAX` because `instant(MAX)`
-    /// saturates to an empty range and `r.contains(MAX)` requires
-    /// `MAX < r.end`, which is unreachable — both sides are false.
+    /// `r.contains(ts)` is equivalent to `r ∩ [ts, ts+1) ≠ ∅`.
+    ///
+    /// `arb_timestamp()` draws `ts` from the valid event-timestamp range
+    /// `[MIN, MAX)` — [`Timestamp::MAX`] is reserved as an exclusive-bound
+    /// sentinel and is never generated — so `TimeRange::instant(ts)` is
+    /// guaranteed to return `Some(_)` here. The previous boundary dodge
+    /// (both sides of the equivalence being trivially false at `ts == MAX`)
+    /// is no longer needed, because the domain excludes `MAX` by construction.
     #[test]
     fn prop_contains_iff_instant_intersect(r in arb_time_range(), ts in arb_timestamp()) {
-        prop_assert_eq!(
-            r.contains(ts),
-            r.intersect(TimeRange::instant(ts)).is_some()
-        );
+        let instant = TimeRange::instant(ts).expect("arb_timestamp excludes MAX sentinel");
+        prop_assert_eq!(r.contains(ts), r.intersect(instant).is_some());
     }
 
     /// Shifting forward by `n` and back by `-n` is the identity, when

@@ -1317,7 +1317,8 @@ See Section 12.
 ```bql
 CAST(amount AS INT)
 CAST(step_reached >= 2 AS INT)     -- Bool to Int for AVG
-CAST(ts AS STRING)                  -- ISO-8601 format
+CAST(ts AS STRING)                  -- RFC 3339 / ISO-8601 UTC, e.g. 2023-11-14T22:13:20.123456789Z
+CAST('2023-11-14T22:13:20Z' AS TIMESTAMP)  -- RFC 3339, non-UTC offsets accepted and normalized to UTC
 ```
 
 Type-system.md Section 4.2 defines the full cast table and failure semantics (failed casts produce NULL, not errors).
@@ -1908,7 +1909,7 @@ events LAST 30d
 | MATCH → MATCH | Not supported | Stream transformation; use alias + IN |
 | IN set form | Three forms: literal list `IN (...)`, subquery `IN QUERY (...)`, alias `IN name` | Explicit `QUERY` keyword disambiguates pipelines from one-element literal lists |
 | Self-join | Not supported | Would require table aliases; not needed for v1 use cases |
-| Database init | CLI-only (`bqlite init`) | No BQL statement for creating a database; shard count and UUID set at initialization |
+| Database init | CLI-only (`bqlite init`) | No BQL statement for creating a database; shard count and UUID set at initialization. **Wave 1 shortcut:** until `CREATE TABLE` DDL lands in Wave 2, `Database::open_or_create` seeds a default `events` table into the manifest so `bqlite query "events"` can parse-plan-execute against a freshly created database (the Wave 1 acceptance gate). The seeded entry carries a `bootstrap_events_table: true` flag in `TableEntry` (storage-format.md §12.3) that later waves check to retire the shortcut cleanly once user DDL takes over — see TASK-125. |
 | BY clause | Not supported anywhere | Entity key is declared once in the table schema; no per-query override |
 | LIMIT | Not terminal — may be followed by more operators | LIMIT output is still a row stream; composability matters |
 | EXPLAIN | `EXPLAIN <pipeline>` for plan output (pipelines only) | Standard SQL term; DESCRIBE remains for table schemas |

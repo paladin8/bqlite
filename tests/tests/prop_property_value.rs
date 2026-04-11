@@ -55,6 +55,35 @@ proptest! {
         prop_assert_eq!(back, original);
     }
 
+    /// Round-trip invariant for the `Timestamp` ↔ `String` coercion pair
+    /// documented in type-system.md §4.2: formatting a `Timestamp` as
+    /// RFC 3339 UTC and then parsing the result back yields the original
+    /// nanosecond value. Guards against the drift that existed before the
+    /// contract was normalized — the pre-Wave-1 `Timestamp → String` arm
+    /// emitted `"<secs>.<nanos>s (epoch nanos)"` which did not round-trip
+    /// through any RFC 3339 parser.
+    ///
+    /// The strategy draws from roughly ±100 years around the epoch
+    /// (~1870..2070). That range covers every event timestamp a
+    /// behavioral-analytics workload is realistically going to produce
+    /// and keeps the property test inside the range where chrono's
+    /// RFC 3339 formatter and parser agree on nanosecond precision
+    /// without fuss. The broader chrono-valid range (~1677..2262) is
+    /// exercised by the example tests in `crates/bqlite-core/src/property.rs`.
+    #[test]
+    fn timestamp_string_coercion_roundtrip(
+        ns in -3_155_760_000_000_000_000_i64..=3_155_760_000_000_000_000_i64,
+    ) {
+        let original = PropertyValue::Timestamp(ns);
+        let as_string = original
+            .coerce_to(&BqlType::String)
+            .expect("Timestamp always coerces to String");
+        let back = as_string
+            .coerce_to(&BqlType::Timestamp)
+            .expect("the RFC 3339 form must parse back");
+        prop_assert_eq!(back, original);
+    }
+
     /// For any non-null scalar value `v`, `bql_type()` returns the static
     /// type that `v` coerces into under identity coercion. Guards against
     /// accidental drift between the `bql_type()` classifier and the
