@@ -310,9 +310,15 @@ mod tests {
 
         match engine.query("", &db) {
             Err(BqliteError::Parse(msg)) => {
+                // Wave 2's parser surfaces the empty-input case as an
+                // UnexpectedEof with the hint "expected a table name" —
+                // more actionable than the Wave 1 stub's "empty input"
+                // wording, but still satisfies the engine contract that
+                // the parse error propagates cleanly as
+                // `BqliteError::Parse`.
                 assert!(
-                    msg.contains("empty"),
-                    "error should describe the empty input: {msg}"
+                    msg.contains("table name"),
+                    "error should describe the expected source: {msg}"
                 );
             }
             other => panic!("expected Parse error, got {other:?}"),

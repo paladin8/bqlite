@@ -3,107 +3,58 @@
 //! BQL text parser.
 //!
 //! Parses BQL query text into the AST types defined in `bqlite-ast`.
-//! The full language (design: docs/design/query-language.md) eventually
-//! handles:
-//! - Pattern expressions: `match(A -> B -> C)`
-//! - Time windows: `within 7d`
-//! - Entity grouping: `by user_id`
-//! - Property predicates: `WHERE amount > 50`, `WHERE query ~= ".*shoes.*"`
-//! - Pipe operators: `| stats count, avg(duration)`
-//! - Convenience wrappers: `funnel(...)`, `retention(...)`, `sessionize(...)`
-//! - DDL/DML: `CREATE TABLE`, `INSERT INTO`, `DELETE FROM`
+//! Design: `docs/design/query-language.md` (grammar §26, error strategy
+//! §27, error-recovery policy §30.10) and
+//! `docs/design/language/grammar-framework.md` (this crate's
+//! implementation technology — hand-rolled recursive descent plus a
+//! hand-written lexer).
 //!
-//! The parser produces the same AST as the Rust and Python builder APIs.
+//! ## Public surface
 //!
-//! ## Wave 1 status — deliberately minimal
+//! - [`parse`] — lex and parse a BQL source string into a
+//!   [`bqlite_ast::Statement`].
+//! - [`ParseError`] — the typed error returned when lexing or parsing
+//!   fails. Every variant carries a byte offset and, where available,
+//!   a line/column pair and a hand-tuned suggestion string so callers
+//!   can render a caret with the `§27.1` common-error heuristics.
 //!
-//! Wave 1 (TASK-114) only needs to parse a single bare identifier — a
-//! table name like `events` — so the end-to-end smoke test
-//! `bqlite query "events"` can drive parser → planner → operators →
-//! engine against an empty database and return an empty result set.
+//! Internal modules ([`lex`], [`parser`], [`error`]) are kept
+//! crate-private; only `parse` and `ParseError` are exported from this
+//! crate. This matches the Wave 1 stub's public surface so the engine
+//! integration (see `crates/bqlite-engine/src/query.rs`) keeps working
+//! without changes.
 //!
-//! The grammar accepted here is therefore:
+//! ## Wave 2 CP1 status
 //!
-//! ```text
-//! Statement  := Whitespace? Identifier Whitespace?
-//! Identifier := PlainIdent | BacktickIdent
-//! PlainIdent := [A-Za-z_] [A-Za-z0-9_]*
-//! BacktickIdent := '`' ( any char except '`' )+ '`'
-//! ```
+//! This checkpoint lands the lexer, error types, and parser cursor —
+//! the full framework scaffolding pinned by TASK-203 — and replaces
+//! the Wave 1 single-identifier stub with a new implementation routed
+//! through the framework. The statement dispatcher recognizes the
+//! Wave 1 surface exactly (a bare source name, producing an empty
+//! pipeline) so the smoke test and engine integration keep passing.
 //!
-//! The parse result is a `Statement::Query` wrapping a `Pipeline` whose
-//! `source.primary` is the identifier and whose `stages` list is empty.
-//! Anything else — keywords, operators, whitespace inside the name,
-//! multiple tokens, numeric literals — is a parse error. There is no
-//! error recovery: the parser halts on the first failure.
+//! The expression grammar, DDL productions, DML productions, and the
+//! pipeline-stage dispatcher all land in later checkpoints / tasks:
 //!
-//! This implementation is explicitly throwaway scaffolding. The real
-//! grammar framework (hand-rolled vs. parser generator, error recovery
-//! strategy, span tracking, CSV `WITH (...)` remap clause, etc.) is the
-//! Wave 2 design task **TASK-203**, and every real production lives
-//! downstream of that. The surface exposed here — a single `parse`
-//! entry point returning `Result<Statement, ParseError>` — is chosen
-//! so the Wave 2 implementation can replace the body without touching
-//! any caller in `bqlite-engine`.
+//! - **TASK-220 CP2** — Pratt expression grammar in `expr.rs`.
+//! - **TASK-221** — DDL (`CREATE`, `ALTER`, `DROP`, `DESCRIBE`, `EXPLAIN`).
+//! - **TASK-222** — `INSERT ... FROM` with the `WITH (...)` option list.
+//! - **TASK-223** — Pipeline `|` and the `WHERE` / `SELECT` / `LIMIT` verbs.
+//! - **TASK-238** — `INSERT ... VALUES`.
 
-use bqlite_ast::{Name, Pipeline, Source, Span, Statement, TableRef};
-use thiserror::Error;
+mod error;
+mod lex;
+mod parser;
 
-/// An error raised while parsing BQL source text.
-///
-/// Wave 1 only recognizes a single identifier, so the errors are
-/// correspondingly coarse. Every variant carries a byte offset into the
-/// original source text so later stages (and Wave 2's real parser) can
-/// render diagnostics with a caret.
-#[derive(Debug, Error, PartialEq, Eq, Clone)]
-pub enum ParseError {
-    /// The input was empty or contained only whitespace.
-    #[error("expected a table name, found empty input")]
-    Empty,
+use bqlite_ast::Statement;
 
-    /// A character was encountered that cannot start a valid identifier.
-    #[error("syntax error at byte {offset}: {reason}")]
-    Syntax {
-        /// Byte offset into the original source text.
-        offset: usize,
-        /// Human-readable explanation of the failure.
-        reason: String,
-    },
-
-    /// Input remained after the first identifier. Wave 1 accepts a
-    /// single token only — keywords and operators are Wave 2.
-    #[error("unexpected trailing input at byte {offset}: `{rest}`")]
-    TrailingInput {
-        /// Byte offset of the unexpected text in the original source.
-        offset: usize,
-        /// The trailing source text (trimmed to a short snippet).
-        rest: String,
-    },
-
-    /// A backtick-quoted identifier was opened but never closed.
-    #[error("unterminated backtick identifier at byte {offset}")]
-    UnterminatedBacktick {
-        /// Byte offset of the opening backtick.
-        offset: usize,
-    },
-
-    /// A backtick-quoted identifier contained no characters between
-    /// the delimiters.
-    #[error("empty backtick identifier at byte {offset}")]
-    EmptyBacktick {
-        /// Byte offset of the opening backtick.
-        offset: usize,
-    },
-}
+pub use crate::error::{Expected, LiteralKind, NameRole, ParseError, UnterminatedKind};
 
 /// Parse a BQL query text into a [`Statement`].
 ///
-/// Wave 1 only accepts a single identifier — a bare table name. The
-/// result is `Statement::Query(Pipeline { source, stages: [] })` where
-/// `source.primary` carries the parsed name.
-///
-/// See the crate-level documentation for the exact grammar and for the
-/// Wave 2 upgrade path (TASK-203).
+/// Wave 2 CP1 only accepts the Wave 1 surface — a bare table name,
+/// optionally followed by a trailing semicolon. Every other form is
+/// rejected at parse time and will land in a later checkpoint.
 ///
 /// # Examples
 ///
@@ -114,144 +65,19 @@ pub enum ParseError {
 /// let stmt = parse("events").unwrap();
 /// match stmt {
 ///     Statement::Query(p) => assert_eq!(p.source.primary.name.text, "events"),
-///     _ => unreachable!("wave 1 parser only emits Query statements"),
+///     _ => unreachable!("Wave 2 CP1 parser only emits Query statements"),
 /// }
 /// ```
 pub fn parse(text: &str) -> Result<Statement, ParseError> {
-    // Skip leading ASCII whitespace. `is_ascii_whitespace` on bytes is
-    // safe: every ASCII-whitespace byte is a complete UTF-8 codepoint,
-    // so truncating on the first non-whitespace byte lands on a valid
-    // char boundary.
-    let leading_ws: usize = text.bytes().take_while(|b| b.is_ascii_whitespace()).count();
-    let (start_offset, body) = (leading_ws, &text[leading_ws..]);
-
-    if body.is_empty() {
-        return Err(ParseError::Empty);
-    }
-
-    // Extract the identifier token and its byte length within `body`.
-    let (name_text, name_len) = parse_identifier(body, start_offset)?;
-
-    // Skip any trailing whitespace after the identifier.
-    let tail = &body[name_len..];
-    let tail_ws: usize = tail.bytes().take_while(|b| b.is_ascii_whitespace()).count();
-    let after = &tail[tail_ws..];
-
-    if !after.is_empty() {
-        let offset = start_offset + name_len + tail_ws;
-        return Err(ParseError::TrailingInput {
-            offset,
-            rest: snippet(after),
-        });
-    }
-
-    // Wave 1 assumes single-line input — we do not scan the leading
-    // whitespace for newlines, so `line` is hard-coded to 1 and `column`
-    // is the byte offset + 1. For the Wave 1 smoke test (`events`) that
-    // is exact; for multi-line inputs it is a deliberate
-    // simplification. Proper line/column tracking arrives with the real
-    // grammar framework in TASK-203.
-    let ident_span = Span::new(
-        start_offset,
-        start_offset + name_len,
-        1,
-        (start_offset as u32).saturating_add(1),
-    );
-
-    let primary = TableRef {
-        name: Name::new(name_text, ident_span),
-        span: ident_span,
-    };
-    let source = Source {
-        primary,
-        joins: vec![],
-        time_range: None,
-        span: ident_span,
-    };
-    let pipeline = Pipeline {
-        source,
-        stages: vec![],
-        span: ident_span,
-    };
-    Ok(Statement::Query(pipeline))
-}
-
-/// Parse a single identifier from the start of `s`, returning the
-/// identifier text and the number of bytes consumed within `s`.
-///
-/// `global_offset` is the byte offset of `s` within the original source
-/// text; it is used only to populate error offsets.
-fn parse_identifier(s: &str, global_offset: usize) -> Result<(String, usize), ParseError> {
-    let first = s.chars().next().ok_or(ParseError::Empty)?;
-
-    if first == '`' {
-        // Backtick-quoted identifier. Skip the leading backtick and scan
-        // for the closing one. Wave 1 does not support escaped backticks
-        // (`` ` ``) inside a quoted identifier — that, too, is Wave 2.
-        let mut closing: Option<usize> = None;
-        for (i, c) in s[1..].char_indices() {
-            if c == '`' {
-                closing = Some(1 + i);
-                break;
-            }
-        }
-        let close_idx = closing.ok_or(ParseError::UnterminatedBacktick {
-            offset: global_offset,
-        })?;
-        let inner = &s[1..close_idx];
-        if inner.is_empty() {
-            return Err(ParseError::EmptyBacktick {
-                offset: global_offset,
-            });
-        }
-        Ok((inner.to_string(), close_idx + 1))
-    } else if is_ident_start(first) {
-        // Plain [A-Za-z_][A-Za-z0-9_]* identifier. Advance until the
-        // first character that cannot continue an identifier.
-        let mut end = first.len_utf8();
-        for c in s[end..].chars() {
-            if is_ident_continue(c) {
-                end += c.len_utf8();
-            } else {
-                break;
-            }
-        }
-        Ok((s[..end].to_string(), end))
-    } else {
-        Err(ParseError::Syntax {
-            offset: global_offset,
-            reason: format!("unexpected character `{first}`"),
-        })
-    }
-}
-
-#[inline]
-fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
-}
-
-#[inline]
-fn is_ident_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-/// Return a short, display-friendly snippet of trailing text for the
-/// `TrailingInput` error payload so errors stay printable even if a
-/// caller passes a huge string.
-fn snippet(s: &str) -> String {
-    const MAX: usize = 32;
-    let trimmed = s.trim_end();
-    if trimmed.chars().count() <= MAX {
-        return trimmed.to_string();
-    }
-    let cut: String = trimmed.chars().take(MAX).collect();
-    format!("{cut}…")
+    let mut p = parser::Parser::new(text)?;
+    let stmt = parser::statement(&mut p)?;
+    p.expect_eof()?;
+    Ok(stmt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bqlite_ast::Statement;
 
     fn name_of(stmt: &Statement) -> &str {
         match stmt {
@@ -260,19 +86,21 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Happy path — identifier acceptance
+    // ------------------------------------------------------------------
+
     #[test]
     fn parses_bare_identifier() {
         let stmt = parse("events").unwrap();
         assert_eq!(name_of(&stmt), "events");
         match stmt {
-            Statement::Query(p) => {
-                assert!(p.stages.is_empty(), "Wave 1 pipeline has no stages");
-                assert!(p.source.joins.is_empty());
-                assert!(p.source.time_range.is_none());
-                // Span points into the input at offset 0..6.
-                assert_eq!(p.source.primary.span.start, 0);
-                assert_eq!(p.source.primary.span.end, 6);
-                assert_eq!(p.source.primary.name.text, "events");
+            Statement::Query(pipe) => {
+                assert!(pipe.stages.is_empty());
+                assert!(pipe.source.joins.is_empty());
+                assert!(pipe.source.time_range.is_none());
+                assert_eq!(pipe.source.primary.span.start, 0);
+                assert_eq!(pipe.source.primary.span.end, 6);
             }
             _ => unreachable!(),
         }
@@ -289,9 +117,9 @@ mod tests {
         let stmt = parse("   events").unwrap();
         assert_eq!(name_of(&stmt), "events");
         match stmt {
-            Statement::Query(p) => {
-                assert_eq!(p.source.primary.span.start, 3);
-                assert_eq!(p.source.primary.span.end, 9);
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.primary.span.start, 3);
+                assert_eq!(pipe.source.primary.span.end, 9);
             }
             _ => unreachable!(),
         }
@@ -299,14 +127,20 @@ mod tests {
 
     #[test]
     fn parses_trailing_whitespace() {
-        let stmt = parse("events   ").unwrap();
-        assert_eq!(name_of(&stmt), "events");
+        assert_eq!(name_of(&parse("events   ").unwrap()), "events");
     }
 
     #[test]
     fn parses_both_leading_and_trailing_whitespace() {
-        let stmt = parse("  events\n").unwrap();
-        assert_eq!(name_of(&stmt), "events");
+        assert_eq!(name_of(&parse("  events\n").unwrap()), "events");
+    }
+
+    #[test]
+    fn parses_trailing_semicolon() {
+        // Framework-doc §12 #3: the parser tolerates a single trailing
+        // `;` as a statement terminator for REPL ergonomics.
+        assert_eq!(name_of(&parse("events;").unwrap()), "events");
+        assert_eq!(name_of(&parse("events ;").unwrap()), "events");
     }
 
     #[test]
@@ -314,10 +148,9 @@ mod tests {
         let stmt = parse("`weird name`").unwrap();
         assert_eq!(name_of(&stmt), "weird name");
         match stmt {
-            Statement::Query(p) => {
-                // Span covers the backticks.
-                assert_eq!(p.source.primary.span.start, 0);
-                assert_eq!(p.source.primary.span.end, "`weird name`".len());
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.primary.span.start, 0);
+                assert_eq!(pipe.source.primary.span.end, "`weird name`".len());
             }
             _ => unreachable!(),
         }
@@ -325,154 +158,244 @@ mod tests {
 
     #[test]
     fn parses_backtick_with_symbols_inside() {
-        let stmt = parse("`table.with.dots`").unwrap();
-        assert_eq!(name_of(&stmt), "table.with.dots");
+        assert_eq!(
+            name_of(&parse("`table.with.dots`").unwrap()),
+            "table.with.dots"
+        );
     }
 
     #[test]
-    fn rejects_empty_input() {
-        assert_eq!(parse(""), Err(ParseError::Empty));
+    fn parses_backtick_with_doubled_backtick() {
+        // `` `a``b` `` → literal identifier `a`b`
+        assert_eq!(name_of(&parse("`a``b`").unwrap()), "a`b");
+    }
+
+    // ------------------------------------------------------------------
+    // Error paths — updated to the new ParseError variants
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rejects_empty_input_as_eof() {
+        match parse("") {
+            Err(ParseError::UnexpectedEof {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Name);
+                assert_eq!(detail, Some("expected a table name"));
+            }
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
     }
 
     #[test]
-    fn rejects_whitespace_only_input() {
-        assert_eq!(parse("   \t\n  "), Err(ParseError::Empty));
+    fn rejects_whitespace_only_input_as_eof() {
+        match parse("   \t\n  ") {
+            Err(ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
     }
 
     #[test]
-    fn rejects_leading_digit() {
+    fn rejects_leading_digit_with_trailing_token_error() {
+        // `42events` lexes as Int(42) followed by Ident("events"). The
+        // first token is the Int, which is not a valid source name, so
+        // the dispatcher raises Unexpected/Name.
         match parse("42events") {
-            Err(ParseError::Syntax { offset, .. }) => assert_eq!(offset, 0),
-            other => panic!("expected Syntax error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_leading_symbol() {
-        match parse("@foo") {
-            Err(ParseError::Syntax { offset, reason }) => {
+            Err(ParseError::Unexpected {
+                offset, expected, ..
+            }) => {
                 assert_eq!(offset, 0);
-                assert!(reason.contains('@'), "reason should mention the char");
+                assert_eq!(expected, Expected::Name);
             }
-            other => panic!("expected Syntax error, got {other:?}"),
+            other => panic!("expected Unexpected, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_two_identifiers() {
+    fn rejects_leading_symbol_as_lexer_error() {
+        // `@` is not a valid lexer byte and produces a lex-level
+        // Unexpected error before the parser runs.
+        match parse("@foo") {
+            Err(ParseError::Unexpected { offset, found, .. }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(found, "@");
+            }
+            other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_two_identifiers_as_trailing_input() {
         match parse("events extra") {
-            Err(ParseError::TrailingInput { offset, rest }) => {
+            Err(ParseError::Unexpected {
+                offset,
+                expected,
+                found,
+                ..
+            }) => {
                 assert_eq!(offset, 7);
-                assert_eq!(rest, "extra");
+                assert_eq!(expected, Expected::Eof);
+                assert_eq!(found, "extra");
             }
-            other => panic!("expected TrailingInput, got {other:?}"),
+            other => panic!("expected Unexpected/Eof, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_dotted_name() {
-        // Wave 2 will handle qualified references; Wave 1 treats `.` as
-        // unexpected trailing input after the first identifier.
+    fn rejects_dotted_name_as_trailing_input() {
+        // The new lexer tokenizes `schema.events` as Ident, Dot, Ident.
+        // The dispatcher accepts the first Ident and expect_eof rejects
+        // the `.` with `Expected::Eof`. Wave 2 does not yet support
+        // qualified source references (§26 line 1492 is single-name).
         match parse("schema.events") {
-            Err(ParseError::TrailingInput { offset, rest }) => {
+            Err(ParseError::Unexpected {
+                offset, expected, ..
+            }) => {
                 assert_eq!(offset, 6);
-                assert_eq!(rest, ".events");
+                assert_eq!(expected, Expected::Eof);
             }
-            other => panic!("expected TrailingInput, got {other:?}"),
+            other => panic!("expected Unexpected/Eof, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_pipeline_stage() {
-        // `| filter ...` is a Wave 2 production, not Wave 1.
+    fn rejects_pipeline_stage_as_trailing_input() {
+        // `events | filter` — the Wave 2 CP1 dispatcher does not yet
+        // handle the pipe operator (TASK-223 adds pipeline stages), so
+        // the `|` is rejected as trailing input.
         match parse("events | filter") {
-            Err(ParseError::TrailingInput { offset, rest }) => {
+            Err(ParseError::Unexpected {
+                offset,
+                expected,
+                found,
+                ..
+            }) => {
                 assert_eq!(offset, 7);
-                assert_eq!(rest, "| filter");
+                assert_eq!(expected, Expected::Eof);
+                assert_eq!(found, "|");
             }
-            other => panic!("expected TrailingInput, got {other:?}"),
+            other => panic!("expected Unexpected, got {other:?}"),
         }
     }
 
     #[test]
     fn rejects_non_ident_char_immediately_after_identifier() {
-        // Guards the off-by-one case where the rejected character has
-        // no intervening whitespace between it and the name.
         match parse("events!") {
-            Err(ParseError::TrailingInput { offset, rest }) => {
+            Err(ParseError::Unexpected { offset, found, .. }) => {
                 assert_eq!(offset, 6);
-                assert_eq!(rest, "!");
+                assert_eq!(found, "!");
             }
-            other => panic!("expected TrailingInput, got {other:?}"),
+            other => panic!("expected Unexpected, got {other:?}"),
         }
     }
 
     #[test]
     fn rejects_trailing_garbage_after_backtick_identifier() {
-        // Guards the `close_idx + 1` offset arithmetic for the backtick
-        // path by confirming trailing input is flagged at the correct
-        // byte offset (just past the closing backtick).
         let input = "`weird name` extra";
-        let closing_backtick_plus_one = "`weird name`".len(); // 12
         match parse(input) {
-            Err(ParseError::TrailingInput { offset, rest }) => {
-                assert_eq!(offset, closing_backtick_plus_one + 1); // 13, past the space
-                assert_eq!(rest, "extra");
+            Err(ParseError::Unexpected {
+                offset,
+                expected,
+                found,
+                ..
+            }) => {
+                assert_eq!(offset, 13);
+                assert_eq!(expected, Expected::Eof);
+                assert_eq!(found, "extra");
             }
-            other => panic!("expected TrailingInput, got {other:?}"),
+            other => panic!("expected Unexpected, got {other:?}"),
         }
     }
 
     #[test]
     fn rejects_unterminated_backtick() {
         match parse("`never_closed") {
-            Err(ParseError::UnterminatedBacktick { offset }) => assert_eq!(offset, 0),
-            other => panic!("expected UnterminatedBacktick, got {other:?}"),
+            Err(ParseError::Unterminated { offset, kind }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(kind, UnterminatedKind::BacktickIdent);
+            }
+            other => panic!("expected Unterminated, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_empty_backtick() {
+    fn rejects_empty_backtick_as_invalid_literal() {
         match parse("``") {
-            Err(ParseError::EmptyBacktick { offset }) => assert_eq!(offset, 0),
-            other => panic!("expected EmptyBacktick, got {other:?}"),
+            Err(ParseError::InvalidLiteral { offset, kind, .. }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(kind, LiteralKind::String);
+            }
+            other => panic!("expected InvalidLiteral, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_bare_reserved_keyword_as_source() {
+        match parse("MATCH") {
+            Err(ParseError::ReservedKeyword { keyword, role, .. }) => {
+                assert_eq!(keyword, "MATCH");
+                assert_eq!(role, NameRole::TableName);
+            }
+            other => panic!("expected ReservedKeyword, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bare_reserved_keyword_case_insensitively() {
+        assert!(matches!(
+            parse("where"),
+            Err(ParseError::ReservedKeyword {
+                keyword: "WHERE",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unicode_non_ascii_is_rejected_as_lex_error() {
+        match parse("événements") {
+            Err(ParseError::Unexpected { offset, .. }) => assert_eq!(offset, 0),
+            other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backtick_wrapped_keyword_is_accepted_by_parser() {
+        // §26.3 rule 3 defers keyword-shadowing rejection to the
+        // planner; the parser accepts `` `MATCH` `` as a name.
+        let stmt = parse("`MATCH`").unwrap();
+        assert_eq!(name_of(&stmt), "MATCH");
     }
 
     #[test]
     fn trailing_snippet_is_truncated_for_huge_input() {
+        // A 200-char trailing identifier — the `found` field in the
+        // error must truncate to ~32 chars + ellipsis so error messages
+        // stay printable even when callers pass a pathological input.
         let huge = format!("events {}", "x".repeat(200));
         match parse(&huge) {
-            Err(ParseError::TrailingInput { rest, .. }) => {
-                // Snippet capped at ~32 chars + ellipsis.
+            Err(ParseError::Unexpected { found, .. }) => {
                 assert!(
-                    rest.chars().count() <= 33,
+                    found.chars().count() <= 33,
                     "snippet should be truncated, got {} chars",
-                    rest.chars().count()
+                    found.chars().count()
                 );
-                assert!(rest.ends_with('…'), "snippet should be ellipsized");
+                assert!(found.ends_with('…'), "snippet should be ellipsized");
             }
-            other => panic!("expected TrailingInput, got {other:?}"),
+            other => panic!("expected Unexpected, got {other:?}"),
         }
     }
 
+    // ------------------------------------------------------------------
+    // Regression / sanity
+    // ------------------------------------------------------------------
+
     #[test]
-    fn stub_is_round_trippable_via_debug() {
+    fn parse_result_is_cloneable_and_comparable() {
         // The returned Statement should be comparable and cloneable
         // like every other AST node.
         let a = parse("events").unwrap();
         let b = a.clone();
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn unicode_non_ascii_is_rejected_as_syntax_error() {
-        // Wave 1 only accepts ASCII identifiers. Unicode identifiers
-        // are Wave 2 (and may never be added — the Wave 0 design doc
-        // pins identifiers to ASCII).
-        match parse("événements") {
-            Err(ParseError::Syntax { offset, .. }) => assert_eq!(offset, 0),
-            other => panic!("expected Syntax error, got {other:?}"),
-        }
     }
 }
