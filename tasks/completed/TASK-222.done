@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-3",
   "task_id": "TASK-222",
   "claimed_at": "2026-04-11T15:07:30Z",
+  "completed_at": "2026-04-11T15:18:42Z",
   "branch": "task/TASK-222",
   "description": "INSERT FROM production with column remapping (WITH option list + map clause)"
 }
