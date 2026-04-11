@@ -70,7 +70,7 @@ Tasks are numbered by wave:
 | 6    | TASK-600 — TASK-699    |
 | 7    | TASK-700 — TASK-799    |
 
-Anchor tasks typically take the low numbers in a wave's range. New non-anchor tasks take the next available number within the wave. Numbers are never reused — a cancelled task leaves its number retired.
+Anchor tasks typically take the low numbers in a wave's range. New non-anchor tasks take the next available number within the wave. Numbers are never reused — a cancelled task leaves its number retired. The final number in each wave range (199, 299, 399, ...) is reserved for that wave's quality audit task, which updates `docs/quality-score.md` as a wave-closing reflective pass.
 
 ### Wave 0 is a special case
 
@@ -142,12 +142,12 @@ Resolved design questions (including cohort materialization, alias scoping, even
 
 **Scope exclusions.** The top-level `bqlite` re-export crate and `bqlite-ffi` already exist as compile-only scaffolds from initial crate creation and are not extended in Wave 1 — the public Rust and Python APIs land in Wave 6. The builder API mentioned historically in architecture docs is deferred; no Wave 1 task exists for it.
 
-**Size.** 25 tasks.
+**Size.** 26 tasks.
 **Parallelism.** 6-8 agents concurrent at peak.
 
 Wave 1 is deliberately trait-heavy — it's the only wave where `[TRAIT]` is the norm rather than the exception. After Wave 1, the trait surface is frozen and any change requires a high-priority `[TRAIT]` task.
 
-All 25 Wave 1 tasks are enumerated below (no placeholder slots — Wave 1 is the next thing to execute, so it is fully planned).
+All 26 Wave 1 tasks are enumerated below (no placeholder slots — Wave 1 is the next thing to execute, so it is fully planned).
 
 ### TASK-101: [IMPL] Dependency direction check
 **Output**: scripts/check-dep-direction.sh, .github/workflows/ci.yml
@@ -301,13 +301,18 @@ No memory management, no concurrency, no cancellation yet.
 
 Unlocks: TASK-115 planner stub (needs `Catalog` to resolve `events`), TASK-118 engine query API (wires catalog into the planner call), TASK-123 smoke test (needs a resolvable `events` table in a freshly created database).
 
+### TASK-199: [IMPL] Wave 1 quality audit
+**Output**: docs/quality-score.md
+**Depends on**: TASK-123
+**Description**: Wave-closing reflective pass on per-crate quality. Score every crate in the workspace on each dimension in docs/quality-score.md (Tests, API, Docs, Benchmarks) and assign an overall A-F grade. Gather evidence with `cargo test -p <crate>` (test count + pass rate), `cargo bench -p <crate> --no-run` (bench presence), and rustdoc coverage of public items. Record a one-line justification per cell — extend the table format if a flat grade cell is too terse to be useful. If any crate lands below C on any dimension, file a follow-up task addressing the gap (same or next wave) rather than silently accepting the grade. Wave 1 is not declared done until this audit lands and any below-C follow-ups are at least filed.
+
 ---
 
 ## Wave 2: Scan & Filter MVP
 
 **Goal.** Real queries return real data over user-declared schemas. Segment format v1 with the full v1 encoding set, CSV ingest with column remapping, CREATE TABLE / INSERT / EXPLAIN, scan + filter + select + limit operators, predicate pushdown, projection pruning, zone-map-based row-group skipping.
 
-**Size.** ~36 tasks.
+**Size.** ~37 tasks.
 **Parallelism.** 10-14 agents at peak.
 
 **Acceptance.** The following script runs end-to-end against a freshly created database and returns the expected rows:
@@ -542,6 +547,11 @@ Wave 2 is where the real interfaces get decided, so design anchors are front-loa
 
 Each bench asserts its target from the Wave 2 performance gate table as a hard ceiling. Regression CI compares against the previous green main and trips if any metric slips >10%. CI gate uses the 1.5× relaxed targets on GitHub Actions hardware; local reference targets are verified on the pinned reference machine before the wave is declared complete.
 
+### TASK-299: [IMPL] Wave 2 quality audit
+**Output**: docs/quality-score.md
+**Depends on**: TASK-235, TASK-236
+**Description**: Same audit pattern as TASK-199, rescored after Wave 2. Wave 2 is the first wave with a real performance gate, so the Benchmarks dimension must reflect whether the Wave 2 perf-gate targets are met on reference hardware — not merely whether benches exist. bqlite-storage (segment format, encodings, ingest), bqlite-planner (pushdown, projection pruning, EXPLAIN), and bqlite-operators (scan/filter/project/limit) will see the biggest grade movements. Any crate slipping vs. its Wave 1 grade is flagged in the commit message. Below-C grades get follow-up tasks; Wave 3 does not start until those are filed.
+
 ---
 
 ## Wave 3: Pattern Matching MVP
@@ -587,6 +597,11 @@ Each bench asserts its target from the Wave 2 performance gate table as a hard c
 **Description**: Foundational operator for funnel output and most analytics queries. count/sum/avg/min/max/distinct_count. Works on columnar batches.
 
 Additional Wave 3 tasks: individual pattern grammar productions, limit/sort operators, EMIT ALL output assembly, MATCH lowering in the planner, matcher microbenchmarks, integration tests for common funnel shapes.
+
+### TASK-399: [IMPL] Wave 3 quality audit
+**Output**: docs/quality-score.md
+**Depends on**: TASK-301, TASK-302, TASK-303, TASK-304, TASK-305, TASK-306, TASK-307
+**Description**: Same audit pattern as TASK-199, rescored after Wave 3. Focus on the crates Wave 3 grew substantially — bqlite-operators (MATCH + hash aggregate + matcher strategies) and bqlite-parser (pattern grammar). The Tests dimension specifically checks coverage of matcher edge cases: variable-binding tracks, negation, repetition, time-window expiry, EMIT ALL semantics, and the step-counter vs NFA strategy-selection boundary. Any crate slipping vs. Wave 2 is flagged. Below-C grades get follow-up tasks; Wave 4 does not start until those are filed.
 
 ---
 
@@ -649,6 +664,11 @@ Additional Wave 3 tasks: individual pattern grammar productions, limit/sort oper
 
 Additional Wave 4 tasks: individual encoding implementations from TASK-401 outcomes, SESSIONIZE impl, retention operator, attribution impl, cohort grammar productions, alias binding in planner, FUNNEL and RETENTION syntactic sugar, tombstone writer, tombstone-aware merge scan, compaction microbenchmarks, integration tests for each new feature.
 
+### TASK-499: [IMPL] Wave 4 quality audit
+**Output**: docs/quality-score.md
+**Depends on**: TASK-401, TASK-402, TASK-403, TASK-404, TASK-405, TASK-406, TASK-407, TASK-408, TASK-409, TASK-410
+**Description**: Same audit pattern as TASK-199, rescored after Wave 4. Wave 4 adds compaction, tombstones, advanced encodings, SESSIONIZE, attribution, cohorts, and JSON/Parquet ingest — bqlite-storage and bqlite-operators carry the bulk of the new surface. The Benchmarks dimension must reflect the advanced-encoding evidence from TASK-401 and the compaction microbenches. Cross-cutting concerns (tombstone-aware merge scan, compaction concurrency) need integration-test evidence, not just unit tests. Below-C grades get follow-up tasks; Wave 5 does not start until those are filed.
+
 ---
 
 ## Wave 5: Production Quality & Performance
@@ -695,6 +715,11 @@ Additional Wave 4 tasks: individual encoding implementations from TASK-401 outco
 
 Additional Wave 5 tasks: individual optimizer rule implementations, spill implementations per spillable operator, fusion implementations for specific operator pairs, cancellation plumbing per operator, property tests, stress tests, memory-pressure integration tests.
 
+### TASK-599: [IMPL] Wave 5 quality audit
+**Output**: docs/quality-score.md
+**Depends on**: TASK-501, TASK-502, TASK-503, TASK-504, TASK-505, TASK-506, TASK-507
+**Description**: Same audit pattern as TASK-199, rescored after Wave 5. Wave 5 is the production-quality wave — the audit is a hard gate, not a reflective pass. Every crate is expected to be at least B across all dimensions; anything below B ships only with a named owner, a concrete remediation plan, and human sign-off before Wave 6 begins. The Benchmarks dimension specifically verifies that regression gates are wired up in CI and have been green for at least one full merge cycle. Any below-B grade is a blocker, not a follow-up.
+
 ---
 
 ## Wave 6: Interfaces
@@ -726,6 +751,11 @@ Additional Wave 5 tasks: individual optimizer rule implementations, spill implem
 
 Additional Wave 6 tasks: CLI subcommand implementations, repl line editing, explain output formatting, Python test suite, Python packaging (wheels for macOS/Linux), example scripts.
 
+### TASK-699: [IMPL] Wave 6 quality audit
+**Output**: docs/quality-score.md
+**Depends on**: TASK-601, TASK-602, TASK-603, TASK-604
+**Description**: Same audit pattern as TASK-199, rescored after Wave 6. This is the first wave where the top-level `bqlite` re-export crate and `bqlite-ffi` move from compile-only scaffolds to real content — both are expected at B or better, and the audit is the place to stop deferring their grades with `-`. CLI UX polish and Python API ergonomics are scored under API, not Docs. Python packaging (wheel build success on both target platforms) counts as a Tests-dimension signal for bqlite-ffi. Below-B grades block Wave 7 from starting.
+
 ---
 
 ## Wave 7: Polish
@@ -756,3 +786,8 @@ Additional Wave 6 tasks: CLI subcommand implementations, repl line editing, expl
 **Description**: Systematic review of edge cases — empty datasets, single-event entities, segment boundary crossings, huge entities, zero-time-range queries, schema mismatches, ingest partial failures.
 
 Additional Wave 7 tasks: benchmark dataset acquisition, benchmark runner, public benchmark report, getting-started guide, query language guide, operator reference, error taxonomy document, README polish.
+
+### TASK-799: [IMPL] Wave 7 quality audit — shippable grade
+**Output**: docs/quality-score.md
+**Depends on**: TASK-701, TASK-702, TASK-703, TASK-704
+**Description**: Final pre-ship audit. Same audit pattern as TASK-199, but the standard is an A on every dimension for every crate on the public surface (bqlite, bqlite-core, bqlite-cli, bqlite-ffi). Internal crates may ship at B only if the concrete gap keeping them from A is documented with a rationale and a post-1.0 follow-up task. The public benchmark report from TASK-701 supplies the Benchmarks evidence for the entire workspace. Anything below this standard blocks release — the audit is the last green light before tagging 1.0.
