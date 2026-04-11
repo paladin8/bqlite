@@ -20,6 +20,10 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 
 - **operators/operator-traits.md** — `PhysicalOperator` + `EntityOperator` trait surface, lifecycle, cancellation, sub-batch streaming (TASK-108, Wave 1)
 
+### Storage
+
+- **storage/reader-trait.md** — `SegmentReader` + `SegmentScan` trait surface, segment enumeration, column projection, row-group iteration, zone-map access, predicate pushdown (TASK-109, Wave 1)
+
 ## Infrastructure
 
 7. **agent-workflow.md** -- Parallel agent containers, task locking, git workflow, cmux integration (STATUS: draft)

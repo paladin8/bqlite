@@ -45,3 +45,8 @@ pub use arrow::{
 
 pub mod demand;
 pub use demand::{DemandCapabilities, DemandPropagation};
+
+pub mod storage;
+pub use storage::{
+    ColumnProjection, Predicate, SegmentHandle, SegmentReader, SegmentScan, ZoneMap,
+};
