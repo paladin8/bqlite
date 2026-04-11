@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-1",
   "task_id": "TASK-114",
   "claimed_at": "2026-04-11T00:18:25Z",
+  "completed_at": "2026-04-11T00:24:55Z",
   "branch": "task/TASK-114",
   "description": "[IMPL] Parser stub — hand-rolled mini-parser accepting a single identifier (bare table name like `events`) and producing the corresponding Scan AST node"
 }
