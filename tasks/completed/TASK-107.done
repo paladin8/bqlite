@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-4",
   "task_id": "TASK-107",
   "claimed_at": "2026-04-11T00:17:23Z",
+  "completed_at": "2026-04-11T00:32:15Z",
   "branch": "task/TASK-107",
   "description": "[IMPL] Arrow type mapping — bidirectional conversion between PropertyValue/TableSchema and Arrow DataType/Schema"
 }
