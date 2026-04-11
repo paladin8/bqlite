@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-4",
   "task_id": "TASK-225",
   "claimed_at": "2026-04-11T15:22:48Z",
+  "completed_at": "2026-04-11T15:51:59Z",
   "branch": "task/TASK-225",
   "description": "Expression compilation: TypedExpr + CompiledExpr construction and type checking"
 }
