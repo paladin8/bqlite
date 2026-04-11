@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-3",
   "task_id": "TASK-210",
   "claimed_at": "2026-04-11T07:40:00Z",
+  "completed_at": "2026-04-11T07:48:56Z",
   "branch": "task/TASK-210",
   "description": "[IMPL] Constant encoding"
 }
