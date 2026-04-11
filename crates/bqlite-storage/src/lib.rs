@@ -29,12 +29,12 @@
 //!   [`bqlite_core::Catalog`] and the TASK-125 bootstrap events table
 //!   schema. `Database::open_or_create` seeds the bootstrap entry on
 //!   fresh init so the planner has a resolvable `events` table.
-//! - [`encoding`] — the column [`Encoding`] trait and the [`Plain`]
-//!   reference implementation landed by TASK-206, plus the
-//!   [`Constant`] impl landed by TASK-210. Remaining v1 encodings
-//!   (`Dictionary`, `Delta`, `BitPacking`, and the LZ4 wrapper) land
-//!   in TASK-207 – TASK-209 and TASK-211. The byte layouts produced
-//!   by every impl are pinned by
+//! - [`encoding`] — the column [`Encoding`] trait and concrete v1
+//!   impls: [`Plain`] (TASK-206), [`Constant`] (TASK-210),
+//!   [`BitPacking`] (TASK-209), and the LZ4 post-encoding wrapper
+//!   (TASK-211). Remaining v1 encodings (`Dictionary`, `Delta`)
+//!   land in TASK-207 and TASK-208. The byte layouts produced by
+//!   every impl are pinned by
 //!   `docs/design/storage/segment-format-v1.md` §9.
 //! - [`ingest`] — the ingest partitioner landed by TASK-218, which
 //!   routes incoming events to the correct `(shard, window)` bucket
@@ -55,7 +55,7 @@ pub use catalog::{bootstrap_events_schema, ManifestCatalog, BOOTSTRAP_EVENTS_TAB
 pub use database::{
     empty_segment_reader, Database, LOCK_FILE_NAME, MANIFEST_FILE_NAME, MANIFEST_TMP_FILE_NAME,
 };
-pub use encoding::{Constant, EncodedChunk, Encoding, EncodingType, Plain};
+pub use encoding::{BitPacking, Constant, EncodedChunk, Encoding, EncodingType, Plain};
 pub use manifest::{
     ColumnStats, Manifest, SegmentMeta, TableEntry, WindowManifest, DEFAULT_SHARD_COUNT,
     MANIFEST_FORMAT_VERSION,
