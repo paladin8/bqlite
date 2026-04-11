@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-2",
+  "task_id": "TASK-116",
+  "claimed_at": "2026-04-11T00:57:00Z",
+  "branch": "task/TASK-116",
+  "description": "Storage stub and database bootstrap — Database::open_or_create implementing on-disk directory layout, manifest.json, flock, atomic writes, SegmentReader stub per storage-format.md §5/§12/§14 and reliability.md"
+}
