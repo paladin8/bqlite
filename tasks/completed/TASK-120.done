@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-3",
   "task_id": "TASK-120",
   "claimed_at": "2026-04-11T00:20:44Z",
+  "completed_at": "2026-04-11T00:27:53Z",
   "branch": "task/TASK-120",
   "description": "[IMPL] Integration test fixture framework — temp-dir database helpers, fixture loader stub, assertion helpers that compare result sets by value. tests/common/mod.rs"
 }
