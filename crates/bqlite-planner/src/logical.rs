@@ -50,9 +50,15 @@
 //! When TASK-225 lands, these `Spanned<Expr>` fields move to
 //! `TypedExpr` values produced by its schema-resolving walker.
 
-use bqlite_ast::expr::{Expr, Spanned};
+use std::collections::HashSet;
+
+use bqlite_ast::expr::{Expr, Literal, Spanned};
 use bqlite_ast::pipeline::{Pipeline, TimeRange};
-use bqlite_ast::{PipelineStage, SelectItem, SelectItemKind, Statement};
+use bqlite_ast::{
+    AlterAction, AlterTableStmt, ColumnDef as AstColumnDef, ColumnRole, CreateTableStmt,
+    DescribeStmt, DropTableStmt, InsertBody, InsertStmt, PipelineStage, SelectItem, SelectItemKind,
+    Statement,
+};
 use bqlite_core::{
     BqlType, BqliteError, Catalog, ColumnDef, OperatorSchema, PropertyValue, Result, TableSchema,
 };
@@ -386,21 +392,12 @@ impl LogicalPlan {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build the canonical empty output schema used by DDL / DML nodes.
-///
-/// Wired into the DDL lowering paths in TASK-224 C2; the C1
-/// checkpoint tests the helper directly so a regression surfaces
-/// before C2 starts touching it.
-#[allow(dead_code)]
 fn empty_output_schema() -> OperatorSchema {
     OperatorSchema::new(Vec::new()).expect("empty column list is always a valid schema")
 }
 
 /// Build the fixed four-column `DESCRIBE` output schema.
 /// `(name, type, nullable, role)` — see §4.8.
-///
-/// Same C1/C2 split as [`empty_output_schema`]: tested in C1,
-/// wired into `Describe` lowering in C2.
-#[allow(dead_code)]
 fn describe_output_schema() -> OperatorSchema {
     OperatorSchema::new(vec![
         ColumnDef::required("name", BqlType::String),
@@ -429,9 +426,11 @@ fn explain_output_schema() -> OperatorSchema {
 /// `catalog`; unknown tables surface as [`BqliteError::Plan`] via
 /// `bqlite_core::catalog::unknown_table_error`.
 ///
-/// Wave 2 scope: Query and Explain pipelines are fully lowered in
-/// this checkpoint (TASK-224 C1). DDL and Insert lowering lands in
-/// C2 — they currently return a placeholder `Plan` error.
+/// Every Wave 2 depth variant from logical-plan-nodes.md §3 is
+/// covered: pipeline queries (+ EXPLAIN) landed in C1, DDL /
+/// Insert landed in C2. `Statement::Delete` and
+/// `Statement::DefineAlias` are explicitly rejected with forward-
+/// compat messages pointing at the Wave 4 tasks that own them.
 pub fn lower_statement(statement: Statement, catalog: &dyn Catalog) -> Result<LogicalPlan> {
     match statement {
         Statement::Query(pipeline) => lower_query_pipeline(pipeline, catalog),
@@ -439,20 +438,16 @@ pub fn lower_statement(statement: Statement, catalog: &dyn Catalog) -> Result<Lo
             let plan = lower_query_pipeline(pipeline, catalog)?;
             Ok(LogicalPlan::explain(plan))
         }
+        Statement::CreateTable(stmt) => lower_create_table(stmt, catalog),
+        Statement::DropTable(stmt) => lower_drop_table(stmt, catalog),
+        Statement::AlterTable(stmt) => lower_alter_table(stmt, catalog),
+        Statement::Describe(stmt) => lower_describe(stmt, catalog),
+        Statement::Insert(stmt) => lower_insert(stmt, catalog),
         Statement::Delete(_) => Err(BqliteError::Plan(
             "DELETE is deferred to Wave 4 alongside tombstones (TASK-404)".into(),
         )),
         Statement::DefineAlias { .. } => Err(BqliteError::Plan(
             "alias definitions are deferred to Wave 4 (TASK-407)".into(),
-        )),
-        Statement::CreateTable(_)
-        | Statement::DropTable(_)
-        | Statement::AlterTable(_)
-        | Statement::Describe(_)
-        | Statement::Insert(_) => Err(BqliteError::Plan(
-            "DDL/DML logical lowering lands in TASK-224 checkpoint 2 — \
-             Query and Explain pipelines are supported in checkpoint 1"
-                .into(),
         )),
     }
 }
@@ -655,6 +650,431 @@ fn lower_select(items: Vec<SelectItem>, acc: LogicalPlan) -> Result<LogicalPlan>
     }
 
     LogicalPlan::project(project_items, acc)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DDL lowering — §4.5 – §4.8
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `CREATE TABLE <name> (<columns>)` into a `CreateTable` node.
+///
+/// Validation happens *at plan time*, not at engine bind time:
+///
+/// 1. The target name must not already exist in the catalog.
+/// 2. Role assignment: exactly one column per required role
+///    (ENTITY KEY, EVENT TIME, EVENT TYPE).
+/// 3. [`TableSchema::new`] is invoked as the authoritative validator
+///    — it enforces every rule in type-system.md §5.1 (type
+///    constraints on role columns, NOT NULL on role columns,
+///    unique names, reserved-prefix check, and default-value type
+///    consistency).
+///
+/// The returned [`LogicalPlan::CreateTable`] holds the **destructured**
+/// pieces (columns, entity_key, event_time, event_type) rather than
+/// a `TableSchema` value, matching the design doc §4.5 because the
+/// catalog does not yet contain the table — `TableSchema` carries a
+/// catalog identity in its `name()` field that only becomes meaningful
+/// once the engine bind step (TASK-232) atomically writes it to the
+/// manifest.
+fn lower_create_table(stmt: CreateTableStmt, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+    let name = stmt.table.text.clone();
+
+    // §4.5 error: duplicate table.
+    if catalog.resolve_table(&name).is_ok() {
+        return Err(BqliteError::Schema(format!(
+            "CREATE TABLE: table `{name}` already exists"
+        )));
+    }
+
+    // Scan roles. Exactly one per required role — anything else is a
+    // plan-time error before we even hand the list to TableSchema::new.
+    let mut entity_key: Option<String> = None;
+    let mut event_time: Option<String> = None;
+    let mut event_type: Option<String> = None;
+    let mut columns: Vec<ColumnDef> = Vec::with_capacity(stmt.columns.len());
+
+    for ast_col in stmt.columns {
+        let col_name = ast_col.name.text.clone();
+        match ast_col.role {
+            ColumnRole::EntityKey => {
+                if entity_key.is_some() {
+                    return Err(BqliteError::Schema(format!(
+                        "CREATE TABLE `{name}`: multiple ENTITY KEY columns"
+                    )));
+                }
+                entity_key = Some(col_name.clone());
+            }
+            ColumnRole::EventTime => {
+                if event_time.is_some() {
+                    return Err(BqliteError::Schema(format!(
+                        "CREATE TABLE `{name}`: multiple EVENT TIME columns"
+                    )));
+                }
+                event_time = Some(col_name.clone());
+            }
+            ColumnRole::EventType => {
+                if event_type.is_some() {
+                    return Err(BqliteError::Schema(format!(
+                        "CREATE TABLE `{name}`: multiple EVENT TYPE columns"
+                    )));
+                }
+                event_type = Some(col_name.clone());
+            }
+            ColumnRole::Regular => {}
+        }
+        columns.push(ast_column_to_core(ast_col)?);
+    }
+
+    let entity_key = entity_key.ok_or_else(|| {
+        BqliteError::Schema(format!(
+            "CREATE TABLE `{name}`: exactly one column must be declared ENTITY KEY"
+        ))
+    })?;
+    let event_time = event_time.ok_or_else(|| {
+        BqliteError::Schema(format!(
+            "CREATE TABLE `{name}`: exactly one column must be declared EVENT TIME"
+        ))
+    })?;
+    let event_type = event_type.ok_or_else(|| {
+        BqliteError::Schema(format!(
+            "CREATE TABLE `{name}`: exactly one column must be declared EVENT TYPE"
+        ))
+    })?;
+
+    // Authoritative §5.1 validation — duplicates, role-column types,
+    // NOT NULL on role columns, default-value type consistency, etc.
+    // We throw the TableSchema away and hold only its pre-validated
+    // inputs; the engine bind step reconstructs the same value.
+    TableSchema::new(
+        name.clone(),
+        columns.clone(),
+        &entity_key,
+        &event_time,
+        &event_type,
+    )?;
+
+    Ok(LogicalPlan::CreateTable {
+        name,
+        columns,
+        entity_key,
+        event_time,
+        event_type,
+        output_schema: empty_output_schema(),
+    })
+}
+
+/// Lower `DROP TABLE <name>`.
+///
+/// Catalog lookup raises the unknown-table `Plan` error for a
+/// missing table, matching §4.6. There is no `IF EXISTS` modifier.
+fn lower_drop_table(stmt: DropTableStmt, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+    let name = stmt.table.text.clone();
+    let _ = catalog.resolve_table(&name)?;
+    Ok(LogicalPlan::DropTable {
+        name,
+        output_schema: empty_output_schema(),
+    })
+}
+
+/// Lower `ALTER TABLE <name> ADD COLUMN <column>`.
+///
+/// Enforces the §4.7 plan-time rules:
+/// - Unknown table → `Plan` error.
+/// - Duplicate column name → `Schema` error.
+/// - Role columns are frozen at CREATE TABLE → only `Regular` roles
+///   are allowed.
+/// - NOT NULL without DEFAULT would make existing rows read as NULL
+///   for the added column, violating the constraint → `Schema`
+///   error.
+fn lower_alter_table(stmt: AlterTableStmt, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+    let name = stmt.table.text.clone();
+    let table = catalog.resolve_table(&name)?;
+
+    match stmt.action {
+        AlterAction::AddColumn(ast_col) => {
+            let col_name = ast_col.name.text.clone();
+
+            // Role columns are frozen at CREATE TABLE. Only `Regular`
+            // columns can be added via ALTER in v1.
+            if !matches!(ast_col.role, ColumnRole::Regular) {
+                return Err(BqliteError::Schema(format!(
+                    "ALTER TABLE `{name}` ADD COLUMN `{col_name}`: \
+                     role columns (ENTITY KEY / EVENT TIME / EVENT TYPE) are frozen \
+                     at CREATE TABLE and cannot be added via ALTER"
+                )));
+            }
+
+            // Duplicate-name check against the existing schema.
+            if table.columns().iter().any(|c| c.name == col_name) {
+                return Err(BqliteError::Schema(format!(
+                    "ALTER TABLE `{name}` ADD COLUMN `{col_name}`: column already exists"
+                )));
+            }
+
+            let column = ast_column_to_core(ast_col)?;
+
+            // NOT NULL without DEFAULT is a schema-evolution error —
+            // existing rows would have no value to supply for the
+            // new column (type-system.md §5.3).
+            if !column.nullable && column.default_value.is_none() {
+                return Err(BqliteError::Schema(format!(
+                    "ALTER TABLE `{name}` ADD COLUMN `{col_name}`: \
+                     a NOT NULL column must declare a DEFAULT — existing rows would \
+                     otherwise read as NULL"
+                )));
+            }
+
+            Ok(LogicalPlan::AlterTableAddColumn {
+                name,
+                column,
+                output_schema: empty_output_schema(),
+            })
+        }
+    }
+}
+
+/// Lower `DESCRIBE <name>`.
+///
+/// Unknown table → `Plan` error. The fixed four-column output
+/// schema is built once via [`describe_output_schema`].
+fn lower_describe(stmt: DescribeStmt, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+    let name = stmt.table.text.clone();
+    let _ = catalog.resolve_table(&name)?;
+    Ok(LogicalPlan::Describe {
+        name,
+        output_schema: describe_output_schema(),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DML lowering — §4.9 INSERT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `INSERT INTO <table> <body>`.
+///
+/// Resolves the target table against the catalog, then resolves
+/// the body — coercing literals for `VALUES`, normalizing options
+/// and the column-rename map for `FROM`. Both paths share the
+/// rule that the target table must exist at plan time.
+fn lower_insert(stmt: InsertStmt, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+    let table = catalog.resolve_table(&stmt.table.text)?;
+    let body = resolve_insert_body(stmt.body, &table)?;
+    Ok(LogicalPlan::Insert {
+        table,
+        body,
+        output_schema: empty_output_schema(),
+    })
+}
+
+/// Resolve an AST [`InsertBody`] against the target table's schema.
+fn resolve_insert_body(body: InsertBody, table: &TableSchema) -> Result<InsertLogicalBody> {
+    match body {
+        InsertBody::Values(rows) => {
+            resolve_insert_values(rows, table).map(InsertLogicalBody::Values)
+        }
+        InsertBody::From { path, options, map } => {
+            resolve_insert_from(path, options, map, table).map(InsertLogicalBody::From)
+        }
+    }
+}
+
+/// Resolve `INSERT INTO t VALUES (lit, ...), ...` into a
+/// `Vec<Vec<PropertyValue>>`.
+///
+/// Per §4.9 each row is:
+/// - **Arity-checked** against the table's declared column count
+///   (system columns `__seq_id` / `__batch_id` are excluded because
+///   they are auto-generated by the ingest layer).
+/// - **Coerced** column-by-column to the target `BqlType` via
+///   [`PropertyValue::coerce_to`].
+/// - **NOT NULL**-checked for NULL literals in non-nullable columns.
+///
+/// Errors name the offending row index so an operator can fix the
+/// failing tuple without re-running the query.
+fn resolve_insert_values(
+    rows: Vec<Vec<Literal>>,
+    table: &TableSchema,
+) -> Result<Vec<Vec<PropertyValue>>> {
+    let expected_arity = table.columns().len();
+    let mut coerced_rows: Vec<Vec<PropertyValue>> = Vec::with_capacity(rows.len());
+
+    for (row_idx, row) in rows.into_iter().enumerate() {
+        if row.len() != expected_arity {
+            return Err(BqliteError::Plan(format!(
+                "INSERT INTO `{}` VALUES row {row_idx}: arity {} does not match \
+                 the table's {expected_arity} declared columns",
+                table.name(),
+                row.len()
+            )));
+        }
+
+        let mut coerced_row: Vec<PropertyValue> = Vec::with_capacity(expected_arity);
+        for (col_idx, lit) in row.into_iter().enumerate() {
+            let col = &table.columns()[col_idx];
+            let raw = literal_to_property_value(lit);
+
+            // NULL in NOT NULL column — error before attempting coercion.
+            if matches!(raw, PropertyValue::Null) {
+                if !col.nullable {
+                    return Err(BqliteError::Plan(format!(
+                        "INSERT INTO `{}` VALUES row {row_idx}: NULL in NOT NULL column `{}`",
+                        table.name(),
+                        col.name
+                    )));
+                }
+                coerced_row.push(PropertyValue::Null);
+                continue;
+            }
+
+            let coerced = raw.coerce_to(&col.bql_type).ok_or_else(|| {
+                BqliteError::Plan(format!(
+                    "INSERT INTO `{}` VALUES row {row_idx}: cannot coerce literal for column `{}` to {}",
+                    table.name(),
+                    col.name,
+                    col.bql_type
+                ))
+            })?;
+            coerced_row.push(coerced);
+        }
+        coerced_rows.push(coerced_row);
+    }
+
+    Ok(coerced_rows)
+}
+
+/// Resolve `INSERT INTO t FROM '<path>' WITH (...)` into an
+/// [`InsertFromDescriptor`].
+///
+/// Normalizes the flat option list (extracting `format` into a
+/// typed [`IngestFormat`] and coercing `delimiter` / `header` to
+/// `PropertyValue`), rejects unknown option keys, and resolves
+/// the `map` clause against the target schema (every target must
+/// exist; duplicate targets error). Per §4.9, source-file I/O is
+/// deferred to engine-time (TASK-233), so the descriptor is
+/// catalog-checked but the file is not opened here.
+///
+/// Wave 2 only ships `IngestFormat::Csv`; `JsonL` and `Parquet`
+/// are rejected with a forward-compat error that names TASK-410.
+fn resolve_insert_from(
+    path: String,
+    options: Vec<bqlite_ast::InsertOption>,
+    map: Option<Vec<bqlite_ast::ColumnMapping>>,
+    table: &TableSchema,
+) -> Result<InsertFromDescriptor> {
+    let mut format_opt: Option<IngestFormat> = None;
+    let mut resolved_options: Vec<(String, PropertyValue)> = Vec::new();
+
+    for opt in options {
+        let key = opt.key.text;
+        match key.as_str() {
+            "format" => {
+                let Literal::String(fmt_str) = opt.value else {
+                    return Err(BqliteError::Plan(
+                        "INSERT FROM: `format` option must be a string literal".into(),
+                    ));
+                };
+                format_opt = Some(parse_ingest_format(&fmt_str)?);
+            }
+            "delimiter" | "header" => {
+                resolved_options.push((key, literal_to_property_value(opt.value)));
+            }
+            other => {
+                return Err(BqliteError::Plan(format!(
+                    "INSERT FROM: unknown option `{other}` — \
+                     known options are `format`, `delimiter`, `header`, and `map`"
+                )));
+            }
+        }
+    }
+
+    // Default format = CSV when the option is absent. Inferring from
+    // the path extension is a Wave 4 ergonomics improvement.
+    let format = format_opt.unwrap_or(IngestFormat::Csv);
+    if format != IngestFormat::Csv {
+        return Err(BqliteError::Plan(format!(
+            "INSERT FROM: `{format:?}` ingest is deferred to Wave 4 (TASK-410); \
+             Wave 2 supports `csv` only"
+        )));
+    }
+
+    // Resolve the column map against the target schema. Every
+    // `target` must exist; duplicate targets error. Source-column
+    // validation happens at engine-time (TASK-233) against the
+    // live file schema.
+    let mut column_map: Vec<(String, String)> = Vec::new();
+    if let Some(mappings) = map {
+        let mut seen_targets: HashSet<String> = HashSet::new();
+        for mapping in mappings {
+            let source = mapping.source.text;
+            let target = mapping.target.text;
+            if table.column(&target).is_none() {
+                return Err(BqliteError::Plan(format!(
+                    "INSERT FROM `{}`: map target `{target}` is not a column on the target table",
+                    table.name()
+                )));
+            }
+            if !seen_targets.insert(target.clone()) {
+                return Err(BqliteError::Plan(format!(
+                    "INSERT FROM `{}`: duplicate map target `{target}`",
+                    table.name()
+                )));
+            }
+            column_map.push((source, target));
+        }
+    }
+
+    Ok(InsertFromDescriptor {
+        path,
+        format,
+        options: resolved_options,
+        column_map,
+    })
+}
+
+/// Parse a `format: '<name>'` option value into an [`IngestFormat`].
+fn parse_ingest_format(s: &str) -> Result<IngestFormat> {
+    match s.to_ascii_lowercase().as_str() {
+        "csv" => Ok(IngestFormat::Csv),
+        "jsonl" | "json" => Ok(IngestFormat::JsonL),
+        "parquet" => Ok(IngestFormat::Parquet),
+        other => Err(BqliteError::Plan(format!(
+            "INSERT FROM: unknown format `{other}` — supported formats are csv, jsonl, parquet"
+        ))),
+    }
+}
+
+/// Convert an AST [`Literal`] into a [`PropertyValue`].
+///
+/// Duration literals collapse to `PropertyValue::Int` (nanoseconds)
+/// since the type system tracks durations as `BqlType::Int` per
+/// type-system.md §2.2. Timestamp literals preserve their Timestamp
+/// type-tag so coercion rules apply correctly at the column boundary.
+fn literal_to_property_value(literal: Literal) -> PropertyValue {
+    match literal {
+        Literal::Null => PropertyValue::Null,
+        Literal::Bool(b) => PropertyValue::Bool(b),
+        Literal::Int(i) => PropertyValue::Int(i),
+        Literal::Float(f) => PropertyValue::Float(f),
+        Literal::String(s) => PropertyValue::String(s),
+        Literal::Duration(ns) => PropertyValue::Int(ns),
+        Literal::Timestamp(ts) => PropertyValue::Timestamp(ts),
+    }
+}
+
+/// Convert an AST [`AstColumnDef`] into a [`bqlite_core::ColumnDef`].
+///
+/// Discards the AST's `role` field because the parent caller
+/// (CreateTable / AlterTable lowering) handles roles separately.
+/// Coerces the `default` literal into a typed `PropertyValue` at
+/// plan time so the node carries validation-ready values.
+fn ast_column_to_core(ast: AstColumnDef) -> Result<ColumnDef> {
+    let default_value = ast.default.map(literal_to_property_value);
+    Ok(ColumnDef {
+        name: ast.name.text,
+        bql_type: ast.data_type,
+        nullable: !ast.not_null,
+        default_value,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1196,68 +1616,792 @@ mod tests {
         }
     }
 
-    // ── DDL / DML stubs — C2 lands these ────────────────────────────────────
+    // ── DDL: CreateTable ────────────────────────────────────────────────────
 
-    #[test]
-    fn create_table_is_deferred_to_c2() {
-        use bqlite_ast::{
-            AlterAction, AlterTableStmt, ColumnDef as AstColumnDef, ColumnRole, CreateTableStmt,
-            DescribeStmt, DropTableStmt, InsertBody, InsertStmt,
-        };
-        let cat = InMemoryCatalog::default();
-        let stmt = Statement::CreateTable(CreateTableStmt {
-            table: Name::synthetic("t"),
-            columns: vec![],
-            span: Span::EMPTY,
-        });
-        let _ = AstColumnDef {
-            name: Name::synthetic("c"),
-            data_type: BqlType::Int,
-            role: ColumnRole::Regular,
-            not_null: false,
+    fn ast_column(
+        name: &str,
+        data_type: BqlType,
+        role: bqlite_ast::ColumnRole,
+        not_null: bool,
+    ) -> bqlite_ast::ColumnDef {
+        bqlite_ast::ColumnDef {
+            name: Name::synthetic(name),
+            data_type,
+            role,
+            not_null,
             default: None,
             span: Span::EMPTY,
-        }; // smoke-reference the AST type so the import is live
-        let err = lower_statement(stmt, &cat).unwrap_err();
-        match err {
-            BqliteError::Plan(msg) => assert!(msg.contains("C2") || msg.contains("checkpoint 2")),
-            other => panic!("expected Plan error, got {other:?}"),
-        }
-
-        // Same placeholder applies to the other DDL / Insert variants.
-        for stmt in [
-            Statement::DropTable(DropTableStmt {
-                table: Name::synthetic("t"),
-                span: Span::EMPTY,
-            }),
-            Statement::AlterTable(AlterTableStmt {
-                table: Name::synthetic("t"),
-                action: AlterAction::AddColumn(AstColumnDef {
-                    name: Name::synthetic("c"),
-                    data_type: BqlType::Int,
-                    role: ColumnRole::Regular,
-                    not_null: false,
-                    default: None,
-                    span: Span::EMPTY,
-                }),
-                span: Span::EMPTY,
-            }),
-            Statement::Describe(DescribeStmt {
-                table: Name::synthetic("t"),
-                span: Span::EMPTY,
-            }),
-            Statement::Insert(InsertStmt {
-                table: Name::synthetic("t"),
-                body: InsertBody::Values(vec![]),
-                span: Span::EMPTY,
-            }),
-        ] {
-            assert!(matches!(
-                lower_statement(stmt, &cat),
-                Err(BqliteError::Plan(_))
-            ));
         }
     }
+
+    fn ast_column_with_default(
+        name: &str,
+        data_type: BqlType,
+        role: bqlite_ast::ColumnRole,
+        not_null: bool,
+        default: Literal,
+    ) -> bqlite_ast::ColumnDef {
+        bqlite_ast::ColumnDef {
+            name: Name::synthetic(name),
+            data_type,
+            role,
+            not_null,
+            default: Some(default),
+            span: Span::EMPTY,
+        }
+    }
+
+    fn valid_purchases_create_stmt() -> bqlite_ast::CreateTableStmt {
+        bqlite_ast::CreateTableStmt {
+            table: Name::synthetic("purchases"),
+            columns: vec![
+                ast_column(
+                    "user_id",
+                    BqlType::String,
+                    bqlite_ast::ColumnRole::EntityKey,
+                    true,
+                ),
+                ast_column(
+                    "ts",
+                    BqlType::Timestamp,
+                    bqlite_ast::ColumnRole::EventTime,
+                    true,
+                ),
+                ast_column(
+                    "event",
+                    BqlType::String,
+                    bqlite_ast::ColumnRole::EventType,
+                    true,
+                ),
+                ast_column(
+                    "amount",
+                    BqlType::Float,
+                    bqlite_ast::ColumnRole::Regular,
+                    false,
+                ),
+            ],
+            span: Span::EMPTY,
+        }
+    }
+
+    #[test]
+    fn create_table_happy_path_destructures_roles_and_columns() {
+        let cat = InMemoryCatalog::default();
+        let plan =
+            lower_statement(Statement::CreateTable(valid_purchases_create_stmt()), &cat).unwrap();
+        match plan {
+            LogicalPlan::CreateTable {
+                name,
+                columns,
+                entity_key,
+                event_time,
+                event_type,
+                output_schema,
+            } => {
+                assert_eq!(name, "purchases");
+                assert_eq!(columns.len(), 4);
+                assert_eq!(entity_key, "user_id");
+                assert_eq!(event_time, "ts");
+                assert_eq!(event_type, "event");
+                assert_eq!(output_schema.len(), 0);
+                // Column order and types preserved.
+                assert_eq!(columns[0].name, "user_id");
+                assert_eq!(columns[0].bql_type, BqlType::String);
+                assert!(!columns[0].nullable);
+                assert_eq!(columns[3].name, "amount");
+                assert_eq!(columns[3].bql_type, BqlType::Float);
+                assert!(columns[3].nullable);
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_duplicate_table_name() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(Statement::CreateTable(valid_purchases_create_stmt()), &cat)
+            .unwrap_err();
+        match err {
+            BqliteError::Schema(msg) => assert!(msg.contains("already exists")),
+            other => panic!("expected Schema error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_missing_entity_key_role() {
+        let cat = InMemoryCatalog::default();
+        let stmt = bqlite_ast::CreateTableStmt {
+            table: Name::synthetic("purchases"),
+            columns: vec![
+                ast_column(
+                    "user_id",
+                    BqlType::String,
+                    bqlite_ast::ColumnRole::Regular,
+                    true,
+                ),
+                ast_column(
+                    "ts",
+                    BqlType::Timestamp,
+                    bqlite_ast::ColumnRole::EventTime,
+                    true,
+                ),
+                ast_column(
+                    "event",
+                    BqlType::String,
+                    bqlite_ast::ColumnRole::EventType,
+                    true,
+                ),
+            ],
+            span: Span::EMPTY,
+        };
+        let err = lower_statement(Statement::CreateTable(stmt), &cat).unwrap_err();
+        match err {
+            BqliteError::Schema(msg) => assert!(msg.contains("ENTITY KEY")),
+            other => panic!("expected Schema error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_multiple_entity_key_columns() {
+        let cat = InMemoryCatalog::default();
+        let stmt = bqlite_ast::CreateTableStmt {
+            table: Name::synthetic("purchases"),
+            columns: vec![
+                ast_column(
+                    "a",
+                    BqlType::String,
+                    bqlite_ast::ColumnRole::EntityKey,
+                    true,
+                ),
+                ast_column(
+                    "b",
+                    BqlType::String,
+                    bqlite_ast::ColumnRole::EntityKey,
+                    true,
+                ),
+                ast_column(
+                    "ts",
+                    BqlType::Timestamp,
+                    bqlite_ast::ColumnRole::EventTime,
+                    true,
+                ),
+                ast_column(
+                    "event",
+                    BqlType::String,
+                    bqlite_ast::ColumnRole::EventType,
+                    true,
+                ),
+            ],
+            span: Span::EMPTY,
+        };
+        let err = lower_statement(Statement::CreateTable(stmt), &cat).unwrap_err();
+        match err {
+            BqliteError::Schema(msg) => assert!(msg.contains("multiple ENTITY KEY")),
+            other => panic!("expected Schema error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_duplicate_column_name() {
+        // TableSchema::new catches the duplicate; our lowering
+        // forwards the error unchanged.
+        let cat = InMemoryCatalog::default();
+        let stmt = bqlite_ast::CreateTableStmt {
+            table: Name::synthetic("purchases"),
+            columns: vec![
+                ast_column(
+                    "user_id",
+                    BqlType::String,
+                    bqlite_ast::ColumnRole::EntityKey,
+                    true,
+                ),
+                ast_column(
+                    "ts",
+                    BqlType::Timestamp,
+                    bqlite_ast::ColumnRole::EventTime,
+                    true,
+                ),
+                ast_column(
+                    "event",
+                    BqlType::String,
+                    bqlite_ast::ColumnRole::EventType,
+                    true,
+                ),
+                ast_column(
+                    "user_id",
+                    BqlType::Int,
+                    bqlite_ast::ColumnRole::Regular,
+                    false,
+                ),
+            ],
+            span: Span::EMPTY,
+        };
+        let err = lower_statement(Statement::CreateTable(stmt), &cat).unwrap_err();
+        match err {
+            BqliteError::Schema(msg) => assert!(msg.contains("duplicate")),
+            other => panic!("expected Schema error, got {other:?}"),
+        }
+    }
+
+    // ── DDL: DropTable ──────────────────────────────────────────────────────
+
+    #[test]
+    fn drop_table_happy_path_emits_drop_node() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let plan = lower_statement(
+            Statement::DropTable(bqlite_ast::DropTableStmt {
+                table: Name::synthetic("purchases"),
+                span: Span::EMPTY,
+            }),
+            &cat,
+        )
+        .unwrap();
+        match plan {
+            LogicalPlan::DropTable {
+                name,
+                output_schema,
+            } => {
+                assert_eq!(name, "purchases");
+                assert_eq!(output_schema.len(), 0);
+            }
+            other => panic!("expected DropTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_table_rejects_unknown_table() {
+        let cat = InMemoryCatalog::default();
+        let err = lower_statement(
+            Statement::DropTable(bqlite_ast::DropTableStmt {
+                table: Name::synthetic("ghost"),
+                span: Span::EMPTY,
+            }),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => {
+                assert!(msg.contains("ghost"));
+                assert!(msg.contains("unknown table"));
+            }
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    // ── DDL: AlterTable ADD COLUMN ──────────────────────────────────────────
+
+    fn alter_add_column(table: &str, column: bqlite_ast::ColumnDef) -> Statement {
+        Statement::AlterTable(bqlite_ast::AlterTableStmt {
+            table: Name::synthetic(table),
+            action: bqlite_ast::AlterAction::AddColumn(column),
+            span: Span::EMPTY,
+        })
+    }
+
+    #[test]
+    fn alter_add_column_happy_path() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let new_col = ast_column(
+            "referrer",
+            BqlType::String,
+            bqlite_ast::ColumnRole::Regular,
+            false,
+        );
+        let plan = lower_statement(alter_add_column("purchases", new_col), &cat).unwrap();
+        match plan {
+            LogicalPlan::AlterTableAddColumn {
+                name,
+                column,
+                output_schema,
+            } => {
+                assert_eq!(name, "purchases");
+                assert_eq!(column.name, "referrer");
+                assert_eq!(column.bql_type, BqlType::String);
+                assert!(column.nullable);
+                assert_eq!(output_schema.len(), 0);
+            }
+            other => panic!("expected AlterTableAddColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alter_add_column_not_null_with_default_ok() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let new_col = ast_column_with_default(
+            "source",
+            BqlType::String,
+            bqlite_ast::ColumnRole::Regular,
+            true,
+            Literal::String("unknown".into()),
+        );
+        let plan = lower_statement(alter_add_column("purchases", new_col), &cat).unwrap();
+        match plan {
+            LogicalPlan::AlterTableAddColumn { column, .. } => {
+                assert!(!column.nullable);
+                assert!(matches!(
+                    column.default_value,
+                    Some(PropertyValue::String(_))
+                ));
+            }
+            other => panic!("expected AlterTableAddColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alter_add_column_not_null_without_default_is_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let new_col = ast_column(
+            "source",
+            BqlType::String,
+            bqlite_ast::ColumnRole::Regular,
+            true, // NOT NULL
+        );
+        let err = lower_statement(alter_add_column("purchases", new_col), &cat).unwrap_err();
+        match err {
+            BqliteError::Schema(msg) => {
+                assert!(msg.contains("NOT NULL"));
+                assert!(msg.contains("DEFAULT"));
+            }
+            other => panic!("expected Schema error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alter_add_column_rejects_role_columns() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let new_col = ast_column(
+            "another_key",
+            BqlType::String,
+            bqlite_ast::ColumnRole::EntityKey,
+            true,
+        );
+        let err = lower_statement(alter_add_column("purchases", new_col), &cat).unwrap_err();
+        match err {
+            BqliteError::Schema(msg) => assert!(msg.contains("frozen")),
+            other => panic!("expected Schema error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alter_add_column_rejects_duplicate_name() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let new_col = ast_column(
+            "amount",
+            BqlType::Int,
+            bqlite_ast::ColumnRole::Regular,
+            false,
+        );
+        let err = lower_statement(alter_add_column("purchases", new_col), &cat).unwrap_err();
+        match err {
+            BqliteError::Schema(msg) => assert!(msg.contains("already exists")),
+            other => panic!("expected Schema error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alter_add_column_rejects_unknown_table() {
+        let cat = InMemoryCatalog::default();
+        let new_col = ast_column("x", BqlType::Int, bqlite_ast::ColumnRole::Regular, false);
+        let err = lower_statement(alter_add_column("ghost", new_col), &cat).unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("ghost")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    // ── DDL: Describe ───────────────────────────────────────────────────────
+
+    #[test]
+    fn describe_happy_path_has_fixed_four_column_schema() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let plan = lower_statement(
+            Statement::Describe(bqlite_ast::DescribeStmt {
+                table: Name::synthetic("purchases"),
+                span: Span::EMPTY,
+            }),
+            &cat,
+        )
+        .unwrap();
+        match plan {
+            LogicalPlan::Describe {
+                name,
+                output_schema,
+            } => {
+                assert_eq!(name, "purchases");
+                let cols: Vec<&str> = output_schema
+                    .columns()
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                assert_eq!(cols, vec!["name", "type", "nullable", "role"]);
+            }
+            other => panic!("expected Describe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_rejects_unknown_table() {
+        let cat = InMemoryCatalog::default();
+        let err = lower_statement(
+            Statement::Describe(bqlite_ast::DescribeStmt {
+                table: Name::synthetic("ghost"),
+                span: Span::EMPTY,
+            }),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("ghost")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    // ── DML: Insert VALUES ──────────────────────────────────────────────────
+
+    fn insert_values(table: &str, rows: Vec<Vec<Literal>>) -> Statement {
+        Statement::Insert(bqlite_ast::InsertStmt {
+            table: Name::synthetic(table),
+            body: bqlite_ast::InsertBody::Values(rows),
+            span: Span::EMPTY,
+        })
+    }
+
+    #[test]
+    fn insert_values_happy_path_coerces_literals() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        // purchases: user_id String, ts Timestamp, event String,
+        // amount Float (nullable), country String (nullable)
+        let plan = lower_statement(
+            insert_values(
+                "purchases",
+                vec![
+                    vec![
+                        Literal::String("u1".into()),
+                        Literal::Timestamp(1_700_000_000_000_000_000),
+                        Literal::String("view".into()),
+                        Literal::Int(12), // Int → Float coercion
+                        Literal::String("US".into()),
+                    ],
+                    vec![
+                        Literal::String("u2".into()),
+                        Literal::Timestamp(1_700_000_001_000_000_000),
+                        Literal::String("checkout".into()),
+                        Literal::Float(99.5),
+                        Literal::Null, // nullable column, valid
+                    ],
+                ],
+            ),
+            &cat,
+        )
+        .unwrap();
+        match plan {
+            LogicalPlan::Insert {
+                table,
+                body,
+                output_schema,
+            } => {
+                assert_eq!(table.name(), "purchases");
+                assert_eq!(output_schema.len(), 0);
+                match body {
+                    InsertLogicalBody::Values(rows) => {
+                        assert_eq!(rows.len(), 2);
+                        // Row 0: amount was Int, coerced to Float
+                        assert!(matches!(rows[0][3], PropertyValue::Float(_)));
+                        // Row 1: country was Null (nullable column)
+                        assert!(matches!(rows[1][4], PropertyValue::Null));
+                    }
+                    other => panic!("expected Values body, got {other:?}"),
+                }
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_rejects_arity_mismatch() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(
+            insert_values(
+                "purchases",
+                vec![vec![Literal::String("u1".into()), Literal::Int(0)]],
+            ),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => {
+                assert!(msg.contains("arity"));
+                assert!(msg.contains("row 0"));
+            }
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_rejects_null_in_not_null_column() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(
+            insert_values(
+                "purchases",
+                vec![vec![
+                    Literal::Null, // user_id is NOT NULL
+                    Literal::Timestamp(1_700_000_000_000_000_000),
+                    Literal::String("view".into()),
+                    Literal::Float(12.5),
+                    Literal::String("US".into()),
+                ]],
+            ),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => {
+                assert!(msg.contains("NULL"));
+                assert!(msg.contains("user_id"));
+            }
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_rejects_type_mismatch() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        // ts column is Timestamp; passing a Bool is not coercible.
+        let err = lower_statement(
+            insert_values(
+                "purchases",
+                vec![vec![
+                    Literal::String("u1".into()),
+                    Literal::Bool(true), // type mismatch on ts
+                    Literal::String("view".into()),
+                    Literal::Float(1.0),
+                    Literal::String("US".into()),
+                ]],
+            ),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("cannot coerce")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_rejects_unknown_table() {
+        let cat = InMemoryCatalog::default();
+        let err = lower_statement(insert_values("ghost", vec![]), &cat).unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("ghost")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    // ── DML: Insert FROM ────────────────────────────────────────────────────
+
+    fn insert_from(
+        table: &str,
+        path: &str,
+        options: Vec<(&str, Literal)>,
+        map: Option<Vec<(&str, &str)>>,
+    ) -> Statement {
+        Statement::Insert(bqlite_ast::InsertStmt {
+            table: Name::synthetic(table),
+            body: bqlite_ast::InsertBody::From {
+                path: path.to_string(),
+                options: options
+                    .into_iter()
+                    .map(|(k, v)| bqlite_ast::InsertOption {
+                        key: Name::synthetic(k),
+                        value: v,
+                        span: Span::EMPTY,
+                    })
+                    .collect(),
+                map: map.map(|mappings| {
+                    mappings
+                        .into_iter()
+                        .map(|(s, t)| bqlite_ast::ColumnMapping {
+                            source: Name::synthetic(s),
+                            target: Name::synthetic(t),
+                            span: Span::EMPTY,
+                        })
+                        .collect()
+                }),
+            },
+            span: Span::EMPTY,
+        })
+    }
+
+    #[test]
+    fn insert_from_csv_with_map_happy_path() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let plan = lower_statement(
+            insert_from(
+                "purchases",
+                "data.csv",
+                vec![
+                    ("format", Literal::String("csv".into())),
+                    ("delimiter", Literal::String(",".into())),
+                ],
+                Some(vec![("uid", "user_id"), ("evt", "event")]),
+            ),
+            &cat,
+        )
+        .unwrap();
+        match plan {
+            LogicalPlan::Insert {
+                body: InsertLogicalBody::From(desc),
+                ..
+            } => {
+                assert_eq!(desc.path, "data.csv");
+                assert_eq!(desc.format, IngestFormat::Csv);
+                assert_eq!(desc.options.len(), 1);
+                assert_eq!(desc.options[0].0, "delimiter");
+                assert_eq!(
+                    desc.column_map,
+                    vec![
+                        ("uid".to_string(), "user_id".to_string()),
+                        ("evt".to_string(), "event".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Insert::From, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_from_defaults_to_csv_when_format_option_absent() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let plan =
+            lower_statement(insert_from("purchases", "data.csv", vec![], None), &cat).unwrap();
+        match plan {
+            LogicalPlan::Insert {
+                body: InsertLogicalBody::From(desc),
+                ..
+            } => assert_eq!(desc.format, IngestFormat::Csv),
+            other => panic!("expected Insert::From, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_from_rejects_unknown_option_key() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(
+            insert_from(
+                "purchases",
+                "data.csv",
+                vec![("mystery", Literal::String("oops".into()))],
+                None,
+            ),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("unknown option")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_from_rejects_jsonl_in_wave_2() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(
+            insert_from(
+                "purchases",
+                "data.jsonl",
+                vec![("format", Literal::String("jsonl".into()))],
+                None,
+            ),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => {
+                assert!(msg.contains("Wave 4") || msg.contains("TASK-410"));
+            }
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_from_rejects_non_string_format_literal() {
+        // `format: 123` should reject cleanly rather than silently
+        // accept a wrong-typed value.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(
+            insert_from(
+                "purchases",
+                "data.csv",
+                vec![("format", Literal::Int(123))],
+                None,
+            ),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("string literal")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_from_rejects_unknown_format_name() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(
+            insert_from(
+                "purchases",
+                "data.bin",
+                vec![("format", Literal::String("avro".into()))],
+                None,
+            ),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("unknown format")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_from_map_rejects_unknown_target_column() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(
+            insert_from(
+                "purchases",
+                "data.csv",
+                vec![],
+                Some(vec![("src_col", "ghost_target")]),
+            ),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("ghost_target")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_from_map_rejects_duplicate_target() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(
+            insert_from(
+                "purchases",
+                "data.csv",
+                vec![],
+                Some(vec![("a", "user_id"), ("b", "user_id")]),
+            ),
+            &cat,
+        )
+        .unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => assert!(msg.contains("duplicate map target")),
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    // ── Deferred-statement rejections ───────────────────────────────────────
 
     #[test]
     fn delete_is_deferred_to_wave_4() {
