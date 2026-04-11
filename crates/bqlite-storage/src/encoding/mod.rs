@@ -47,12 +47,14 @@ use bqlite_core::{BqlType, BqliteError, Result};
 pub mod bitpacking;
 pub mod constant;
 pub mod delta;
+pub mod dictionary;
 pub mod lz4;
 pub mod plain;
 
 pub use bitpacking::BitPacking;
 pub use constant::Constant;
 pub use delta::Delta;
+pub use dictionary::Dictionary;
 pub use lz4::{compress_lz4, decompress_lz4, CompressionType};
 pub use plain::Plain;
 
@@ -69,7 +71,7 @@ pub use plain::Plain;
 pub enum EncodingType {
     /// Uncompressed primitive layout. §9.1.
     Plain = 0,
-    /// Reserved for TASK-207.
+    /// Sorted distinct values + bit-packed ordinal codes. §9.2.
     Dictionary = 1,
     /// Reserved for TASK-208.
     Delta = 2,

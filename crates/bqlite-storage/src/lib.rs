@@ -31,11 +31,10 @@
 //!   fresh init so the planner has a resolvable `events` table.
 //! - [`encoding`] — the column [`Encoding`] trait and concrete v1
 //!   impls: [`Plain`] (TASK-206), [`Constant`] (TASK-210),
-//!   [`BitPacking`] (TASK-209), [`Delta`] (TASK-208), and the LZ4
-//!   post-encoding wrapper (TASK-211). The remaining v1 encoding
-//!   (`Dictionary`) lands in TASK-207. The byte layouts produced by
-//!   every impl are pinned by
-//!   `docs/design/storage/segment-format-v1.md` §9.
+//!   [`BitPacking`] (TASK-209), [`Delta`] (TASK-208),
+//!   [`Dictionary`] (TASK-207), and the LZ4 post-encoding wrapper
+//!   (TASK-211). The byte layouts produced by every impl are pinned
+//!   by `docs/design/storage/segment-format-v1.md` §9.
 //! - [`ingest`] — the ingest partitioner landed by TASK-218, which
 //!   routes incoming events to the correct `(shard, window)` bucket
 //!   and hands sorted batches off to the writer.
@@ -56,7 +55,9 @@ pub use catalog::{bootstrap_events_schema, ManifestCatalog, BOOTSTRAP_EVENTS_TAB
 pub use database::{
     empty_segment_reader, Database, LOCK_FILE_NAME, MANIFEST_FILE_NAME, MANIFEST_TMP_FILE_NAME,
 };
-pub use encoding::{BitPacking, Constant, Delta, EncodedChunk, Encoding, EncodingType, Plain};
+pub use encoding::{
+    BitPacking, Constant, Delta, Dictionary, EncodedChunk, Encoding, EncodingType, Plain,
+};
 pub use manifest::{
     ColumnStats, Manifest, SegmentMeta, TableEntry, WindowManifest, DEFAULT_SHARD_COUNT,
     MANIFEST_FORMAT_VERSION,
