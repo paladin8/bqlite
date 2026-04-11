@@ -48,6 +48,7 @@
 //! implementations driven by compiled expressions from
 //! [`bqlite_planner::compiled::CompiledExpr`].
 
+pub mod eval;
 pub mod filter;
 pub mod limit;
 pub mod operator;

@@ -12,3 +12,6 @@ bqlite-storage = { workspace = true }
 bqlite-planner = { workspace = true }
 arrow = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+bqlite-ast = { workspace = true }

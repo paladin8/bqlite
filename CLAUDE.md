@@ -25,7 +25,7 @@ bqlite-ast           → core
 bqlite-storage       → core
 bqlite-parser        → ast
 bqlite-planner       → ast, core
-bqlite-operators     → core, storage, planner
+bqlite-operators     → core, storage, planner  (+ ast test-only)
 bqlite-engine        → parser, planner, operators, storage, core
 bqlite-cli           → engine
 bqlite-ffi           → engine

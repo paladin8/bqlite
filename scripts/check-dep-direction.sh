@@ -29,7 +29,10 @@ allowed_deps() {
         bqlite-storage)   echo "bqlite-core" ;;
         bqlite-parser)    echo "bqlite-ast" ;;
         bqlite-planner)   echo "bqlite-ast bqlite-core" ;;
-        bqlite-operators) echo "bqlite-core bqlite-storage bqlite-planner" ;;
+        # bqlite-ast is test-only — needed to construct AST values
+        # when building `TypedExpr` / `CompiledExpr` inputs for the
+        # runtime evaluator's unit tests. Not a runtime dependency.
+        bqlite-operators) echo "bqlite-core bqlite-storage bqlite-planner bqlite-ast" ;;
         bqlite-engine)    echo "bqlite-core bqlite-storage bqlite-parser bqlite-planner bqlite-operators" ;;
         bqlite-cli)       echo "bqlite-engine" ;;
         bqlite-ffi)       echo "bqlite-engine" ;;

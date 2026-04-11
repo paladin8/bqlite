@@ -381,6 +381,7 @@ name = "bqlite-operators"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bqlite-ast",
  "bqlite-core",
  "bqlite-planner",
  "bqlite-storage",
