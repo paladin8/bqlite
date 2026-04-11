@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-1",
+  "task_id": "TASK-211",
+  "claimed_at": "2026-04-11T07:44:30Z",
+  "branch": "task/TASK-211",
+  "description": "[IMPL] LZ4 compression wrapper"
+}
