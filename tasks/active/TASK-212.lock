@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-2",
+  "task_id": "TASK-212",
+  "claimed_at": "2026-04-11T14:48:30Z",
+  "branch": "task/TASK-212",
+  "description": "[IMPL] Encoding selector heuristic"
+}
