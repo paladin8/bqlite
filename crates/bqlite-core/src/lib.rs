@@ -33,3 +33,9 @@ pub mod schema;
 pub use schema::{
     ColumnDef, OperatorSchema, TableSchema, BATCH_ID_COLUMN, SEQ_ID_COLUMN, SYSTEM_COLUMN_PREFIX,
 };
+
+pub mod arrow;
+pub use arrow::{
+    arrow_to_bql_type, bql_type_to_arrow, column_def_to_field, property_value_to_arrow_type,
+    table_schema_to_arrow,
+};

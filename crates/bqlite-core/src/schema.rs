@@ -19,11 +19,11 @@
 //! `TASKS.md` for the task definition.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
+use ::arrow::datatypes::{Field, Schema as ArrowSchema};
 use serde::{Deserialize, Serialize};
 
+use crate::arrow::bql_type_to_arrow;
 use crate::error::{BqliteError, Result};
 use crate::property::{BqlType, PropertyValue};
 
@@ -484,10 +484,9 @@ impl OperatorSchema {
 
     /// Convert to an Arrow [`ArrowSchema`].
     ///
-    /// Delegates to a private `BqlType` → `DataType` helper that mirrors
-    /// docs/design/type-system.md §7.1. TASK-107 will lift that helper
-    /// into `crates/bqlite-core/src/arrow.rs` and add the reverse
-    /// `Arrow → BqlType` direction plus round-trip tests.
+    /// Delegates to [`crate::arrow::bql_type_to_arrow`] — the single
+    /// source of truth for the `BqlType → Arrow` mapping specified in
+    /// docs/design/type-system.md §7.1.
     pub fn to_arrow_schema(&self) -> ArrowSchema {
         let fields: Vec<Field> = self
             .columns
@@ -498,31 +497,6 @@ impl OperatorSchema {
     }
 }
 
-/// Private helper mirroring the spec in docs/design/type-system.md §7.1.
-///
-/// TASK-107 will relocate this into `crates/bqlite-core/src/arrow.rs`
-/// and add the reverse mapping and round-trip guarantee tests. It is
-/// private here so TASK-107 can move it freely.
-fn bql_type_to_arrow(ty: &BqlType) -> DataType {
-    match ty {
-        BqlType::Bool => DataType::Boolean,
-        BqlType::Int => DataType::Int64,
-        BqlType::Float => DataType::Float64,
-        BqlType::String => DataType::Utf8View,
-        BqlType::Timestamp => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-        BqlType::List(elem) => {
-            DataType::List(Arc::new(Field::new("item", bql_type_to_arrow(elem), true)))
-        }
-        BqlType::Map(value) => {
-            let entries = DataType::Struct(Fields::from(vec![
-                Field::new("key", DataType::Utf8View, false),
-                Field::new("value", bql_type_to_arrow(value), true),
-            ]));
-            DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -530,6 +504,8 @@ fn bql_type_to_arrow(ty: &BqlType) -> DataType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use ::arrow::datatypes::{DataType, TimeUnit};
 
     fn minimal_events() -> Vec<ColumnDef> {
         vec![
