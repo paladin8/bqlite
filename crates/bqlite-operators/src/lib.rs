@@ -13,3 +13,15 @@
 //! - **cohort**: behavioral cohort materializer
 //! - **paths**: Sankey-style path aggregation
 //! - **limit**: per-entity event count enforcement
+//!
+//! ## Trait surface
+//!
+//! The v0 execution trait surface lives in [`operator`]. Every stateless
+//! operator implements [`PhysicalOperator`]; stateful per-entity operators
+//! implement [`EntityOperator`] and are wrapped by an
+//! `EntityOperatorAdapter` (landing in a later wave). See
+//! `docs/design/operators/operator-traits.md` for the frozen design.
+
+pub mod operator;
+
+pub use operator::{CancellationToken, EntityOperator, PhysicalOperator};
