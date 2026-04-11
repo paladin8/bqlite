@@ -1159,11 +1159,15 @@ INSERT INTO events FROM 'data.csv' WITH (delimiter: ',', header: true)
 INSERT INTO events FROM 'events.jsonl' WITH (format: 'jsonl')
 
 -- Insert from file with column remapping: rename `uid` to `user_id`,
--- `time` to `ts`, `evt` to `event`; other source columns pass through
--- by name match.
+-- `event_ts` to `ts`, `evt` to `event_type`; other source columns
+-- pass through by name match. The map clause requires **bare**
+-- identifiers on both sides — reserved keywords like `time`, `type`,
+-- or `event` are rejected at parse time, so source or target columns
+-- with such names need to be renamed upstream (or targeted via the
+-- passthrough rule against differently-named catalog columns).
 INSERT INTO events
 FROM 'data.csv'
-WITH (format: 'csv', map: (uid AS user_id, time AS ts, evt AS event))
+WITH (format: 'csv', map: (uid AS user_id, event_ts AS ts, evt AS event_type))
 ```
 
 Literal INSERT takes positional tuples matching the table's column order. Column lists for named inserts are out of scope for v1 — they can be added later without breaking existing queries.
@@ -1659,6 +1663,8 @@ insert_body      := VALUES literal_tuple ("," literal_tuple)*
                   | FROM string_lit (WITH "(" insert_option ("," insert_option)* ")")?
 literal_tuple    := "(" literal ("," literal)* ")"
 insert_option    := identifier ":" literal
+                  | MAP ":" "(" column_mapping ("," column_mapping)* ")"
+column_mapping   := identifier AS identifier
 delete_stmt      := DELETE FROM name WHERE predicate
 
 -- DDL

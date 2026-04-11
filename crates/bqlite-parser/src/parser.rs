@@ -293,6 +293,7 @@ pub(crate) fn statement(p: &mut Parser) -> Result<Statement, ParseError> {
         TokenKind::Kw(Keyword::Alter) => crate::ddl::parse_alter_table(p),
         TokenKind::Kw(Keyword::Describe) => crate::ddl::parse_describe(p),
         TokenKind::Kw(Keyword::Explain) => crate::ddl::parse_explain(p),
+        TokenKind::Kw(Keyword::Insert) => crate::dml::parse_insert(p),
 
         TokenKind::Kw(kw) => {
             // Any other reserved keyword in source position is an

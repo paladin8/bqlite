@@ -43,14 +43,17 @@
 //!
 //! Later wave tasks add the remaining productions:
 //!
-//! - **TASK-222** — `INSERT ... FROM` with the `WITH (...)` option list.
-//! - **TASK-238** — `INSERT ... VALUES`.
+//! TASK-222 adds the `INSERT ... FROM '<path>' [WITH (...)]` DML
+//! production via the `dml` module, including the structured
+//! `map: (src AS dst, ...)` column-rename clause. `INSERT ... VALUES`
+//! (TASK-238) and `DELETE` (Wave 4) are deferred.
 //!
 //! Expression features deferred to later tasks: function calls,
 //! `CAST`, `CASE`, `BETWEEN`, `LIKE`, `~=`, `CONTAINS`, `IN` / `NOT
 //! IN`, and `@`-prefixed timestamp literals.
 
 mod ddl;
+mod dml;
 mod error;
 mod expr;
 mod lex;
