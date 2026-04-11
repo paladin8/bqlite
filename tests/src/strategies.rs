@@ -1,21 +1,15 @@
 //! Shared `proptest` strategies for the bqlite property-test suite.
 //!
-//! This module is **not** a standalone target — it is included by each
-//! per-topic test file via `#[path = "mod.rs"] mod strategies;`. The
-//! indirection keeps strategy definitions reusable across sibling test
-//! files (`property_value.rs`, future `time.rs`, future `schema.rs`, …)
-//! without turning `tests/prop/` into a separate library crate.
+//! This module is re-exported from [`crate`] (the `bqlite-tests` library)
+//! and consumed by every property-test binary under `tests/tests/prop_*.rs`
+//! via the normal module path:
 //!
-//! See `tests/prop/README.md` for the full pattern.
-
-// Strategies here are imported by individual `tests/prop/<topic>.rs`
-// files via `#[path = "mod.rs"]`. Each `[[test]]` target compiles as
-// its own crate, so a strategy used by only one of them still looks
-// "dead" to the compiler of every other target. The allow is
-// deliberate; do not delete "unused" strategies without checking
-// every sibling test file — and remember that Wave 2+ tests will
-// grow this module.
-#![allow(dead_code)]
+//! ```ignore
+//! use bqlite_tests::strategies::{arb_property_value, arb_time_range};
+//! ```
+//!
+//! Authoring guidance for individual property tests lives in the
+//! `bqlite-tests` crate-level docstring at `tests/src/lib.rs`.
 
 use bqlite_core::{BqlType, PropertyValue, TimeRange, Timestamp};
 use proptest::prelude::*;

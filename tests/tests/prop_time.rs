@@ -9,12 +9,9 @@
 //! specific edge cases by hand; this file covers the same surface over
 //! arbitrary inputs.
 
-#[path = "mod.rs"]
-mod strategies;
-
 use bqlite_core::TimeRange;
+use bqlite_tests::strategies::{arb_time_range, arb_timestamp};
 use proptest::prelude::*;
-use strategies::{arb_time_range, arb_timestamp};
 
 proptest! {
     /// `overlaps` and `intersect` must agree: two ranges overlap iff they

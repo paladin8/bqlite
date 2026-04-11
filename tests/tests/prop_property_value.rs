@@ -1,31 +1,25 @@
 //! Property-tests for [`bqlite_core::PropertyValue`].
 //!
-//! This file is the **template** for every other property-test file under
-//! `tests/prop/`. The pattern it demonstrates:
+//! This file is the **template** for every other property-test binary
+//! under `tests/tests/prop_*.rs`. The pattern it demonstrates:
 //!
-//! 1. Pull a strategy from `prop/mod.rs` (included here via `#[path]`).
+//! 1. Pull a strategy from [`bqlite_tests::strategies`].
 //! 2. Wrap each invariant in a `proptest!` block with a single
 //!    `prop_assert_eq!` / `prop_assert!` as the assertion.
 //! 3. Keep per-test logic small — one invariant per test — so a failing
 //!    shrink points at exactly one property.
 //!
-//! See `tests/prop/README.md` for the full playbook.
-
-// Pull the shared strategies into this test binary. `mod.rs` is not a
-// standalone Cargo target, so we reach into it directly via `#[path]`
-// instead of declaring a normal `mod strategies;`. Every future
-// `tests/prop/<topic>.rs` file uses this same one-line include.
-#[path = "mod.rs"]
-mod strategies;
+//! See the `bqlite-tests` crate-level docstring at `tests/src/lib.rs`
+//! for the full playbook.
 
 use std::cmp::Ordering;
 
 use bqlite_core::{BqlType, PropertyValue};
-use proptest::prelude::*;
-use strategies::{
+use bqlite_tests::strategies::{
     arb_bql_type, arb_property_value, arb_scalar_property_value, DEFAULT_COLLECTION_SIZE,
     DEFAULT_RECURSION_DEPTH,
 };
+use proptest::prelude::*;
 
 proptest! {
     /// Round-trip invariant: encoding a [`PropertyValue`] to JSON and
@@ -128,7 +122,7 @@ proptest! {
 /// because the JSON round-trip test routes values through a decimal text
 /// format and any non-finite float would flake.
 ///
-/// Per `tests/prop/README.md`: tests that need the full `f64` domain define
+/// Per `tests/README.md`: tests that need the full `f64` domain define
 /// a local strategy rather than widening the shared one. The ordering laws
 /// must hold for NaN because `PropertyValue::cmp` uses `f64::total_cmp`,
 /// which is a total order over the entire `f64` lattice — that is exactly

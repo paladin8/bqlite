@@ -1,25 +1,12 @@
 //! Workspace-level integration-test helpers shared across every
 //! `bqlite` test binary.
 //!
-//! This module is the Wave 1 foundation for fixture-driven tests.
-//! The Wave 1 smoke test (TASK-123) is its first real consumer; every
-//! Wave 2+ suite under `tests/suite/` is expected to include it via
-//! the same `#[path]` idiom and extend it as new assertion shapes are
-//! needed.
-//!
-//! ## Inclusion pattern
-//!
-//! Like [`tests/prop/mod.rs`](../prop/mod.rs), this file is **not** a
-//! standalone Cargo target — it has no `[[test]]` entry and no
-//! integration test file lives alongside it. Individual test files
-//! include the module inline:
+//! This module is the Wave 1 foundation for fixture-driven tests. The
+//! Wave 1 smoke test (TASK-123) is its first real consumer; every Wave 2+
+//! suite under `tests/suite/` is expected to import it the normal way:
 //!
 //! ```ignore
-//! // tests/<your_test>.rs
-//! #[path = "common/mod.rs"]
-//! mod common;
-//!
-//! use common::{TempDb, assert_batches_empty};
+//! use bqlite_tests::common::{assert_batches_empty, TempDb};
 //!
 //! #[test]
 //! fn my_integration_test() {
@@ -29,18 +16,10 @@
 //! }
 //! ```
 //!
-//! The `#[path]` attribute is load-bearing: each Cargo `[[test]]`
-//! target is compiled as its own crate root, so the helpers cannot be
-//! reached through a normal module tree. This is the same trick
-//! `tests/prop/mod.rs` uses. The companion test `tests/common_smoke.rs`
-//! exercises every helper below and doubles as a copy-paste template
-//! for the next test file that lands.
-//!
-//! When a new test file is added:
-//!
-//! 1. Create `tests/<name>.rs` and include `common/mod.rs` via `#[path]`.
-//! 2. Register the target in `tests/Cargo.toml` with a `[[test]]` entry.
-//! 3. Run `scripts/local-ci.sh` — `cargo test --all-targets` picks it up.
+//! The companion test `tests/tests/common_smoke.rs` exercises every helper
+//! below and doubles as a copy-paste template for the next test file that
+//! lands. When a new test file is added it just goes in `tests/tests/`
+//! and Cargo's auto-discovery picks it up — no `[[test]]` registration.
 //!
 //! ## Scope at Wave 1
 //!
@@ -60,16 +39,6 @@
 //!   (row-reorder tolerance, numeric epsilons, null-equivalence rules)
 //!   should land as its own named helper rather than widening
 //!   `assert_batches_eq`.
-//!
-//! ## Dead code
-//!
-//! The module attribute below is required: Cargo compiles each
-//! `[[test]]` target in its own crate and the helpers used by one
-//! target look dead to the compiler of every other target. Do not
-//! delete "unused" helpers without grepping every sibling file, and
-//! remember that later waves will grow this module.
-
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

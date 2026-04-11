@@ -1,22 +1,20 @@
-//! Unit-style smoke tests for [`tests/common/mod.rs`].
+//! Unit-style smoke tests for [`bqlite_tests::common`].
 //!
 //! This target is deliberately small: it exists to compile-check the
-//! helpers in `tests/common/mod.rs`, verify they behave as documented,
-//! and double as the canonical `#[path]`-include template that every
-//! future test file under `tests/` copies. The real Wave 1 smoke test
-//! (`bqlite query "events"` end-to-end) lands as `tests/smoke.rs`
-//! under TASK-123.
-
-#[path = "common/mod.rs"]
-mod common;
+//! helpers in `bqlite_tests::common`, verify they behave as documented,
+//! and double as the canonical template every future test binary under
+//! `tests/tests/` copies. The real Wave 1 smoke test
+//! (`bqlite query "events"` end-to-end) lands as
+//! `tests/tests/smoke.rs` under TASK-123.
 
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-
-use common::{assert_batches_empty, assert_batches_eq, load_fixture, FixtureError, TempDb};
+use bqlite_tests::common::{
+    assert_batches_empty, assert_batches_eq, load_fixture, FixtureError, TempDb,
+};
 
 /// A one-column `Int64` batch with the given values. Tiny helper so
 /// the assertion tests below read as assertions, not setup.

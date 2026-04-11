@@ -8,31 +8,25 @@ repository.workspace = true
 publish = false
 autobins = false
 autoexamples = false
-autotests = false
 autobenches = false
 
-# Explicit test targets. This package intentionally has no lib/bin — it
-# exists only to host workspace-level tests whose file layout (tests/prop/,
-# tests/suite/, tests/smoke.rs, ...) does not match Cargo's default target
-# auto-discovery. Every test file is listed here with an explicit path.
-[[test]]
-name = "prop_property_value"
-path = "prop/property_value.rs"
+# This package's source layout:
+#
+#   src/lib.rs        — re-exports `common` (test helpers) and `strategies`
+#                       (proptest strategies). Cargo auto-discovers it.
+#   tests/*.rs        — one integration-test binary per file. Cargo
+#                       auto-discovers everything in tests/, so adding a
+#                       new test file requires zero manifest changes.
+#
+# `bqlite-tests` is `publish = false` and lives outside the dep-direction
+# graph enforced by `scripts/check-dep-direction.sh` (which walks
+# `crates/*/` only). Adding deps here is not a rule bypass.
 
-[[test]]
-name = "prop_time"
-path = "prop/time.rs"
-
-[[test]]
-name = "prop_arrow"
-path = "prop/arrow.rs"
-
-# Self-test for the helpers in `tests/common/mod.rs` — doubles as the
-# canonical `#[path]`-include template for every future test file under
-# `tests/` (TASK-120).
-[[test]]
-name = "common_smoke"
-path = "common_smoke.rs"
+[dependencies]
+arrow = { workspace = true }
+bqlite-core = { workspace = true }
+proptest = { workspace = true }
+thiserror = { workspace = true }
 
 # Wave 1 end-to-end smoke test (TASK-123). Spawns the compiled
 # `bqlite` binary as a subprocess and exercises the full parse →
@@ -46,8 +40,4 @@ name = "smoke"
 path = "smoke.rs"
 
 [dev-dependencies]
-bqlite-core = { workspace = true }
-arrow = { workspace = true }
-proptest = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }

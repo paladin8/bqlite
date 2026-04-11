@@ -288,7 +288,7 @@ No memory management, no concurrency, no cancellation yet.
 ### TASK-124: [IMPL] Property-test harness
 **Output**: tests/prop/mod.rs, tests/prop/property_value.rs
 **Depends on**: TASK-104
-**Description**: Adds `proptest` as a dev-dep, writes one round-trip test on `PropertyValue` as a template, documents the pattern in tests/prop/README.md. Later waves add real property tests for storage encodings, parser round-trips, and the sequence matcher.
+**Description**: Adds `proptest` as a dev-dep, writes one round-trip test on `PropertyValue` as a template, documents the pattern in the `bqlite-tests` package README (now at tests/README.md after the post-TASK-124 restructure). Later waves add real property tests for storage encodings, parser round-trips, and the sequence matcher.
 
 ### TASK-125: [IMPL] Catalog trait and bootstrap events table
 **Output**: crates/bqlite-core/src/catalog.rs, crates/bqlite-storage/src/catalog.rs
@@ -532,7 +532,7 @@ Wave 2 is where the real interfaces get decided, so design anchors are front-loa
 - Result formatter that, for any query with no explicit `| limit`, injects `LIMIT 1000` at the CLI boundary (not inside the engine) and prints a truncation footer like `... 49,999,000 rows omitted (use --limit N or --no-limit)`. Explicit `| limit` in the query suppresses auto-injection. `--no-limit` disables truncation; `--limit N` overrides the default.
 
 ### TASK-235: [IMPL] Wave 2 acceptance test + CSV fixture loader
-**Output**: tests/wave2_acceptance.rs, tests/common/csv.rs
+**Output**: tests/tests/wave2_acceptance.rs, tests/src/csv.rs (new module re-exported from `tests/src/lib.rs`)
 **Depends on**: TASK-234
 **Description**: CSV fixture loader extends the Wave 1 harness (TASK-120) — deterministic synthetic-data generator producing the `purchases` schema at parameterized scale. Integration test runs the full acceptance script (CREATE → INSERT → filter/select/limit query → EXPLAIN) at 1M-row scale against a fresh temp directory and asserts the exact result rows and the expected `ExplainNode` structure (pushed-down predicate, pruned columns). A 100M-row variant lives behind `#[ignore]` and runs in the bench job. Failure here is the Wave 2 acceptance-gate trip.
 
