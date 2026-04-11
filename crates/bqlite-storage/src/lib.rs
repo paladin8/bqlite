@@ -30,10 +30,12 @@
 //!   schema. `Database::open_or_create` seeds the bootstrap entry on
 //!   fresh init so the planner has a resolvable `events` table.
 //! - [`encoding`] — the column [`Encoding`] trait and the [`Plain`]
-//!   reference implementation landed by TASK-206. Later Wave 2 tasks
-//!   (TASK-207 – TASK-211) add `Dictionary`, `Delta`, `BitPacking`,
-//!   `Constant`, and the LZ4 wrapper. The byte layouts produced by
-//!   every impl are pinned by `docs/design/storage/segment-format-v1.md` §9.
+//!   reference implementation landed by TASK-206, plus the
+//!   [`Constant`] impl landed by TASK-210. Remaining v1 encodings
+//!   (`Dictionary`, `Delta`, `BitPacking`, and the LZ4 wrapper) land
+//!   in TASK-207 – TASK-209 and TASK-211. The byte layouts produced
+//!   by every impl are pinned by
+//!   `docs/design/storage/segment-format-v1.md` §9.
 //! - [`ingest`] — the ingest partitioner landed by TASK-218, which
 //!   routes incoming events to the correct `(shard, window)` bucket
 //!   and hands sorted batches off to the writer.
@@ -53,7 +55,7 @@ pub use catalog::{bootstrap_events_schema, ManifestCatalog, BOOTSTRAP_EVENTS_TAB
 pub use database::{
     empty_segment_reader, Database, LOCK_FILE_NAME, MANIFEST_FILE_NAME, MANIFEST_TMP_FILE_NAME,
 };
-pub use encoding::{EncodedChunk, Encoding, EncodingType, Plain};
+pub use encoding::{Constant, EncodedChunk, Encoding, EncodingType, Plain};
 pub use manifest::{
     ColumnStats, Manifest, SegmentMeta, TableEntry, WindowManifest, DEFAULT_SHARD_COUNT,
     MANIFEST_FORMAT_VERSION,
