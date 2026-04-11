@@ -20,6 +20,10 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 
 - **operators/operator-traits.md** — `PhysicalOperator` + `EntityOperator` trait surface, lifecycle, cancellation, sub-batch streaming (TASK-108, Wave 1)
 
+### Planner
+
+- **planner/logical-plan-nodes.md** — authoritative enumeration of logical plan nodes across all waves, with Wave 2 depth nodes (Scan, Filter, Project, Limit, DDL/DML, Explain) fully specified and later-wave nodes stubbed so the catalog doesn't churn (TASK-204, Wave 2)
+
 ### Storage
 
 - **storage/reader-trait.md** — `SegmentReader` + `SegmentScan` trait surface, segment enumeration, column projection, row-group iteration, zone-map access, predicate pushdown (TASK-109, Wave 1)

@@ -350,9 +350,12 @@ This section enumerates every node. Each node's input type, output schema rules,
 ```rust
 pub enum LogicalPlan {
     Scan {
-        table: TableRef,
+        // Catalog-resolved after lowering — every plan node holds
+        // resolved schemas so downstream passes never re-query the
+        // catalog. See planner/logical-plan-nodes.md §2.1 and §4.1.
+        table: TableSchema,
         time_range: Option<TimeRange>,
-        joined_tables: Vec<TableRef>,       // empty for single-table sources
+        joined_tables: Vec<TableSchema>,    // empty for single-table sources
         // Populated by optimizer Pass 3 and Pass 4:
         scan_predicates: Vec<TypedExpr>,
         projected_columns: Vec<ColumnId>,
