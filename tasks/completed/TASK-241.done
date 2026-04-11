@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-241",
   "claimed_at": "2026-04-11T23:41:46Z",
+  "completed_at": "2026-04-12T00:30:00Z",
   "branch": "task/TASK-241",
   "description": "Wave 2 benchmark CI job + baseline + regression gate"
 }
