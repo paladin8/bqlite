@@ -280,17 +280,24 @@ pub(crate) fn statement(p: &mut Parser) -> Result<Statement, ParseError> {
         });
     }
 
-    // Dispatch on the first token. Wave 2 currently only implements the
-    // source-expression / pipeline case; every other first-token
-    // variant is either a later-wave statement (CREATE, DROP, ALTER,
-    // DESCRIBE, EXPLAIN, INSERT, DELETE) or an error.
+    // Dispatch on the first token. Source names and backtick-wrapped
+    // names start a pipeline; DDL and EXPLAIN keywords route into the
+    // `crate::ddl` module; every other reserved keyword is rejected
+    // with `ReservedKeyword` so the user sees the specific keyword
+    // name rather than a generic "unexpected token."
     match p.peek_kind() {
-        TokenKind::Ident(_) | TokenKind::QuotedName(_) => parse_pipeline(p),
+        TokenKind::Ident(_) | TokenKind::QuotedName(_) => parse_query_pipeline(p),
+
+        TokenKind::Kw(Keyword::Create) => crate::ddl::parse_create_table(p),
+        TokenKind::Kw(Keyword::Drop) => crate::ddl::parse_drop_table(p),
+        TokenKind::Kw(Keyword::Alter) => crate::ddl::parse_alter_table(p),
+        TokenKind::Kw(Keyword::Describe) => crate::ddl::parse_describe(p),
+        TokenKind::Kw(Keyword::Explain) => crate::ddl::parse_explain(p),
 
         TokenKind::Kw(kw) => {
-            // Reserved keyword in source position — the planner-facing
-            // error is `ReservedKeyword` so the user sees the specific
-            // keyword name rather than a generic "unexpected token."
+            // Any other reserved keyword in source position is an
+            // error — the user meant a table name but hit a reserved
+            // word.
             let tok = p.peek();
             Err(ParseError::ReservedKeyword {
                 offset: tok.start,
@@ -303,12 +310,17 @@ pub(crate) fn statement(p: &mut Parser) -> Result<Statement, ParseError> {
     }
 }
 
-/// Parse a `source ("|" operator)*` pipeline.
+/// Parse a `source ("|" operator)*` pipeline body and return the
+/// resulting [`Pipeline`].
 ///
 /// The source is a single bare table name for now (joins and time
 /// ranges are later-wave productions). Pipeline stages are delegated
 /// to [`crate::pipeline::parse_pipeline_stages`].
-fn parse_pipeline(p: &mut Parser) -> Result<Statement, ParseError> {
+///
+/// Consumers:
+/// - [`parse_query_pipeline`] wraps the result in `Statement::Query`.
+/// - [`crate::ddl::parse_explain`] wraps it in `Statement::Explain`.
+pub(crate) fn parse_pipeline_body(p: &mut Parser) -> Result<Pipeline, ParseError> {
     let name = p.expect_name(NameRole::TableName)?;
     let primary_span = name.span;
     let primary = TableRef {
@@ -334,12 +346,16 @@ fn parse_pipeline(p: &mut Parser) -> Result<Statement, ParseError> {
         .map(|s| primary_span.merged(s.span()))
         .unwrap_or(primary_span);
 
-    let pipeline = Pipeline {
+    Ok(Pipeline {
         source,
         stages,
         span: pipeline_span,
-    };
-    Ok(Statement::Query(pipeline))
+    })
+}
+
+/// Parse a pipeline body and wrap it in `Statement::Query`.
+fn parse_query_pipeline(p: &mut Parser) -> Result<Statement, ParseError> {
+    parse_pipeline_body(p).map(Statement::Query)
 }
 
 #[cfg(test)]

@@ -54,6 +54,14 @@ pub mod pipeline;
 pub mod span;
 pub mod statement;
 
+// Re-export from `bqlite-core` so downstream crates that only depend
+// on `bqlite-ast` (notably `bqlite-parser`, per the architecture graph
+// in `docs/architecture.md`) can reach `BqlType` without needing a
+// direct edge to `bqlite-core`. The re-export is a curated surface,
+// not a pass-through — new `bqlite-core` types do not automatically
+// leak through here.
+pub use bqlite_core::BqlType;
+
 pub use expr::{
     BinaryOp, CaseArm, CompareOp, Expr, InRhs, Literal, OrderItem, OverClause, SortDir, Spanned,
     UnaryOp,

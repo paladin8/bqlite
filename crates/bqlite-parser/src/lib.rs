@@ -35,11 +35,14 @@
 //!
 //! TASK-223 wires the `|` pipeline operator into the top-level
 //! dispatcher and lands the Wave 2 pipeline verbs — `WHERE`,
-//! `SELECT [DISTINCT]`, and `LIMIT` — via the [`pipeline`] module.
+//! `SELECT [DISTINCT]`, and `LIMIT` — via the `pipeline` module.
+//!
+//! TASK-221 lands the schema DDL surface (`CREATE TABLE`,
+//! `ALTER TABLE ADD COLUMN`, `DROP TABLE`, `DESCRIBE`) and the
+//! `EXPLAIN pipeline` wrapper via the `ddl` module.
 //!
 //! Later wave tasks add the remaining productions:
 //!
-//! - **TASK-221** — DDL (`CREATE`, `ALTER`, `DROP`, `DESCRIBE`, `EXPLAIN`).
 //! - **TASK-222** — `INSERT ... FROM` with the `WITH (...)` option list.
 //! - **TASK-238** — `INSERT ... VALUES`.
 //!
@@ -47,6 +50,7 @@
 //! `CAST`, `CASE`, `BETWEEN`, `LIKE`, `~=`, `CONTAINS`, `IN` / `NOT
 //! IN`, and `@`-prefixed timestamp literals.
 
+mod ddl;
 mod error;
 mod expr;
 mod lex;
@@ -59,9 +63,12 @@ pub use crate::error::{Expected, LiteralKind, NameRole, ParseError, Unterminated
 
 /// Parse a BQL query text into a [`Statement`].
 ///
-/// Wave 2 CP1 only accepts the Wave 1 surface — a bare table name,
-/// optionally followed by a trailing semicolon. Every other form is
-/// rejected at parse time and will land in a later checkpoint.
+/// As of Wave 2, the parser accepts pipeline queries (source + optional
+/// `|`-separated `WHERE` / `SELECT` / `LIMIT` stages), `DROP TABLE`,
+/// `DESCRIBE`, `EXPLAIN pipeline`, and (soon) `CREATE TABLE` and
+/// `ALTER TABLE ADD COLUMN`. INSERT and DELETE land in later Wave 2
+/// tasks; every form the grammar does not yet support returns a
+/// [`ParseError`] naming the offending position.
 ///
 /// # Examples
 ///
@@ -72,7 +79,7 @@ pub use crate::error::{Expected, LiteralKind, NameRole, ParseError, Unterminated
 /// let stmt = parse("events").unwrap();
 /// match stmt {
 ///     Statement::Query(p) => assert_eq!(p.source.primary.name.text, "events"),
-///     _ => unreachable!("Wave 2 CP1 parser only emits Query statements"),
+///     _ => unreachable!("bare-source parses to a Query statement"),
 /// }
 /// ```
 pub fn parse(text: &str) -> Result<Statement, ParseError> {

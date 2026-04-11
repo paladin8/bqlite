@@ -1671,7 +1671,7 @@ column_def       := name type_expr column_modifier*
 type_expr        := scalar_type | composite_type
 scalar_type      := BOOL | INT | FLOAT | STRING | TIMESTAMP
 composite_type   := LIST "(" type_expr ")" | MAP "(" type_expr ")"
-column_modifier  := ENTITY KEY | EVENT TYPE | EVENT TIME | NOT NULL | NULL
+column_modifier  := ENTITY KEY | EVENT TYPE | EVENT TIME | NOT NULL | NULL | DEFAULT literal
 alter_modifier   := NOT NULL | NULL | DEFAULT literal
 
 -- Literals (terminals)
