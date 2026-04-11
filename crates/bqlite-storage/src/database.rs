@@ -335,6 +335,48 @@ impl Database {
             .snapshot_for_query(table_name, time_range, shard_id)
     }
 
+    /// Atomically reserve a fresh `batch_id` for an ingest call on
+    /// `table_name`.
+    ///
+    /// Bumps the table entry's persisted `next_batch_id` counter by
+    /// one and returns the value the counter held *before* the
+    /// bump — i.e. the id the caller should stamp onto every
+    /// segment it writes in this batch.
+    ///
+    /// Used by the ingest partitioner (`TASK-218`) at construction
+    /// time so each partitioner instance carries its own durable,
+    /// monotonic id. Per `docs/design/storage-format.md` §6.2, a
+    /// gap in the batch-id sequence is acceptable — a counter bump
+    /// that succeeds but is followed by a failed ingest simply
+    /// retires the id, and the next ingest starts from a higher
+    /// value.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if `table_name` is not
+    ///   registered in the manifest.
+    /// - [`BqliteError::Execution`] if the counter would overflow
+    ///   `u64::MAX` — astronomically unreachable at real ingest
+    ///   rates, but the check is here for completeness.
+    /// - Any I/O error from the atomic manifest write propagates
+    ///   unchanged.
+    pub fn allocate_batch_id(&mut self, table_name: &str) -> Result<u64> {
+        self.update_manifest(|m| {
+            let entry = m.tables.get_mut(table_name).ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "allocate_batch_id: unknown table '{table_name}'"
+                ))
+            })?;
+            let issued = entry.next_batch_id;
+            entry.next_batch_id = issued.checked_add(1).ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "allocate_batch_id: batch_id counter for table '{table_name}' would overflow u64"
+                ))
+            })?;
+            Ok(issued)
+        })
+    }
+
     /// Apply `f` to a mutable copy of the current manifest, persist
     /// the result atomically, then adopt it as the new in-memory
     /// state.
@@ -346,11 +388,12 @@ impl Database {
     /// insignificant at Wave 2 scale (a handful of tables with a
     /// handful of segments each).
     ///
-    /// Private for now because the only callers are the three
-    /// `add_segment` / `remove_segment` / `snapshot_for_query`
-    /// wrappers above. Future ingest and compaction tasks that want
-    /// to batch multiple mutations into one fsync can promote this
-    /// to `pub(crate)` — a later wave concern.
+    /// Private for now because the callers live inside this crate
+    /// ([`Database::add_segment`], [`Database::remove_segment`],
+    /// [`Database::allocate_batch_id`]). Future ingest and
+    /// compaction tasks that want to batch multiple mutations into
+    /// one fsync can promote this to `pub(crate)` — a later wave
+    /// concern.
     fn update_manifest<R, F>(&mut self, f: F) -> Result<R>
     where
         F: FnOnce(&mut Manifest) -> Result<R>,
@@ -1049,5 +1092,56 @@ mod tests {
             !scratch.path().join(MANIFEST_TMP_FILE_NAME).exists(),
             "tmp file is renamed away by write_manifest_atomic"
         );
+    }
+
+    // ── allocate_batch_id ──────────────────────────────────────────────────
+
+    #[test]
+    fn allocate_batch_id_returns_monotonic_values_and_persists() {
+        let scratch = Scratch::new("batch-id-persist");
+        {
+            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            let first = db.allocate_batch_id("events").expect("alloc 1");
+            let second = db.allocate_batch_id("events").expect("alloc 2");
+            let third = db.allocate_batch_id("events").expect("alloc 3");
+            // Fresh databases start the counter at 0, so the first
+            // three reservations are 0, 1, 2.
+            assert_eq!(first, 0);
+            assert_eq!(second, 1);
+            assert_eq!(third, 2);
+            // In-memory counter reflects the bump.
+            assert_eq!(db.manifest().tables["events"].next_batch_id, 3);
+        }
+        // Reopen and verify the counter persisted through fsync.
+        let mut db = Database::open_or_create(scratch.path()).expect("reopen");
+        assert_eq!(db.manifest().tables["events"].next_batch_id, 3);
+        // Next allocation picks up from where the previous session
+        // left off — the gap-tolerance contract.
+        let fourth = db.allocate_batch_id("events").expect("alloc 4");
+        assert_eq!(fourth, 3);
+        assert_eq!(db.manifest().tables["events"].next_batch_id, 4);
+    }
+
+    #[test]
+    fn allocate_batch_id_unknown_table_leaves_state_untouched() {
+        let scratch = Scratch::new("batch-id-unknown");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let before_mem = db.manifest().clone();
+        let before_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+
+        let err = db
+            .allocate_batch_id("missing")
+            .expect_err("unknown table must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("unknown table"), "got: {msg}");
+                assert!(msg.contains("missing"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+
+        assert_eq!(&before_mem, db.manifest());
+        let after_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(before_disk, after_disk);
     }
 }

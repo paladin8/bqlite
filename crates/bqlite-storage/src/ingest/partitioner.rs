@@ -18,22 +18,22 @@
 //!
 //! # Module shape
 //!
-//! Wave 2 TASK-218 is split into two checkpoints:
+//! - Pure helpers — [`shard_id_for`] and [`window_id_for`] — plus
+//!   the sharding / windowing invariants they enforce.
+//! - The stateful [`Partitioner`] that buffers events, tracks a
+//!   memory budget, sorts each `(window, shard)` bucket on drain,
+//!   and carries a fresh `batch_id` that the caller obtained from
+//!   the manifest counter via
+//!   [`crate::database::Database::allocate_batch_id`].
 //!
-//! 1. Pure helpers — [`shard_id_for`] and [`window_id_for`] — plus
-//!    the sharding / windowing invariants they enforce. This is the
-//!    current checkpoint.
-//! 2. The stateful [`Partitioner`] that buffers events, tracks a
-//!    memory budget, sorts on drain, and assigns a fresh `batch_id`
-//!    from the manifest counter. Lands in a follow-up checkpoint on
-//!    the same branch.
-//!
-//! Both halves live in this file so downstream tasks (TASK-214
-//! writer orchestration, TASK-233 CSV ingest) can import a single
-//! `crate::ingest::partitioner::Partitioner`.
+//! Downstream tasks (TASK-214 writer orchestration, TASK-233 CSV
+//! ingest) import a single `crate::ingest::partitioner::Partitioner`.
+
+use std::collections::BTreeMap;
 
 use bqlite_core::error::{BqliteError, Result};
-use bqlite_core::event::EntityId;
+use bqlite_core::event::{EntityId, Event};
+use bqlite_core::property::PropertyValue;
 use bqlite_core::time::Timestamp;
 use twox_hash::XxHash64;
 
@@ -126,6 +126,296 @@ pub fn window_id_for(ts: Timestamp, window_days: u32) -> Result<u32> {
     let day_idx = day_idx as u32;
     let remainder = day_idx % window_days;
     Ok(day_idx - remainder)
+}
+
+/// Composite key used inside [`Partitioner`] to bucket events.
+///
+/// `(window_id, shard_id)` is the natural primary key for the
+/// per-window, per-shard directory layout in
+/// `docs/design/storage-format.md` §5.2. [`BTreeMap`] sorts its
+/// keys lexicographically — ascending by `window_id` first, then
+/// by `shard_id` — which matches the order the writer prefers to
+/// visit buckets (oldest window first, shard 0 first).
+pub type BucketKey = (u32, u16);
+
+/// Ingest partitioner — per-ingest-call buffer that routes events
+/// into `(window, shard)` buckets and hands each bucket off as a
+/// sorted stream when the caller drains it.
+///
+/// # Lifecycle
+///
+/// 1. The ingest driver calls
+///    [`crate::database::Database::allocate_batch_id`] to atomically
+///    reserve a fresh `batch_id` from the target table's manifest
+///    counter.
+/// 2. The driver constructs a [`Partitioner`] with that `batch_id`,
+///    the database's `shard_count`, the table's `window_days`
+///    (defaulted to 30 until per-table config lands), and a
+///    memory-budget ceiling.
+/// 3. The driver streams events in via
+///    [`Partitioner::push_event`]. Each push hashes the entity id
+///    to a shard, derives the window id from the timestamp,
+///    estimates the event's memory cost, and either appends it to
+///    the matching bucket or loudly errors if the buffer would
+///    exceed its budget.
+/// 4. Once every input row has been pushed, the driver calls
+///    [`Partitioner::drain_sorted`]. That consumes the partitioner,
+///    sorts each bucket by `(entity_id, timestamp)` (a stable
+///    sort — ties retain insertion order), and yields an iterator
+///    of `(BucketKey, Vec<Event>)` pairs in ascending `(window_id,
+///    shard_id)` order. The writer (TASK-214) consumes those
+///    streams one bucket at a time.
+///
+/// # Wave 2 memory model
+///
+/// The buffer is tracked as a simple running sum of per-event
+/// heap-size estimates (see [`estimated_event_size`]). When a push
+/// would cross the configured budget, the partitioner refuses the
+/// event with [`BqliteError::Execution`] — the task spec calls this
+/// the "error loudly" stub. Real on-disk spill is a Wave 5 concern
+/// (TASKS.md TASK-218). The estimate is deliberately cheap and
+/// monotonic: it will under-count some exotic `PropertyValue`
+/// shapes, but it is stable under equal inputs and never returns
+/// zero for a non-empty event, which is all the Wave 2 gate needs.
+///
+/// # Why `BTreeMap`, not `HashMap`
+///
+/// Deterministic iteration order on drain keeps snapshot-style
+/// tests stable and lets the writer emit segments in time order
+/// without a separate sort pass. Wave 2 buckets fit comfortably in
+/// an ordered map at any workload the partitioner sees — a handful
+/// of windows times a handful of shards times a few hundred
+/// thousand events. O(log n) per insert is dwarfed by the
+/// per-event allocation cost.
+#[derive(Debug)]
+pub struct Partitioner {
+    shard_count: u16,
+    window_days: u32,
+    batch_id: u64,
+    budget_bytes: usize,
+    buffered_bytes: usize,
+    buckets: BTreeMap<BucketKey, Vec<Event>>,
+}
+
+impl Partitioner {
+    /// Construct a fresh partitioner for one ingest call.
+    ///
+    /// `batch_id` is the fresh counter value returned by
+    /// [`crate::database::Database::allocate_batch_id`]; the
+    /// partitioner holds it verbatim and the writer reads it back
+    /// through [`Partitioner::batch_id`] to stamp the produced
+    /// segments.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Schema`] if `shard_count == 0` — the
+    ///   manifest invariant that forbids this is enforced at
+    ///   database init, but the constructor double-checks so a
+    ///   partitioner cannot land in a state where `shard_id_for`
+    ///   would panic.
+    /// - [`BqliteError::Schema`] if `window_days == 0` — same
+    ///   reasoning for [`window_id_for`].
+    /// - [`BqliteError::Schema`] if `budget_bytes == 0` — a zero
+    ///   budget cannot hold even one event, which is almost always
+    ///   a misconfiguration.
+    pub fn new(
+        shard_count: u16,
+        window_days: u32,
+        batch_id: u64,
+        budget_bytes: usize,
+    ) -> Result<Self> {
+        if shard_count == 0 {
+            return Err(BqliteError::Schema(
+                "partitioner: shard_count must be at least 1".into(),
+            ));
+        }
+        if window_days == 0 {
+            return Err(BqliteError::Schema(
+                "partitioner: window_days must be at least 1".into(),
+            ));
+        }
+        if budget_bytes == 0 {
+            return Err(BqliteError::Schema(
+                "partitioner: budget_bytes must be greater than 0".into(),
+            ));
+        }
+        Ok(Self {
+            shard_count,
+            window_days,
+            batch_id,
+            budget_bytes,
+            buffered_bytes: 0,
+            buckets: BTreeMap::new(),
+        })
+    }
+
+    /// The `batch_id` this partitioner is stamping onto its events.
+    #[inline]
+    pub fn batch_id(&self) -> u64 {
+        self.batch_id
+    }
+
+    /// Configured shard count (unchanged for the partitioner's
+    /// lifetime).
+    #[inline]
+    pub fn shard_count(&self) -> u16 {
+        self.shard_count
+    }
+
+    /// Configured window-days span (unchanged for the partitioner's
+    /// lifetime).
+    #[inline]
+    pub fn window_days(&self) -> u32 {
+        self.window_days
+    }
+
+    /// Configured memory-budget ceiling in bytes.
+    #[inline]
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
+    /// Current buffered-bytes estimate. Monotonically
+    /// non-decreasing — [`Partitioner::drain_sorted`] consumes the
+    /// partitioner outright, so there is no observable reset mid
+    /// lifetime.
+    #[inline]
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes
+    }
+
+    /// Total number of events buffered across every bucket.
+    pub fn buffered_events(&self) -> usize {
+        self.buckets.values().map(Vec::len).sum()
+    }
+
+    /// Number of non-empty `(window, shard)` buckets currently held.
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Route `event` into its `(window, shard)` bucket.
+    ///
+    /// The partitioner hashes `event.entity` into a shard and
+    /// derives a window id from `event.timestamp`, estimates the
+    /// event's in-memory footprint, and refuses the push if adding
+    /// it would take the running buffer past [`Self::budget_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] with a `"pre-epoch"` reason if
+    ///   the timestamp is before 1970-01-01 UTC (via
+    ///   [`window_id_for`]).
+    /// - [`BqliteError::Execution`] with a `"memory budget"`
+    ///   reason if the push would cross the configured budget.
+    ///   Wave 2 refuses the event outright — spill-to-disk is a
+    ///   Wave 5 concern — and leaves every previously-pushed event
+    ///   untouched, so the caller can abort the ingest and retry
+    ///   with a larger budget.
+    pub fn push_event(&mut self, event: Event) -> Result<()> {
+        let shard_id = shard_id_for(&event.entity, self.shard_count);
+        let window_id = window_id_for(event.timestamp, self.window_days)?;
+
+        let size = estimated_event_size(&event);
+        // Refuse the push if adding this event would take the
+        // running buffer past the ceiling. Pre-check against
+        // `saturating_add` so a pathologically large estimate does
+        // not wrap into a small number.
+        let projected = self.buffered_bytes.saturating_add(size);
+        if projected > self.budget_bytes {
+            return Err(BqliteError::Execution(format!(
+                "partitioner: memory budget would be exceeded — adding a {size}-byte event \
+                 would take buffered_bytes from {} to {projected}, above the {} ceiling \
+                 (TASK-218 Wave 2 refuses overflow; on-disk spill lands in a later wave)",
+                self.buffered_bytes, self.budget_bytes
+            )));
+        }
+
+        self.buckets
+            .entry((window_id, shard_id))
+            .or_default()
+            .push(event);
+        self.buffered_bytes = projected;
+        Ok(())
+    }
+
+    /// Consume the partitioner and yield each `(BucketKey,
+    /// sorted events)` pair in ascending `(window_id, shard_id)`
+    /// order.
+    ///
+    /// Each bucket is sorted in place by `(entity_id, timestamp)`
+    /// using a stable sort, so two events with identical sort keys
+    /// retain their insertion order — the property downstream
+    /// operators rely on when, for example, two rows of the same
+    /// entity share a nanosecond timestamp.
+    ///
+    /// The returned iterator is just a transformed `BTreeMap`
+    /// iterator, so the drain is `O(total_events)` for the sort
+    /// pass plus `O(buckets)` for the ordered walk.
+    pub fn drain_sorted(self) -> impl Iterator<Item = (BucketKey, Vec<Event>)> {
+        let mut buckets = self.buckets;
+        for events in buckets.values_mut() {
+            events.sort_by(|a, b| {
+                a.entity
+                    .cmp(&b.entity)
+                    .then_with(|| a.timestamp.cmp(&b.timestamp))
+            });
+        }
+        buckets.into_iter()
+    }
+}
+
+/// Cheap best-effort estimate of an event's in-memory footprint,
+/// in bytes.
+///
+/// This is a Wave 2 heuristic, not an exact measurement. It counts
+/// the struct itself plus the heap allocations the fields own
+/// (string capacities, property-bag entries, nested
+/// [`PropertyValue`]s). The goal is monotonicity — bigger events
+/// must estimate bigger — not numerical accuracy. When Wave 5
+/// adds real spill-to-disk, this function is the natural place to
+/// plug in a tighter measurement (or to reach for `mem::size_of_val`
+/// on stable Rust).
+fn estimated_event_size(event: &Event) -> usize {
+    let mut size = std::mem::size_of::<Event>();
+    match &event.entity {
+        EntityId::String(s) => size += s.capacity(),
+        EntityId::Int(_) => {}
+    }
+    size += event.event_type.capacity();
+    for (key, value) in &event.properties {
+        size += std::mem::size_of::<(String, PropertyValue)>();
+        size += key.capacity();
+        size += estimated_property_size(value);
+    }
+    size
+}
+
+/// Best-effort estimate of a [`PropertyValue`]'s heap footprint.
+///
+/// Scalar variants are constant-sized; String adds its capacity;
+/// List / Map recurse into their elements.
+fn estimated_property_size(value: &PropertyValue) -> usize {
+    match value {
+        PropertyValue::Null
+        | PropertyValue::Bool(_)
+        | PropertyValue::Int(_)
+        | PropertyValue::Float(_)
+        | PropertyValue::Timestamp(_) => 0,
+        PropertyValue::String(s) => s.capacity(),
+        PropertyValue::List(items) => items
+            .iter()
+            .map(|v| std::mem::size_of::<PropertyValue>() + estimated_property_size(v))
+            .sum(),
+        PropertyValue::Map(pairs) => pairs
+            .iter()
+            .map(|(k, v)| {
+                std::mem::size_of::<(String, PropertyValue)>()
+                    + k.capacity()
+                    + estimated_property_size(v)
+            })
+            .sum(),
+    }
 }
 
 #[cfg(test)]
@@ -332,5 +622,276 @@ mod tests {
         let expected_day = (ts.as_nanos() / NS_PER_DAY) as u32;
         let expected_window = expected_day - (expected_day % 30);
         assert_eq!(got, expected_window);
+    }
+
+    // ── Partitioner ────────────────────────────────────────────────────────
+
+    fn simple_event(entity: &str, ts_day: i64, event_type: &str) -> Event {
+        Event::new(EntityId::from(entity), day(ts_day), event_type)
+    }
+
+    #[test]
+    fn partitioner_new_rejects_zero_shard_count() {
+        let err = Partitioner::new(0, 30, 1, 1024).expect_err("zero shard_count must error");
+        assert!(matches!(err, BqliteError::Schema(_)));
+    }
+
+    #[test]
+    fn partitioner_new_rejects_zero_window_days() {
+        let err = Partitioner::new(4, 0, 1, 1024).expect_err("zero window_days must error");
+        assert!(matches!(err, BqliteError::Schema(_)));
+    }
+
+    #[test]
+    fn partitioner_new_rejects_zero_budget() {
+        let err = Partitioner::new(4, 30, 1, 0).expect_err("zero budget must error");
+        assert!(matches!(err, BqliteError::Schema(_)));
+    }
+
+    #[test]
+    fn partitioner_new_returns_configured_values() {
+        let p = Partitioner::new(8, 7, 42, 1024).unwrap();
+        assert_eq!(p.shard_count(), 8);
+        assert_eq!(p.window_days(), 7);
+        assert_eq!(p.batch_id(), 42);
+        assert_eq!(p.budget_bytes(), 1024);
+        assert_eq!(p.buffered_bytes(), 0);
+        assert_eq!(p.buffered_events(), 0);
+        assert_eq!(p.bucket_count(), 0);
+    }
+
+    #[test]
+    fn push_event_fills_bucket_and_tracks_buffer_stats() {
+        let mut p = Partitioner::new(4, 30, 1, 1 << 20).unwrap();
+        p.push_event(simple_event("alice", 0, "click")).unwrap();
+        p.push_event(simple_event("alice", 1, "view")).unwrap();
+        p.push_event(simple_event("bob", 2, "click")).unwrap();
+
+        assert_eq!(p.buffered_events(), 3);
+        assert!(p.buffered_bytes() > 0);
+        // "alice" and "bob" could collide on the same shard with
+        // shard_count = 4 — that's a hash-dependent accident. We
+        // only assert that at least one bucket exists and that the
+        // total event count is right.
+        assert!(p.bucket_count() >= 1);
+    }
+
+    #[test]
+    fn push_event_errors_when_budget_would_be_exceeded() {
+        // Choose a budget so small that even the empty-event
+        // baseline exceeds it. That's the cleanest way to trigger
+        // the overflow branch without having to know the exact
+        // per-event estimate. `estimated_event_size` is guaranteed
+        // to return at least `size_of::<Event>()` bytes, so a
+        // 1-byte budget always overflows on the first push.
+        let mut p = Partitioner::new(4, 30, 1, 1).unwrap();
+        let err = p
+            .push_event(simple_event("alice", 0, "click"))
+            .expect_err("budget must overflow on first push");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("memory budget"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+        // Nothing was inserted into the bucket map and the buffer
+        // counter stayed at 0 — the error leaves the partitioner in
+        // its pre-push state so the caller can abort and retry.
+        assert_eq!(p.buffered_events(), 0);
+        assert_eq!(p.buffered_bytes(), 0);
+        assert_eq!(p.bucket_count(), 0);
+    }
+
+    #[test]
+    fn push_event_errors_on_pre_epoch_timestamp() {
+        let mut p = Partitioner::new(4, 30, 1, 1 << 20).unwrap();
+        let pre_epoch = Event::new(EntityId::from("alice"), Timestamp(-1), "click");
+        let err = p
+            .push_event(pre_epoch)
+            .expect_err("pre-epoch timestamp must error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("pre-epoch"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+        assert_eq!(p.buffered_events(), 0);
+        assert_eq!(p.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn push_event_recovers_after_a_failed_push() {
+        // A failed push (pre-epoch timestamp here) must not poison
+        // the partitioner — subsequent valid pushes still land.
+        let mut p = Partitioner::new(4, 30, 1, 1 << 20).unwrap();
+        let _ = p
+            .push_event(Event::new(EntityId::from("alice"), Timestamp(-1), "click"))
+            .expect_err("pre-epoch must error");
+        p.push_event(simple_event("alice", 0, "click"))
+            .expect("valid push after failure must succeed");
+        assert_eq!(p.buffered_events(), 1);
+        assert!(p.buffered_bytes() > 0);
+    }
+
+    #[test]
+    fn push_event_at_exact_budget_boundary_succeeds() {
+        // The overflow check is `projected > budget_bytes`, so a
+        // push that lands exactly on the budget must succeed. Pin
+        // the equality branch by sizing the budget to the event.
+        let event = simple_event("alice", 0, "click");
+        let exact = estimated_event_size(&event);
+        let mut p = Partitioner::new(1, 30, 1, exact).unwrap();
+        p.push_event(event).expect("exact-fit push must succeed");
+        assert_eq!(p.buffered_bytes(), exact);
+        assert_eq!(p.buffered_events(), 1);
+
+        // A second push of the same shape now exceeds the budget
+        // by one event's worth and must error without mutating.
+        let err = p
+            .push_event(simple_event("alice", 1, "click"))
+            .expect_err("second push must overflow");
+        assert!(matches!(err, BqliteError::Execution(_)));
+        assert_eq!(
+            p.buffered_bytes(),
+            exact,
+            "failed push must leave the buffer counter untouched"
+        );
+        assert_eq!(p.buffered_events(), 1);
+    }
+
+    #[test]
+    fn drain_sorted_returns_buckets_in_window_then_shard_order() {
+        // Craft events across multiple windows and shards. With
+        // shard_count = 1, every entity lands in shard 0, so the
+        // bucket key is just `(window_id, 0)`. We push events in
+        // scrambled window order and assert the drain visits them
+        // in ascending window order.
+        let mut p = Partitioner::new(1, 30, 1, 1 << 20).unwrap();
+        p.push_event(simple_event("alice", 90, "click")).unwrap(); // window 90
+        p.push_event(simple_event("alice", 0, "click")).unwrap(); // window 0
+        p.push_event(simple_event("alice", 60, "click")).unwrap(); // window 60
+        p.push_event(simple_event("alice", 30, "click")).unwrap(); // window 30
+
+        let drained: Vec<(BucketKey, Vec<Event>)> = p.drain_sorted().collect();
+        let window_ids: Vec<u32> = drained.iter().map(|((w, _s), _)| *w).collect();
+        assert_eq!(window_ids, vec![0, 30, 60, 90]);
+    }
+
+    #[test]
+    fn drain_sorted_sorts_each_bucket_by_entity_then_timestamp() {
+        // Insertion order deliberately does not match sort order.
+        // After drain, every bucket must be ordered by
+        // (entity_id, timestamp) ascending.
+        let mut p = Partitioner::new(1, 30, 1, 1 << 20).unwrap();
+        // All land in window 0, shard 0.
+        p.push_event(simple_event("charlie", 5, "click")).unwrap();
+        p.push_event(simple_event("alice", 10, "click")).unwrap();
+        p.push_event(simple_event("bob", 7, "click")).unwrap();
+        p.push_event(simple_event("alice", 2, "click")).unwrap();
+        p.push_event(simple_event("charlie", 1, "click")).unwrap();
+
+        let drained: Vec<(BucketKey, Vec<Event>)> = p.drain_sorted().collect();
+        assert_eq!(drained.len(), 1);
+        let sorted = &drained[0].1;
+        let keys: Vec<(String, i64)> = sorted
+            .iter()
+            .map(|e| {
+                (
+                    e.entity.as_str().unwrap().to_string(),
+                    e.timestamp.as_nanos(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("alice".into(), 2 * NS_PER_DAY),
+                ("alice".into(), 10 * NS_PER_DAY),
+                ("bob".into(), 7 * NS_PER_DAY),
+                ("charlie".into(), NS_PER_DAY),
+                ("charlie".into(), 5 * NS_PER_DAY),
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_sorted_sort_is_stable_for_equal_keys() {
+        // Two events with identical (entity, timestamp) must
+        // retain their insertion order — a stable sort invariant
+        // downstream operators rely on when ties can legitimately
+        // happen at nanosecond resolution.
+        let mut p = Partitioner::new(1, 30, 1, 1 << 20).unwrap();
+        p.push_event(simple_event("alice", 0, "first")).unwrap();
+        p.push_event(simple_event("alice", 0, "second")).unwrap();
+        p.push_event(simple_event("alice", 0, "third")).unwrap();
+
+        let drained: Vec<(BucketKey, Vec<Event>)> = p.drain_sorted().collect();
+        let types: Vec<String> = drained[0].1.iter().map(|e| e.event_type.clone()).collect();
+        assert_eq!(types, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn drain_sorted_distributes_events_across_multiple_shards() {
+        // With shard_count > 1, distinct entities must land in
+        // different shard buckets for at least one pair (otherwise
+        // the hash has collapsed, which the helper tests already
+        // guard against). We confirm the drained bucket keys
+        // reflect the actual `(window, shard)` distribution.
+        let mut p = Partitioner::new(32, 30, 1, 1 << 20).unwrap();
+        for n in 0..64_u64 {
+            p.push_event(simple_event(&format!("user_{n}"), 0, "click"))
+                .unwrap();
+        }
+
+        let drained: Vec<(BucketKey, Vec<Event>)> = p.drain_sorted().collect();
+        // Every bucket key shares the same window_id (0) because
+        // every event is at day 0.
+        for ((window_id, _), _) in &drained {
+            assert_eq!(*window_id, 0);
+        }
+        // At least two distinct shards must appear; collapsing all
+        // 64 entities onto one shard would be a hash regression.
+        let shard_ids: std::collections::HashSet<u16> =
+            drained.iter().map(|((_w, s), _)| *s).collect();
+        assert!(
+            shard_ids.len() >= 2,
+            "64 distinct entities collapsed onto a single shard — hash is broken"
+        );
+    }
+
+    #[test]
+    fn push_event_with_custom_shard_count_respects_bounds() {
+        let mut p = Partitioner::new(3, 30, 1, 1 << 20).unwrap();
+        for n in 0..50 {
+            p.push_event(simple_event(&format!("user_{n}"), 0, "click"))
+                .unwrap();
+        }
+        for ((_w, shard_id), _) in p.drain_sorted() {
+            assert!(shard_id < 3, "shard_id {shard_id} out of range for 3");
+        }
+    }
+
+    // ── estimated_event_size ───────────────────────────────────────────────
+
+    #[test]
+    fn estimated_event_size_is_monotonic_in_event_content() {
+        use bqlite_core::property::PropertyValue;
+
+        let bare = Event::new(EntityId::from("a"), Timestamp(0), "c");
+        let mut with_prop = bare.clone();
+        with_prop.properties.push((
+            "k".into(),
+            PropertyValue::String("some long string value".into()),
+        ));
+
+        let bare_size = estimated_event_size(&bare);
+        let big_size = estimated_event_size(&with_prop);
+        assert!(big_size > bare_size);
+    }
+
+    #[test]
+    fn estimated_event_size_never_returns_zero_for_any_event() {
+        let bare = Event::new(EntityId::from(0_i64), Timestamp(0), "");
+        assert!(estimated_event_size(&bare) >= std::mem::size_of::<Event>());
     }
 }
