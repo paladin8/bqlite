@@ -62,6 +62,19 @@
 //!   per-row-group zone map surface — zone-map pruning is applied
 //!   by each input scan individually via its own predicate hook,
 //!   and the merge only sees rows that survived pruning.
+//!
+//! # Access-pattern hints (TASK-243)
+//!
+//! The merge does not open segment files directly — it owns a
+//! `Vec<Box<dyn SegmentScan>>` constructed upstream. Every input
+//! scan opened through
+//! [`crate::segment::reader::SegmentFileReader::open`] has already
+//! issued a `POSIX_FADV_SEQUENTIAL` hint at open time via
+//! [`crate::segment::advise::advise_sequential`], so the merged
+//! stream inherits sequential-scan readahead from each leaf
+//! without needing any hint of its own. `WillNeed` for the next
+//! row group and the compaction-specific hint pair are deferred
+//! to Wave 4 per `docs/design/storage-format.md` §8.2.
 
 use std::sync::Arc;
 

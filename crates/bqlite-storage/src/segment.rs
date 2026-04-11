@@ -35,6 +35,7 @@
 //! These tasks build on top of [`layout`] without reshaping it — the
 //! on-disk format is frozen for Wave 2.
 
+pub(crate) mod advise;
 pub mod layout;
 pub mod merge;
 pub mod reader;

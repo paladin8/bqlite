@@ -16,3 +16,10 @@ uuid = { workspace = true }
 twox-hash = { workspace = true }
 lz4_flex = { workspace = true }
 postcard = { workspace = true }
+
+# `libc` is only pulled in on platforms where `posix_fadvise(2)` is
+# a real syscall (TASK-243). On macOS/iOS/Windows the segment reader
+# compiles without it and the advisory call is a no-op — see
+# `src/segment/advise.rs`.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "android"))'.dependencies]
+libc = "0.2"

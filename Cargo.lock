@@ -410,6 +410,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bqlite-core",
+ "libc",
  "lz4_flex",
  "postcard",
  "serde",

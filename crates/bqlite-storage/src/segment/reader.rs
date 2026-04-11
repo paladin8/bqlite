@@ -46,6 +46,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -141,9 +142,26 @@ impl SegmentFileReader {
     /// validation path as [`Self::from_bytes`]. Any I/O error is
     /// returned as `BqliteError::Io`; any format error is
     /// `BqliteError::Corruption`.
+    ///
+    /// Before the read, the opener issues a sequential-scan
+    /// access-pattern hint to the kernel via
+    /// [`crate::segment::advise::advise_sequential`] — Wave 2 only
+    /// scans segments front-to-back, so `POSIX_FADV_SEQUENTIAL`
+    /// is the single hint that actually matches every call path
+    /// (see `docs/design/storage-format.md` §8.2 and TASK-243).
+    /// The hint is advisory and silently no-ops on platforms that
+    /// do not expose `posix_fadvise`.
     pub fn open<P: AsRef<Path>>(path: P, current_schema: TableSchema) -> Result<Self> {
         // Path comes from the manifest (trusted internal state), not user input.
-        let bytes = fs::read(path)?; // nosemgrep
+        let mut file = fs::File::open(path)?; // nosemgrep
+
+        // Hint the kernel before reading so it can start aggressive
+        // readahead on the first page fault rather than waiting for
+        // its own pattern detector to catch up.
+        crate::segment::advise::advise_sequential(&file);
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
         Self::from_bytes(bytes, current_schema)
     }
 
@@ -3915,5 +3933,106 @@ mod tests {
             zones.get("entity_id").unwrap().min,
             Some(PropertyValue::String("a".into()))
         );
+    }
+
+    // ── TASK-243: sequential-scan access-pattern hint ───────────────
+
+    /// `SegmentFileReader::open` must issue a sequential-scan hint
+    /// (via `posix_fadvise` on supported platforms, no-op elsewhere)
+    /// before reading the file's bytes. Verified cross-platform via
+    /// the test-only counter in `crate::segment::advise`.
+    #[test]
+    fn open_issues_sequential_scan_hint() {
+        use crate::segment::advise::SEQUENTIAL_HINT_COUNT;
+        use std::sync::atomic::Ordering;
+
+        let schema = roundtrip_schema();
+
+        // Smallest round-trip fixture: one row group, one row per
+        // column. The hint is about the open path, not row-group
+        // decode, so a single-row segment is enough.
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 1,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["u1"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u1".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[1_700_000_000_000_000_000]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(1_700_000_000_000_000_000)),
+                        zone_max: Some(PropertyValue::Timestamp(1_700_000_000_000_000_000)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true])),
+                        encoded: encode_plain_int(&[42]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(42)),
+                        zone_max: Some(PropertyValue::Int(42)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 1_700_000_000_000_000_000,
+            seq_id_range: (0, 0),
+            batch_id: 1,
+            compaction_level: 0,
+        };
+
+        // Serialize to bytes via the writer, then write to a
+        // uniquely-named temp file (mirrors the pattern used by
+        // `database.rs` tests so we don't pull in `tempfile` as a
+        // dev-dep).
+        let bytes = encode_segment(&request).expect("encode segment");
+
+        let pid = std::process::id();
+        let seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut path = std::env::temp_dir();
+        path.push(format!("bqlite-task243-open-{pid}-{seq}.seg"));
+        std::fs::write(&path, &bytes).expect("write temp segment");
+
+        // Snapshot the counter before the open and confirm the
+        // open bumped it. Using `after > before` (rather than
+        // `after - before == 1`) keeps the test robust against
+        // other parallel tests that also open segments through
+        // the same code path.
+        let before = SEQUENTIAL_HINT_COUNT.load(Ordering::Relaxed);
+        let reader = SegmentFileReader::open(&path, schema.clone()).expect("open segment");
+        let after = SEQUENTIAL_HINT_COUNT.load(Ordering::Relaxed);
+
+        assert!(
+            after > before,
+            "SegmentFileReader::open must issue a sequential-scan \
+             hint at open time (counter was {before} \u{2192} {after})",
+        );
+        assert_eq!(reader.row_count(), 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
