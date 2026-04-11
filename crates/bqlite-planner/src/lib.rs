@@ -63,6 +63,7 @@ use bqlite_core::{Catalog, Result};
 pub mod compiled;
 pub mod expr;
 pub mod logical;
+pub mod opt;
 pub mod physical;
 
 pub use compiled::{
