@@ -50,3 +50,6 @@ pub mod storage;
 pub use storage::{
     ColumnProjection, Predicate, SegmentHandle, SegmentReader, SegmentScan, ZoneMap,
 };
+
+pub mod catalog;
+pub use catalog::Catalog;
