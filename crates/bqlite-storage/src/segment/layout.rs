@@ -36,6 +36,14 @@
 use bqlite_core::{BqlType, PropertyValue, TableSchema};
 use serde::{Deserialize, Serialize};
 
+// The compression discriminant for a column chunk's payload (§8). Owned
+// by [`crate::encoding::CompressionType`] because TASK-211 landed the
+// codec and the discriminant enum together, and having two enums with
+// the same name in the same crate would be a trap. Re-exported here so
+// callers constructing segment layout values see the same type name in
+// both places.
+pub use crate::encoding::CompressionType;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Format-wide constants (§4)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,48 +84,6 @@ pub const TRAILER_LEN: usize = 8;
 /// `FILE_HEADER_LEN + CHECKSUM_LEN + TRAILER_LEN = 22` bytes long to be
 /// a valid v1 file (§15 rule 1).
 pub const FOOTER_SUFFIX_LEN: usize = CHECKSUM_LEN + TRAILER_LEN;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Compression discriminant (§8)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Post-encoding compression codec applied to a column chunk's payload
-/// bytes. v1 defines exactly two values. Later waves may extend this
-/// enum, but every addition requires a format-version bump so v1
-/// readers can continue rejecting unknown discriminants as corruption.
-///
-/// The numeric value is the byte written into
-/// [`ColumnChunkMeta::compression`]. The match with §10.2 is intentional
-/// and must not be changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum CompressionType {
-    /// No compression — the encoded payload is written to disk verbatim.
-    None = 0,
-    /// LZ4 block compression (§8). Wraps only the encoded payload; the
-    /// null bitmap and encoding header stay uncompressed.
-    Lz4 = 1,
-}
-
-impl CompressionType {
-    /// The byte that identifies this compression codec on disk.
-    pub fn discriminant(self) -> u8 {
-        self as u8
-    }
-
-    /// Parse a byte read out of a segment footer back into a
-    /// [`CompressionType`]. Unknown values are **not** an error at the
-    /// layout layer — this is a pure-data conversion used in both
-    /// directions. Callers who want to reject unknown values (e.g. the
-    /// reader) match on the `Option`.
-    pub fn from_discriminant(byte: u8) -> Option<Self> {
-        match byte {
-            0 => Some(Self::None),
-            1 => Some(Self::Lz4),
-            _ => None,
-        }
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Footer body (§10.1 – §10.3)
@@ -413,18 +379,6 @@ mod tests {
         let a = postcard::to_allocvec(&footer).unwrap();
         let b = postcard::to_allocvec(&footer).unwrap();
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn compression_type_round_trips_its_discriminants() {
-        for variant in [CompressionType::None, CompressionType::Lz4] {
-            let byte = variant.discriminant();
-            assert_eq!(CompressionType::from_discriminant(byte), Some(variant));
-        }
-        // v1 reserves {0, 1}; anything else is unknown. The layout layer
-        // returns None (the reader surfaces this as corruption).
-        assert_eq!(CompressionType::from_discriminant(2), None);
-        assert_eq!(CompressionType::from_discriminant(255), None);
     }
 
     #[test]
