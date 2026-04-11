@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-4",
+  "task_id": "TASK-213",
+  "claimed_at": "2026-04-11T14:32:54Z",
+  "branch": "task/TASK-213",
+  "description": "Segment file format writer (low-level) — emits v1 on-disk bytes from encoded column chunks"
+}
