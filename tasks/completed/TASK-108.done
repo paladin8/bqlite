@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-2",
   "task_id": "TASK-108",
   "claimed_at": "2026-04-11T00:18:15Z",
+  "completed_at": "2026-04-11T00:31:54Z",
   "branch": "task/TASK-108",
   "description": "[DESIGN][TRAIT] PhysicalOperator + EntityOperator traits — pull-based iterator protocol, OperatorSchema propagation, open/next/close lifecycle, error propagation, cancellation hook, entity-aligned batching, sub-batch streaming. Design note + trait impl in bqlite-operators."
 }
