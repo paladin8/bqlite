@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-233",
+  "claimed_at": "2026-04-11T23:41:59Z",
+  "branch": "task/TASK-233",
+  "description": "Engine INSERT execution + CSV reader integration"
+}
