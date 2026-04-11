@@ -56,7 +56,8 @@ pub use database::{
     empty_segment_reader, Database, LOCK_FILE_NAME, MANIFEST_FILE_NAME, MANIFEST_TMP_FILE_NAME,
 };
 pub use encoding::{
-    BitPacking, Constant, Delta, Dictionary, EncodedChunk, Encoding, EncodingType, Plain,
+    select_encoding, select_encoding_type, BitPacking, CompressionType, Constant, Delta,
+    Dictionary, EncodedChunk, Encoding, EncodingType, Plain, SelectedEncoding,
 };
 pub use manifest::{
     ColumnStats, Manifest, SegmentMeta, TableEntry, WindowManifest, DEFAULT_SHARD_COUNT,

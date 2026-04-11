@@ -50,6 +50,7 @@ pub mod delta;
 pub mod dictionary;
 pub mod lz4;
 pub mod plain;
+pub mod selector;
 
 pub use bitpacking::BitPacking;
 pub use constant::Constant;
@@ -57,6 +58,7 @@ pub use delta::Delta;
 pub use dictionary::Dictionary;
 pub use lz4::{compress_lz4, decompress_lz4, CompressionType};
 pub use plain::Plain;
+pub use selector::{decode_cost, select_encoding, select_encoding_type, SelectedEncoding};
 
 /// On-disk encoding discriminant per `segment-format-v1.md` §9.
 ///
