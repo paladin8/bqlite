@@ -13,3 +13,16 @@
 //! - **Merge scanning**: entity-complete stream across multiple segments
 //! - **Compression**: dictionary, delta, and general-purpose codecs per column type
 //! - **Indexes**: bloom filters on entity keys, zone maps on timestamps
+//!
+//! # Wave 1 surface
+//!
+//! Only the manifest type is implemented so far. [`manifest::Manifest`]
+//! describes the serialized on-disk shape; the `Database::open_or_create`
+//! bootstrap and real segment I/O land in follow-up checkpoints of
+//! TASK-116 and later waves.
+
+pub mod manifest;
+
+pub use manifest::{
+    Manifest, SegmentEntry, TableEntry, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION,
+};
