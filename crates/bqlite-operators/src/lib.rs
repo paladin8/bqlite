@@ -12,7 +12,7 @@
 //! - **aggregate**: hash/sort aggregation (count, sum, avg, min, max, percentiles)
 //! - **cohort**: behavioral cohort materializer
 //! - **paths**: Sankey-style path aggregation
-//! - **limit**: per-entity event count enforcement
+//! - **limit**: row-count cutoff with early child termination
 //!
 //! ## Trait surface
 //!
@@ -38,13 +38,24 @@
 //! real `Box<dyn PhysicalOperator>` implementors to materialize from
 //! the plain-data physical descriptor. Real filtering, projection
 //! pruning, and k-way merge land in later waves.
+//!
+//! ## Wave 2 operators
+//!
+//! TASK-231 lands the real stateless surface alongside the Wave 1
+//! stubs. The first addition is the [`limit`] operator, which is
+//! purely additive (no Wave 1 stub existed). TASK-231's follow-up
+//! checkpoints replace [`filter`] and [`project`] with real
+//! implementations driven by compiled expressions from
+//! [`bqlite_planner::compiled::CompiledExpr`].
 
 pub mod filter;
+pub mod limit;
 pub mod operator;
 pub mod project;
 pub mod scan;
 
 pub use filter::FilterOperator;
+pub use limit::LimitOperator;
 pub use operator::{CancellationToken, EntityOperator, PhysicalOperator};
 pub use project::ProjectOperator;
 pub use scan::ScanOperator;
