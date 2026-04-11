@@ -1157,6 +1157,13 @@ INSERT INTO events VALUES
 INSERT INTO events FROM 'data.parquet'
 INSERT INTO events FROM 'data.csv' WITH (delimiter: ',', header: true)
 INSERT INTO events FROM 'events.jsonl' WITH (format: 'jsonl')
+
+-- Insert from file with column remapping: rename `uid` to `user_id`,
+-- `time` to `ts`, `evt` to `event`; other source columns pass through
+-- by name match.
+INSERT INTO events
+FROM 'data.csv'
+WITH (format: 'csv', map: (uid AS user_id, time AS ts, evt AS event))
 ```
 
 Literal INSERT takes positional tuples matching the table's column order. Column lists for named inserts are out of scope for v1 — they can be added later without breaking existing queries.
@@ -1164,6 +1171,23 @@ Literal INSERT takes positional tuples matching the table's column order. Column
 INSERT targets only user-declared columns. The implicit system columns `__seq_id` and `__batch_id` are assigned by the storage layer and are not valid insert targets.
 
 File INSERT reads from a path (local filesystem in v1) and ingests rows into the target table. Supported formats: Parquet (default), CSV, JSONL. Format is inferred from the file extension or explicit `WITH (format: ...)`. Each file ingest is a single batch; see storage-format.md Section 6 for the ingest pipeline details.
+
+**`WITH (...)` options.** All options use the colon-separated `key: value` form (§26). The recognized keys for `INSERT ... FROM` are:
+
+| Key | Value shape | Meaning |
+|---|---|---|
+| `format` | string literal (`'csv'`, `'jsonl'`, `'parquet'`) | Explicit format override. Defaults to the file extension. |
+| `delimiter` | single-character string literal | CSV field separator. CSV format only. |
+| `header` | boolean literal | Whether the first CSV row is a header. CSV format only. Defaults to `true`. |
+| `map` | parenthesized `(src AS dst, ...)` list | Column rename clause, see below. |
+
+Options may appear in any order and any combination. Unknown keys are a plan-time error.
+
+**The `map` clause.** `map: (src AS dst, ...)` renames columns from the source file to target columns in the destination table. Each entry is a pair of bare identifiers separated by the keyword `AS`; the left-hand side is the source column name as it appears in the input file, and the right-hand side is the target table column. Source columns *not* named in the `map` list default to passthrough when the source name already matches a target table column name; source columns that are neither mapped nor name-matched cause a plan-time error. A `map` list with duplicate target names is a plan-time error. The parentheses are mandatory, and an empty parenthesized list is a parse error.
+
+The `map` clause is the only `WITH` option whose right-hand side is not a literal — the grammar's other keys take strings, numbers, or booleans, but `map` takes a list of identifier pairs. This is a deliberate choice: the syntactic shape `src AS dst` mirrors SELECT aliasing (§8.4), and making `map` a structured clause avoids string-parsing identifiers out of a literal at plan time. The AST carries it in a dedicated field on `InsertBody::From` rather than as an entry in the flat option list — see the AST-shape note at the bottom of this subsection.
+
+**AST-shape note (informs TASK-222 / TASK-233).** The `InsertBody::From` AST variant in `bqlite-ast` carries three fields: `path: String`, `options: Vec<InsertOption>`, and `map: Option<Vec<ColumnMapping>>`. The `map` field is out of band from the flat option list because `InsertOption { key: Name, value: Literal }` cannot hold a list of identifier pairs without widening its `value` type — and widening would either (a) force every consumer to pattern-match on an option-value enum even when they only care about literal keys, or (b) bury the mapping list inside a string and force the parser to re-parse it at plan time. The structured field is cheaper: the parser emits `ColumnMapping { source, target, span }` values directly, consumers see a single `Option<Vec<ColumnMapping>>` to walk, and the type system enforces that `map`'s value shape is distinct from every other option's. The alternative considered was an `InsertOptionValue` enum with `Literal` and `ColumnMappings(Vec<ColumnMapping>)` variants; it is recorded here for posterity but not chosen. `None` means the clause was absent; the parser never produces `Some(vec![])` (grammar requires at least one entry inside the parentheses), and downstream code may assume the list is non-empty whenever it is `Some`.
 
 ### 20.2 DELETE
 

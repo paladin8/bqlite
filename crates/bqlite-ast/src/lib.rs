@@ -69,6 +69,6 @@ pub use pattern::{
 pub use pipeline::{Pipeline, Source, TableRef, TimeRange};
 pub use span::{Name, Span};
 pub use statement::{
-    AlterAction, AlterTableStmt, ColumnDef, ColumnRole, CreateTableStmt, DeleteStmt, DescribeStmt,
-    DropTableStmt, InsertBody, InsertOption, InsertStmt, Statement,
+    AlterAction, AlterTableStmt, ColumnDef, ColumnMapping, ColumnRole, CreateTableStmt, DeleteStmt,
+    DescribeStmt, DropTableStmt, InsertBody, InsertOption, InsertStmt, Statement,
 };

@@ -151,15 +151,41 @@ pub enum InsertBody {
     /// v1 restricts the right-hand side of VALUES to literals only —
     /// no expressions, no subqueries — per query-language.md §20.
     Values(Vec<Vec<Literal>>),
-    /// `FROM '<path>' [WITH (opt: val, ...)]` — bulk load.
+    /// `FROM '<path>' [WITH (opt: val, ..., map: (src AS dst, ...))]` — bulk load.
     ///
     /// The grammar has no dedicated `FORMAT` keyword: format (`csv`,
     /// `jsonl`, …) is either inferred from the file extension or
     /// passed as a `format: 'csv'` entry in the `WITH (...)` option
     /// list like any other option (§26 line 1634).
+    ///
+    /// The `map` clause is modeled as a dedicated [`map`] field rather
+    /// than a flat entry inside `options` because its right-hand side
+    /// is a *list of column renames*, not a [`Literal`], and it would
+    /// not fit `InsertOption { key, value: Literal }` without widening
+    /// every option's value type. Keeping `map` out of band preserves
+    /// the flat option list for genuinely literal-valued keys
+    /// (`format`, `delimiter`, `header`) — see the AST-shape note in
+    /// query-language.md §20.1 for the rationale.
+    ///
+    /// [`map`]: InsertBody::From::map
     From {
+        /// File path literal as written in the source (e.g. `'data.csv'`).
         path: String,
+        /// Flat `WITH (...)` options whose values are literals
+        /// (`format: 'csv'`, `delimiter: ','`, `header: true`, ...).
+        /// The `map` clause lives separately in [`map`](Self::From::map).
         options: Vec<InsertOption>,
+        /// Structured `map: (src AS dst, ...)` column-rename clause.
+        ///
+        /// `None` means the clause was absent. `Some(non-empty)` is
+        /// the only value the grammar produces — an empty mapping
+        /// list is a parse error (parentheses without entries are
+        /// rejected by TASK-222's parser). The AST does not enforce
+        /// non-emptiness at the type level because hand-constructed
+        /// test fixtures occasionally need the flexibility, but the
+        /// documented invariant is that parsed programs never produce
+        /// `Some(vec![])`.
+        map: Option<Vec<ColumnMapping>>,
     },
 }
 
@@ -168,6 +194,29 @@ pub enum InsertBody {
 pub struct InsertOption {
     pub key: Name,
     pub value: Literal,
+    pub span: Span,
+}
+
+/// A single column rename inside the `map: (src AS dst, ...)` clause
+/// of `INSERT ... FROM`.
+///
+/// Renames a source column from the input file (CSV / JSONL / Parquet)
+/// to a target column in the destination table. Source columns *not*
+/// appearing in the `map` list default to passthrough when their name
+/// already matches a target column — see query-language.md §20.1.
+///
+/// The AST only carries the syntactic shape. Semantic validation —
+/// duplicate `target` names within one `map`, unknown source columns,
+/// missing required target columns, type mismatches — is the
+/// planner's job (TASK-226). That split keeps the AST catalog-free
+/// so the parser can run without a database handle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnMapping {
+    /// Source column name in the input file.
+    pub source: Name,
+    /// Target column name in the destination table.
+    pub target: Name,
+    /// Span covering the whole `<src> AS <dst>` fragment.
     pub span: Span,
 }
 
@@ -308,15 +357,88 @@ mod tests {
                     span: Span::EMPTY,
                 },
             ],
+            map: None,
         };
         match body {
-            InsertBody::From { path, options } => {
+            InsertBody::From { path, options, map } => {
                 assert_eq!(path, "/tmp/data.csv");
                 assert_eq!(options.len(), 2);
                 assert_eq!(options[0].key.text, "format");
+                assert!(map.is_none());
             }
             _ => panic!("expected From body"),
         }
+    }
+
+    #[test]
+    fn insert_from_file_with_map_clause() {
+        // `INSERT INTO events FROM 'data.csv'
+        //  WITH (format: 'csv', map: (uid AS user_id, evt AS event))`
+        //
+        // The `map` clause is carried on its own field, parallel to
+        // the flat option list, because its right-hand side is a list
+        // of column renames rather than a literal.
+        let body = InsertBody::From {
+            path: "data.csv".into(),
+            options: vec![InsertOption {
+                key: Name::synthetic("format"),
+                value: Literal::String("csv".into()),
+                span: Span::EMPTY,
+            }],
+            map: Some(vec![
+                ColumnMapping {
+                    source: Name::synthetic("uid"),
+                    target: Name::synthetic("user_id"),
+                    span: Span::EMPTY,
+                },
+                ColumnMapping {
+                    source: Name::synthetic("evt"),
+                    target: Name::synthetic("event"),
+                    span: Span::EMPTY,
+                },
+            ]),
+        };
+        match body {
+            InsertBody::From { path, options, map } => {
+                assert_eq!(path, "data.csv");
+                assert_eq!(options.len(), 1);
+                let mappings = map.expect("map clause present");
+                assert_eq!(mappings.len(), 2);
+                assert_eq!(mappings[0].source.text, "uid");
+                assert_eq!(mappings[0].target.text, "user_id");
+                assert_eq!(mappings[1].source.text, "evt");
+                assert_eq!(mappings[1].target.text, "event");
+            }
+            _ => panic!("expected From body"),
+        }
+    }
+
+    #[test]
+    fn insert_from_map_clause_serde_round_trip() {
+        // Guards against accidental #[serde(skip)] regressions on the
+        // new `map` field or `ColumnMapping` struct — the parser and
+        // planner both rely on the derived Serde impls covering every
+        // field of `InsertBody::From`.
+        let stmt = Statement::Insert(InsertStmt {
+            table: Name::synthetic("events"),
+            body: InsertBody::From {
+                path: "data.csv".into(),
+                options: vec![InsertOption {
+                    key: Name::synthetic("format"),
+                    value: Literal::String("csv".into()),
+                    span: Span::EMPTY,
+                }],
+                map: Some(vec![ColumnMapping {
+                    source: Name::synthetic("uid"),
+                    target: Name::synthetic("user_id"),
+                    span: Span::EMPTY,
+                }]),
+            },
+            span: Span::EMPTY,
+        });
+        let json = serde_json::to_string(&stmt).expect("serialize");
+        let back: Statement = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(stmt, back);
     }
 
     #[test]
