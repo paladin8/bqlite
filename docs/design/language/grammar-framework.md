@@ -28,7 +28,7 @@ normative grammar and stays the single source of truth. This document is the
 | Numeric disambiguation | Longest match — duration > number > integer | §6.4 |
 | Operator precedence | Pratt (precedence climbing) inside `expr` production | §7.3 |
 | Production pattern | One function per production, all on a `Parser<'s>` impl | §7.1 |
-| `WITH (...)` option surface | Flat list of `Name ":" OptionValue`, with a typed `OptionValue` enum covering literals *and* the structured `map` clause | §8 |
+| `WITH (...)` option surface | Flat literal-valued options plus a sidecar structured `map: (src AS dst, ...)` clause (AST shape landed by TASK-237 commit `8a7c7cd`) | §8 |
 | Tests | Per-production example tests + one proptest per round-trippable subset | §9 |
 
 ---
@@ -703,10 +703,12 @@ Two distinct grammatical novelties live inside this clause:
    `(src AS dst, src AS dst, ...)` that cannot be represented as a
    `Literal`.
 
-TASK-237 owns the AST shape decision for (2). TASK-203 owns the *parser
-surface* decision — the concrete productions TASK-222 will implement against
-whatever AST shape TASK-237 lands. Those two decisions are independent and
-must not trample each other, so we fix them here.
+TASK-237 owned the AST-shape decision for (2) and landed a parallel-field
+shape on `InsertBody::From` (see §8.3). TASK-203 owns the *parser surface*
+decision — the concrete productions TASK-222 will implement against the
+AST shape TASK-237 landed. Those two decisions are independent in principle
+and were sequenced so the AST shape landed first; §8.2 fixes the surface,
+§8.3 adapts the productions to the AST.
 
 ### 8.2 Surface productions
 
@@ -749,64 +751,67 @@ Notes:
   column aliasing — we pick the `source AS destination` direction because
   that reads in "natural English" inside an ingest context.
 
-### 8.3 AST interface (what TASK-222 depends on TASK-237 providing)
+### 8.3 AST interface (the shape TASK-237 landed)
 
-TASK-237 must ship one of the following AST shapes, recorded in its design
-note section. Whichever it picks, the parser production above slots in:
+TASK-237 (commit `8a7c7cd`) landed the following AST shape for
+`InsertBody::From`:
 
-**Option A — parallel field:**
 ```rust
 pub enum InsertBody {
     Values(Vec<Vec<Literal>>),
     From {
         path: String,
-        options: Vec<InsertOption>,          // existing flat list, literal-only
-        map: Option<Vec<ColumnMapping>>,     // new structured field
+        options: Vec<InsertOption>,          // flat literal-valued options
+        map: Option<Vec<ColumnMapping>>,     // structured column-rename clause
     },
 }
-pub struct ColumnMapping { pub src: Name, pub dst: Name, pub span: Span }
+pub struct InsertOption { pub key: Name, pub value: Literal, pub span: Span }
+pub struct ColumnMapping { pub source: Name, pub target: Name, pub span: Span }
 ```
 
-**Option B — enum-valued option:**
-```rust
-pub enum InsertBody {
-    Values(Vec<Vec<Literal>>),
-    From { path: String, options: Vec<InsertOption> },
-}
-pub struct InsertOption {
-    pub key: Name,
-    pub value: InsertOptionValue,  // replaces the old Literal field
-    pub span: Span,
-}
-pub enum InsertOptionValue {
-    Literal(Literal),
-    Map(Vec<ColumnMapping>),
-}
-pub struct ColumnMapping { pub src: Name, pub dst: Name, pub span: Span }
-```
+TASK-237 chose the **parallel-field** shape — a dedicated `map` field on the
+`From` variant, sitting alongside the existing flat `options` list — rather
+than widening `InsertOption::value` into an enum. The rationale TASK-237
+records in its commit message:
 
-**This framework doc has a strong opinion: Option B is the right shape.**
-Rationale:
+> widening `InsertOption::value` to admit lists would force every option
+> consumer to pattern-match even when it only cares about literal-valued
+> keys.
 
-1. It keeps the uniform `options: Vec<InsertOption>` iteration pattern that
-   TASK-232 and TASK-233 already expect. No code has to special-case "flat
-   options plus a sidecar map field" — every option is still one loop.
-2. It generalizes to any future structured-value option (if `columns: (...)`
-   is ever added, it's just another `InsertOptionValue` variant — no second
-   sidecar field).
-3. The `span` fidelity is better: the whole `map: (...)` clause has one
-   span in Option B; in Option A the `map` field's span has to be tracked
-   out-of-band.
-4. Serde round-trip tests stay one function — a `Vec<InsertOption>` is the
-   serialized shape whichever value-kind each option carries.
+That's a defensible call for a single structured-value key: TASK-232 /
+TASK-233's option consumers iterate the flat `options` list looking for
+`format`, `delimiter`, `header`, and similar literal keys; widening those
+consumers to handle an enum that could also carry a column-mapping list
+would add pattern-match noise for no gain as long as `map` is the only
+structured-value key in v1. If a future option ever needs a second
+structured-value shape, the decision can be revisited at that point —
+either by adding a second parallel field or by introducing the enum then.
 
-TASK-237 is free to disagree and land Option A. TASK-203's parser design
-works with either, because the two productions (`parse_option_literal` and
-`parse_option_map`) are separate functions; only the final `Vec` the
-`option_list` production returns changes shape. If Option A is chosen,
-TASK-222 emits one `Vec<InsertOption>` for the literal options plus an
-`Option<Vec<ColumnMapping>>` sidecar; if Option B is chosen, everything lands
-in one `Vec<InsertOption>`.
+**Implications for the parser productions in §8.2:**
+
+- `parse_with_clause` produces `(Vec<InsertOption>, Option<Vec<ColumnMapping>>)`
+  rather than a single `Vec<Option>`. The outer `option_list` production
+  accumulates literal-valued options into the flat list and routes the
+  `map:` entry into the separate return value.
+- The production *rejects* multiple `map:` entries in the same `WITH (...)`
+  clause with a dedicated error (`ParseError::Unexpected` carrying
+  `detail: Some("duplicate map clause")`) rather than silently keeping the
+  last one.
+- An empty `map: ()` (zero entries between the parentheses) is also a parse
+  error (`detail: Some("empty map clause")`) — TASK-237's AST comment notes
+  that "parsed programs never produce `Some(vec![])`" even though the type
+  would admit it.
+- `ColumnMapping`'s fields are named `source` and `target` in the AST, *not*
+  `src` and `dst`. The user-facing grammar in §8.2 still reads
+  `src AS dst` — those are just the identifier *labels* users write in
+  source text. TASK-222's parser maps the left `identifier` →
+  `ColumnMapping.source` and the right `identifier` → `ColumnMapping.target`.
+- **Literal-option keyword collisions.** TASK-237's `InsertOption.value` is
+  still a plain `Literal`, so key collisions between a legitimate option
+  name (`format`, `delimiter`, `header`) and a reserved keyword (`TABLE`,
+  `FROM`, `VALUES`) are caught by the §4.2 `ReservedKeyword` variant when
+  the key is lexed as a `Kw(...)` token. The parser surfaces the specific
+  offending keyword, not a generic "unexpected token."
 
 ---
 
@@ -1019,8 +1024,10 @@ touching the framework. The halt-on-first-error policy from §30.10 is
 honored by the use of `Result` + `?` throughout — no recovery state, no
 partial trees, no phantom errors.
 
-The only non-trivial design call is the `WITH (...)` option-value shape,
-and the framework pre-resolves it in §8 by recommending Option B
-(enum-valued options) while leaving TASK-237 room to disagree. Either
-AST decision produces a parser that works; the grammar productions are
-the same either way.
+The only non-trivial design call is the `WITH (...)` option-value shape.
+TASK-237 landed the parallel-field AST shape (a dedicated `map` field
+alongside the flat literal-valued options list); §8 pins the matching
+parser surface and the error sites for the duplicate-map-clause and
+empty-map-clause cases. The grammar productions in §8.2 are neutral to
+the AST-layering decision — only `parse_with_clause`'s return tuple
+reflects it.
