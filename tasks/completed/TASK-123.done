@@ -2,6 +2,7 @@
   "agent_id": "bqlite-agent-4",
   "task_id": "TASK-123",
   "claimed_at": "2026-04-11T01:56:46Z",
+  "completed_at": "2026-04-11T02:02:04Z",
   "branch": "task/TASK-123",
   "description": "[IMPL] End-to-end smoke test — runs bqlite query \"events\" against an empty database directory and asserts OK + empty result. Wave 1 acceptance gate."
 }
