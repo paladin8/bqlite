@@ -491,28 +491,24 @@ impl SegmentScan for SegmentFileScan {
             let idx = self.next_idx;
             self.next_idx += 1;
 
-            // Predicate pruning — walk every column the predicate
-            // declares as referenced, not the projection: a query
-            // like `WHERE amount > 100 | SELECT user_id` must still
-            // prune on `amount` even though it is not in the output.
-            // Predicates with an empty referenced-column set skip the
-            // zone-map build entirely so the default
-            // `referenced_columns() -> &[]` impl has zero cost.
+            // Predicate pruning — delegated to the crate-local
+            // `zone_map` module, which wraps
+            // `Predicate::accepts_zone_group` (the Wave 2
+            // multi-column pruning entry point). Per
+            // `docs/design/storage/predicate-pushdown.md` §6, the
+            // multi-column form is strictly preferred over the
+            // per-column `accepts_zone` loop we used previously — it
+            // is the only shape where conjuncts on columns *absent*
+            // from the row-group's zone map (schema evolution,
+            // all-null columns) are handled correctly.
+            //
+            // `should_decode_row_group` owns the full three-step
+            // decision — referenced-columns short-circuit, zone-map
+            // load, predicate evaluation — so the reader's hot path
+            // stays focused on iteration bookkeeping.
             if let Some(pred) = &self.predicate {
-                let referenced = pred.referenced_columns();
-                let mut pruned = false;
-                if !referenced.is_empty() {
-                    let zones = self.row_group_zone_maps(idx)?;
-                    for col_name in referenced {
-                        if let Some(zone) = zones.get(col_name) {
-                            if !pred.accepts_zone(col_name, zone) {
-                                pruned = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if pruned {
+                let scan: &dyn SegmentScan = &*self;
+                if !crate::zone_map::should_decode_row_group(scan, &**pred, idx)? {
                     // Per the trait: "Implementations may return
                     // `Ok(None)` early if they know every remaining
                     // row-group is pruned." We can't assume that in
