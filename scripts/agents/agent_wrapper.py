@@ -10,12 +10,13 @@ quotas.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import pathlib
 import pty
 import subprocess
 import sys
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 
 SCRIPTS_DIR = pathlib.Path(__file__).resolve().parent
@@ -135,8 +136,150 @@ def has_needs_input(output: str) -> bool:
 
 @dataclasses.dataclass
 class ClaudeRunResult:
+    """Result of a claude -p invocation.
+
+    `output` is the extracted assistant text (concatenated text_delta events)
+    and is what [NEEDS INPUT] scanning runs against — scanning thinking
+    tokens or tool inputs would be a false-positive magnet.
+
+    `raw_output` is every byte that came off the pty, useful for tests and
+    post-hoc debugging.
+    """
     returncode: int
     output: str
+    raw_output: str = ""
+
+
+@dataclasses.dataclass
+class _StreamState:
+    assistant_text_parts: list[str] = dataclasses.field(default_factory=list)
+    in_text_stream: bool = False
+    thinking_active: bool = False
+
+    def assistant_text(self) -> str:
+        return "".join(self.assistant_text_parts)
+
+
+def _preview_tool_input(input_data: Any) -> str:
+    if not isinstance(input_data, dict):
+        text = str(input_data)
+        return text[:100]
+    # Promote common interesting fields first.
+    for key in ("file_path", "path", "command", "pattern", "query", "url"):
+        if key in input_data and isinstance(input_data[key], (str, int, float)):
+            val = str(input_data[key])
+            return val[:100] if len(val) <= 100 else val[:97] + "..."
+    try:
+        text = json.dumps(input_data, separators=(",", ":"))
+    except (TypeError, ValueError):
+        text = str(input_data)
+    return text[:100] if len(text) <= 100 else text[:97] + "..."
+
+
+def _tool_result_preview(content: Any) -> str:
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        text = " ".join(parts)
+    else:
+        text = str(content)
+    stripped = text.strip()
+    if not stripped:
+        return "(empty)"
+    first_line = stripped.splitlines()[0]
+    return first_line[:140] if len(first_line) <= 140 else first_line[:137] + "..."
+
+
+def _format_stream_event(event: dict, state: _StreamState) -> Optional[tuple[str, str]]:
+    """Turn one stream-json event into a (kind, content) pair for display.
+
+    kind is "inline" for text_delta streams that should be written without a
+    trailing newline, or "line" for standalone lines. Returns None for events
+    the wrapper intentionally silences (hook chatter, empty message
+    boundaries, thinking-token noise).
+    """
+    t = event.get("type")
+
+    if t == "system":
+        subtype = event.get("subtype")
+        if subtype == "init":
+            session_id = str(event.get("session_id", ""))[:8]
+            tools = event.get("tools", [])
+            cwd = event.get("cwd", "?")
+            return ("line", f"• session {session_id} cwd={cwd} tools={len(tools)}")
+        return None
+
+    if t == "stream_event":
+        inner = event.get("event", {})
+        it = inner.get("type")
+        if it == "content_block_start":
+            block = inner.get("content_block", {}) or {}
+            if block.get("type") == "thinking":
+                state.thinking_active = True
+                return ("line", "◇ thinking…")
+            return None
+        if it == "content_block_stop":
+            # Any block boundary ends the "currently thinking" state so the
+            # next thinking block in the same turn gets its own indicator.
+            state.thinking_active = False
+            return None
+        if it == "content_block_delta":
+            delta = inner.get("delta", {})
+            dt = delta.get("type")
+            if dt == "text_delta":
+                text = delta.get("text", "")
+                if not text:
+                    return None
+                state.assistant_text_parts.append(text)
+                return ("inline", text)
+            # thinking_delta / input_json_delta / signature_delta are all
+            # silenced — they duplicate information we already print on
+            # content_block_start (thinking indicator, tool call name).
+            return None
+        return None
+
+    if t == "assistant":
+        msg = event.get("message", {})
+        lines = []
+        for block in msg.get("content", []) or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                name = block.get("name", "tool")
+                preview = _preview_tool_input(block.get("input"))
+                lines.append(f"🔧 {name}({preview})")
+        if lines:
+            return ("line", "\n".join(lines))
+        return None
+
+    if t == "user":
+        msg = event.get("message", {})
+        for block in msg.get("content", []) or []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                preview = _tool_result_preview(block.get("content"))
+                return ("line", f"↩ {preview}")
+        return None
+
+    if t == "result":
+        subtype = event.get("subtype", "")
+        turns = event.get("num_turns", 0)
+        duration_ms = event.get("duration_ms", 0) or 0
+        return ("line", f"✓ result ({subtype}, {turns} turns, {duration_ms/1000:.1f}s)")
+
+    if t == "rate_limit_event":
+        info = event.get("rate_limit_info", {}) or {}
+        return (
+            "line",
+            f"⚠ rate limit: {info.get('status','?')} "
+            f"type={info.get('rateLimitType','?')} "
+            f"util={info.get('utilization','?')}",
+        )
+
+    return None
 
 
 def run_claude(
@@ -148,15 +291,18 @@ def run_claude(
     resume: bool,
     env: Optional[dict[str, str]] = None,
 ) -> ClaudeRunResult:
-    """Run `claude -p --verbose` once, mirroring its output to our own
-    stdout live and capturing the full output for later scanning (NEEDS INPUT
-    detection).
+    """Run `claude -p --verbose --output-format stream-json` once, parsing
+    each JSON event as it arrives and pretty-printing human-readable lines
+    (tool calls, tool results, streamed text, rate-limit warnings) to the
+    cmux tab. Assistant text blocks are accumulated into
+    `ClaudeRunResult.output` for [NEEDS INPUT] detection.
 
-    claude is attached to a pseudo-terminal rather than a plain pipe. With a
-    pipe, stdio in the child switches to block buffering and `--verbose`
-    output stalls in 4 KB chunks until the process exits, which leaves the
-    cmux tab looking dead for long tasks. A pty keeps the child line-buffered
-    so tool-call chatter streams as it happens.
+    claude is attached to a pseudo-terminal so its stdio stays line-buffered
+    and events stream as they happen instead of stalling in a 4 KB pipe
+    buffer. Plain `-p --verbose` in text mode does NOT stream intermediate
+    progress — the print format only emits the final assistant text — so
+    `--output-format stream-json --include-partial-messages` is the only way
+    to actually observe what the model is doing.
 
     When `resume` is True, passes `-c` and omits `--append-system-prompt` (a
     resumed session inherits the prior system prompt). When False, passes the
@@ -166,6 +312,9 @@ def run_claude(
         "claude",
         "-p",
         "--verbose",
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
         "--model",
         model,
         "--effort",
@@ -194,26 +343,78 @@ def run_claude(
         # reads on the master return EOF cleanly once the child exits.
         os.close(slave_fd)
 
-    captured: list[str] = []
+    state = _StreamState()
+    raw_chunks: list[str] = []
+    buf = b""
+
+    def _emit(kind: str, content: str) -> None:
+        if kind == "inline":
+            sys.stdout.write(content)
+            state.in_text_stream = True
+        else:  # "line"
+            if state.in_text_stream:
+                sys.stdout.write("\n")
+                state.in_text_stream = False
+            sys.stdout.write(content)
+            if not content.endswith("\n"):
+                sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    def _handle_line(line_bytes: bytes) -> None:
+        line_text = line_bytes.decode("utf-8", errors="replace")
+        if not line_text.strip():
+            return
+        try:
+            event = json.loads(line_text)
+        except json.JSONDecodeError:
+            # Non-JSON: probably terminal escape sequences or a stderr panic
+            # line. Echo it so a broken claude doesn't go unnoticed.
+            if line_text.strip().startswith("{"):
+                # Partial JSON that failed to parse — warn once per chunk so
+                # we don't silently drop real events.
+                if state.in_text_stream:
+                    sys.stdout.write("\n")
+                    state.in_text_stream = False
+                sys.stdout.write(f"⚠ stream-json parse error: {line_text[:160]}\n")
+                sys.stdout.flush()
+            return
+        formatted = _format_stream_event(event, state)
+        if formatted is None:
+            return
+        kind, content = formatted
+        _emit(kind, content)
+
     try:
         while True:
             try:
                 chunk = os.read(master_fd, 4096)
             except OSError:
-                # On Linux, reading the master after the slave closes raises
-                # EIO. macOS returns an empty bytes object. Treat both as EOF.
+                # Linux raises EIO when the slave side closes; macOS returns
+                # empty bytes. Treat both as EOF.
                 break
             if not chunk:
                 break
-            text = chunk.decode("utf-8", errors="replace")
-            sys.stdout.write(text)
-            sys.stdout.flush()
-            captured.append(text)
+            raw_chunks.append(chunk.decode("utf-8", errors="replace"))
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                _handle_line(line)
+        if buf.strip():
+            _handle_line(buf)
+            buf = b""
     finally:
         os.close(master_fd)
 
+    if state.in_text_stream:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
     proc.wait()
-    return ClaudeRunResult(returncode=proc.returncode, output="".join(captured))
+    return ClaudeRunResult(
+        returncode=proc.returncode,
+        output=state.assistant_text(),
+        raw_output="".join(raw_chunks),
+    )
 
 
 def _filesystem_task_state(task_id: str) -> str:

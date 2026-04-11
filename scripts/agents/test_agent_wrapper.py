@@ -72,7 +72,9 @@ class AgentWrapperClaudeInvocationTests(unittest.TestCase):
         env["PATH"] = f"{tmpdir}:{env.get('PATH', '')}"
         return fake, env
 
-    def test_run_claude_captures_stdout(self) -> None:
+    def test_run_claude_captures_raw_output(self) -> None:
+        """Non-JSON chatter on the pty ends up in raw_output (for debugging),
+        but output (assistant text extracted from stream-json) stays empty."""
         _, env = self._make_fake_claude('echo "hello from claude"\nexit 0\n')
         result = agent_wrapper.run_claude(
             prompt="ignored",
@@ -83,7 +85,8 @@ class AgentWrapperClaudeInvocationTests(unittest.TestCase):
             env=env,
         )
         self.assertEqual(result.returncode, 0)
-        self.assertIn("hello from claude", result.output)
+        self.assertIn("hello from claude", result.raw_output)
+        self.assertEqual(result.output, "")
 
     def test_run_claude_sets_resume_flag(self) -> None:
         _, env = self._make_fake_claude('printf "ARGV:%s\\n" "$@"\nexit 0\n')
@@ -96,9 +99,9 @@ class AgentWrapperClaudeInvocationTests(unittest.TestCase):
             env=env,
         )
         self.assertEqual(result.returncode, 0)
-        self.assertIn("ARGV:-c", result.output)
-        self.assertIn("ARGV:do the thing", result.output)
-        self.assertNotIn("--append-system-prompt", result.output)
+        self.assertIn("ARGV:-c", result.raw_output)
+        self.assertIn("ARGV:do the thing", result.raw_output)
+        self.assertNotIn("--append-system-prompt", result.raw_output)
 
     def test_run_claude_passes_system_prompt_on_fresh(self) -> None:
         _, env = self._make_fake_claude('printf "ARGV:%s\\n" "$@"\nexit 0\n')
@@ -110,8 +113,8 @@ class AgentWrapperClaudeInvocationTests(unittest.TestCase):
             resume=False,
             env=env,
         )
-        self.assertIn("ARGV:--append-system-prompt", result.output)
-        self.assertIn("ARGV:you are fake agent", result.output)
+        self.assertIn("ARGV:--append-system-prompt", result.raw_output)
+        self.assertIn("ARGV:you are fake agent", result.raw_output)
 
     def test_run_claude_propagates_nonzero_exit(self) -> None:
         _, env = self._make_fake_claude('echo "boom" >&2\nexit 7\n')
@@ -124,6 +127,84 @@ class AgentWrapperClaudeInvocationTests(unittest.TestCase):
             env=env,
         )
         self.assertEqual(result.returncode, 7)
+
+    def test_run_claude_requests_stream_json_output_format(self) -> None:
+        """run_claude must pass --output-format stream-json --include-partial-
+        messages so the wrapper sees progress events as they happen (plain
+        -p --verbose text mode only emits the final answer)."""
+        _, env = self._make_fake_claude('printf "ARGV:%s\\n" "$@"\nexit 0\n')
+        result = agent_wrapper.run_claude(
+            prompt="dummy",
+            model="fake-model",
+            effort="high",
+            system_prompt_text="sys",
+            resume=False,
+            env=env,
+        )
+        self.assertIn("ARGV:--output-format", result.raw_output)
+        self.assertIn("ARGV:stream-json", result.raw_output)
+        self.assertIn("ARGV:--include-partial-messages", result.raw_output)
+
+    def test_run_claude_extracts_assistant_text_from_stream_json(self) -> None:
+        """The stream-json parser must extract text_delta events into
+        ClaudeRunResult.output so [NEEDS INPUT] detection and success
+        reporting see the actual assistant reply."""
+        # Fake emits three stream-json events on separate lines: two text
+        # deltas that together spell "hello world", and a final result event.
+        script = (
+            r'''printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello "}}}' '''
+            r'''&& printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"world"}}}' '''
+            r'''&& printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"duration_ms":42}' '''
+            "&& exit 0\n"
+        )
+        _, env = self._make_fake_claude(script)
+        result = agent_wrapper.run_claude(
+            prompt="dummy",
+            model="fake-model",
+            effort="high",
+            system_prompt_text="sys",
+            resume=False,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.output, "hello world")
+
+    def test_run_claude_scans_needs_input_only_in_assistant_text(self) -> None:
+        """has_needs_input must ignore [NEEDS INPUT] appearing in thinking
+        or tool-call events and only fire on assistant text."""
+        script = (
+            # thinking_delta contains the marker — must NOT count
+            r'''printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm [NEEDS INPUT] maybe"}}}' '''
+            # assistant text does not — must not fire
+            r'''&& printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"here is my answer"}}}' '''
+            "&& exit 0\n"
+        )
+        _, env = self._make_fake_claude(script)
+        result = agent_wrapper.run_claude(
+            prompt="dummy",
+            model="fake-model",
+            effort="high",
+            system_prompt_text="sys",
+            resume=False,
+            env=env,
+        )
+        self.assertEqual(result.output, "here is my answer")
+        self.assertFalse(agent_wrapper.has_needs_input(result.output))
+        # Same input but assistant text *does* carry the marker → must fire.
+        script_with_marker = (
+            r'''printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"I am blocked. [NEEDS INPUT] which path?"}}}' '''
+            "&& exit 0\n"
+        )
+        _, env2 = self._make_fake_claude(script_with_marker)
+        result2 = agent_wrapper.run_claude(
+            prompt="dummy",
+            model="fake-model",
+            effort="high",
+            system_prompt_text="sys",
+            resume=False,
+            env=env2,
+        )
+        self.assertTrue(agent_wrapper.has_needs_input(result2.output))
 
 
 class FakeClaude:
