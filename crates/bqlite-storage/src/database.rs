@@ -62,9 +62,10 @@ use bqlite_core::schema::TableSchema;
 use bqlite_core::storage::{
     ColumnProjection, Predicate, SegmentHandle, SegmentReader, SegmentScan,
 };
+use bqlite_core::time::TimeRange;
 
 use crate::catalog::ManifestCatalog;
-use crate::manifest::{Manifest, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION};
+use crate::manifest::{Manifest, SegmentMeta, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION};
 
 /// Name of the advisory lock file at the database root.
 pub const LOCK_FILE_NAME: &str = ".lock";
@@ -78,10 +79,13 @@ pub const MANIFEST_TMP_FILE_NAME: &str = "manifest.json.tmp";
 /// An open bqlite database.
 ///
 /// Owns the exclusive advisory lock on the database directory and
-/// holds an in-memory snapshot of the manifest. The manifest can be
-/// read back via [`Database::manifest`]; Wave 1 does not expose a
-/// mutation API — later waves will wire ingest and compaction into an
-/// atomic `update_manifest` helper.
+/// holds an in-memory snapshot of the manifest. Reads go through
+/// [`Database::manifest`]; segment-level mutations go through
+/// [`Database::add_segment`] / [`Database::remove_segment`], which
+/// clone-apply-persist-swap via a private atomic update helper so
+/// every mutation is crash-safe. Query-time segment enumeration uses
+/// [`Database::snapshot_for_query`], which borrows from the current
+/// snapshot.
 ///
 /// Dropping a `Database` releases the lock so a subsequent open (in
 /// the same process or another) can succeed.
@@ -228,9 +232,13 @@ impl Database {
 
     /// In-memory snapshot of the current manifest.
     ///
-    /// The returned reference is stable for the lifetime of
-    /// [`Database`] — Wave 1 is read-only, so there is no mutation
-    /// API yet.
+    /// The borrow reflects the latest committed state — Wave 2
+    /// mutation methods ([`Database::add_segment`],
+    /// [`Database::remove_segment`]) swap `self.manifest` for the
+    /// updated clone only after a successful atomic disk write, so a
+    /// borrow taken before a mutation is stale the moment the
+    /// mutation commits (and is not held across `&mut self` calls
+    /// anyway — the borrow checker enforces that).
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -276,6 +284,82 @@ impl Database {
         Ok(Box::new(EmptySegmentReader {
             schema: entry.schema.clone(),
         }))
+    }
+
+    /// Register a newly written segment in the on-disk manifest and
+    /// update the in-memory snapshot atomically.
+    ///
+    /// Delegates the in-memory mutation to
+    /// [`Manifest::add_segment`] and persists the result through the
+    /// same `manifest.json.tmp → fsync → rename` path the open code
+    /// uses on init. If the in-memory mutation errors, nothing is
+    /// written and the in-memory snapshot is untouched.
+    ///
+    /// See [`Manifest::add_segment`] for the error taxonomy.
+    pub fn add_segment(
+        &mut self,
+        table_name: &str,
+        window_id: u32,
+        shard_id: u32,
+        segment: SegmentMeta,
+    ) -> Result<()> {
+        self.update_manifest(|m| m.add_segment(table_name, window_id, shard_id, segment))
+    }
+
+    /// Remove a segment from the on-disk manifest and return the
+    /// removed [`SegmentMeta`].
+    ///
+    /// Delegates to [`Manifest::remove_segment`] and persists the
+    /// result atomically. The removed meta is returned so callers
+    /// (e.g. compaction, batch delete) can reap the underlying
+    /// segment file once the manifest update is durable.
+    ///
+    /// See [`Manifest::remove_segment`] for the error taxonomy.
+    pub fn remove_segment(&mut self, table_name: &str, segment_id: u64) -> Result<SegmentMeta> {
+        self.update_manifest(|m| m.remove_segment(table_name, segment_id))
+    }
+
+    /// Read-only snapshot of segments matching `(table_name,
+    /// time_range, shard_id)`, computed against the current
+    /// in-memory manifest.
+    ///
+    /// This is a pure forwarding wrapper around
+    /// [`Manifest::snapshot_for_query`]; it does not touch disk.
+    pub fn snapshot_for_query(
+        &self,
+        table_name: &str,
+        time_range: TimeRange,
+        shard_id: u32,
+    ) -> Result<Vec<SegmentMeta>> {
+        self.manifest
+            .snapshot_for_query(table_name, time_range, shard_id)
+    }
+
+    /// Apply `f` to a mutable copy of the current manifest, persist
+    /// the result atomically, then adopt it as the new in-memory
+    /// state.
+    ///
+    /// The clone-apply-persist-swap shape guarantees that a failing
+    /// closure or a failing disk write leaves both the on-disk
+    /// manifest and `self.manifest` untouched — callers only observe
+    /// the mutation when every step succeeds. The clone cost is
+    /// insignificant at Wave 2 scale (a handful of tables with a
+    /// handful of segments each).
+    ///
+    /// Private for now because the only callers are the three
+    /// `add_segment` / `remove_segment` / `snapshot_for_query`
+    /// wrappers above. Future ingest and compaction tasks that want
+    /// to batch multiple mutations into one fsync can promote this
+    /// to `pub(crate)` — a later wave concern.
+    fn update_manifest<R, F>(&mut self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Manifest) -> Result<R>,
+    {
+        let mut updated = self.manifest.clone();
+        let result = f(&mut updated)?;
+        write_manifest_atomic(&self.root, &updated)?;
+        self.manifest = updated;
+        Ok(result)
     }
 }
 
@@ -760,5 +844,210 @@ mod tests {
         let reader = db.segment_reader("events").expect("reader for events");
         assert_eq!(reader.schema().name(), "events");
         assert_eq!(reader.segments().count(), 0);
+    }
+
+    // ── Wave 2 add_segment / remove_segment / snapshot_for_query ────────────
+
+    use bqlite_core::property::PropertyValue;
+    use bqlite_core::time::TimeRange;
+
+    use crate::manifest::{ColumnStats, SegmentMeta};
+
+    /// Shared sample SegmentMeta for the Database-level tests.
+    /// Mirrors the manifest-module helper but intentionally separate
+    /// so both test suites can evolve independently.
+    fn sample_segment(segment_id: u64, batch_id: u64, ts_range: (i64, i64)) -> SegmentMeta {
+        SegmentMeta {
+            segment_id,
+            level: 0,
+            schema_version: 1,
+            row_count: 10,
+            byte_size: 256,
+            ts_range,
+            entity_range: (
+                PropertyValue::String("alice".into()),
+                PropertyValue::String("zoe".into()),
+            ),
+            column_stats: vec![ColumnStats {
+                column_name: "entity_id".into(),
+                min: Some(PropertyValue::String("alice".into())),
+                max: Some(PropertyValue::String("zoe".into())),
+                null_count: 0,
+                distinct_count_estimate: None,
+            }],
+            created_at: 1_700_000_000_000_000_000,
+            batch_id,
+        }
+    }
+
+    #[test]
+    fn add_segment_persists_across_reopen() {
+        let scratch = Scratch::new("add-persists");
+        {
+            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            db.add_segment("events", 3, 1, sample_segment(42, 7, (0, 100)))
+                .expect("add_segment");
+            // In-memory snapshot reflects the mutation immediately.
+            let windows = &db.manifest().tables["events"].windows;
+            assert_eq!(windows.len(), 1);
+            assert_eq!(windows[0].window_id, 3);
+            assert_eq!(windows[0].shards[1].len(), 1);
+            assert_eq!(windows[0].shards[1][0].segment_id, 42);
+        }
+        // Reopen and confirm the mutation survived the fsync+rename.
+        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        let entry = db.manifest().tables.get("events").expect("events entry");
+        assert_eq!(entry.windows.len(), 1);
+        let win = &entry.windows[0];
+        assert_eq!(win.window_id, 3);
+        assert_eq!(
+            win.shards.len(),
+            DEFAULT_SHARD_COUNT as usize,
+            "window preserves shard_count slots across reopen"
+        );
+        assert_eq!(win.shards[1].len(), 1);
+        let seg = &win.shards[1][0];
+        assert_eq!(seg.segment_id, 42);
+        assert_eq!(seg.batch_id, 7);
+        assert_eq!(seg.ts_range, (0, 100));
+    }
+
+    #[test]
+    fn remove_segment_persists_across_reopen() {
+        let scratch = Scratch::new("remove-persists");
+        {
+            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            db.add_segment("events", 0, 0, sample_segment(1, 1, (0, 50)))
+                .unwrap();
+            db.add_segment("events", 0, 0, sample_segment(2, 1, (50, 100)))
+                .unwrap();
+            let removed = db.remove_segment("events", 1).expect("remove");
+            assert_eq!(removed.segment_id, 1);
+            // In-memory snapshot reflects the removal.
+            assert_eq!(db.manifest().tables["events"].windows[0].shards[0].len(), 1);
+        }
+        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        let shard = &db.manifest().tables["events"].windows[0].shards[0];
+        assert_eq!(shard.len(), 1);
+        assert_eq!(shard[0].segment_id, 2);
+    }
+
+    #[test]
+    fn snapshot_for_query_reflects_committed_state() {
+        let scratch = Scratch::new("snapshot-wiring");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        db.add_segment("events", 0, 0, sample_segment(1, 1, (0, 100)))
+            .unwrap();
+        db.add_segment("events", 0, 0, sample_segment(2, 1, (200, 300)))
+            .unwrap();
+        db.add_segment("events", 0, 1, sample_segment(3, 1, (0, 100)))
+            .unwrap();
+
+        // Shard 0, unbounded: two segments, in insertion order.
+        let got = db
+            .snapshot_for_query("events", TimeRange::unbounded(), 0)
+            .unwrap();
+        let ids: Vec<u64> = got.iter().map(|s| s.segment_id).collect();
+        assert_eq!(ids, vec![1, 2]);
+
+        // Shard 0, narrow range over segment 1 only.
+        let range = TimeRange::new(0.into(), 50.into());
+        let got = db.snapshot_for_query("events", range, 0).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].segment_id, 1);
+
+        // Shard 1 sees its own segment and nothing else.
+        let got = db
+            .snapshot_for_query("events", TimeRange::unbounded(), 1)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].segment_id, 3);
+    }
+
+    #[test]
+    fn add_segment_unknown_table_leaves_manifest_unchanged() {
+        // The clone-apply-persist-swap shape means a failing mutation
+        // must leave both disk and memory exactly as they were. This
+        // test asserts it end-to-end by comparing the serialized
+        // manifest before and after a failed call.
+        let scratch = Scratch::new("add-unknown");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let before_mem = db.manifest().clone();
+        let before_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+
+        let err = db
+            .add_segment("nope", 0, 0, sample_segment(1, 1, (0, 1)))
+            .expect_err("unknown table must error");
+        assert!(matches!(err, BqliteError::Execution(_)));
+
+        assert_eq!(&before_mem, db.manifest(), "in-memory manifest preserved");
+        let after_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(before_disk, after_disk, "on-disk manifest bytes preserved");
+    }
+
+    #[test]
+    fn add_segment_duplicate_id_leaves_manifest_unchanged() {
+        // Second add with the same segment_id must error without
+        // corrupting the first insert.
+        let scratch = Scratch::new("add-duplicate");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        db.add_segment("events", 0, 0, sample_segment(7, 1, (0, 100)))
+            .unwrap();
+
+        let checkpoint_mem = db.manifest().clone();
+        let checkpoint_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+
+        let err = db
+            .add_segment("events", 5, 1, sample_segment(7, 2, (100, 200)))
+            .expect_err("duplicate id must error");
+        match err {
+            BqliteError::Execution(msg) => assert!(msg.contains("already exists"), "got: {msg}"),
+            other => panic!("expected Execution, got {other:?}"),
+        }
+
+        assert_eq!(
+            &checkpoint_mem,
+            db.manifest(),
+            "in-memory manifest unchanged after failed duplicate add",
+        );
+        let after_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(
+            checkpoint_disk, after_disk,
+            "on-disk manifest bytes unchanged after failed duplicate add",
+        );
+    }
+
+    #[test]
+    fn remove_segment_missing_id_leaves_manifest_unchanged() {
+        let scratch = Scratch::new("remove-missing");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        db.add_segment("events", 0, 0, sample_segment(1, 1, (0, 1)))
+            .unwrap();
+
+        let checkpoint_mem = db.manifest().clone();
+        let checkpoint_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+
+        let err = db
+            .remove_segment("events", 999)
+            .expect_err("missing id must error");
+        assert!(matches!(err, BqliteError::Execution(_)));
+
+        assert_eq!(&checkpoint_mem, db.manifest());
+        let after_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(checkpoint_disk, after_disk);
+    }
+
+    #[test]
+    fn add_segment_does_not_leave_manifest_tmp_behind() {
+        // A successful atomic update renames the tmp file over the
+        // real manifest, so no `manifest.json.tmp` should linger.
+        let scratch = Scratch::new("no-tmp-leak");
+        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        db.add_segment("events", 0, 0, sample_segment(1, 1, (0, 1)))
+            .unwrap();
+        assert!(
+            !scratch.path().join(MANIFEST_TMP_FILE_NAME).exists(),
+            "tmp file is renamed away by write_manifest_atomic"
+        );
     }
 }
