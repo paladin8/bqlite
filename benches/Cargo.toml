@@ -1,0 +1,27 @@
+[package]
+name = "bqlite-benches"
+description = "Criterion benchmarks for the bqlite query engine. Not published."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# The lib target exists only so the `common` helper module — which is
+# specified at `benches/common/mod.rs` by TASKS.md — can be exposed to
+# every Criterion bench file via `use bqlite_benches::common::*`. No
+# production code lives here.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# Wave 1 smoke benchmark — exercises the Criterion harness in CI so that
+# later waves can drop microbenchmarks in without rediscovering the
+# wiring. Every subsequent bench follows the same `[[bench]]` pattern:
+# one entry per file under `benches/benches/`, always with
+# `harness = false` so Criterion drives execution instead of libtest.
+[[bench]]
+name = "smoke"
+harness = false
