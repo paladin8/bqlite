@@ -32,14 +32,17 @@
 //! 2. Converts the owned box into an `Arc<dyn SegmentReader>` so the
 //!    scan can share ownership with future parallel shard-tasks
 //!    without changing the trait surface.
-//! 3. Constructs a [`ScanOperator`] with `ColumnProjection::all` and
-//!    no predicate — TASK-230 will thread the descriptor's
-//!    `projected_columns` / `scan_predicates` in when the real
-//!    entity-sorted scan lands.
+//! 3. Constructs a [`ScanOperator`] with the descriptor's
+//!    `projected_columns` / `scan_predicates` threaded through per
+//!    TASK-230. Until TASK-227 (predicate pushdown) and TASK-228
+//!    (projection pruning) populate those fields they remain empty,
+//!    and the scan operator falls back to
+//!    `ColumnProjection::all()` with no zone-map predicate — the
+//!    same shape the Wave 1 stub produced.
 
 use std::sync::Arc;
 
-use bqlite_core::{BqliteError, ColumnProjection, Result, SegmentReader};
+use bqlite_core::{BqliteError, Result, SegmentReader};
 use bqlite_operators::{CancellationToken, PhysicalOperator, ScanOperator};
 use bqlite_planner::{PhysicalPlan, ScanPhysical};
 use bqlite_storage::Database;
@@ -94,16 +97,18 @@ fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOpera
     let reader_box: Box<dyn SegmentReader> = db.segment_reader(&scan.table)?;
     let reader: Arc<dyn SegmentReader> = Arc::from(reader_box);
 
-    // Wave 1: scan every column, no predicate pushdown, fresh
-    // cancellation token. Wave 2's TASK-226 threads these in from the
-    // ScanPhysical descriptor once the projection-pruning and
-    // predicate-pushdown passes land.
+    // Thread the descriptor's projection and pushed predicates into
+    // the scan operator. Both fields are empty at lowering time in
+    // Wave 2 (TASK-228's projection pruning and TASK-227's predicate
+    // pushdown populate them during optimization), so this reduces
+    // to `ColumnProjection::all()` with no zone-map predicate until
+    // those passes run.
     let op = ScanOperator::new(
         reader,
-        ColumnProjection::all(),
-        None,
+        &scan.projected_columns,
+        scan.scan_predicates.clone(),
         CancellationToken::new(),
-    );
+    )?;
     Ok(Box::new(op))
 }
 
@@ -186,14 +191,41 @@ mod tests {
     }
 
     #[test]
-    fn bind_scan_output_schema_matches_descriptor() {
+    fn bind_scan_output_schema_reflects_declared_columns() {
+        // The descriptor's `output_schema` widens to
+        // `OperatorSchema::from_table` (declared columns + implicit
+        // `__seq_id` / `__batch_id` system columns) because that's
+        // the shape the planner uses to compose downstream
+        // operators. The Wave 2 scan operator, however, narrows to
+        // **declared columns only** — the segment reader does not
+        // yet materialize system columns, and the k-way merge would
+        // reject batches whose schema did not match the one passed
+        // at construction. This test pins both facts explicitly so a
+        // regression in either side surfaces as a clean assertion.
         let scratch = Scratch::new("schema");
         let db = Database::open_or_create(scratch.path()).expect("open db");
         let descriptor = bootstrap_scan_descriptor();
-        let expected = descriptor.output_schema().clone();
 
         let op = bind_physical(&descriptor, &db).expect("bind must succeed");
-        assert_eq!(op.output_schema(), &expected);
+
+        let op_names: Vec<&str> = op
+            .output_schema()
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(op_names, vec!["entity_id", "ts", "event_type"]);
+
+        let descriptor_names: Vec<&str> = descriptor
+            .output_schema()
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            descriptor_names,
+            vec!["entity_id", "ts", "event_type", "__seq_id", "__batch_id"]
+        );
     }
 
     #[test]

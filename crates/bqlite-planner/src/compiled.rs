@@ -57,7 +57,13 @@
 
 use std::sync::Arc;
 
-use bqlite_ast::expr::{BinaryOp, CompareOp, UnaryOp};
+// Re-export these operator enums from `bqlite_planner::compiled` so
+// downstream crates (notably `bqlite-operators`, which is forbidden
+// from taking a runtime dependency on `bqlite-ast`) can match on the
+// variants stored inside [`CompiledNode::Arith`], [`CompiledNode::Compare`],
+// and [`CompiledNode::Unary`] without adding a new dep. These are pure
+// path re-exports — they do not introduce any behavior.
+pub use bqlite_ast::expr::{BinaryOp, CompareOp, UnaryOp};
 use bqlite_core::{BqlType, PropertyValue};
 
 use crate::expr::{ScalarFunctionSig, TypedExpr, TypedExprKind};

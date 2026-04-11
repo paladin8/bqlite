@@ -1,134 +1,284 @@
-//! Wave 1 stub implementation of the scan operator.
+//! Entity-sorted scan operator (TASK-230).
 //!
-//! `ScanOperator` is the leaf of every v0 execution tree: it drives a
-//! [`SegmentReader`] to completion and emits one [`RecordBatch`] per
-//! row-group. The scan holds a per-query snapshot of the manifest
-//! through the reader (see `docs/design/storage/reader-trait.md`),
-//! opens each segment in turn, and forwards every row-group the
-//! segment yields.
+//! `ScanOperator` is the leaf of every Wave 2 data-plane execution
+//! tree. It turns the `SegmentReader` trait's per-segment iteration
+//! into a globally `(entity_id, ts)`-ordered stream of record batches
+//! and applies two layers of predicate evaluation on the way out:
 //!
-//! ## Scope
+//! 1. **Zone-map pruning**. The operator converts whichever pushable
+//!    shapes it can recognise from `scan_predicates: Vec<CompiledExpr>`
+//!    into a [`ScanPredicate`] and hands that to every
+//!    `open_segment` call. The storage reader uses it to short-
+//!    circuit row-group decode via
+//!    [`ScanPredicate::accepts_zone_group`] (TASK-216). Non-pushable
+//!    expressions flow straight through to the post-filter step
+//!    below; zone-map pruning never sees them.
+//! 2. **Row-level post-filter**. After the k-way merge materialises
+//!    a batch, the operator evaluates **every** entry in
+//!    `scan_predicates` via [`crate::eval::evaluate_bool`] and drops
+//!    rows that fail. Zone-map pruning is one-sided — it may return
+//!    extras that the row-level evaluator is expected to drop — so
+//!    the post-filter is what preserves exact semantics. See
+//!    `docs/design/storage/predicate-pushdown.md` §8 for the
+//!    one-sided contract, and TASK-230's description for the "against
+//!    materialized row groups" wording.
 //!
-//! This is the Wave 1 stub called out by TASK-117: it actually drives
-//! `SegmentReader::segments()` and `SegmentScan::next_row_group()` so
-//! downstream planner + engine work has real types to wire to. It is
-//! **not** the production scan operator. In particular:
+//! Across segments, the operator consults
+//! [`SegmentReader::segments`], opens every returned handle via
+//! [`SegmentReader::open_segment`] (forwarding the same
+//! [`ColumnProjection`] and the [`ScanPredicate`] built above), and
+//! feeds the resulting per-segment [`SegmentScan`]s into a
+//! [`KWayMergeScan`] that emits a single globally ordered row
+//! stream. The merge honours the same
+//! `Arc<[u8]> / Arc<FooterV1>` sharing inside each per-segment scan,
+//! so the scan operator never duplicates segment bytes.
 //!
-//! - Projection pruning is not implemented — the stub only supports
-//!   [`ColumnProjection::all`] and the output schema is
-//!   [`OperatorSchema::from_table`] of the reader's schema. Passing a
-//!   non-all projection is accepted and forwarded to the reader, but
-//!   the scan's `output_schema` still reflects the full table shape;
-//!   TASK-2xx (projection pruning) will rebuild the schema from the
-//!   projection and drop unreferenced columns.
-//! - No k-way merge across segments — segments are read sequentially
-//!   per `reader-trait.md §4`. K-way merge lands with the Wave 2
-//!   segment format.
-//! - No zone-map driven row-group skipping — the scan passes the
-//!   optional predicate through to `open_segment` but does not itself
-//!   consult `SegmentScan::row_group_zone_maps`.
-//! - No metrics instrumentation (TASK-112's `Metrics` trait is wired
-//!   in later waves).
+//! ## Projection
+//!
+//! Empty `projected_columns` means "decode every declared column",
+//! matching [`ColumnProjection::all`]. An explicit list must include
+//! the table's entity-key and timestamp columns — the k-way merge
+//! uses them as its sort key, so a projection that omits them is
+//! rejected with `BqliteError::Schema` at construction time rather
+//! than failing later inside the merge. Dropping the sort key from a
+//! scan output is a concern of a future projection-pruning pass
+//! (TASK-228), which must insert an extraction step rather than
+//! asking the scan to emit an unsorted stream.
+//!
+//! ## Output schema
+//!
+//! The scan's [`OperatorSchema`] reflects the **declared columns**
+//! the reader actually materialises — the same set that
+//! `SegmentFileScan::build_scan_plan` constructs from
+//! `current_schema.columns()`. Implicit system columns (`__seq_id`,
+//! `__batch_id`) are **not** included; the Wave 2 segment reader
+//! does not yet expose them to the scan plan, and declaring them in
+//! `output_schema` would cause the k-way merge to reject real
+//! batches that carry only the three declared columns. A future
+//! extension may materialise system columns as a per-row counter,
+//! at which point the scan's contract widens without breaking this
+//! task's reader/merge pipeline.
 //!
 //! ## Lifecycle
 //!
-//! Follows the [`PhysicalOperator`] contract:
-//!
-//! 1. `open()` materializes the segment handle list from the reader's
-//!    snapshot. Any error yielded by the reader's iterator surfaces
-//!    from `open()` so that failure is visible before the first row
-//!    flows.
-//! 2. `next_batch()` walks the handles, opening each segment lazily
-//!    and draining it row-group by row-group. Cancellation is
-//!    observed at the top of every call via the shared
-//!    [`CancellationToken`].
-//! 3. `close()` drops the current scan and the handle list. It is
-//!    idempotent — the engine may call it during tear-down even if
-//!    `open()` failed or `next_batch()` was never called.
+//! - `open()` enumerates segment handles, opens every segment, and
+//!   primes a [`KWayMergeScan`]. Any error in enumeration or in a
+//!   per-segment open surfaces here so that failures happen before
+//!   the first pull. Opening is idempotent in the sense that the
+//!   engine may call `close()` afterwards without ever calling
+//!   `next_batch()`.
+//! - `next_batch()` pulls from the merge, post-filters, and returns
+//!   the first non-empty result. Fully rejected batches cause the
+//!   operator to loop back and pull the merge again, matching the
+//!   `FilterOperator` convention so downstream operators rarely see
+//!   zero-row batches.
+//! - `close()` drops the merge (which releases every per-segment
+//!   scan) and marks the operator exhausted. Subsequent calls to
+//!   `next_batch()` return `Ok(None)`.
 
 use std::sync::Arc;
 
+use arrow::array::BooleanArray;
+use arrow::compute::{self, kernels::boolean};
+use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::{
-    BqliteError, ColumnProjection, OperatorSchema, Predicate, Result, SegmentHandle, SegmentReader,
-    SegmentScan,
+    BqliteError, ColumnDef, ColumnProjection, OperatorSchema, Predicate, PropertyValue, RangeOp,
+    Result, ScanConjunct, ScanPredicate, SegmentHandle, SegmentReader, SegmentScan, TableSchema,
 };
+use bqlite_planner::compiled::{CompareOp, CompiledExpr, CompiledNode};
+use bqlite_storage::segment::merge::KWayMergeScan;
 
+use crate::eval;
 use crate::operator::{CancellationToken, PhysicalOperator};
 
-/// Pull-based scan over a [`SegmentReader`].
+// ─────────────────────────────────────────────────────────────────────────────
+// ScanOperator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Entity-sorted scan over a [`SegmentReader`].
 ///
-/// Constructed with the reader, a column projection, an optional
-/// predicate, and a cancellation token. Wave 1 only supports
-/// [`ColumnProjection::all`] for the purposes of `output_schema`;
-/// non-all projections are still forwarded to the reader (so the test
-/// fixture can exercise the plumbing) but do not reshape the output
-/// schema. Projection-driven schema narrowing is a later wave's task.
+/// See the module docs for the full contract. Briefly: enumerate
+/// segments → open each with projection + zone-map predicate → feed
+/// into [`KWayMergeScan`] → post-filter with the compiled predicates
+/// → emit sorted batches.
 pub struct ScanOperator {
+    /// Upstream reader. Held as `Arc` so multiple shard-tasks can
+    /// share one reader in later waves without changing the trait.
     reader: Arc<dyn SegmentReader>,
+    /// Column projection forwarded to every `open_segment` call.
     projection: ColumnProjection,
-    predicate: Option<Arc<dyn Predicate>>,
+    /// Zone-map pruning predicate. Built from the convertible subset
+    /// of `post_filters`. `None` when no predicate converts — in that
+    /// case no zone-map pruning happens and the reader streams every
+    /// row-group unchanged.
+    scan_predicate: Option<Arc<dyn Predicate>>,
+    /// Full list of pushed `CompiledExpr` predicates. The scan
+    /// re-evaluates **all** of them on every materialised batch, not
+    /// just the ones that failed to convert to a `ScanConjunct` —
+    /// this is how the operator honours the "exact semantics" half
+    /// of the pushdown contract when zone-map pruning is
+    /// conservative.
+    post_filters: Vec<CompiledExpr>,
+    /// Cancellation flag checked at the top of each `next_batch`.
     cancel: CancellationToken,
+    /// The operator's public output schema. Built from the reader's
+    /// [`TableSchema`] and `projection`; reflects the declared
+    /// columns the reader actually materialises (see module docs).
     output_schema: OperatorSchema,
-    /// Segment handles materialized from `reader.segments()` at
-    /// `open()` time. `None` until `open()` has been called.
-    segments: Option<Vec<SegmentHandle>>,
-    /// Index of the next segment to open in `segments`.
-    next_segment: usize,
-    /// Active scan over the current segment, if any. Replaced when
-    /// the current scan is exhausted and there is another segment.
-    current: Option<Box<dyn SegmentScan>>,
-    /// Latches to `true` on the first `Ok(None)` and keeps subsequent
-    /// calls cheap and side-effect-free.
+    /// Arrow form of `output_schema`, cached so the merge gets a
+    /// shared `Arc<ArrowSchema>` without rebuilding per batch.
+    arrow_schema: Arc<ArrowSchema>,
+    /// Ordinal of the entity-key column in `arrow_schema`. Computed
+    /// at construction so the merge's sort-key walk does not pay a
+    /// name lookup per batch.
+    entity_col: usize,
+    /// Ordinal of the timestamp column in `arrow_schema`.
+    ts_col: usize,
+    /// Running k-way merge. `None` until `open()` has been called;
+    /// reset to `None` by `close()` so the operator may be closed
+    /// before any data flows.
+    merge: Option<KWayMergeScan>,
+    /// Latches on the first `Ok(None)` from `next_batch` and keeps
+    /// subsequent pulls cheap and side-effect-free.
     exhausted: bool,
 }
 
+impl std::fmt::Debug for ScanOperator {
+    /// Lightweight [`Debug`] impl. The struct holds a few trait
+    /// objects (`Arc<dyn SegmentReader>`, `Arc<dyn Predicate>`) that
+    /// we deliberately do not dereference — dumping their state is
+    /// not useful for operator debugging, and the trait objects'
+    /// own `Debug` surface is minimal. Tests that use `expect_err`
+    /// format this value on the failing `Ok` arm; see `Result::expect_err`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanOperator")
+            .field("projection", &self.projection)
+            .field("output_schema", &self.output_schema)
+            .field("entity_col", &self.entity_col)
+            .field("ts_col", &self.ts_col)
+            .field("has_scan_predicate", &self.scan_predicate.is_some())
+            .field("post_filter_count", &self.post_filters.len())
+            .field("open", &self.merge.is_some())
+            .field("exhausted", &self.exhausted)
+            .finish()
+    }
+}
+
 impl ScanOperator {
-    /// Build a scan over every segment the reader enumerates.
+    /// Construct an entity-sorted scan.
     ///
-    /// The output schema is derived from the reader's current table
-    /// schema (see `bqlite_core::storage::SegmentReader::schema`),
-    /// which matches the manifest's "schema authority" contract from
-    /// `storage-format.md §12.2`.
+    /// # Arguments
     ///
-    /// **Wave 1 caveat.** Non-[`ColumnProjection::all`] projections
-    /// are accepted and forwarded to the reader so the plumbing is
-    /// exercised, but `output_schema()` still reflects the full
-    /// table schema. Projection-driven narrowing lands with the
-    /// projection-pruning task in a later wave; callers that hit
-    /// the schema mismatch today should pass [`ColumnProjection::all`].
+    /// - `reader` — the table's segment reader, typically from
+    ///   [`bqlite_storage::Database::segment_reader`]. Its
+    ///   [`TableSchema`] drives projection resolution and sort-key
+    ///   discovery.
+    /// - `projected_columns` — empty means "every declared column".
+    ///   A non-empty list must include the entity-key and timestamp
+    ///   columns so the k-way merge has a sort key; a list missing
+    ///   either returns [`BqliteError::Schema`].
+    /// - `scan_predicates` — the `Vec<CompiledExpr>` TASK-227's
+    ///   predicate-pushdown pass lifted out of a parent
+    ///   `FilterPhysical`. Every entry is re-evaluated post-decode
+    ///   for exact semantics; the convertible subset additionally
+    ///   drives zone-map pruning at row-group granularity.
+    /// - `cancel` — shared cancellation token.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Schema`] if `projected_columns` names a
+    ///   column absent from the reader's table schema, or if the
+    ///   projection omits the entity-key or timestamp column.
+    /// - [`BqliteError::Execution`] if the resulting Arrow schema
+    ///   has a key column type unsupported by [`KWayMergeScan`] —
+    ///   this is effectively unreachable because
+    ///   [`TableSchema::new`] already rejects unsupported key
+    ///   types, but the constructor propagates the merge's
+    ///   validation error rather than assuming.
     pub fn new(
         reader: Arc<dyn SegmentReader>,
-        projection: ColumnProjection,
-        predicate: Option<Arc<dyn Predicate>>,
+        projected_columns: &[String],
+        scan_predicates: Vec<CompiledExpr>,
         cancel: CancellationToken,
-    ) -> Self {
-        let output_schema = OperatorSchema::from_table(reader.schema());
-        Self {
+    ) -> Result<Self> {
+        let projection = if projected_columns.is_empty() {
+            ColumnProjection::all()
+        } else {
+            ColumnProjection::with_columns(projected_columns.iter().cloned())
+        };
+        let output_schema = build_output_schema(reader.schema(), &projection)?;
+        let arrow_schema = Arc::new(output_schema.to_arrow_schema());
+
+        let entity_name = reader.schema().entity_key_column().name.as_str();
+        let ts_name = reader.schema().timestamp_column().name.as_str();
+        let entity_col = output_schema
+            .column(entity_name)
+            .map(|(i, _)| i)
+            .ok_or_else(|| {
+                BqliteError::Schema(format!(
+                    "scan: projection must include the entity-key column `{entity_name}`"
+                ))
+            })?;
+        let ts_col = output_schema
+            .column(ts_name)
+            .map(|(i, _)| i)
+            .ok_or_else(|| {
+                BqliteError::Schema(format!(
+                    "scan: projection must include the timestamp column `{ts_name}`"
+                ))
+            })?;
+
+        let scan_predicate = build_scan_predicate(&scan_predicates);
+
+        Ok(Self {
             reader,
             projection,
-            predicate,
+            scan_predicate,
+            post_filters: scan_predicates,
             cancel,
             output_schema,
-            segments: None,
-            next_segment: 0,
-            current: None,
+            arrow_schema,
+            entity_col,
+            ts_col,
+            merge: None,
             exhausted: false,
-        }
+        })
     }
 
-    /// Convenience constructor that projects every column with no
-    /// predicate pushdown and an unused cancellation token. The
-    /// engine bind step (TASK-118) will use the full constructor; this
-    /// shortcut keeps planner unit tests terse.
-    pub fn full_scan(reader: Arc<dyn SegmentReader>) -> Self {
-        Self::new(
-            reader,
-            ColumnProjection::all(),
-            None,
-            CancellationToken::new(),
-        )
+    /// Convenience constructor: scan every declared column with no
+    /// pushed predicates and a fresh cancellation token. Used by
+    /// planner unit tests that want to exercise the operator's
+    /// iteration shape without building a full `CompiledExpr` tree.
+    pub fn full_scan(reader: Arc<dyn SegmentReader>) -> Result<Self> {
+        Self::new(reader, &[], Vec::new(), CancellationToken::new())
+    }
+
+    /// Evaluate every entry in `post_filters` against `batch` and
+    /// return the subset of rows that satisfy all of them.
+    ///
+    /// Empty `post_filters` short-circuits to the input — avoiding
+    /// both an Arrow allocation and the boolean-array dance — which
+    /// matters for the common pre-TASK-227 case where nothing has
+    /// been pushed yet.
+    fn apply_post_filters(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if self.post_filters.is_empty() {
+            return Ok(batch);
+        }
+        let mut combined: Option<BooleanArray> = None;
+        for predicate in &self.post_filters {
+            let mask = eval::evaluate_bool(predicate, &batch)?;
+            combined = Some(match combined {
+                None => mask,
+                Some(acc) => boolean::and_kleene(&acc, &mask)?,
+            });
+        }
+        // `post_filters.is_empty()` short-circuits above, so we
+        // always have at least one mask when we reach this point.
+        let mask = combined.expect("post_filters non-empty");
+        let filtered = compute::filter_record_batch(&batch, &mask)?;
+        Ok(filtered)
     }
 }
 
@@ -138,15 +288,27 @@ impl PhysicalOperator for ScanOperator {
     }
 
     fn open(&mut self) -> Result<()> {
-        // Materialize the segment list eagerly. `SegmentReader::segments`
-        // returns a lazy iterator; collecting here surfaces any reader
-        // error before `next_batch` is first called, which matches the
-        // "fail cleanly before results start flowing" clause in the
-        // trait doc (`operator.rs` §PhysicalOperator::open).
+        // Materialise the handle list up-front so any enumeration
+        // error surfaces from `open()`, before results start
+        // flowing — matches the `PhysicalOperator::open` doc.
         let handles: Result<Vec<SegmentHandle>> = self.reader.segments().collect();
-        self.segments = Some(handles?);
-        self.next_segment = 0;
-        self.current = None;
+        let handles = handles?;
+
+        let mut scans: Vec<Box<dyn SegmentScan>> = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            let scan =
+                self.reader
+                    .open_segment(handle, &self.projection, self.scan_predicate.clone())?;
+            scans.push(scan);
+        }
+
+        let merge = KWayMergeScan::new(
+            scans,
+            self.arrow_schema.clone(),
+            self.entity_col,
+            self.ts_col,
+        )?;
+        self.merge = Some(merge);
         self.exhausted = false;
         Ok(())
     }
@@ -158,48 +320,231 @@ impl PhysicalOperator for ScanOperator {
         if self.cancel.is_cancelled() {
             return Err(BqliteError::Cancelled);
         }
-        let segments = self
-            .segments
-            .as_ref()
-            .expect("ScanOperator::next_batch called before open()");
-
         loop {
-            // Ensure we have an active per-segment scan.
-            if self.current.is_none() {
-                if self.next_segment >= segments.len() {
-                    self.exhausted = true;
-                    return Ok(None);
-                }
-                let handle = &segments[self.next_segment];
-                self.next_segment += 1;
-                let scan =
-                    self.reader
-                        .open_segment(handle, &self.projection, self.predicate.clone())?;
-                self.current = Some(scan);
+            let merge = self.merge.as_mut().ok_or_else(|| {
+                BqliteError::Execution("ScanOperator::next_batch called before open()".to_string())
+            })?;
+            let Some(batch) = merge.next_batch()? else {
+                self.exhausted = true;
+                return Ok(None);
+            };
+            if batch.num_rows() == 0 {
+                // The merge itself emits non-empty batches, but
+                // downstream evolution may produce empties; forward
+                // unconditionally rather than loop.
+                return Ok(Some(batch));
             }
-
-            let scan = self.current.as_mut().expect("current scan just set");
-            match scan.next_row_group()? {
-                Some(batch) => return Ok(Some(batch)),
-                None => {
-                    // Exhausted this segment — drop the scan and loop
-                    // to advance to the next one (or signal overall
-                    // exhaustion).
-                    self.current = None;
-                }
+            let filtered = self.apply_post_filters(batch)?;
+            if filtered.num_rows() > 0 {
+                return Ok(Some(filtered));
             }
+            // Every row rejected — pull the merge again.
         }
     }
 
     fn close(&mut self) -> Result<()> {
-        // Dropping the current scan releases its OS resources
-        // (mmap, file handle, decompression state) per the trait doc.
-        // `close` must be idempotent: clearing already-None fields is
-        // cheap and correct.
-        self.current = None;
-        self.segments = None;
+        // Dropping the merge releases every held per-segment scan
+        // (file handles, decompression state) via its destructors.
+        // `close` must tolerate being called with `merge == None`
+        // after a failed `open` or without ever reaching `open`.
+        self.merge = None;
         self.exhausted = true;
         Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Output schema construction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the scan operator's [`OperatorSchema`] from the reader's
+/// table schema and the effective [`ColumnProjection`].
+///
+/// For `is_all` projections the result lists every declared column
+/// in table order. For an explicit projection the function resolves
+/// every requested name against `TableSchema::column` and preserves
+/// duplicates (duplicates are rejected by `OperatorSchema::new`).
+///
+/// The returned schema matches what
+/// [`bqlite_storage::segment::reader::SegmentFileScan::build_scan_plan`]
+/// materialises for the same projection; this match is load-bearing
+/// because the k-way merge validates each per-segment batch's
+/// schema against the operator-supplied one.
+fn build_output_schema(
+    table: &TableSchema,
+    projection: &ColumnProjection,
+) -> Result<OperatorSchema> {
+    let columns: Vec<ColumnDef> = if projection.is_all() {
+        table.columns().to_vec()
+    } else {
+        let mut resolved = Vec::with_capacity(projection.len());
+        for name in projection.columns() {
+            let (_, col) = table.column(name).ok_or_else(|| {
+                BqliteError::Schema(format!(
+                    "scan: projected column `{name}` not in table `{}`",
+                    table.name()
+                ))
+            })?;
+            resolved.push(col.clone());
+        }
+        resolved
+    };
+    OperatorSchema::new(columns)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CompiledExpr → ScanPredicate lowering
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert a `Vec<CompiledExpr>` into a `ScanPredicate`, extracting
+/// every conjunct that matches one of the pushable shapes from
+/// `docs/design/storage/predicate-pushdown.md` §4.
+///
+/// Non-convertible expressions are silently dropped from the
+/// returned predicate — they remain in the scan operator's
+/// `post_filters` list and are re-evaluated at row level after the
+/// merge materialises each batch. Dropping unconvertible
+/// expressions here is safe because post-filter is the single
+/// source of truth for exactness; the `ScanPredicate` is only ever
+/// used as a zone-map pruning hint.
+///
+/// Returns `None` when no conjunct converts. That is treated as
+/// "no pushdown at the reader level" — the `open_segment` call
+/// then hands `None` for `predicate`, and the reader streams every
+/// row-group unchanged.
+fn build_scan_predicate(predicates: &[CompiledExpr]) -> Option<Arc<dyn Predicate>> {
+    let mut conjuncts: Vec<ScanConjunct> = Vec::new();
+    for pred in predicates {
+        if let Some(conj) = lower_to_conjunct(pred) {
+            conjuncts.push(conj);
+        }
+    }
+    if conjuncts.is_empty() {
+        None
+    } else {
+        Some(Arc::new(ScanPredicate::new(conjuncts)) as Arc<dyn Predicate>)
+    }
+}
+
+/// Try to convert a single [`CompiledExpr`] to a [`ScanConjunct`].
+/// Returns `None` when the expression does not match any of the
+/// Wave 2 pushable shapes.
+fn lower_to_conjunct(expr: &CompiledExpr) -> Option<ScanConjunct> {
+    match &expr.node {
+        CompiledNode::Compare {
+            op, left, right, ..
+        } => lower_compare(*op, left, right),
+        CompiledNode::IsNull { input, negated } => {
+            let column = column_name(input)?;
+            Some(if *negated {
+                ScanConjunct::IsNotNull { column }
+            } else {
+                ScanConjunct::IsNull { column }
+            })
+        }
+        CompiledNode::InLiteralSet {
+            input,
+            values,
+            negated,
+            ..
+        } => {
+            if *negated || values.is_empty() {
+                // `NOT IN` is not a Wave 2 pushable shape (it would
+                // decompose into a NotEqual conjunct per literal,
+                // which the storage layer does not yet support as a
+                // cross-row conjunction). Empty `IN ()` should never
+                // reach us — TASK-227 elides empty sets to a
+                // constant `false` residual — but guard defensively.
+                return None;
+            }
+            let column = column_name(input)?;
+            Some(ScanConjunct::InSet {
+                column,
+                values: values.clone(),
+            })
+        }
+        // Column / literal nodes at the top level cannot be
+        // pushable on their own; And / Or / Not / arithmetic /
+        // function calls are not in the §4 taxonomy. Every other
+        // variant falls through as "not pushable".
+        _ => None,
+    }
+}
+
+/// Lower a `Compare` node where exactly one side is a column and
+/// the other is a literal. Other shapes (col-to-col, expr-to-expr,
+/// literal-to-literal) are not pushable in Wave 2.
+fn lower_compare(op: CompareOp, left: &CompiledExpr, right: &CompiledExpr) -> Option<ScanConjunct> {
+    let (column, value, flipped) = match (&left.node, &right.node) {
+        (CompiledNode::Column { name, .. }, CompiledNode::Literal(v)) => {
+            (name.clone(), v.clone(), false)
+        }
+        (CompiledNode::Literal(v), CompiledNode::Column { name, .. }) => {
+            (name.clone(), v.clone(), true)
+        }
+        _ => return None,
+    };
+    // `PropertyValue::Null` on either side makes the comparison
+    // UNKNOWN under three-valued logic; the filter operator drops
+    // such rows. The storage layer does not currently understand a
+    // null-valued `Equal` / `Range` conjunct, so skip pushdown and
+    // let post-filter handle it.
+    if matches!(value, PropertyValue::Null) {
+        return None;
+    }
+    let op = if flipped { flip_compare(op) } else { op };
+    Some(compare_to_conjunct(op, column, value))
+}
+
+/// Flip a comparison operator so the column is always on the left
+/// after the rewrite. Called from [`lower_compare`] when the
+/// literal was on the left-hand side of the original expression.
+fn flip_compare(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Equal => CompareOp::Equal,
+        CompareOp::NotEqual => CompareOp::NotEqual,
+        CompareOp::Less => CompareOp::Greater,
+        CompareOp::LessOrEqual => CompareOp::GreaterOrEqual,
+        CompareOp::Greater => CompareOp::Less,
+        CompareOp::GreaterOrEqual => CompareOp::LessOrEqual,
+    }
+}
+
+fn compare_to_conjunct(op: CompareOp, column: String, value: PropertyValue) -> ScanConjunct {
+    match op {
+        CompareOp::Equal => ScanConjunct::Equal { column, value },
+        CompareOp::NotEqual => ScanConjunct::NotEqual { column, value },
+        CompareOp::Less => ScanConjunct::Range {
+            column,
+            op: RangeOp::Lt,
+            value,
+        },
+        CompareOp::LessOrEqual => ScanConjunct::Range {
+            column,
+            op: RangeOp::Le,
+            value,
+        },
+        CompareOp::Greater => ScanConjunct::Range {
+            column,
+            op: RangeOp::Gt,
+            value,
+        },
+        CompareOp::GreaterOrEqual => ScanConjunct::Range {
+            column,
+            op: RangeOp::Ge,
+            value,
+        },
+    }
+}
+
+/// Extract the column name from a [`CompiledExpr`] whose outermost
+/// node is a bare column read. Returns `None` for every other shape
+/// — `CompiledExpr::Column`'s `name` is the canonical source for
+/// the column a conjunct references.
+fn column_name(expr: &CompiledExpr) -> Option<String> {
+    match &expr.node {
+        CompiledNode::Column { name, .. } => Some(name.clone()),
+        _ => None,
     }
 }
 
@@ -213,14 +558,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::array::{Array as _, ArrayRef, StringViewArray, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, TimeUnit};
 
-    use bqlite_core::{BqlType, ColumnDef, TableSchema, ZoneMap};
+    use bqlite_ast::expr::{CompareOp, Expr, Literal, Spanned};
+    use bqlite_ast::span::{Name, Span};
+    use bqlite_core::{BqlType, ColumnDef, PropertyValue, TableSchema, ZoneMap};
+    use bqlite_planner::expr::{FunctionRegistry, TypedExpr};
 
     use super::*;
 
-    // ── Fixtures ─────────────────────────────────────────────────────────────
+    // ── Canonical schemas and batch helpers ──────────────────────────────────
 
     fn minimal_schema() -> TableSchema {
         TableSchema::new(
@@ -237,43 +585,83 @@ mod tests {
         .unwrap()
     }
 
-    fn arrow_schema() -> Arc<ArrowSchema> {
+    fn minimal_arrow_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
-            Field::new("entity_id", DataType::Utf8, false),
-            Field::new("ts", DataType::Int64, false),
-            Field::new("event_type", DataType::Utf8, false),
+            Field::new("entity_id", DataType::Utf8View, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("event_type", DataType::Utf8View, false),
         ]))
     }
 
     fn make_batch(ids: &[&str], tss: &[i64], evts: &[&str]) -> RecordBatch {
-        let ids: ArrayRef = Arc::new(StringArray::from(ids.to_vec()));
-        let tss: ArrayRef = Arc::new(Int64Array::from(tss.to_vec()));
-        let evts: ArrayRef = Arc::new(StringArray::from(evts.to_vec()));
-        RecordBatch::try_new(arrow_schema(), vec![ids, tss, evts]).unwrap()
+        let ids: ArrayRef = Arc::new(StringViewArray::from(ids.to_vec()));
+        let tss: ArrayRef = Arc::new(
+            TimestampNanosecondArray::from(tss.iter().copied().map(Some).collect::<Vec<_>>())
+                .with_timezone("UTC"),
+        );
+        let evts: ArrayRef = Arc::new(StringViewArray::from(evts.to_vec()));
+        RecordBatch::try_new(minimal_arrow_schema(), vec![ids, tss, evts]).unwrap()
     }
 
-    /// Reader that yields a fixed list of segments, each carrying a
-    /// fixed list of row-groups. Good enough to exercise multi-segment
-    /// multi-row-group iteration without a real storage layer.
-    ///
-    /// The reader also captures the last `predicate` argument it saw
-    /// through [`open_segment`] so tests can assert that predicate
-    /// forwarding actually reaches the storage layer — a weaker
-    /// assertion (compile-time type-check only) would miss a
-    /// regression where the scan silently dropped the predicate.
+    fn make_handle(segment_id: u64, row_count: u64) -> SegmentHandle {
+        SegmentHandle {
+            segment_id,
+            shard_id: 0,
+            window_id: 0,
+            row_count,
+            schema_version: 0,
+        }
+    }
+
+    // ── In-memory SegmentReader with zone-map pruning support ───────────────
+
+    /// One entry in a test fixture: segment handle + row-group
+    /// batches + parallel list of per-row-group zone maps. Named so
+    /// clippy's `type_complexity` lint stays quiet without hiding
+    /// the shape from the reader.
+    type VecSegment = (
+        SegmentHandle,
+        Vec<RecordBatch>,
+        Vec<HashMap<String, ZoneMap>>,
+    );
+
+    /// A test-only `SegmentReader` that owns a list of
+    /// `(handle, batches, zone_maps)` tuples and hands out fake
+    /// [`SegmentScan`]s that materialise them one row-group at a
+    /// time. Unlike the Wave 1 `VecReader`, this reader respects a
+    /// pushed-down predicate at row-group boundaries, mirroring the
+    /// real `SegmentFileScan`'s behaviour closely enough that the
+    /// scan operator's merge path can be exercised without linking
+    /// a real segment writer into the test crate.
     struct VecReader {
         schema: TableSchema,
-        segments: Vec<(SegmentHandle, Vec<RecordBatch>)>,
+        segments: Vec<VecSegment>,
         open_calls: AtomicUsize,
+        last_projection: Mutex<Option<ColumnProjection>>,
         last_predicate: Mutex<Option<Arc<dyn Predicate>>>,
     }
 
     impl VecReader {
-        fn new(schema: TableSchema, segments: Vec<(SegmentHandle, Vec<RecordBatch>)>) -> Self {
+        fn empty(schema: TableSchema) -> Self {
+            Self {
+                schema,
+                segments: Vec::new(),
+                open_calls: AtomicUsize::new(0),
+                last_projection: Mutex::new(None),
+                last_predicate: Mutex::new(None),
+            }
+        }
+
+        fn with_segments(schema: TableSchema, segments: Vec<VecSegment>) -> Self {
             Self {
                 schema,
                 segments,
                 open_calls: AtomicUsize::new(0),
+                last_projection: Mutex::new(None),
                 last_predicate: Mutex::new(None),
             }
         }
@@ -289,6 +677,8 @@ mod tests {
 
     struct VecScan {
         batches: Vec<RecordBatch>,
+        zone_maps: Vec<HashMap<String, ZoneMap>>,
+        predicate: Option<Arc<dyn Predicate>>,
         position: usize,
     }
 
@@ -298,20 +688,23 @@ mod tests {
         }
 
         fn segments(&self) -> Box<dyn Iterator<Item = Result<SegmentHandle>> + Send + '_> {
-            Box::new(self.segments.iter().map(|(h, _)| Ok(h.clone())))
+            Box::new(self.segments.iter().map(|(h, _, _)| Ok(h.clone())))
         }
 
         fn open_segment(
             &self,
             handle: &SegmentHandle,
-            _projection: &ColumnProjection,
+            projection: &ColumnProjection,
             predicate: Option<Arc<dyn Predicate>>,
         ) -> Result<Box<dyn SegmentScan>> {
             self.open_calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_predicate.lock().unwrap() = predicate;
-            match self.segments.iter().find(|(h, _)| h == handle) {
-                Some((_, batches)) => Ok(Box::new(VecScan {
+            *self.last_projection.lock().unwrap() = Some(projection.clone());
+            *self.last_predicate.lock().unwrap() = predicate.clone();
+            match self.segments.iter().find(|(h, _, _)| h == handle) {
+                Some((_, batches, zones)) => Ok(Box::new(VecScan {
                     batches: batches.clone(),
+                    zone_maps: zones.clone(),
+                    predicate,
                     position: 0,
                 })),
                 None => Err(BqliteError::Execution(format!(
@@ -326,32 +719,35 @@ mod tests {
             self.batches.len()
         }
 
-        fn row_group_zone_maps(&self, _idx: usize) -> Result<HashMap<String, ZoneMap>> {
-            Ok(HashMap::new())
+        fn row_group_zone_maps(&self, idx: usize) -> Result<HashMap<String, ZoneMap>> {
+            Ok(self.zone_maps.get(idx).cloned().unwrap_or_default())
         }
 
         fn next_row_group(&mut self) -> Result<Option<RecordBatch>> {
-            if self.position >= self.batches.len() {
-                return Ok(None);
+            loop {
+                if self.position >= self.batches.len() {
+                    return Ok(None);
+                }
+                let idx = self.position;
+                self.position += 1;
+                // Real `SegmentFileScan` prunes row-groups whose
+                // zone-maps the predicate rejects. Mirror that here
+                // so the scan operator's pushdown path has exactly
+                // the behaviour it relies on in production.
+                if let Some(pred) = &self.predicate {
+                    let zones = self.zone_maps.get(idx).cloned().unwrap_or_default();
+                    if !pred.accepts_zone_group(&zones) {
+                        continue;
+                    }
+                }
+                return Ok(Some(self.batches[idx].clone()));
             }
-            let b = self.batches[self.position].clone();
-            self.position += 1;
-            Ok(Some(b))
         }
     }
 
-    fn make_handle(segment_id: u64, row_count: u64) -> SegmentHandle {
-        SegmentHandle {
-            segment_id,
-            shard_id: 0,
-            window_id: 0,
-            row_count,
-            schema_version: 0,
-        }
-    }
-
-    /// Reader that returns an error mid-iteration. Proves `open()`
-    /// surfaces iterator errors instead of silently swallowing them.
+    /// Reader that yields a handle then surfaces an I/O error —
+    /// proves `open()` aborts on enumeration failure before any
+    /// per-segment work.
     struct ErroringReader {
         schema: TableSchema,
     }
@@ -382,8 +778,8 @@ mod tests {
         }
     }
 
-    /// Reader whose `open_segment` fails. Proves `next_batch()`
-    /// surfaces per-segment open errors.
+    /// Reader whose `open_segment` fails. Proves `open()` surfaces
+    /// per-segment open errors during priming.
     struct OpenFailReader {
         schema: TableSchema,
         handle: SegmentHandle,
@@ -408,293 +804,617 @@ mod tests {
         }
     }
 
-    /// Predicate that records each `accepts_zone` call so the test
-    /// can verify it was forwarded through to the reader.
-    #[derive(Debug, Default)]
-    struct RecordingPredicate {
-        calls: AtomicUsize,
+    // ── Predicate builders ──────────────────────────────────────────────────
+
+    fn compile_predicate(ast: Spanned<Expr>, schema: &OperatorSchema) -> CompiledExpr {
+        let reg = FunctionRegistry::with_builtins();
+        let typed = TypedExpr::from_ast(&ast, schema, &reg).expect("predicate type checks");
+        CompiledExpr::from_typed(&typed)
     }
 
-    impl Predicate for RecordingPredicate {
-        fn accepts_zone(&self, _column: &str, _zone: &ZoneMap) -> bool {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            true
-        }
+    fn sp<T>(node: T) -> Spanned<T> {
+        Spanned::new(node, Span::EMPTY)
     }
 
-    // ── ScanOperator: construction and schema ────────────────────────────────
-
-    #[test]
-    fn scan_output_schema_matches_reader_table_schema() {
-        let reader = Arc::new(VecReader::new(minimal_schema(), vec![]));
-        let scan = ScanOperator::full_scan(reader);
-        let schema = scan.output_schema();
-        // `OperatorSchema::from_table` includes declared columns plus
-        // the implicit system columns.
-        let names: Vec<&str> = schema.columns().iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"entity_id"));
-        assert!(names.contains(&"ts"));
-        assert!(names.contains(&"event_type"));
+    fn col(name: &str) -> Spanned<Expr> {
+        sp(Expr::Column(Name::synthetic(name)))
     }
 
-    // ── ScanOperator: empty reader ───────────────────────────────────────────
-
-    #[test]
-    fn empty_reader_yields_no_batches() {
-        // This is the exact shape TASK-116's storage stub returns and
-        // the smoke test at TASK-123 relies on: an open database with
-        // zero segments must drain cleanly.
-        let reader = Arc::new(VecReader::new(minimal_schema(), vec![]));
-        let mut scan = ScanOperator::full_scan(reader);
-        scan.open().unwrap();
-        assert!(scan.next_batch().unwrap().is_none());
-        // Exhaustion is sticky.
-        assert!(scan.next_batch().unwrap().is_none());
-        assert!(scan.next_batch().unwrap().is_none());
-        scan.close().unwrap();
+    fn string_lit(value: &str) -> Spanned<Expr> {
+        sp(Expr::Literal(Literal::String(value.to_string())))
     }
 
-    // ── ScanOperator: single segment ─────────────────────────────────────────
+    fn int_lit(value: i64) -> Spanned<Expr> {
+        sp(Expr::Literal(Literal::Int(value)))
+    }
 
-    #[test]
-    fn single_segment_single_row_group_yields_one_batch() {
-        let batch = make_batch(&["u1", "u1", "u2"], &[100, 200, 300], &["a", "b", "c"]);
-        let expected_rows = batch.num_rows();
-        let reader = Arc::new(VecReader::new(
-            minimal_schema(),
-            vec![(make_handle(1, 3), vec![batch])],
-        ));
-        let open_counter = reader.clone();
-        let mut scan = ScanOperator::full_scan(reader);
-        scan.open().unwrap();
+    fn compare(op: CompareOp, left: Spanned<Expr>, right: Spanned<Expr>) -> Spanned<Expr> {
+        sp(Expr::Compare {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
 
-        let out = scan.next_batch().unwrap().expect("batch");
-        assert_eq!(out.num_rows(), expected_rows);
-        assert_eq!(out.num_columns(), 3);
+    // ── Fixture builders ────────────────────────────────────────────────────
 
-        assert!(scan.next_batch().unwrap().is_none());
-        assert_eq!(
-            open_counter.open_calls(),
-            1,
-            "should open each segment exactly once"
+    /// Build a zone map over the `entity_id` and `ts` columns for a
+    /// row-group whose rows are all `[min, max]`-bounded.
+    fn zones_for(
+        entity_min: &str,
+        entity_max: &str,
+        ts_min: i64,
+        ts_max: i64,
+    ) -> HashMap<String, ZoneMap> {
+        let mut map = HashMap::new();
+        map.insert(
+            "entity_id".to_string(),
+            ZoneMap {
+                min: Some(PropertyValue::String(entity_min.to_string())),
+                max: Some(PropertyValue::String(entity_max.to_string())),
+                null_count: 0,
+                row_count: 0,
+            },
         );
+        map.insert(
+            "ts".to_string(),
+            ZoneMap {
+                min: Some(PropertyValue::Timestamp(ts_min)),
+                max: Some(PropertyValue::Timestamp(ts_max)),
+                null_count: 0,
+                row_count: 0,
+            },
+        );
+        map
+    }
+
+    fn zones_with_event(entity: &str, ts: i64, event: &str) -> HashMap<String, ZoneMap> {
+        let mut map = zones_for(entity, entity, ts, ts);
+        map.insert(
+            "event_type".to_string(),
+            ZoneMap {
+                min: Some(PropertyValue::String(event.to_string())),
+                max: Some(PropertyValue::String(event.to_string())),
+                null_count: 0,
+                row_count: 1,
+            },
+        );
+        map
+    }
+
+    // ── Construction and schema ─────────────────────────────────────────────
+
+    #[test]
+    fn output_schema_reflects_declared_columns_for_full_scan() {
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
+        let scan = ScanOperator::full_scan(reader).expect("ok");
+        let names: Vec<&str> = scan
+            .output_schema()
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["entity_id", "ts", "event_type"]);
     }
 
     #[test]
-    fn single_segment_multi_row_group_yields_every_batch() {
-        let b1 = make_batch(&["u1"], &[10], &["x"]);
-        let b2 = make_batch(&["u2", "u2"], &[20, 30], &["y", "z"]);
-        let b3 = make_batch(&["u3"], &[40], &["w"]);
-        let reader = Arc::new(VecReader::new(
-            minimal_schema(),
-            vec![(make_handle(1, 4), vec![b1, b2, b3])],
-        ));
-        let mut scan = ScanOperator::full_scan(reader);
-        scan.open().unwrap();
+    fn explicit_projection_narrows_output_schema_and_preserves_order() {
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
+        let projection = vec![
+            "ts".to_string(),
+            "entity_id".to_string(),
+            "event_type".to_string(),
+        ];
+        let scan = ScanOperator::new(reader, &projection, Vec::new(), CancellationToken::new())
+            .expect("projection resolves");
+        let names: Vec<&str> = scan
+            .output_schema()
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["ts", "entity_id", "event_type"]);
+    }
 
-        let mut rows = 0;
-        let mut batches = 0;
-        while let Some(batch) = scan.next_batch().unwrap() {
-            rows += batch.num_rows();
-            batches += 1;
+    #[test]
+    fn explicit_projection_rejects_unknown_column() {
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
+        let projection = vec!["entity_id".to_string(), "nope".to_string()];
+        let err = ScanOperator::new(reader, &projection, Vec::new(), CancellationToken::new())
+            .expect_err("unknown column rejected");
+        match err {
+            BqliteError::Schema(msg) => assert!(msg.contains("nope"), "{msg}"),
+            other => panic!("expected Schema error, got {other:?}"),
         }
-        assert_eq!(batches, 3);
-        assert_eq!(rows, 4);
     }
 
-    // ── ScanOperator: multi-segment ──────────────────────────────────────────
+    #[test]
+    fn explicit_projection_without_entity_key_is_rejected() {
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
+        let projection = vec!["ts".to_string(), "event_type".to_string()];
+        let err = ScanOperator::new(reader, &projection, Vec::new(), CancellationToken::new())
+            .expect_err("entity key required");
+        match err {
+            BqliteError::Schema(msg) => {
+                assert!(msg.contains("entity-key"), "{msg}");
+                assert!(msg.contains("entity_id"), "{msg}");
+            }
+            other => panic!("expected Schema error, got {other:?}"),
+        }
+    }
 
     #[test]
-    fn multi_segment_advances_across_segments() {
-        let s1_b1 = make_batch(&["u1"], &[1], &["a"]);
-        let s2_b1 = make_batch(&["u2"], &[2], &["b"]);
-        let s2_b2 = make_batch(&["u3"], &[3], &["c"]);
-        let reader = Arc::new(VecReader::new(
-            minimal_schema(),
-            vec![
-                (make_handle(1, 1), vec![s1_b1]),
-                (make_handle(2, 2), vec![s2_b1, s2_b2]),
-            ],
-        ));
-        let open_counter = reader.clone();
-        let mut scan = ScanOperator::full_scan(reader);
-        scan.open().unwrap();
+    fn explicit_projection_without_timestamp_is_rejected() {
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
+        let projection = vec!["entity_id".to_string(), "event_type".to_string()];
+        let err = ScanOperator::new(reader, &projection, Vec::new(), CancellationToken::new())
+            .expect_err("timestamp required");
+        match err {
+            BqliteError::Schema(msg) => {
+                assert!(msg.contains("timestamp"), "{msg}");
+                assert!(msg.contains("ts"), "{msg}");
+            }
+            other => panic!("expected Schema error, got {other:?}"),
+        }
+    }
 
-        let mut all_rows = Vec::new();
-        while let Some(batch) = scan.next_batch().unwrap() {
+    // ── Drainage ────────────────────────────────────────────────────────────
+
+    fn drain_entity_ids(op: &mut ScanOperator) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch().expect("next_batch ok") {
             let col = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<StringArray>()
+                .downcast_ref::<StringViewArray>()
                 .unwrap();
             for i in 0..col.len() {
-                all_rows.push(col.value(i).to_string());
+                out.push(col.value(i).to_string());
             }
         }
-        assert_eq!(all_rows, vec!["u1", "u2", "u3"]);
+        out
+    }
+
+    #[test]
+    fn empty_reader_drains_to_none() {
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.open().unwrap();
+        assert!(op.next_batch().unwrap().is_none());
+        // Exhaustion is sticky.
+        assert!(op.next_batch().unwrap().is_none());
+        op.close().unwrap();
+    }
+
+    #[test]
+    fn single_segment_drains_every_row() {
+        let batch = make_batch(&["u1", "u1", "u2"], &[100, 200, 300], &["a", "b", "c"]);
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
+            minimal_schema(),
+            vec![(make_handle(1, 3), vec![batch], vec![HashMap::new()])],
+        ));
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.open().unwrap();
+        assert_eq!(drain_entity_ids(&mut op), vec!["u1", "u1", "u2"]);
+        op.close().unwrap();
+    }
+
+    #[test]
+    fn multi_segment_merge_produces_globally_sorted_stream() {
+        // Two segments interleaved on entity_id/ts. The merge must
+        // emit the combined stream in `(entity_id, ts)` order even
+        // though neither segment on its own is globally sorted.
+        let s1 = make_batch(&["u1", "u3"], &[100, 300], &["a", "c"]);
+        let s2 = make_batch(&["u2", "u2", "u4"], &[150, 200, 400], &["b", "b", "d"]);
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
+            minimal_schema(),
+            vec![
+                (make_handle(1, 2), vec![s1], vec![HashMap::new()]),
+                (make_handle(2, 3), vec![s2], vec![HashMap::new()]),
+            ],
+        ));
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.open().unwrap();
         assert_eq!(
-            open_counter.open_calls(),
-            2,
-            "opens each segment exactly once"
+            drain_entity_ids(&mut op),
+            vec!["u1", "u2", "u2", "u3", "u4"],
         );
     }
 
     #[test]
-    fn empty_segment_is_skipped_to_next_segment() {
-        // A segment with zero row-groups should not terminate the
-        // scan — the iterator must advance to the next segment.
-        let real = make_batch(&["u1"], &[1], &["a"]);
-        let reader = Arc::new(VecReader::new(
+    fn multi_segment_multi_row_group_merges_batches() {
+        // Segment 1 has two row groups; segment 2 has one. Exercises
+        // the reload-between-pulls path in the merge.
+        let s1_a = make_batch(&["u1"], &[100], &["a"]);
+        let s1_b = make_batch(&["u3"], &[300], &["c"]);
+        let s2 = make_batch(&["u2"], &[200], &["b"]);
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
             minimal_schema(),
-            vec![(make_handle(1, 0), vec![]), (make_handle(2, 1), vec![real])],
+            vec![
+                (
+                    make_handle(1, 2),
+                    vec![s1_a, s1_b],
+                    vec![HashMap::new(), HashMap::new()],
+                ),
+                (make_handle(2, 1), vec![s2], vec![HashMap::new()]),
+            ],
         ));
-        let mut scan = ScanOperator::full_scan(reader);
-        scan.open().unwrap();
-        let batch = scan.next_batch().unwrap().expect("next segment yields");
-        assert_eq!(batch.num_rows(), 1);
-        assert!(scan.next_batch().unwrap().is_none());
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.open().unwrap();
+        assert_eq!(drain_entity_ids(&mut op), vec!["u1", "u2", "u3"]);
     }
 
-    // ── ScanOperator: error propagation ──────────────────────────────────────
+    // ── Zone-map pruning ────────────────────────────────────────────────────
 
     #[test]
-    fn open_surfaces_segment_iterator_error() {
-        let reader = Arc::new(ErroringReader {
+    fn scan_predicate_is_built_and_prunes_disjoint_row_groups() {
+        // Predicate: event_type = 'keep'. The "keep" batch has a
+        // matching zone map; the "skip" batch has a zone map with
+        // min == max == "drop", which the `ScanConjunct::Equal`
+        // rule rejects. The fake reader honours
+        // `Predicate::accepts_zone_group` so we can verify the
+        // conservative pruning path end-to-end.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("event_type"), string_lit("keep")),
+            &output_schema,
+        );
+
+        let keep_batch = make_batch(&["u1", "u2"], &[10, 20], &["keep", "keep"]);
+        let skip_batch = make_batch(&["u3"], &[30], &["drop"]);
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
+            minimal_schema(),
+            vec![(
+                make_handle(1, 3),
+                vec![keep_batch, skip_batch],
+                vec![
+                    zones_with_event("u1", 20, "keep"),
+                    zones_with_event("u3", 30, "drop"),
+                ],
+            )],
+        ));
+
+        let mut op = ScanOperator::new(reader, &[], vec![pred], CancellationToken::new()).unwrap();
+        op.open().unwrap();
+        assert_eq!(drain_entity_ids(&mut op), vec!["u1", "u2"]);
+    }
+
+    #[test]
+    fn non_pushable_predicate_falls_back_to_post_filter() {
+        // Pure post-filter: the compiled predicate references the
+        // timestamp column, and `Timestamp` literals don't lower to
+        // a pushable conjunct through our current lowering (Literal
+        // type `Int`-vs-`Timestamp` asymmetry). Even so, the scan
+        // must enforce the predicate against the materialised rows
+        // so downstream sees only surviving rows. This covers the
+        // exact-semantics guarantee described in the module doc.
+        //
+        // The predicate is `ts > 150`; the batch carries ts values
+        // `[100, 200]`, so the row-level evaluator drops the first
+        // row.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        // `ts > 150` — the literal broadcasts as an `Int`, which
+        // matches `TimestampNanosecondArray` via the type-checker's
+        // implicit `Int → Timestamp` coercion. We intentionally
+        // test the shape that *might* be pushable and rely on the
+        // post-filter fallback to enforce correctness regardless of
+        // whether lowering converted it.
+        let pred = compile_predicate(
+            compare(CompareOp::Greater, col("ts"), int_lit(150)),
+            &output_schema,
+        );
+
+        let batch = make_batch(&["u1", "u2"], &[100, 200], &["a", "b"]);
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
+            minimal_schema(),
+            vec![(make_handle(1, 2), vec![batch], vec![HashMap::new()])],
+        ));
+
+        let mut op = ScanOperator::new(reader, &[], vec![pred], CancellationToken::new()).unwrap();
+        op.open().unwrap();
+        assert_eq!(drain_entity_ids(&mut op), vec!["u2"]);
+    }
+
+    #[test]
+    fn predicate_not_converted_still_forwarded_as_none_to_reader() {
+        // When every pushed predicate is non-convertible, the scan
+        // must hand `None` to `open_segment` (not an empty
+        // `ScanPredicate`), so readers that treat `Some` as
+        // "evaluate zone maps" see a clean disable. A column-to-
+        // column compare (`entity_id = event_type`) is explicitly
+        // non-pushable per predicate-pushdown.md §4, so we can
+        // force the `None` path without any runtime coercion
+        // surprises.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("entity_id"), col("event_type")),
+            &output_schema,
+        );
+
+        let batch = make_batch(&["u1"], &[200], &["u1"]);
+        let reader = Arc::new(VecReader::with_segments(
+            minimal_schema(),
+            vec![(make_handle(1, 1), vec![batch], vec![HashMap::new()])],
+        ));
+        let inspect = reader.clone();
+        let reader_arc: Arc<dyn SegmentReader> = reader;
+
+        let mut op =
+            ScanOperator::new(reader_arc, &[], vec![pred], CancellationToken::new()).unwrap();
+        op.open().unwrap();
+        let _ = op.next_batch().unwrap();
+        assert_eq!(inspect.open_calls(), 1);
+        assert!(
+            inspect.last_predicate().is_none(),
+            "non-pushable predicates should not materialise a ScanPredicate"
+        );
+    }
+
+    // ── Post-filter behaviour ───────────────────────────────────────────────
+
+    #[test]
+    fn every_row_rejected_forces_next_batch_loop() {
+        // First merged batch fails every row; the operator must
+        // drop it entirely and pull another, rather than emit an
+        // empty batch to downstream. Mirrors the FilterOperator
+        // "re-pull on empty" convention.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("event_type"), string_lit("match")),
+            &output_schema,
+        );
+
+        let s1 = make_batch(&["u1"], &[100], &["miss"]);
+        let s2 = make_batch(&["u2"], &[200], &["match"]);
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
+            minimal_schema(),
+            vec![
+                (make_handle(1, 1), vec![s1], vec![HashMap::new()]),
+                (make_handle(2, 1), vec![s2], vec![HashMap::new()]),
+            ],
+        ));
+        let mut op = ScanOperator::new(reader, &[], vec![pred], CancellationToken::new()).unwrap();
+        op.open().unwrap();
+
+        // First `next_batch` must materialise the surviving row.
+        let out = op.next_batch().unwrap().expect("batch");
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(drain_entity_ids(&mut op), Vec::<String>::new());
+    }
+
+    // ── Error propagation ───────────────────────────────────────────────────
+
+    #[test]
+    fn open_surfaces_enumeration_error() {
+        let reader: Arc<dyn SegmentReader> = Arc::new(ErroringReader {
             schema: minimal_schema(),
         });
-        let mut scan = ScanOperator::full_scan(reader);
-        let err = scan.open().expect_err("iterator error should surface");
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        let err = op.open().expect_err("enumeration error surfaces");
         assert!(matches!(err, BqliteError::Io(_)), "{err}");
     }
 
     #[test]
-    fn next_batch_surfaces_open_segment_error() {
-        let reader = Arc::new(OpenFailReader {
+    fn open_surfaces_per_segment_open_error() {
+        let reader: Arc<dyn SegmentReader> = Arc::new(OpenFailReader {
             schema: minimal_schema(),
             handle: make_handle(1, 0),
         });
-        let mut scan = ScanOperator::full_scan(reader);
-        scan.open().unwrap();
-        let err = scan
-            .next_batch()
-            .expect_err("open_segment failure should surface");
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        let err = op.open().expect_err("per-segment open error surfaces");
         assert!(matches!(err, BqliteError::Execution(_)), "{err}");
     }
 
-    // ── ScanOperator: cancellation ───────────────────────────────────────────
+    // ── Cancellation ────────────────────────────────────────────────────────
 
     #[test]
     fn cancelled_token_aborts_next_batch() {
         let batch = make_batch(&["u1"], &[1], &["a"]);
-        let reader = Arc::new(VecReader::new(
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
             minimal_schema(),
-            vec![(make_handle(1, 1), vec![batch])],
+            vec![(make_handle(1, 1), vec![batch], vec![HashMap::new()])],
         ));
         let cancel = CancellationToken::new();
-        let mut scan = ScanOperator::new(reader, ColumnProjection::all(), None, cancel.clone());
-        scan.open().unwrap();
+        let mut op = ScanOperator::new(reader, &[], Vec::new(), cancel.clone()).unwrap();
+        op.open().unwrap();
         cancel.cancel();
-        let err = scan.next_batch().expect_err("cancellation should abort");
+        let err = op.next_batch().expect_err("cancellation fires");
         assert!(matches!(err, BqliteError::Cancelled), "{err}");
     }
 
     #[test]
-    fn exhausted_scan_ignores_cancellation() {
-        // Once the scan has reached exhaustion, subsequent
-        // `next_batch` calls return `Ok(None)` without checking the
-        // cancellation token. This matches the `Ok(None)` sticky
-        // contract in the PhysicalOperator trait doc.
-        let reader = Arc::new(VecReader::new(minimal_schema(), vec![]));
+    fn exhausted_scan_stays_none_after_cancellation() {
+        // Once `Ok(None)` latches, subsequent pulls must continue
+        // to return `Ok(None)` without consulting the token. The
+        // sticky-exhausted contract is identical to the Wave 1
+        // stub's.
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
         let cancel = CancellationToken::new();
-        let mut scan = ScanOperator::new(reader, ColumnProjection::all(), None, cancel.clone());
-        scan.open().unwrap();
-        assert!(scan.next_batch().unwrap().is_none());
+        let mut op = ScanOperator::new(reader, &[], Vec::new(), cancel.clone()).unwrap();
+        op.open().unwrap();
+        assert!(op.next_batch().unwrap().is_none());
         cancel.cancel();
-        assert!(scan.next_batch().unwrap().is_none());
+        assert!(op.next_batch().unwrap().is_none());
     }
 
-    // ── ScanOperator: lifecycle ──────────────────────────────────────────────
+    // ── Lifecycle ───────────────────────────────────────────────────────────
 
     #[test]
     fn close_is_idempotent() {
-        let reader = Arc::new(VecReader::new(minimal_schema(), vec![]));
-        let mut scan = ScanOperator::full_scan(reader);
-        scan.close().unwrap();
-        scan.close().unwrap();
-        scan.close().unwrap();
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.close().unwrap();
+        op.close().unwrap();
+        op.close().unwrap();
     }
 
     #[test]
     fn close_without_open_is_ok() {
-        let reader = Arc::new(VecReader::new(minimal_schema(), vec![]));
-        let mut scan = ScanOperator::full_scan(reader);
-        scan.close().unwrap();
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.close().unwrap();
     }
 
     #[test]
     fn close_after_drain_is_ok() {
         let batch = make_batch(&["u1"], &[1], &["a"]);
-        let reader = Arc::new(VecReader::new(
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
             minimal_schema(),
-            vec![(make_handle(1, 1), vec![batch])],
+            vec![(make_handle(1, 1), vec![batch], vec![HashMap::new()])],
         ));
-        let mut scan = ScanOperator::full_scan(reader);
-        scan.open().unwrap();
-        while scan.next_batch().unwrap().is_some() {}
-        scan.close().unwrap();
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.open().unwrap();
+        while op.next_batch().unwrap().is_some() {}
+        op.close().unwrap();
     }
 
-    #[test]
-    fn predicate_is_forwarded_to_open_segment() {
-        // Predicate is consulted inside the reader / segment scan —
-        // the Wave 1 scan stub does not itself call `accepts_zone`,
-        // but it must forward the `Arc<dyn Predicate>` to
-        // `open_segment` unchanged so later waves can rely on it.
-        //
-        // We observe forwarding in two ways:
-        //   1. VecReader captures the received predicate in
-        //      `last_predicate`; after driving the scan, the captured
-        //      predicate must be `Some(_)`.
-        //   2. Calling `accepts_zone` on the captured predicate
-        //      bumps the RecordingPredicate counter, proving the
-        //      *same* Arc was forwarded (and not replaced by `None`).
-        let recording: Arc<RecordingPredicate> = Arc::new(RecordingPredicate::default());
-        let predicate: Arc<dyn Predicate> = Arc::clone(&recording) as Arc<dyn Predicate>;
-        let batch = make_batch(&["u1"], &[1], &["a"]);
-        let reader = Arc::new(VecReader::new(
-            minimal_schema(),
-            vec![(make_handle(1, 1), vec![batch])],
-        ));
-        let reader_for_assert = Arc::clone(&reader);
-        let mut scan = ScanOperator::new(
-            reader,
-            ColumnProjection::all(),
-            Some(predicate),
-            CancellationToken::new(),
-        );
-        scan.open().unwrap();
-        let _ = scan.next_batch().unwrap();
-
-        // Captured predicate is non-None and points at the same
-        // RecordingPredicate instance — calling it must increment
-        // the original counter, not a separate one.
-        let captured = reader_for_assert
-            .last_predicate()
-            .expect("reader must have received Some(predicate)");
-        let zone = ZoneMap::default();
-        assert!(captured.accepts_zone("entity_id", &zone));
-        assert_eq!(recording.calls.load(Ordering::SeqCst), 1);
-    }
-
-    // ── Trait object compatibility ───────────────────────────────────────────
+    // ── Trait object compatibility ──────────────────────────────────────────
 
     #[test]
     fn scan_operator_is_trait_object() {
-        // The engine bind step will materialize the scan into a
-        // `Box<dyn PhysicalOperator>` tree. Pin object safety at
-        // compile time.
-        let reader = Arc::new(VecReader::new(minimal_schema(), vec![]));
-        let scan: Box<dyn PhysicalOperator> = Box::new(ScanOperator::full_scan(reader));
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
+        let scan: Box<dyn PhysicalOperator> = Box::new(ScanOperator::full_scan(reader).unwrap());
         let _ = scan;
+    }
+
+    // ── Lowering CompiledExpr → ScanConjunct ────────────────────────────────
+
+    #[test]
+    fn pushable_equal_lowers_to_scan_conjunct() {
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("event_type"), string_lit("checkout")),
+            &output_schema,
+        );
+        let pred_opt = build_scan_predicate(&[pred]);
+        let pred = pred_opt.expect("predicate lowered");
+        let cols = pred.referenced_columns();
+        assert_eq!(cols, &["event_type".to_string()]);
+    }
+
+    #[test]
+    fn pushable_equal_accepts_literal_on_either_side() {
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        // `'checkout' = event_type` — literal on the left — must
+        // still lower to an `Equal` conjunct on `event_type`.
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, string_lit("checkout"), col("event_type")),
+            &output_schema,
+        );
+        assert!(build_scan_predicate(&[pred]).is_some());
+    }
+
+    #[test]
+    fn column_to_column_compare_is_not_pushable() {
+        // A Compare between two columns is never zone-map prunable.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("entity_id"), col("event_type")),
+            &output_schema,
+        );
+        assert!(build_scan_predicate(&[pred]).is_none());
+    }
+
+    #[test]
+    fn literal_to_literal_compare_is_not_pushable() {
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, string_lit("a"), string_lit("b")),
+            &output_schema,
+        );
+        assert!(build_scan_predicate(&[pred]).is_none());
+    }
+
+    #[test]
+    fn is_null_on_column_lowers_to_is_null_conjunct() {
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            sp(Expr::IsNull {
+                expr: Box::new(col("event_type")),
+                negated: false,
+            }),
+            &output_schema,
+        );
+        let pred = build_scan_predicate(&[pred]).expect("IsNull lowered");
+        // Precise rule coverage — assert the conjunct name via the
+        // cached referenced-columns list, which the `ScanPredicate`
+        // populates from the conjunct's column on construction.
+        assert_eq!(pred.referenced_columns(), &["event_type".to_string()]);
+    }
+
+    #[test]
+    fn is_not_null_on_column_lowers_to_is_not_null_conjunct() {
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            sp(Expr::IsNull {
+                expr: Box::new(col("event_type")),
+                negated: true,
+            }),
+            &output_schema,
+        );
+        let pred = build_scan_predicate(&[pred]).expect("IsNotNull lowered");
+        assert_eq!(pred.referenced_columns(), &["event_type".to_string()]);
+    }
+
+    #[test]
+    fn in_literal_set_on_column_lowers_to_in_set_conjunct() {
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            sp(Expr::In {
+                lhs: vec![col("event_type")],
+                rhs: bqlite_ast::expr::InRhs::List(vec![
+                    string_lit("checkout"),
+                    string_lit("signup"),
+                ]),
+                negated: false,
+            }),
+            &output_schema,
+        );
+        let pred = build_scan_predicate(&[pred]).expect("InSet lowered");
+        assert_eq!(pred.referenced_columns(), &["event_type".to_string()]);
+    }
+
+    #[test]
+    fn not_in_literal_set_is_not_pushable() {
+        // `NOT IN` is explicitly out of the Wave 2 pushable shapes
+        // per `predicate-pushdown.md` §4 — a multi-literal NotEqual
+        // conjunction would be needed, which the storage layer does
+        // not yet evaluate cross-row. Verify the lowering drops it
+        // so the only enforcement path is post-filter.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            sp(Expr::In {
+                lhs: vec![col("event_type")],
+                rhs: bqlite_ast::expr::InRhs::List(vec![string_lit("spam"), string_lit("bot")]),
+                negated: true,
+            }),
+            &output_schema,
+        );
+        assert!(build_scan_predicate(&[pred]).is_none());
+    }
+
+    #[test]
+    fn multiple_pushable_conjuncts_compose_into_one_scan_predicate() {
+        // Two conjuncts on different columns should coexist in a
+        // single `ScanPredicate`. The cached `referenced_columns`
+        // list is populated in first-occurrence order — verify the
+        // order matches and no duplicates leak in.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let a = compile_predicate(
+            compare(CompareOp::Equal, col("event_type"), string_lit("checkout")),
+            &output_schema,
+        );
+        let b = compile_predicate(
+            sp(Expr::IsNull {
+                expr: Box::new(col("entity_id")),
+                negated: true,
+            }),
+            &output_schema,
+        );
+        let pred = build_scan_predicate(&[a, b]).expect("both lowered");
+        assert_eq!(
+            pred.referenced_columns(),
+            &["event_type".to_string(), "entity_id".to_string()]
+        );
     }
 }
