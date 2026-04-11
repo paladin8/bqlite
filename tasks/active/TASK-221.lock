@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-3",
+  "task_id": "TASK-221",
+  "claimed_at": "2026-04-11T14:52:00Z",
+  "branch": "task/TASK-221",
+  "description": "Schema DDL + EXPLAIN productions (CREATE TABLE, DROP TABLE, ALTER TABLE ADD COLUMN, DESCRIBE, EXPLAIN)"
+}
