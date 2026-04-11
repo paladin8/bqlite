@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-2",
+  "task_id": "TASK-202",
+  "claimed_at": "2026-04-11T07:22:30Z",
+  "branch": "task/TASK-202",
+  "description": "[DESIGN] Scan interface and predicate pushdown protocol"
+}
