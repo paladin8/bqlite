@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-232",
   "claimed_at": "2026-04-11T22:46:48Z",
+  "completed_at": "2026-04-11T23:25:00Z",
   "branch": "task/TASK-232",
   "description": "Engine bind step extension + DDL execution path"
 }
