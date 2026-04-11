@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-3",
+  "task_id": "TASK-201",
+  "claimed_at": "2026-04-11T07:01:15Z",
+  "branch": "task/TASK-201",
+  "description": "[DESIGN] Segment format v1"
+}
