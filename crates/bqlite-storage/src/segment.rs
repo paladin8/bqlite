@@ -36,6 +36,7 @@
 //! on-disk format is frozen for Wave 2.
 
 pub(crate) mod advise;
+pub mod cleanup;
 pub mod layout;
 pub mod merge;
 pub mod reader;

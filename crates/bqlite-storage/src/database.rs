@@ -33,6 +33,13 @@
 //! guarantees that either the old or the new manifest is fully
 //! present, so the stale temp file carries no information.
 //!
+//! After the manifest is loaded, the open path runs the TASK-239
+//! orphan-segment reconciliation pass
+//! ([`crate::segment::cleanup::reconcile_segments`]), which sweeps
+//! `.tmp` segment files from crashed ingests/compactions and removes
+//! `.seg` files not referenced by the manifest (deferred compaction
+//! deletes, dropped-table remnants). See `storage-format.md` §7.4.
+//!
 //! # Concurrency
 //!
 //! [`Database::open_or_create`] acquires an exclusive lock on
@@ -68,6 +75,7 @@ use crate::catalog::ManifestCatalog;
 use crate::manifest::{
     Manifest, SegmentMeta, TableEntry, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION,
 };
+use crate::segment::cleanup;
 
 /// Name of the advisory lock file at the database root.
 pub const LOCK_FILE_NAME: &str = ".lock";
@@ -220,6 +228,18 @@ impl Database {
                 return Err(io_ctx("read manifest", &manifest_path, e));
             }
         };
+
+        // Reconcile on-disk segment files against the manifest
+        // before handing out a live Database handle. This implements
+        // the crash-safety contract from storage-format.md §7.4 and
+        // reliability.md §Crash Safety: sweep orphan .tmp files from
+        // crashed ingests/compactions, and remove .seg files that are
+        // not referenced by the loaded manifest (deferred compaction
+        // deletes, dropped-table remnants).
+        // The report is intentionally discarded for now — there is no
+        // logging framework in scope. When tracing lands, add a
+        // `tracing::info!` here for operational visibility.
+        let _report = cleanup::reconcile_segments(&root, &manifest)?;
 
         Ok(Self {
             root,
@@ -1517,5 +1537,212 @@ mod tests {
             .allocate_sequence_id_range("events", 2)
             .expect_err("overflow must error");
         assert!(matches!(err, BqliteError::Execution(_)));
+    }
+
+    // ── Startup orphan reconciliation (TASK-239) ───────────────────
+
+    /// Helper: build a shard directory path matching the writer's
+    /// `segment_file_path` layout.
+    fn shard_dir_path(root: &Path, table: &str, window_id: u32, shard_id: usize) -> PathBuf {
+        root.join(table)
+            .join("windows")
+            .join(format!("w_{window_id:06}"))
+            .join(format!("shard_{shard_id:02}"))
+    }
+
+    /// Helper: write a manifest that includes the given segment in the
+    /// given `(table, window, shard)` cell. Overwrites whatever was on
+    /// disk before, so the test can simulate a particular crash state.
+    fn write_manifest_with_segment(
+        root: &Path,
+        table: &str,
+        window_id: u32,
+        shard_id: usize,
+        segment_id: u64,
+        shard_count: u16,
+    ) {
+        use crate::manifest::{ColumnStats, SegmentMeta, WindowManifest};
+        let manifest_path = root.join(MANIFEST_FILE_NAME);
+        let bytes = fs::read(&manifest_path).unwrap();
+        let mut m: Manifest = serde_json::from_slice(&bytes).unwrap();
+
+        let seg = SegmentMeta {
+            segment_id,
+            level: 0,
+            schema_version: 1,
+            row_count: 10,
+            byte_size: 512,
+            ts_range: (0, 1_000_000),
+            entity_range: (
+                bqlite_core::property::PropertyValue::String("a".into()),
+                bqlite_core::property::PropertyValue::String("z".into()),
+            ),
+            column_stats: vec![ColumnStats {
+                column_name: "entity_id".into(),
+                min: Some(bqlite_core::property::PropertyValue::String("a".into())),
+                max: Some(bqlite_core::property::PropertyValue::String("z".into())),
+                null_count: 0,
+                distinct_count_estimate: None,
+            }],
+            created_at: 1_000_000,
+            batch_id: 0,
+        };
+
+        let entry = m.tables.get_mut(table).unwrap();
+        // Find or create the WindowManifest for the given window_id.
+        let wm = entry.windows.iter_mut().find(|w| w.window_id == window_id);
+        match wm {
+            Some(w) => {
+                w.shards[shard_id].push(seg);
+            }
+            None => {
+                let mut shards = vec![Vec::new(); shard_count as usize];
+                shards[shard_id] = vec![seg];
+                entry.windows.push(WindowManifest { window_id, shards });
+            }
+        }
+        entry.next_segment_id = segment_id + 1;
+
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn open_cleans_up_orphan_tmp_segment_file() {
+        // Simulate a crashed ingest: a .tmp segment file exists but the
+        // manifest was never updated. On reopen the file must be gone.
+        let scratch = Scratch::new("cleanup-tmp");
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("init");
+        }
+
+        // Plant an orphan .tmp file in a shard directory.
+        let shard = shard_dir_path(scratch.path(), "events", 1, 0);
+        fs::create_dir_all(&shard).unwrap();
+        let orphan = shard.join("segment_42.seg.tmp");
+        fs::write(&orphan, b"partial-write").unwrap();
+        assert!(orphan.exists());
+
+        // Reopen — the reconciliation pass runs during open.
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("reopen");
+            assert!(!orphan.exists(), ".tmp orphan must be deleted on open");
+        }
+    }
+
+    #[test]
+    fn open_cleans_up_orphaned_seg_file_not_in_manifest() {
+        // Simulate a completed compaction whose old input segments were
+        // not deleted before the process stopped. The new manifest
+        // references only the merged output; the old inputs are orphans.
+        let scratch = Scratch::new("cleanup-orphan-seg");
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("init");
+        }
+
+        let shard = shard_dir_path(scratch.path(), "events", 1, 0);
+        fs::create_dir_all(&shard).unwrap();
+
+        // Register segment 20 as active in the manifest.
+        write_manifest_with_segment(
+            scratch.path(),
+            "events",
+            1,
+            0,
+            20,
+            crate::manifest::DEFAULT_SHARD_COUNT,
+        );
+
+        // Write the active segment file plus two orphan old inputs.
+        fs::write(shard.join("segment_20.seg"), b"active").unwrap();
+        fs::write(shard.join("segment_10.seg"), b"orphan-old").unwrap();
+        fs::write(shard.join("segment_11.seg"), b"orphan-old").unwrap();
+
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("reopen");
+            assert!(
+                shard.join("segment_20.seg").exists(),
+                "active segment must survive"
+            );
+            assert!(
+                !shard.join("segment_10.seg").exists(),
+                "orphan input must be removed"
+            );
+            assert!(
+                !shard.join("segment_11.seg").exists(),
+                "orphan input must be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn open_with_no_orphans_leaves_active_segments_intact() {
+        // Happy path: no orphans exist. The manifest's active segment
+        // must survive untouched.
+        let scratch = Scratch::new("cleanup-happy");
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("init");
+        }
+
+        let shard = shard_dir_path(scratch.path(), "events", 1, 0);
+        fs::create_dir_all(&shard).unwrap();
+
+        write_manifest_with_segment(
+            scratch.path(),
+            "events",
+            1,
+            0,
+            5,
+            crate::manifest::DEFAULT_SHARD_COUNT,
+        );
+        fs::write(shard.join("segment_5.seg"), b"data").unwrap();
+
+        {
+            let db = Database::open_or_create(scratch.path()).expect("reopen");
+            assert!(shard.join("segment_5.seg").exists());
+            // The manifest itself is unchanged — still has the segment.
+            let entry = db.manifest().tables.get("events").unwrap();
+            assert_eq!(entry.windows[0].shards[0].len(), 1);
+            assert_eq!(entry.windows[0].shards[0][0].segment_id, 5);
+        }
+    }
+
+    #[test]
+    fn open_after_drop_table_cleans_orphan_segments() {
+        // A table was dropped (manifest no longer references it) but
+        // its segment files remain on disk. Reopen must clean them.
+        let scratch = Scratch::new("cleanup-drop-table");
+        {
+            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            // Add a second table, register a segment, then drop it so
+            // the manifest no longer references those segments.
+            db.create_table("clicks".into(), sample_events_schema())
+                .unwrap();
+        }
+
+        // Manually plant segment files for the "clicks" table.
+        let shard = shard_dir_path(scratch.path(), "clicks", 1, 0);
+        fs::create_dir_all(&shard).unwrap();
+        fs::write(shard.join("segment_0.seg"), b"orphan").unwrap();
+        fs::write(shard.join("segment_1.seg.tmp"), b"orphan-tmp").unwrap();
+
+        // Now drop the table from the manifest (simulate: we write
+        // directly because we don't have the segment in manifest).
+        {
+            let mut db = Database::open_or_create(scratch.path()).expect("reopen-to-drop");
+            db.drop_table("clicks").unwrap();
+        }
+
+        // Reopen — the reconciliation pass should clean up.
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("reopen-after-drop");
+            assert!(
+                !shard.join("segment_0.seg").exists(),
+                "orphan .seg must be removed"
+            );
+            assert!(
+                !shard.join("segment_1.seg.tmp").exists(),
+                "orphan .tmp must be removed"
+            );
+        }
     }
 }
