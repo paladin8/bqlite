@@ -16,6 +16,7 @@ uuid = { workspace = true }
 twox-hash = { workspace = true }
 lz4_flex = { workspace = true }
 postcard = { workspace = true }
+csv = { workspace = true }
 
 # `libc` is only pulled in on platforms where `posix_fadvise(2)` is
 # a real syscall (TASK-243). On macOS/iOS/Windows the segment reader

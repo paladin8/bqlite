@@ -22,4 +22,5 @@
 //! TASK-233 wires a streaming CSV reader into the partitioner's
 //! `push_event` loop.
 
+pub mod csv_reader;
 pub mod partitioner;

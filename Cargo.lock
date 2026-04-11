@@ -332,7 +332,11 @@ dependencies = [
 name = "bqlite-benches"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "bqlite-core",
+ "bqlite-storage",
  "criterion",
+ "serde_json",
 ]
 
 [[package]]
@@ -411,6 +415,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bqlite-core",
+ "csv",
  "libc",
  "lz4_flex",
  "postcard",
