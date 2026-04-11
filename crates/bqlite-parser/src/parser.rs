@@ -2,13 +2,14 @@
 //!
 //! Design: docs/design/language/grammar-framework.md §7.
 //!
-//! Production modules ([`crate::expr`] in a later checkpoint, DDL, DML,
-//! pipeline) build on the `Parser<'s>` cursor defined here. The Wave 2
-//! dispatcher is intentionally narrow — until TASK-221 / TASK-222 /
-//! TASK-223 land their productions, `statement` only recognizes the
-//! Wave 1 single-bare-identifier source form and produces the same
-//! `Statement::Query(Pipeline { ... })` the Wave 1 stub returned so the
-//! engine's smoke test keeps passing end-to-end.
+//! Production modules ([`crate::expr`], [`crate::pipeline`], and the
+//! later DDL / DML modules) build on the `Parser<'s>` cursor defined
+//! here. The Wave 2 dispatcher starts from a bare source name (the
+//! `pipeline := source ("|" operator)*` grammar at §26 line 1514) and
+//! delegates to [`crate::pipeline::parse_pipeline_stages`] for the
+//! `|`-separated tail. DDL and DML productions (TASK-221 / TASK-222 /
+//! TASK-238) plug into the same dispatcher by peeking the first token
+//! and branching into their own entry points.
 
 use bqlite_ast::{Name, Pipeline, Source, Span, Statement, TableRef};
 
@@ -134,8 +135,13 @@ impl<'s> Parser<'s> {
     /// Require a bare identifier (not a keyword, not a quoted name).
     /// Used for grammar positions where a quoted identifier would not
     /// be valid (e.g., `$identifier` variable references, alias names).
-    #[allow(dead_code)] // Used by later production tasks.
-    pub(crate) fn expect_ident(&mut self) -> Result<(String, Span), ParseError> {
+    ///
+    /// `role` drives the [`ParseError::ReservedKeyword`] diagnostic when
+    /// the caller's slot happens to be named by a reserved keyword —
+    /// e.g. `SELECT amount AS where` should say "cannot be used as an
+    /// alias name", not "table name". Production-specific wrappers
+    /// pass the appropriate `NameRole` at their call site.
+    pub(crate) fn expect_ident(&mut self, role: NameRole) -> Result<(String, Span), ParseError> {
         let tok = self.peek();
         let span = token_span(tok);
         match &tok.kind {
@@ -147,7 +153,7 @@ impl<'s> Parser<'s> {
             TokenKind::Kw(kw) => Err(ParseError::ReservedKeyword {
                 offset: tok.start,
                 keyword: kw.canonical(),
-                role: NameRole::TableName,
+                role,
             }),
             _ => Err(self.error_unexpected(Expected::Identifier, None)),
         }
@@ -255,11 +261,13 @@ fn token_source_text(source: &str, tok: &Token) -> String {
 
 /// Top-level statement dispatcher.
 ///
-/// Wave 2 CP1 recognizes only a single bare identifier / backtick name
-/// as a source expression and returns a `Statement::Query(Pipeline)`
-/// with an empty stage list — matching Wave 1's surface behavior. Later
-/// CP2 / TASK-221 / TASK-222 / TASK-223 extend this dispatcher with
-/// DDL, DML, expression, and pipeline productions.
+/// Wave 2 recognizes a bare source name optionally followed by one or
+/// more `|`-separated pipeline stages (TASK-223). The statement is
+/// returned as a `Statement::Query(Pipeline)` whose `stages` vector
+/// contains the parsed `WHERE` / `SELECT` / `LIMIT` verbs in source
+/// order. DDL (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`, `DESCRIBE`,
+/// `EXPLAIN`), DML (`INSERT`), and other statements slot into this
+/// dispatcher in later tasks by branching on the first token.
 pub(crate) fn statement(p: &mut Parser) -> Result<Statement, ParseError> {
     // Empty input is a user-visible error: the parser should say
     // "expected a source table name" rather than a bare "unexpected
@@ -272,12 +280,12 @@ pub(crate) fn statement(p: &mut Parser) -> Result<Statement, ParseError> {
         });
     }
 
-    // Dispatch on the first token. Wave 2 CP1 only implements the
-    // source-expression case; every other first-token variant is either
-    // a later-wave statement (CREATE, DROP, ALTER, DESCRIBE, EXPLAIN,
-    // INSERT, DELETE) or an error.
+    // Dispatch on the first token. Wave 2 currently only implements the
+    // source-expression / pipeline case; every other first-token
+    // variant is either a later-wave statement (CREATE, DROP, ALTER,
+    // DESCRIBE, EXPLAIN, INSERT, DELETE) or an error.
     match p.peek_kind() {
-        TokenKind::Ident(_) | TokenKind::QuotedName(_) => parse_bare_source_pipeline(p),
+        TokenKind::Ident(_) | TokenKind::QuotedName(_) => parse_pipeline(p),
 
         TokenKind::Kw(kw) => {
             // Reserved keyword in source position — the planner-facing
@@ -295,8 +303,12 @@ pub(crate) fn statement(p: &mut Parser) -> Result<Statement, ParseError> {
     }
 }
 
-/// Minimal Wave 2 CP1 pipeline: a bare source name with no stages.
-fn parse_bare_source_pipeline(p: &mut Parser) -> Result<Statement, ParseError> {
+/// Parse a `source ("|" operator)*` pipeline.
+///
+/// The source is a single bare table name for now (joins and time
+/// ranges are later-wave productions). Pipeline stages are delegated
+/// to [`crate::pipeline::parse_pipeline_stages`].
+fn parse_pipeline(p: &mut Parser) -> Result<Statement, ParseError> {
     let name = p.expect_name(NameRole::TableName)?;
     let primary_span = name.span;
     let primary = TableRef {
@@ -309,10 +321,23 @@ fn parse_bare_source_pipeline(p: &mut Parser) -> Result<Statement, ParseError> {
         time_range: None,
         span: primary_span,
     };
+
+    let stages = crate::pipeline::parse_pipeline_stages(p)?;
+
+    // The pipeline span covers the source through the last stage's
+    // span when there is at least one stage, otherwise just the
+    // source. We rely on `PipelineStage::span()` (bqlite-ast) so
+    // adding a new stage variant is a compile error at the AST side
+    // rather than a silent drift here.
+    let pipeline_span = stages
+        .last()
+        .map(|s| primary_span.merged(s.span()))
+        .unwrap_or(primary_span);
+
     let pipeline = Pipeline {
         source,
-        stages: vec![],
-        span: primary_span,
+        stages,
+        span: pipeline_span,
     };
     Ok(Statement::Query(pipeline))
 }

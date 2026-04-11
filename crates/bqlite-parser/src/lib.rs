@@ -24,24 +24,23 @@
 //! integration (see `crates/bqlite-engine/src/query.rs`) keeps working
 //! without changes.
 //!
-//! ## Wave 2 TASK-220 status
+//! ## Wave 2 status
 //!
 //! TASK-220 lands the framework scaffolding (lexer, error types,
 //! parser cursor) and the expression grammar covering every precedence
 //! level from §26's `or_expr → and_expr → not_expr → comparison →
 //! addition → multiplication → unary → primary` ladder for the
 //! literal / column / paren / unary / binary / compare / IS NULL /
-//! AND / OR / NOT subset. The expression parser is reachable
-//! internally via [`crate::expr::parse_expression`]; the top-level
-//! statement dispatcher still recognizes the Wave 1 surface exactly
-//! (a bare source name) because wiring WHERE/SELECT/LIMIT into the
-//! pipeline is TASK-223's job.
+//! AND / OR / NOT subset.
+//!
+//! TASK-223 wires the `|` pipeline operator into the top-level
+//! dispatcher and lands the Wave 2 pipeline verbs — `WHERE`,
+//! `SELECT [DISTINCT]`, and `LIMIT` — via the [`pipeline`] module.
 //!
 //! Later wave tasks add the remaining productions:
 //!
 //! - **TASK-221** — DDL (`CREATE`, `ALTER`, `DROP`, `DESCRIBE`, `EXPLAIN`).
 //! - **TASK-222** — `INSERT ... FROM` with the `WITH (...)` option list.
-//! - **TASK-223** — Pipeline `|` and the `WHERE` / `SELECT` / `LIMIT` verbs.
 //! - **TASK-238** — `INSERT ... VALUES`.
 //!
 //! Expression features deferred to later tasks: function calls,
@@ -52,6 +51,7 @@ mod error;
 mod expr;
 mod lex;
 mod parser;
+mod pipeline;
 
 use bqlite_ast::Statement;
 
@@ -266,10 +266,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pipeline_stage_as_trailing_input() {
-        // `events | filter` — the Wave 2 CP1 dispatcher does not yet
-        // handle the pipe operator (TASK-223 adds pipeline stages), so
-        // the `|` is rejected as trailing input.
+    fn rejects_unknown_pipeline_stage_keyword() {
+        // `events | filter` — the `|` is accepted (TASK-223), but
+        // `filter` is an identifier, not a pipeline-stage keyword, so
+        // the dispatcher errors with `Expected::PipelineStage` pointing
+        // at the `filter` token.
         match parse("events | filter") {
             Err(ParseError::Unexpected {
                 offset,
@@ -277,11 +278,11 @@ mod tests {
                 found,
                 ..
             }) => {
-                assert_eq!(offset, 7);
-                assert_eq!(expected, Expected::Eof);
-                assert_eq!(found, "|");
+                assert_eq!(offset, "events | ".len());
+                assert_eq!(expected, Expected::PipelineStage);
+                assert_eq!(found, "filter");
             }
-            other => panic!("expected Unexpected, got {other:?}"),
+            other => panic!("expected Unexpected/PipelineStage, got {other:?}"),
         }
     }
 

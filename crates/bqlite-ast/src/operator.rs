@@ -103,6 +103,34 @@ pub enum PipelineStage {
     Attribute(Attribute),
 }
 
+impl PipelineStage {
+    /// The source span covering this stage from its leading keyword
+    /// through the last token the stage owns.
+    ///
+    /// Provided as a single entry point so consumers (parser, planner,
+    /// diagnostics) do not have to pattern-match on every variant when
+    /// they only need the span. Adding a new variant without extending
+    /// this match is a compile error, which keeps the helper honest.
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Where { span, .. } => *span,
+            Self::Select { span, .. } => *span,
+            Self::Let { span, .. } => *span,
+            Self::Match { span, .. } => *span,
+            Self::Funnel(f) => f.span,
+            Self::Retention(r) => r.span,
+            Self::Sessionize(s) => s.span,
+            Self::Stats { span, .. } => *span,
+            Self::OrderBy { span, .. } => *span,
+            Self::Limit { span, .. } => *span,
+            Self::Pivot { span, .. } => *span,
+            Self::EventSelect(e) => e.span,
+            Self::Sample(s) => s.span,
+            Self::Attribute(a) => a.span,
+        }
+    }
+}
+
 /// A single projection item in `| SELECT …`.
 ///
 /// Bare column references and star expansions have no alias and use
@@ -354,6 +382,49 @@ mod tests {
             PipelineStage::Limit { count, .. } => assert_eq!(count, 100),
             _ => panic!("expected Limit"),
         }
+    }
+
+    #[test]
+    fn pipeline_stage_span_helper_returns_variant_span() {
+        // Smoke-test the inherent `span()` method for a representative
+        // mix of variants — the exhaustive match makes adding a new
+        // variant without a span accessor a compile error.
+        let named_span = Span::new(10, 20, 3, 5);
+        let where_stage = PipelineStage::Where {
+            predicate: lit_true(),
+            span: named_span,
+        };
+        assert_eq!(where_stage.span(), named_span);
+
+        let select_stage = PipelineStage::Select {
+            distinct: false,
+            items: vec![],
+            span: named_span,
+        };
+        assert_eq!(select_stage.span(), named_span);
+
+        let limit_stage = PipelineStage::Limit {
+            count: 1,
+            span: named_span,
+        };
+        assert_eq!(limit_stage.span(), named_span);
+
+        let attr_stage = PipelineStage::Attribute(Attribute {
+            conversion: EventRef {
+                table: None,
+                event: Name::synthetic("conv"),
+                span: Span::EMPTY,
+            },
+            touchpoints: EventRef {
+                table: None,
+                event: Name::synthetic("tp"),
+                span: Span::EMPTY,
+            },
+            window: 0,
+            touchpoint_key: column("k"),
+            span: named_span,
+        });
+        assert_eq!(attr_stage.span(), named_span);
     }
 
     #[test]
