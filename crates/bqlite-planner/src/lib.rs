@@ -61,6 +61,7 @@ use bqlite_ast::Statement;
 use bqlite_core::{Catalog, Result};
 
 pub mod compiled;
+pub mod explain;
 pub mod expr;
 pub mod logical;
 pub mod opt;
@@ -70,6 +71,7 @@ pub use compiled::{
     ArithKernel, ArrowKernelId, CastKernel, CompareKernel, CompiledExpr, CompiledNode, FunctionId,
     FunctionKernel, InSetKernel, LogicalKernel, UnaryKernel,
 };
+pub use explain::{build_explain_node, format_explain, format_expr, ExplainNode};
 pub use expr::{FunctionRegistry, ScalarFunctionSig, TypedExpr, TypedExprKind};
 pub use logical::{
     lower_statement, IngestFormat, InsertFromDescriptor, InsertLogicalBody, LogicalPlan,
