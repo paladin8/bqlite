@@ -1,0 +1,7 @@
+{
+  "agent_id": "bqlite-agent-3",
+  "task_id": "TASK-110",
+  "claimed_at": "2026-04-11T00:32:57Z",
+  "branch": "task/TASK-110",
+  "description": "[TRAIT] DemandCapabilities protocol scaffold — placeholder enum + propagation trait so operator stubs can implement it from day 1. Real protocol details deferred to a later-wave [DESIGN] task. Minimal v0 surface."
+}
