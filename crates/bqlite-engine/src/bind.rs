@@ -10,10 +10,19 @@
 //! cancellation tokens, memory budgets) that only the engine has
 //! visibility into.
 //!
-//! ## Wave 1 scope
+//! ## Wave 2 scope
 //!
-//! The planner (TASK-115) only emits [`ScanPhysical`], so the bind
-//! step's only arm is `bind_scan`. It:
+//! Post TASK-226, the planner now emits the full Wave 2 descriptor
+//! set (`Scan`, `Filter`, `Project`, `Limit`, DDL, DML, `Explain`).
+//! The bind step, however, still only materializes the Wave 1 `Scan`
+//! arm — TASK-232 adds the other arms (filter/project/limit operator
+//! construction, DDL execution closures, INSERT pipeline wiring).
+//! Until TASK-232 lands, every non-`Scan` descriptor surfaces as a
+//! clean `BqliteError::Plan` naming the deferring task; callers only
+//! hit it if they drive a Wave 2 statement through `Engine::query`
+//! against a database that has not upgraded to TASK-232.
+//!
+//! The `bind_scan` arm:
 //!
 //! 1. Asks the [`Database`] for a `Box<dyn SegmentReader>` for the
 //!    resolved table name (which returns
@@ -24,18 +33,13 @@
 //!    scan can share ownership with future parallel shard-tasks
 //!    without changing the trait surface.
 //! 3. Constructs a [`ScanOperator`] with `ColumnProjection::all` and
-//!    no predicate — Wave 2's TASK-226/227/228 will thread these in
-//!    when the planner starts producing non-trivial descriptors.
-//!
-//! Wave 2's TASK-232 grows this module with arms for `FilterPhysical`,
-//! `ProjectPhysical`, and `LimitPhysical`, plus a DDL execution path
-//! for `CreateTablePhysical`. For now the single arm keeps the
-//! coupling between the engine and the concrete operator types
-//! minimal.
+//!    no predicate — TASK-230 will thread the descriptor's
+//!    `projected_columns` / `scan_predicates` in when the real
+//!    entity-sorted scan lands.
 
 use std::sync::Arc;
 
-use bqlite_core::{ColumnProjection, Result, SegmentReader};
+use bqlite_core::{BqliteError, ColumnProjection, Result, SegmentReader};
 use bqlite_operators::{CancellationToken, PhysicalOperator, ScanOperator};
 use bqlite_planner::{PhysicalPlan, ScanPhysical};
 use bqlite_storage::Database;
@@ -58,6 +62,26 @@ use bqlite_storage::Database;
 pub fn bind_physical(plan: &PhysicalPlan, db: &Database) -> Result<Box<dyn PhysicalOperator>> {
     match plan {
         PhysicalPlan::Scan(scan) => bind_scan(scan, db),
+        // TASK-226 emits the full Wave 2 descriptor set, but the
+        // operator-side plumbing lands in TASK-232 (filter / project /
+        // limit / DDL exec / INSERT) and TASK-229 (explain). Reject
+        // loudly with a message naming the descriptor so tests that
+        // drive a non-Scan plan through `Engine::query` before TASK-232
+        // get a localized failure instead of a panic.
+        PhysicalPlan::Filter(_)
+        | PhysicalPlan::Project(_)
+        | PhysicalPlan::Limit(_)
+        | PhysicalPlan::CreateTable(_)
+        | PhysicalPlan::DropTable(_)
+        | PhysicalPlan::AlterTableAddColumn(_)
+        | PhysicalPlan::Describe(_)
+        | PhysicalPlan::Insert(_)
+        | PhysicalPlan::Explain(_) => Err(BqliteError::Plan(
+            "engine bind: Wave 2 non-Scan descriptors are emitted by TASK-226 but \
+             executable bindings land in TASK-232 (Filter/Project/Limit/DDL/DML) \
+             and TASK-229 (Explain); no operator is available yet"
+                .into(),
+        )),
     }
 }
 
@@ -132,6 +156,9 @@ mod tests {
     fn bootstrap_scan_descriptor() -> PhysicalPlan {
         PhysicalPlan::Scan(ScanPhysical {
             table: "events".to_string(),
+            time_range: None,
+            scan_predicates: Vec::new(),
+            projected_columns: Vec::new(),
             output_schema: OperatorSchema::from_table(&bootstrap_events_schema()),
         })
     }
@@ -163,9 +190,7 @@ mod tests {
         let scratch = Scratch::new("schema");
         let db = Database::open_or_create(scratch.path()).expect("open db");
         let descriptor = bootstrap_scan_descriptor();
-        let expected = match &descriptor {
-            PhysicalPlan::Scan(s) => s.output_schema.clone(),
-        };
+        let expected = descriptor.output_schema().clone();
 
         let op = bind_physical(&descriptor, &db).expect("bind must succeed");
         assert_eq!(op.output_schema(), &expected);
@@ -177,6 +202,9 @@ mod tests {
         let db = Database::open_or_create(scratch.path()).expect("open db");
         let descriptor = PhysicalPlan::Scan(ScanPhysical {
             table: "ghost".to_string(),
+            time_range: None,
+            scan_predicates: Vec::new(),
+            projected_columns: Vec::new(),
             output_schema: OperatorSchema::from_table(&bootstrap_events_schema()),
         });
 

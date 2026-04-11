@@ -6,39 +6,46 @@
 //! descriptor that `bqlite-engine` binds to executable operators at
 //! query-execution time. See
 //! [`docs/design/planner-pipeline.md`](../../docs/design/planner-pipeline.md)
-//! for the full compiler pipeline — the post–Wave 1 planner will grow a
-//! typed logical plan, optimizer passes, expression compiler,
-//! desugaring, and fusion framework.
+//! for the full compiler pipeline.
 //!
-//! ## Wave 1 scope — deliberately minimal
+//! ## Wave 2 scope
 //!
-//! This module is the TASK-115 stub. Its job is to give the engine
-//! (TASK-118) something to bind against so the end-to-end Wave 1 smoke
-//! test (`bqlite query "events"` → TASK-123) can parse → plan →
-//! execute against an empty database. The accepted surface is exactly
-//! what the Wave 1 parser (TASK-114) can produce:
+//! Post TASK-224 (logical plan), TASK-225 (expression compilation),
+//! and TASK-226 (physical descriptors + lowering), the planner
+//! accepts every Wave 2 statement shape the parser can produce:
 //!
-//! - **Only** [`Statement::Query`] wrapping a [`Pipeline`] with
-//!   an empty `stages` list, no joins, and no time-range filter.
-//! - The primary table is resolved via the [`Catalog`] handle the
-//!   caller passes in; unknown tables surface as
-//!   [`BqliteError::Plan`], matching the `TypeError` contract in
-//!   `docs/design/planner-pipeline.md` §4.1.
+//! - `Statement::Query(Pipeline)` — bare source, plus `WHERE`,
+//!   `SELECT`, and `LIMIT` pipeline stages. Lowers to
+//!   `Scan` / `Filter` / `Project` / `Limit` physical descriptors.
+//! - `Statement::Explain(Pipeline)` — lowers the inner pipeline and
+//!   wraps it in [`PhysicalPlan::Explain`].
+//! - DDL (`Statement::CreateTable` / `DropTable` / `AlterTable` /
+//!   `Describe`) — lowers to the matching DDL physical descriptors.
+//! - DML (`Statement::Insert`) — lowers `VALUES` / `FROM` bodies via
+//!   the logical-phase resolver in [`crate::logical`].
 //!
-//! Every other statement shape — DDL, DML, `EXPLAIN`, alias
-//! definitions, or a query with any pipeline stage — is explicitly
-//! rejected with a `Plan` error that names the unsupported construct.
-//! Those productions come online in Wave 2 (TASK-224 / TASK-226).
+//! `Statement::Delete` and `Statement::DefineAlias` remain rejected
+//! by the logical lowering with forward-compat error messages
+//! pointing at the Wave 4 tasks that implement them.
 //!
-//! ## Data shape
+//! ## Two-phase compilation
 //!
-//! Per `docs/design/planner-pipeline.md` §15, the planner emits a
-//! **plain-data** tree of structs — never `Box<dyn PhysicalOperator>`.
-//! The trait object lives above the planner in the crate dependency
-//! graph (`bqlite-operators`), so a planner that held one would
-//! violate the dependency direction enforced by
-//! `scripts/check-dep-direction.sh`. Binding the plain-data tree to
-//! executable operators is TASK-118's job.
+//! [`plan`] is a thin orchestrator that runs both phases:
+//!
+//! ```text
+//! Statement ──▶ LogicalPlan ──▶ PhysicalPlan
+//!            (logical::lower_statement)
+//!                           (physical::lower_physical)
+//! ```
+//!
+//! `logical::lower_statement` resolves tables against the catalog,
+//! type-checks expressions, and validates DDL / DML shapes.
+//! `physical::lower_physical` compiles each `TypedExpr` into a
+//! `CompiledExpr` and reshapes a handful of fields for the engine
+//! bind step. Both phases hold nothing but plain data — the
+//! `Box<dyn PhysicalOperator>` materialization lives above this crate
+//! in `bqlite-engine` (TASK-232), per
+//! `docs/design/planner-pipeline.md` §15.
 //!
 //! ```no_run
 //! use bqlite_ast::Statement;
@@ -50,12 +57,14 @@
 //! }
 //! ```
 
-use bqlite_ast::{Pipeline, Statement};
-use bqlite_core::{BqliteError, Catalog, OperatorSchema, Result};
+use bqlite_ast::Statement;
+use bqlite_core::{Catalog, Result};
 
 pub mod compiled;
 pub mod expr;
 pub mod logical;
+pub mod physical;
+
 pub use compiled::{
     ArithKernel, ArrowKernelId, CastKernel, CompareKernel, CompiledExpr, CompiledNode, FunctionId,
     FunctionKernel, InSetKernel, LogicalKernel, UnaryKernel,
@@ -65,56 +74,12 @@ pub use logical::{
     lower_statement, IngestFormat, InsertFromDescriptor, InsertLogicalBody, LogicalPlan,
     ProjectItem,
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Physical plan
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Plain-data physical plan description.
-///
-/// Per `docs/design/planner-pipeline.md` §15, the planner never holds
-/// `Box<dyn PhysicalOperator>`; the engine's bind step (TASK-118)
-/// consumes a `PhysicalPlan` value and materializes an operator tree
-/// against the concrete implementations in `bqlite-operators`.
-///
-/// Wave 1 only carries a scan descriptor — see [`ScanPhysical`] for the
-/// fields that get added in Wave 2.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PhysicalPlan {
-    /// Scan every row from a catalog table.
-    Scan(ScanPhysical),
-}
-
-impl PhysicalPlan {
-    /// The schema a downstream consumer observes from this plan root.
-    pub fn output_schema(&self) -> &OperatorSchema {
-        match self {
-            PhysicalPlan::Scan(scan) => &scan.output_schema,
-        }
-    }
-}
-
-/// Plain-data description of a scan operator — Wave 1 subset.
-///
-/// The full descriptor in `docs/design/planner-pipeline.md` §9.5 also
-/// carries `scan_predicates`, `projected_columns`, and a `time_range`.
-/// Those fields land in Wave 2 together with the expression compiler
-/// (TASK-225) and the predicate-pushdown / projection-pruning passes
-/// (TASK-227 / TASK-228). Wave 1 deliberately emits neither, because
-/// the parser cannot produce them: a bare table reference has no
-/// predicate and no projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanPhysical {
-    /// Catalog name of the table being scanned — the engine's bind
-    /// step re-resolves this through the database's catalog so the
-    /// operator sees the same `TableSchema` the planner validated
-    /// against.
-    pub table: String,
-    /// The schema a consumer observes from this scan. Equal to
-    /// [`OperatorSchema::from_table`] of the resolved `TableSchema`
-    /// for Wave 1; pruning passes will shrink this in Wave 2.
-    pub output_schema: OperatorSchema,
-}
+pub use physical::{
+    lower_physical, AlterTableAddColumnPhysical, CreateTablePhysical, DescribePhysical,
+    DropTablePhysical, ExplainPhysical, FilterPhysical, InsertPhysical, LimitPhysical,
+    PhysicalPlan, ProjectPhysical, ProjectPhysicalItem, ScanPhysical, DEFAULT_FILTER_TILE_SIZE,
+    MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Plan entry point
@@ -123,105 +88,27 @@ pub struct ScanPhysical {
 /// Compile a [`Statement`] into a [`PhysicalPlan`] using `catalog` to
 /// resolve table references.
 ///
-/// See the crate documentation for the Wave 1 scope. In short: only
-/// `Statement::Query` wrapping an empty pipeline over a known table is
-/// accepted; everything else returns [`BqliteError::Plan`] with a
-/// message that names the unsupported construct.
+/// This is the single public entry point for the planner. It runs the
+/// full AST → logical → physical pipeline:
+///
+/// 1. [`logical::lower_statement`] — catalog resolution, expression
+///    typing, DDL / DML validation. Any failure surfaces here as
+///    [`bqlite_core::BqliteError::Plan`] or
+///    [`bqlite_core::BqliteError::Schema`].
+/// 2. [`physical::lower_physical`] — infallible one-to-one lowering
+///    that swaps `TypedExpr` for `CompiledExpr`.
 ///
 /// # Errors
 ///
-/// - [`BqliteError::Plan`] if the statement variant is unsupported by
-///   Wave 1, if the pipeline contains any stage/join/time-range (since
-///   those cannot yet be lowered), or if the catalog cannot resolve
-///   the primary table.
-/// - Any error returned by [`Catalog::resolve_table`] is forwarded
-///   verbatim so callers can pattern-match on the existing
-///   unknown-table message shape produced by
-///   `bqlite_core::catalog::unknown_table_error`.
-pub fn plan(statement: Statement, catalog: &dyn Catalog) -> Result<PhysicalPlan> {
-    let logical = build_logical(statement, catalog)?;
-    Ok(lower(logical))
-}
-
-/// AST → logical: the only Wave 1 shape is a query over a bare table.
-fn build_logical(statement: Statement, catalog: &dyn Catalog) -> Result<LogicalPlan> {
-    match statement {
-        Statement::Query(pipeline) => plan_query_pipeline(pipeline, catalog),
-        Statement::Explain(_) => Err(unsupported_statement("EXPLAIN")),
-        Statement::Describe(_) => Err(unsupported_statement("DESCRIBE")),
-        Statement::CreateTable(_) => Err(unsupported_statement("CREATE TABLE")),
-        Statement::AlterTable(_) => Err(unsupported_statement("ALTER TABLE")),
-        Statement::DropTable(_) => Err(unsupported_statement("DROP TABLE")),
-        Statement::Insert(_) => Err(unsupported_statement("INSERT")),
-        Statement::Delete(_) => Err(unsupported_statement("DELETE")),
-        Statement::DefineAlias { .. } => Err(unsupported_statement("alias definition")),
-    }
-}
-
-fn plan_query_pipeline(pipeline: Pipeline, catalog: &dyn Catalog) -> Result<LogicalPlan> {
-    // The Wave 1 parser emits `Pipeline { source: {primary, joins:[], time_range:None}, stages:[] }`,
-    // but we still validate defensively because nothing in the type
-    // system prevents a builder or a future parser fix from handing us
-    // a richer pipeline. Rejecting it loudly here beats a silent
-    // "identifier scan" that ignores later stages.
-    if !pipeline.stages.is_empty() {
-        return Err(BqliteError::Plan(
-            "Wave 1 planner does not yet support pipeline stages \
-             (filter / select / limit land in Wave 2 — TASK-224)"
-                .into(),
-        ));
-    }
-    if !pipeline.source.joins.is_empty() {
-        return Err(BqliteError::Plan(
-            "Wave 1 planner does not yet support JOIN clauses".into(),
-        ));
-    }
-    if pipeline.source.time_range.is_some() {
-        return Err(BqliteError::Plan(
-            "Wave 1 planner does not yet support source time ranges \
-             (`LAST` / `BETWEEN` land in Wave 2)"
-                .into(),
-        ));
-    }
-
-    let table_name = pipeline.source.primary.name.text.as_str();
-    let table_schema = catalog.resolve_table(table_name)?;
-    Ok(LogicalPlan::scan(table_schema))
-}
-
-/// Logical → physical: one-to-one lowering for the Wave 1 subset.
+/// Propagates every failure from `lower_statement` verbatim:
 ///
-/// Only [`LogicalPlan::Scan`] has a physical descriptor in this
-/// crate today. The full Wave 2 logical → physical lowering for
-/// Filter / Project / Limit / DDL / DML lands in TASK-226; until
-/// that task ships, `plan_query_pipeline` gates the pipelines it
-/// produces so this function only ever sees a `Scan` node.
-fn lower(logical: LogicalPlan) -> PhysicalPlan {
-    match logical {
-        LogicalPlan::Scan {
-            table,
-            output_schema,
-            ..
-        } => PhysicalPlan::Scan(ScanPhysical {
-            table: table.name().to_string(),
-            output_schema,
-        }),
-        // The Wave 1 gating in `plan_query_pipeline` (no stages, no
-        // joins, no time range) plus `build_logical`'s statement-
-        // level rejections mean every other logical variant is
-        // unreachable here. TASK-226 replaces this `lower` with a
-        // full logical → physical pass.
-        _ => unreachable!(
-            "Wave 1 `lower()` only sees Scan nodes — richer \
-             variants land in TASK-226"
-        ),
-    }
-}
-
-fn unsupported_statement(kind: &str) -> BqliteError {
-    BqliteError::Plan(format!(
-        "Wave 1 planner does not yet support {kind} statements"
-    ))
+/// - `BqliteError::Plan` — unknown table, unsupported pipeline stage,
+///   invalid `INSERT` shape, etc.
+/// - `BqliteError::Schema` — DDL validation failures (duplicate
+///   columns, missing role columns, invalid `ALTER` action).
+pub fn plan(statement: Statement, catalog: &dyn Catalog) -> Result<PhysicalPlan> {
+    let logical = lower_statement(statement, catalog)?;
+    Ok(lower_physical(logical))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,16 +121,15 @@ mod tests {
 
     use bqlite_ast::{
         expr::{Expr, Literal, Spanned},
-        operator::PipelineStage,
-        pipeline::{Source, TableRef, TimeRange},
+        pipeline::{Source, TableRef},
         span::{Name, Span},
-        AlterAction, AlterTableStmt, ColumnDef as AstColumnDef, ColumnRole, CreateTableStmt,
-        DeleteStmt, DescribeStmt, DropTableStmt, InsertBody, InsertStmt,
+        DeleteStmt, Pipeline, PipelineStage,
     };
     use bqlite_core::{
         catalog::unknown_table_error,
         property::BqlType,
         schema::{ColumnDef, TableSchema},
+        BqliteError, OperatorSchema,
     };
 
     use super::*;
@@ -251,8 +137,6 @@ mod tests {
     // ── Helpers ─────────────────────────────────────────────────────
 
     /// A minimal in-memory `Catalog` used only by planner tests.
-    /// The manifest-backed catalog lives in `bqlite-storage` and would
-    /// drag in I/O setup we don't want here.
     #[derive(Debug, Default)]
     struct InMemoryCatalog {
         tables: BTreeMap<String, TableSchema>,
@@ -278,8 +162,6 @@ mod tests {
         }
     }
 
-    /// Build the minimum viable `events` schema that TASK-125's
-    /// bootstrap rule seeds into every fresh database.
     fn events_schema() -> TableSchema {
         TableSchema::new(
             "events",
@@ -295,8 +177,6 @@ mod tests {
         .expect("minimal events schema must validate")
     }
 
-    /// Build a `TableRef` with a synthetic span so tests can construct
-    /// `Pipeline` values without owning any source text.
     fn table_ref(name: &str) -> TableRef {
         TableRef {
             name: Name::synthetic(name),
@@ -304,8 +184,6 @@ mod tests {
         }
     }
 
-    /// Build a bare-identifier pipeline — the exact shape the Wave 1
-    /// parser emits for `bqlite query "<name>"`.
     fn bare_pipeline(name: &str) -> Pipeline {
         Pipeline {
             source: Source {
@@ -328,30 +206,25 @@ mod tests {
 
         let physical = plan(stmt, &catalog).expect("events must plan");
 
-        match physical {
-            PhysicalPlan::Scan(scan) => {
-                assert_eq!(scan.table, "events");
-                // Output schema should match what the engine will bind
-                // against — the declared columns plus `__seq_id` and
-                // `__batch_id`.
-                let col_names: Vec<&str> = scan
-                    .output_schema
-                    .columns()
-                    .iter()
-                    .map(|c| c.name.as_str())
-                    .collect();
-                assert_eq!(
-                    col_names,
-                    vec!["entity_id", "ts", "event_type", "__seq_id", "__batch_id"]
-                );
-            }
-        }
+        let PhysicalPlan::Scan(scan) = physical else {
+            panic!("expected Scan, got {physical:?}");
+        };
+        assert_eq!(scan.table, "events");
+        let col_names: Vec<&str> = scan
+            .output_schema
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            col_names,
+            vec!["entity_id", "ts", "event_type", "__seq_id", "__batch_id"]
+        );
     }
 
     #[test]
     fn physical_output_schema_matches_logical_output_schema() {
-        // §4.5 invariant: logical and physical report the same output
-        // schema because lowering is one-to-one with no pruning.
+        // Lowering is one-to-one so both sides report the same schema.
         let catalog = InMemoryCatalog::default().with(events_schema());
         let stmt = Statement::Query(bare_pipeline("events"));
 
@@ -361,23 +234,10 @@ mod tests {
     }
 
     #[test]
-    fn logical_scan_constructor_caches_output_schema() {
-        let node = LogicalPlan::scan(events_schema());
-        let first = node.output_schema() as *const OperatorSchema;
-        let second = node.output_schema() as *const OperatorSchema;
-        assert_eq!(
-            first, second,
-            "repeated calls must return the same borrowed value"
-        );
-        assert_eq!(node.output_schema().len(), 5);
-    }
-
-    #[test]
     fn plans_via_dyn_catalog_reference() {
-        // Guard the object-safe surface. The engine will hand us
-        // `&dyn Catalog`, so constructing the planner call through
-        // that exact shape is the load-bearing test, not
-        // `&InMemoryCatalog`.
+        // Guard the object-safe surface — the engine hands us
+        // `&dyn Catalog`, so construct the call through that exact
+        // shape rather than `&InMemoryCatalog`.
         let owned = InMemoryCatalog::default().with(events_schema());
         let catalog: &dyn Catalog = &owned;
         let stmt = Statement::Query(bare_pipeline("events"));
@@ -393,34 +253,30 @@ mod tests {
 
         match plan(stmt, &catalog) {
             Err(BqliteError::Plan(msg)) => {
-                assert!(
-                    msg.contains("ghost"),
-                    "error should name the missing table, got: {msg}"
-                );
-                assert!(
-                    msg.contains("unknown table"),
-                    "error should match the catalog's unknown-table phrasing, got: {msg}"
-                );
+                assert!(msg.contains("ghost"), "got: {msg}");
+                assert!(msg.contains("unknown table"), "got: {msg}");
             }
             other => panic!("expected Plan error, got {other:?}"),
         }
     }
 
-    // ── Unsupported pipeline shapes ─────────────────────────────────
+    // ── Error passthrough from logical lowering ─────────────────────
 
     #[test]
-    fn rejects_pipeline_stages() {
+    fn propagates_unsupported_pipeline_stage_error() {
+        // ORDER BY is deferred to Wave 3 — logical lowering rejects it
+        // and `plan` must propagate that error verbatim.
         let catalog = InMemoryCatalog::default().with(events_schema());
         let mut pipeline = bare_pipeline("events");
-        pipeline.stages.push(PipelineStage::Limit {
-            count: 10,
+        pipeline.stages.push(PipelineStage::OrderBy {
+            items: vec![],
             span: Span::EMPTY,
         });
         match plan(Statement::Query(pipeline), &catalog) {
             Err(BqliteError::Plan(msg)) => {
-                assert!(msg.contains("pipeline stages"), "got: {msg}");
+                assert!(msg.contains("ORDER BY"), "got: {msg}");
             }
-            other => panic!("expected Plan error for pipeline stages, got {other:?}"),
+            other => panic!("expected Plan error for ORDER BY, got {other:?}"),
         }
     }
 
@@ -438,121 +294,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_source_time_range() {
+    fn rejects_delete_statement_pending_wave_4() {
         let catalog = InMemoryCatalog::default().with(events_schema());
-        let mut pipeline = bare_pipeline("events");
-        pipeline.source.time_range = Some(TimeRange::Last(86_400_000_000_000));
-        match plan(Statement::Query(pipeline), &catalog) {
-            Err(BqliteError::Plan(msg)) => {
-                assert!(msg.contains("time ranges"), "got: {msg}");
-            }
-            other => panic!("expected Plan error for time range, got {other:?}"),
-        }
-    }
-
-    // ── Unsupported statement variants ──────────────────────────────
-
-    #[test]
-    fn rejects_explain_statement() {
-        let catalog = InMemoryCatalog::default().with(events_schema());
-        let stmt = Statement::Explain(bare_pipeline("events"));
-        expect_unsupported(&catalog, stmt, "EXPLAIN");
-    }
-
-    #[test]
-    fn rejects_create_table() {
-        let catalog = InMemoryCatalog::default();
-        let stmt = Statement::CreateTable(CreateTableStmt {
-            table: Name::synthetic("events"),
-            columns: vec![],
-            span: Span::EMPTY,
-        });
-        expect_unsupported(&catalog, stmt, "CREATE TABLE");
-    }
-
-    #[test]
-    fn rejects_drop_table() {
-        let catalog = InMemoryCatalog::default();
-        let stmt = Statement::DropTable(DropTableStmt {
-            table: Name::synthetic("events"),
-            span: Span::EMPTY,
-        });
-        expect_unsupported(&catalog, stmt, "DROP TABLE");
-    }
-
-    #[test]
-    fn rejects_insert() {
-        let catalog = InMemoryCatalog::default();
-        let stmt = Statement::Insert(InsertStmt {
-            table: Name::synthetic("events"),
-            body: InsertBody::Values(vec![]),
-            span: Span::EMPTY,
-        });
-        expect_unsupported(&catalog, stmt, "INSERT");
-    }
-
-    #[test]
-    fn rejects_describe() {
-        let catalog = InMemoryCatalog::default();
-        let stmt = Statement::Describe(DescribeStmt {
-            table: Name::synthetic("events"),
-            span: Span::EMPTY,
-        });
-        expect_unsupported(&catalog, stmt, "DESCRIBE");
-    }
-
-    #[test]
-    fn rejects_alter_table() {
-        let catalog = InMemoryCatalog::default();
-        let stmt = Statement::AlterTable(AlterTableStmt {
-            table: Name::synthetic("events"),
-            action: AlterAction::AddColumn(AstColumnDef {
-                name: Name::synthetic("source"),
-                data_type: BqlType::String,
-                role: ColumnRole::Regular,
-                not_null: false,
-                default: None,
-                span: Span::EMPTY,
-            }),
-            span: Span::EMPTY,
-        });
-        expect_unsupported(&catalog, stmt, "ALTER TABLE");
-    }
-
-    #[test]
-    fn rejects_delete() {
-        let catalog = InMemoryCatalog::default();
         let stmt = Statement::Delete(DeleteStmt {
             table: Name::synthetic("events"),
             predicate: Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY),
             span: Span::EMPTY,
         });
-        expect_unsupported(&catalog, stmt, "DELETE");
+        match plan(stmt, &catalog) {
+            Err(BqliteError::Plan(msg)) => {
+                assert!(msg.contains("DELETE"), "got: {msg}");
+            }
+            other => panic!("expected Plan error for DELETE, got {other:?}"),
+        }
     }
 
     #[test]
-    fn rejects_define_alias() {
-        let catalog = InMemoryCatalog::default();
+    fn rejects_define_alias_pending_wave_4() {
+        let catalog = InMemoryCatalog::default().with(events_schema());
         let stmt = Statement::DefineAlias {
             name: Name::synthetic("active_users"),
             body: bare_pipeline("events"),
             span: Span::EMPTY,
         };
-        expect_unsupported(&catalog, stmt, "alias definition");
-    }
-
-    /// Shared assertion: the plan call must fail with a
-    /// `BqliteError::Plan` whose message contains `construct` —
-    /// confirming both the error variant and the user-visible naming.
-    fn expect_unsupported(catalog: &dyn Catalog, stmt: Statement, construct: &str) {
-        match plan(stmt, catalog) {
+        match plan(stmt, &catalog) {
             Err(BqliteError::Plan(msg)) => {
-                assert!(
-                    msg.contains(construct),
-                    "message `{msg}` must name the construct `{construct}`"
-                );
+                assert!(msg.contains("alias"), "got: {msg}");
             }
-            other => panic!("expected Plan error for {construct}, got {other:?}"),
+            other => panic!("expected Plan error for alias, got {other:?}"),
         }
     }
 }
