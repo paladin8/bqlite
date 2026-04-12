@@ -328,7 +328,7 @@ Unlocks: TASK-115 planner stub (needs `Catalog` to resolve `events`), TASK-118 e
 
 **Scope exclusions.** `DELETE` is deferred to Wave 4 alongside tombstones (TASK-404, TASK-410 territory) — the AST already models it, but without the tombstone format on disk there is nothing for the planner to lower it onto. Wave 2 parsers and planners therefore do not handle `DELETE`.
 
-**Size.** ~43 tasks (TASK-242 retired during post-Wave-2 architecture reconciliation; see the task stub for rationale).
+**Size.** ~48 tasks (TASK-242 retired during post-Wave-2 architecture reconciliation; TASK-244 through TASK-248 were added after post-wave acceptance validation found remaining correctness/performance gaps).
 **Parallelism.** 10-14 agents at peak.
 
 **Acceptance.** The following script runs end-to-end against a database created via `bqlite init /path/to/db` and returns the expected rows. Surface keywords match the grammar in query-language.md §26: `WHERE` for row filtering, `INSERT ... VALUES` for literal tuples, `WITH (k: v, ...)` option lists using `:` as the key/value separator.
@@ -382,6 +382,8 @@ Source columns not named in the `map` clause pass through if their name matches 
 | Zone-map pruning effectiveness on the acceptance query | ≥ 80% of row-groups skipped |
 
 Regression gate triggers if any bench slips >10% vs. the previous green main. The bench suite itself is TASK-236; the CI job, baseline capture, and comparison machinery that enforce the gate are TASK-241.
+
+**Post-wave acceptance reconciliation.** Validation after the nominal Wave 2 close found that the checked-in runtime still returned zero rows through `Database::segment_reader()`, the acceptance test was asserting manifest row counts rather than exact query results, and the benchmark harness was only exercising scaled-down fixtures without load-bearing target failures. TASK-244 through TASK-248 close those gaps; Wave 2 is not complete until they land.
 
 Wave 2 is where the real interfaces get decided, so design anchors are front-loaded. After the anchors land, the encoding and storage tasks form the longest parallelism vein — the 6 encoding tasks plus the writer/reader/zone-map/manifest tasks give 10+ agents work the moment the trait lands. Rule 5 applies: Wave 2 does not begin until every Wave 1 task is complete.
 
@@ -690,9 +692,34 @@ Tests: a smoke test that opens a segment and asserts `posix_fadvise` was invoked
 
 This task is intentionally tiny (~half a day) and exists to keep the implementation honest with storage-format.md §8.2.
 
+### TASK-244: [HARD][IMPL] Manifest-backed `SegmentReader` reconciliation
+**Output**: crates/bqlite-storage/src/database.rs, crates/bqlite-storage/src/segment/reader.rs, crates/bqlite-engine/src/bind.rs (tests)
+**Depends on**: TASK-215, TASK-217, TASK-230
+**Description**: Replace the lingering Wave 1 `EmptySegmentReader` wiring in `Database::segment_reader()` with the real manifest-backed query snapshot that Wave 2's scan path was always supposed to consume. `segments()` enumerates the table's live segment inventory from `Manifest::snapshot_for_query`, `open_segment()` resolves the on-disk segment path and opens TASK-215's `SegmentFileReader`, and the reader applies the current table schema when older segments are missing newly-added columns. Stable per-query ordering, schema-evolution backfill (`NULL` / default), and foreign-handle rejection remain part of the contract. Keep `empty_segment_reader()` only as an explicit test helper, not the production query path. End-to-end tests must prove `CREATE TABLE → INSERT VALUES/FROM → query` returns real rows through the normal engine bind/scan path rather than by inspecting the manifest directly.
+
+### TASK-245: [EASY][IMPL] Wave 2 acceptance and CLI tests against real rows
+**Output**: tests/tests/wave2_acceptance.rs, tests/smoke.rs, crates/bqlite-cli/src/{main,ingest}.rs (tests)
+**Depends on**: TASK-229, TASK-233, TASK-238, TASK-240, TASK-244
+**Description**: Rework the Wave 2 acceptance-facing tests so they assert the published user-visible behavior rather than the old zero-row stub path. `wave2_acceptance.rs` must assert exact result rows for the `where/select/limit` query, exact `ExplainNode` evidence of pushed predicates and pruned columns, real `DESCRIBE` output, and the expected post-state after `ALTER TABLE ADD COLUMN` / `DROP TABLE`. CLI tests must cover non-empty query output after ingest, auto-injected `LIMIT 1000`, truncation footer text, and the `--limit` / `--no-limit` overrides. Delete or rewrite comments that treat zero-row scans as expected Wave 2 behavior. The ignored 100M-row variant must exercise the same real scan path, not a manifest-only proxy.
+
+### TASK-246: [HARD][IMPL] Reference-dataset bench harness + hard target enforcement
+**Output**: benches/wave2/{scan,encoding,ingest,acceptance}.rs, benches/common/mod.rs, .github/workflows/bench.yml, scripts/bench-compare.sh
+**Depends on**: TASK-235, TASK-236, TASK-241
+**Description**: Reconcile the benchmark suite with the published Wave 2 performance gate in this file. The bench harness gains a dual-mode dataset strategy: CI-scaled fixtures remain for regression-noise control, but reference-mode runs execute the true 100M-row acceptance query and the reference CSV profile from the Wave 2 header on the pinned machine. Bench targets become load-bearing again: reference-mode runs fail when the acceptance query exceeds 1 s, int64 decode or pushed-down equality miss their floors, ingest falls below 100 MB/s, compression ratio exceeds 10%, or zone-map pruning on the acceptance query is below 80%. Bench output must be machine-readable and preserve both scaled-CI and reference-hardware numbers in the uploaded artifacts so TASK-241's regression gate and manual release sign-off are comparing the same metrics.
+
+### TASK-247: [HARD][IMPL] Scan-path performance closure for the acceptance query
+**Output**: crates/bqlite-storage/src/{database.rs,segment/reader.rs,segment/merge.rs,zone_map.rs}, crates/bqlite-operators/src/scan.rs, benches/wave2/{scan,acceptance}.rs
+**Depends on**: TASK-216, TASK-227, TASK-230, TASK-243, TASK-244, TASK-246
+**Description**: Profile and optimize the real query scan path until it meets the Wave 2 scan-side gate on reference hardware. This is the closure task for the numbers that currently miss by a wide margin: the end-to-end acceptance query, columnar decode throughput, pushed-down equality throughput, and zone-map pruning effectiveness. Expected work includes eliminating redundant segment-byte copies and reopen churn in the hot path, reusing projection/decoder planning across row-groups where legal, ensuring dictionary/equality pushdown stays in code space rather than devolving to row-level string comparisons, and making pruning effective for the actual acceptance predicate (`event = 'checkout' AND amount > 100`) rather than only for synthetic microbench filters. Success criteria are the published Wave 2 targets in the header, measured by TASK-246's reference-mode benches.
+
+### TASK-248: [HARD][IMPL] CSV ingest throughput closure
+**Output**: crates/bqlite-engine/src/ingest.rs, crates/bqlite-storage/src/{ingest/csv.rs,ingest/partitioner.rs,writer.rs}, benches/wave2/ingest.rs
+**Depends on**: TASK-214, TASK-218, TASK-233, TASK-246
+**Description**: Bring parse → sort → encode → write throughput up to the Wave 2 `>= 100 MB/s` ingest target on the reference dataset. Bench-driven optimization pass over the real ingest path: reduce string and `PropertyValue` cloning, stream source rows into partition buckets with less intermediate materialization, amortize schema coercion work, minimize temporary allocations in the CSV reader and partitioner, and make sure writer batching does not pessimize the selector/encoder hot loops. The success criterion is not a synthetic microbench win; it is TASK-246's reference-mode ingest bench clearing the published Wave 2 floor while preserving exact ingest semantics and error reporting.
+
 ### TASK-299: [HARD][IMPL] Wave 2 quality audit
 **Output**: docs/quality-score.md
-**Depends on**: TASK-235, TASK-236, TASK-237, TASK-238, TASK-239, TASK-240, TASK-241, TASK-243
+**Depends on**: TASK-235, TASK-236, TASK-237, TASK-238, TASK-239, TASK-240, TASK-241, TASK-243, TASK-244, TASK-245, TASK-246, TASK-247, TASK-248
 **Description**: Same audit pattern as TASK-199, rescored after Wave 2. Wave 2 is the first wave with a real performance gate, so the Benchmarks dimension must reflect whether the Wave 2 perf-gate targets are met on reference hardware — not merely whether benches exist. bqlite-storage (segment format, encodings, ingest), bqlite-planner (pushdown, projection pruning, EXPLAIN), and bqlite-operators (scan/filter/project/limit) will see the biggest grade movements. Any crate slipping vs. its Wave 1 grade is flagged in the commit message. Below-C grades get follow-up tasks; Wave 3 does not start until those are filed.
 
 ---
