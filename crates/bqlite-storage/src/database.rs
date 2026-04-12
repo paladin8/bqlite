@@ -1,11 +1,13 @@
-//! Database — the Wave 1 storage bootstrap entry point.
+//! Database — the bqlite storage entry point.
 //!
-//! [`Database::open_or_create`] implements the v0 database-open
-//! contract from `docs/design/storage-format.md` §5 + §12 + §14 and
-//! `docs/reliability.md`: it creates the directory layout, acquires
-//! an exclusive lock, and reads or initializes the manifest atomically.
+//! [`Database::create`] initializes a fresh database directory with
+//! an empty manifest and exclusive lock. [`Database::open`] opens an
+//! existing database, validating its manifest and acquiring the lock.
+//! These replace the Wave 1 [`Database::open_or_create`] (deprecated)
+//! to align with `query-language.md` §29 ("Database init | CLI-only
+//! (`bqlite init`)").
 //!
-//! # On-disk layout (Wave 1)
+//! # On-disk layout
 //!
 //! ```text
 //! <root>/
@@ -16,9 +18,8 @@
 //!
 //! Wave 1 consolidates what `storage-format.md` §5.2 + §12.1 split
 //! into `db.json` plus per-table `<table>/manifest.json` into a single
-//! top-level `manifest.json`. No segments are ever written yet.
-//! [`crate::manifest`] documents the split and the forward-compat
-//! plan.
+//! top-level `manifest.json`. [`crate::manifest`] documents the split
+//! and the forward-compat plan.
 //!
 //! # Atomicity
 //!
@@ -42,12 +43,13 @@
 //!
 //! # Concurrency
 //!
-//! [`Database::open_or_create`] acquires an exclusive lock on
-//! `<root>/.lock` via `std::fs::File::try_lock` (stabilized in Rust
-//! 1.89). A second concurrent open from the same process or from a
-//! different process returns [`BqliteError::Execution`] with a clear
-//! message. The lock releases when the owning [`Database`] is
-//! dropped. See `storage-format.md` §14.1.
+//! Both [`Database::create`] and [`Database::open`] acquire an
+//! exclusive lock on `<root>/.lock` via `std::fs::File::try_lock`
+//! (stabilized in Rust 1.89). A second concurrent open from the same
+//! process or from a different process returns
+//! [`BqliteError::Execution`] with a clear message. The lock releases
+//! when the owning [`Database`] is dropped. See
+//! `storage-format.md` §14.1.
 //!
 //! # Future extensions
 //!
@@ -110,13 +112,151 @@ pub struct Database {
 }
 
 impl Database {
+    /// Initialize a fresh database at `path` with [`DEFAULT_SHARD_COUNT`].
+    ///
+    /// Equivalent to [`Database::create_with_shards`] with the default
+    /// shard count. The returned `Database` is already open and
+    /// locked — callers do not need a follow-up [`Database::open`].
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if `path` already contains a
+    ///   manifest (use [`Database::open`] instead).
+    /// - [`BqliteError::Io`] on I/O failures creating the directory,
+    ///   opening the lock file, or writing the manifest.
+    /// - [`BqliteError::Execution`] if the database directory is
+    ///   already locked by another process.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        Self::create_with_shards(path, DEFAULT_SHARD_COUNT)
+    }
+
+    /// Initialize a fresh database at `path` with a custom shard count.
+    ///
+    /// Creates the directory (recursively if needed), writes an empty
+    /// manifest with zero tables, and acquires the exclusive lock.
+    /// The returned `Database` is ready for [`Database::create_table`]
+    /// calls — no bootstrap `events` table is seeded (TASK-240).
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Schema`] if `shard_count == 0`.
+    /// - [`BqliteError::Execution`] if `path` already contains a
+    ///   manifest — the caller should use [`Database::open`] instead.
+    /// - [`BqliteError::Io`] on I/O failures.
+    /// - [`BqliteError::Execution`] if the directory is already locked.
+    pub fn create_with_shards(path: impl AsRef<Path>, shard_count: u16) -> Result<Self> {
+        if shard_count == 0 {
+            return Err(BqliteError::Schema("shard_count must be at least 1".into()));
+        }
+
+        let root = path.as_ref().to_path_buf();
+        fs::create_dir_all(&root).map_err(|e| io_ctx("create database directory", &root, e))?;
+
+        let lock = acquire_lock(&root)?;
+
+        // A manifest already on disk means someone initialized this
+        // directory before — error out so callers don't accidentally
+        // re-initialize an existing database.
+        let manifest_path = root.join(MANIFEST_FILE_NAME);
+        if manifest_path.exists() {
+            return Err(BqliteError::Execution(format!(
+                "cannot create database at {}: manifest already exists (use Database::open to open an existing database)",
+                root.display()
+            )));
+        }
+
+        // Clean up any stale tmp file from a prior crashed init.
+        clean_stale_tmp(&root);
+
+        let manifest = Manifest::new_empty(shard_count);
+        write_manifest_atomic(&root, &manifest)?;
+
+        Ok(Self {
+            root,
+            manifest,
+            _lock: lock,
+        })
+    }
+
+    /// Open an existing database at `path`.
+    ///
+    /// Reads and validates the manifest, acquires the exclusive lock,
+    /// and runs the orphan-segment reconciliation pass. Errors if the
+    /// directory has no manifest — callers should use
+    /// [`Database::create`] (or `bqlite init`) to initialize a fresh
+    /// database first.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if the directory has no manifest,
+    ///   with a message pointing the caller at `bqlite init`.
+    /// - [`BqliteError::Execution`] if the manifest is corrupt or has
+    ///   an unsupported `format_version`.
+    /// - [`BqliteError::Execution`] if the database is already locked
+    ///   by another process.
+    /// - [`BqliteError::Io`] on I/O failures.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let root = path.as_ref().to_path_buf();
+
+        if !root.exists() {
+            return Err(BqliteError::Execution(format!(
+                "database not found at {}: directory does not exist (run `bqlite init` to create a new database)",
+                root.display()
+            )));
+        }
+
+        let lock = acquire_lock(&root)?;
+
+        // Clean up stale tmp files from prior crashes.
+        clean_stale_tmp(&root);
+
+        let manifest_path = root.join(MANIFEST_FILE_NAME);
+        let manifest = match fs::read(&manifest_path) {
+            Ok(bytes) => {
+                let m: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
+                    BqliteError::Execution(format!(
+                        "corrupted manifest at {}: {}",
+                        manifest_path.display(),
+                        e
+                    ))
+                })?;
+                if !m.is_supported_version() {
+                    return Err(BqliteError::Execution(format!(
+                        "manifest at {} has unsupported format_version {} (this build reads format_version {})",
+                        manifest_path.display(),
+                        m.format_version,
+                        MANIFEST_FORMAT_VERSION
+                    )));
+                }
+                m
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(BqliteError::Execution(format!(
+                    "database not initialized at {}: no manifest found (run `bqlite init` to create a new database)",
+                    root.display()
+                )));
+            }
+            Err(e) => {
+                return Err(io_ctx("read manifest", &manifest_path, e));
+            }
+        };
+
+        // Reconcile on-disk segment files against the manifest.
+        let _report = cleanup::reconcile_segments(&root, &manifest)?;
+
+        Ok(Self {
+            root,
+            manifest,
+            _lock: lock,
+        })
+    }
+
     /// Open an existing database, or initialize a fresh one if `path`
     /// does not yet contain a manifest.
     ///
-    /// Equivalent to [`Database::open_or_create_with_shards`] with
-    /// [`DEFAULT_SHARD_COUNT`]. The shard count is honoured only on a
-    /// fresh init — reopening an existing database preserves the
-    /// manifest's recorded value.
+    /// **Deprecated (TASK-240).** Use [`Database::create`] to initialize
+    /// and [`Database::open`] to reopen. This method is retained
+    /// temporarily for downstream callers that have not yet migrated.
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_or_create_with_shards(path, DEFAULT_SHARD_COUNT)
     }
@@ -124,59 +264,19 @@ impl Database {
     /// Open an existing database, or initialize a fresh one with the
     /// specified shard count.
     ///
-    /// # Arguments
-    ///
-    /// - `path` — database root directory. Created (recursively) if
-    ///   it does not yet exist.
-    /// - `shard_count` — number of hash shards to stamp into the
-    ///   manifest on a fresh init. Honoured only on init: reopening
-    ///   an existing database ignores this argument and uses the
-    ///   manifest's recorded value, because shard count is fixed for
-    ///   the lifetime of a database (see
-    ///   `docs/design/storage-format.md` §5.1).
-    ///
-    /// # Errors
-    ///
-    /// - [`BqliteError::Schema`] if `shard_count == 0`.
-    /// - [`BqliteError::Io`] on I/O failures creating the directory,
-    ///   opening the lock file, or writing the manifest.
-    /// - [`BqliteError::Execution`] if the database is already open
-    ///   by another process (lock held), or if the existing manifest
-    ///   is corrupt or has an unsupported `format_version`.
+    /// **Deprecated (TASK-240).** Use [`Database::create_with_shards`]
+    /// to initialize and [`Database::open`] to reopen.
     pub fn open_or_create_with_shards(path: impl AsRef<Path>, shard_count: u16) -> Result<Self> {
         if shard_count == 0 {
             return Err(BqliteError::Schema("shard_count must be at least 1".into()));
         }
 
         let root = path.as_ref().to_path_buf();
-        // `create_dir_all` is idempotent. If two processes race on a
-        // brand-new directory, both may observe success here, but only
-        // one will win `try_lock` below; the loser gets a clean
-        // `Execution("already open")` error.
         fs::create_dir_all(&root).map_err(|e| io_ctx("create database directory", &root, e))?;
 
-        // Acquire the exclusive lock first, so any subsequent manifest
-        // read/write is serialized across processes on this directory.
         let lock = acquire_lock(&root)?;
 
-        // Clean up any stale `manifest.json.tmp` left over from a
-        // crash during a prior atomic update. The rename in
-        // `write_manifest_atomic` is atomic, so a stale temp file
-        // necessarily belongs to an aborted update whose target
-        // manifest is either still the old contents or has already
-        // been replaced by the new contents — either way, the temp
-        // file is orphaned and safe to delete. Unconditional
-        // `remove_file` plus ignoring `NotFound` is one syscall fewer
-        // than the check-then-remove dance.
-        let tmp_path = root.join(MANIFEST_TMP_FILE_NAME);
-        match fs::remove_file(&tmp_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => {
-                // Best-effort: a stale tmp file we can't delete is
-                // harmless — the next atomic write will overwrite it.
-            }
-        }
+        clean_stale_tmp(&root);
 
         // Read or initialize the manifest.
         let manifest_path = root.join(MANIFEST_FILE_NAME);
@@ -200,15 +300,6 @@ impl Database {
                 m
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Fresh init — write the new manifest before
-                // returning so an observer opening the same directory
-                // after this call sees a complete, versioned file.
-                //
-                // TASK-125: seed the bootstrap `events` table so
-                // `bqlite query "events"` can parse-plan-execute
-                // against a freshly-created database without a
-                // CREATE TABLE DDL path (which does not exist in v0).
-                // See `crate::catalog` for the rationale.
                 let mut m = Manifest::new_empty(shard_count);
                 m.tables.insert(
                     crate::catalog::BOOTSTRAP_EVENTS_TABLE_NAME.to_string(),
@@ -229,16 +320,6 @@ impl Database {
             }
         };
 
-        // Reconcile on-disk segment files against the manifest
-        // before handing out a live Database handle. This implements
-        // the crash-safety contract from storage-format.md §7.4 and
-        // reliability.md §Crash Safety: sweep orphan .tmp files from
-        // crashed ingests/compactions, and remove .seg files that are
-        // not referenced by the loaded manifest (deferred compaction
-        // deletes, dropped-table remnants).
-        // The report is intentionally discarded for now — there is no
-        // logging framework in scope. When tracing lands, add a
-        // `tracing::info!` here for operational visibility.
         let _report = cleanup::reconcile_segments(&root, &manifest)?;
 
         Ok(Self {
@@ -280,9 +361,8 @@ impl Database {
     /// ```
     ///
     /// The catalog always reflects the manifest snapshot taken when
-    /// [`Database::open_or_create`] ran; Wave 1 has no mutation API,
-    /// so the snapshot is effectively static for the database's
-    /// lifetime.
+    /// the database was opened; Wave 1 has no mutation API, so the
+    /// snapshot is effectively static for the database's lifetime.
     pub fn catalog(&self) -> ManifestCatalog<'_> {
         ManifestCatalog::new(&self.manifest)
     }
@@ -642,6 +722,22 @@ pub fn empty_segment_reader(schema: TableSchema) -> Box<dyn SegmentReader> {
     Box::new(EmptySegmentReader { schema })
 }
 
+/// Best-effort removal of any stale `manifest.json.tmp` left over
+/// from a crash during a prior atomic update. The rename in
+/// `write_manifest_atomic` is atomic, so a stale temp file
+/// necessarily belongs to an aborted update — safe to delete.
+fn clean_stale_tmp(root: &Path) {
+    let tmp_path = root.join(MANIFEST_TMP_FILE_NAME);
+    match fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {
+            // Best-effort: a stale tmp file we can't delete is
+            // harmless — the next atomic write will overwrite it.
+        }
+    }
+}
+
 /// Acquire the exclusive advisory lock on `<root>/.lock`.
 ///
 /// A fresh empty file is created if necessary. On success, the
@@ -785,7 +881,7 @@ mod tests {
             let mut path = std::env::temp_dir();
             path.push(format!("bqlite-storage-db-{label}-{pid}-{seq}"));
             // We explicitly do NOT create the directory here — the
-            // open_or_create path must be able to create it itself.
+            // create / open_or_create path must be able to create it.
             Self { path }
         }
 
@@ -924,7 +1020,167 @@ mod tests {
         assert!(matches!(err, BqliteError::Schema(_)), "got {err:?}");
     }
 
-    // ── Reopen semantics ────────────────────────────────────────────────────
+    // ── Database::create / Database::open (TASK-240) ──────────────────────
+
+    #[test]
+    fn create_initializes_fresh_database_without_bootstrap() {
+        let scratch = Scratch::new("create-fresh");
+        let db = Database::create(scratch.path()).expect("create");
+        assert!(scratch.path().join(LOCK_FILE_NAME).is_file());
+        assert!(scratch.path().join(MANIFEST_FILE_NAME).is_file());
+        let m = db.manifest();
+        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(m.shard_count, DEFAULT_SHARD_COUNT);
+        assert_eq!(m.database_uuid.len(), 36);
+        // No bootstrap events table — TASK-240 retires the seeding.
+        assert!(
+            m.tables.is_empty(),
+            "Database::create must not seed any tables"
+        );
+    }
+
+    #[test]
+    fn create_with_custom_shards() {
+        let scratch = Scratch::new("create-shards");
+        let db = Database::create_with_shards(scratch.path(), 8).expect("create");
+        assert_eq!(db.manifest().shard_count, 8);
+        assert!(db.manifest().tables.is_empty());
+    }
+
+    #[test]
+    fn create_zero_shards_is_rejected() {
+        let scratch = Scratch::new("create-zero-shards");
+        let err =
+            Database::create_with_shards(scratch.path(), 0).expect_err("zero shards must error");
+        assert!(matches!(err, BqliteError::Schema(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn create_errors_if_manifest_already_exists() {
+        let scratch = Scratch::new("create-exists");
+        let _db = Database::create(scratch.path()).expect("first create");
+        drop(_db);
+        let err = Database::create(scratch.path())
+            .expect_err("second create on same directory must fail");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(
+                    msg.contains("manifest already exists"),
+                    "error should mention existing manifest, got: {msg}"
+                );
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_then_open_roundtrips() {
+        let scratch = Scratch::new("create-open");
+        let uuid = {
+            let db = Database::create(scratch.path()).expect("create");
+            db.manifest().database_uuid.clone()
+        };
+        let db = Database::open(scratch.path()).expect("open");
+        assert_eq!(db.manifest().database_uuid, uuid);
+        assert!(db.manifest().tables.is_empty());
+    }
+
+    #[test]
+    fn open_errors_on_missing_directory() {
+        let scratch = Scratch::new("open-missing");
+        // Scratch does NOT create the directory, so this should fail.
+        let err = Database::open(scratch.path()).expect_err("open on missing directory must fail");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(
+                    msg.contains("does not exist"),
+                    "error should mention missing directory, got: {msg}"
+                );
+                assert!(
+                    msg.contains("bqlite init"),
+                    "error should suggest bqlite init, got: {msg}"
+                );
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_errors_on_empty_directory_without_manifest() {
+        let scratch = Scratch::new("open-empty");
+        fs::create_dir_all(scratch.path()).unwrap();
+        let err = Database::open(scratch.path()).expect_err("open on empty directory must fail");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(
+                    msg.contains("not initialized"),
+                    "error should mention not initialized, got: {msg}"
+                );
+                assert!(
+                    msg.contains("bqlite init"),
+                    "error should suggest bqlite init, got: {msg}"
+                );
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_reads_wave1_bootstrap_database() {
+        // A Wave 1 database created with open_or_create (which seeds
+        // the bootstrap events table) must open successfully via the
+        // new Database::open. This tests read-compatibility.
+        let scratch = Scratch::new("open-wave1");
+        {
+            let _db = Database::open_or_create(scratch.path()).expect("wave1 init");
+        }
+        let db = Database::open(scratch.path()).expect("open wave1 db");
+        assert_eq!(db.manifest().tables.len(), 1);
+        let entry = db
+            .manifest()
+            .tables
+            .get("events")
+            .expect("bootstrap events table");
+        assert!(entry.bootstrap_events_table);
+    }
+
+    #[test]
+    fn create_then_open_with_table_survives_roundtrip() {
+        let scratch = Scratch::new("create-table-reopen");
+        {
+            let mut db = Database::create(scratch.path()).expect("create");
+            db.create_table("users".into(), sample_events_schema())
+                .expect("create table");
+        }
+        let db = Database::open(scratch.path()).expect("open");
+        assert!(db.manifest().tables.contains_key("users"));
+    }
+
+    #[test]
+    fn open_cleans_stale_tmp_on_existing_db() {
+        let scratch = Scratch::new("open-clean-tmp");
+        {
+            let _db = Database::create(scratch.path()).expect("create");
+        }
+        let tmp_path = scratch.path().join(MANIFEST_TMP_FILE_NAME);
+        fs::write(&tmp_path, b"stale crash tmp").unwrap();
+        assert!(tmp_path.exists());
+        let _db = Database::open(scratch.path()).expect("open");
+        assert!(
+            !tmp_path.exists(),
+            "open should clean stale manifest.json.tmp"
+        );
+    }
+
+    #[test]
+    fn create_and_open_lock_blocks_concurrent_access() {
+        let scratch = Scratch::new("create-lock");
+        let _db = Database::create(scratch.path()).expect("create");
+        let err = Database::open(scratch.path()).expect_err("open while created db holds lock");
+        assert!(matches!(err, BqliteError::Execution(_)));
+    }
+
+    // ── Reopen semantics (legacy open_or_create) ───────────────────────────
 
     #[test]
     fn reopening_preserves_database_uuid() {
