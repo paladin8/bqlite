@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-329",
+  "claimed_at": "2026-04-12T17:08:26Z",
+  "branch": "task/TASK-329",
+  "description": "End-to-end MATCH variable-binding support + integration closure"
+}
