@@ -13,12 +13,14 @@
 //! ├── src/
 //! │   ├── lib.rs             ← this file
 //! │   ├── common.rs          ← integration helpers (TempDb, assert_*)
+//! │   ├── csv.rs             ← deterministic CSV fixture generator (TASK-235)
 //! │   └── strategies.rs      ← shared `proptest` strategies
 //! ├── tests/                 ← Cargo's auto-discovered test binaries
 //! │   ├── prop_property_value.rs
 //! │   ├── prop_time.rs
 //! │   ├── prop_arrow.rs
-//! │   └── common_smoke.rs
+//! │   ├── common_smoke.rs
+//! │   └── wave2_acceptance.rs
 //! └── suite/                 ← README-only stubs for future Wave 2+ suites
 //! ```
 //!
@@ -40,4 +42,5 @@
 //! here is not a rule bypass.
 
 pub mod common;
+pub mod csv;
 pub mod strategies;
