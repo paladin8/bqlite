@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-238",
+  "claimed_at": "2026-04-12T00:39:58Z",
+  "branch": "task/TASK-238",
+  "description": "INSERT VALUES end-to-end"
+}
