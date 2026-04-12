@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-316",
+  "claimed_at": "2026-04-12T07:34:23Z",
+  "branch": "task/TASK-316",
+  "description": "Parser FUNNEL stage"
+}
