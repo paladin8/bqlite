@@ -23,6 +23,7 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 - **operators/matcher-strategy.md** — Compile-time pattern classifier and strategy selection matrix: `PatternClass` enum, classification predicates, demand override rules, variable-binding interaction with step counter, fallback behavior, microbenchmark methodology (TASK-302, Wave 3)
 - **operators/sort-distinct.md** — `SortOperator` + `DistinctOperator` contracts: physical descriptors, key compilation, null-ordering rules, hard-cap overflow policy, plan-tree placement, no-spill rationale (TASK-310, Wave 3)
 - **operators/aggregate-operator.md** — `Accumulator` trait + `HashAccumulator` architecture: `AggState`/`GroupKey`/`SumState` types, per-function state and merge rules, null propagation, output schema rules, aggregate expression compilation through `CompiledExpr`, fused-downstream protocol via `finish_entity_into`, DDSketch extensibility contract for TASK-327 (TASK-308, Wave 3)
+- **operators/compactstring-evaluation.md** — CompactString (compact_str 0.9) evaluation for matcher hot paths: microbenchmark methodology, go/no-go recommendation (conditional go for `BindingValue::String` only), migration boundaries, alternative approaches (interning, Arc\<str\>) (TASK-332, Wave 3)
 
 ### Language
 

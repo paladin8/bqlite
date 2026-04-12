@@ -24,6 +24,7 @@ arrow = { workspace = true }
 criterion = { workspace = true }
 pprof = { workspace = true }
 serde_json = { workspace = true }
+compact_str = { workspace = true }
 
 # Wave 1 smoke benchmark — exercises the Criterion harness in CI so that
 # later waves can drop microbenchmarks in without rediscovering the
@@ -86,6 +87,13 @@ harness = false
 [[bench]]
 name = "funnel"
 path = "wave3/funnel.rs"
+harness = false
+
+# CompactString evaluation microbenchmark (TASK-332).
+# Run with: cargo bench -p bqlite-benches --bench compactstring_eval
+[[bench]]
+name = "compactstring_eval"
+path = "wave3/compactstring_eval.rs"
 harness = false
 
 # Profiling binary for funnel query analysis (TASK-331).
