@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-299",
   "claimed_at": "2026-04-12T03:18:57Z",
+  "completed_at": "2026-04-12T04:15:00Z",
   "branch": "task/TASK-299",
   "description": "Wave 2 quality audit"
 }
