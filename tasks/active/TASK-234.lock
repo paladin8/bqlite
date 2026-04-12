@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-234",
+  "claimed_at": "2026-04-12T00:12:21Z",
+  "branch": "task/TASK-234",
+  "description": "CLI `ingest` subcommand + result formatter with auto-limit"
+}
