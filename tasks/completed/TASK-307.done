@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-307",
   "claimed_at": "2026-04-12T08:16:20Z",
+  "completed_at": "2026-04-12T09:02:00Z",
   "branch": "task/TASK-307",
   "description": "Hash aggregate operator"
 }
