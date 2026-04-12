@@ -722,6 +722,21 @@ mod tests {
     }
 
     #[test]
+    fn insert_values_negative_literal_errors() {
+        // §26 line 1706: no negative-literal token; `-5` is unary minus
+        // on a positive integer, which is not accepted in a terminal
+        // `literal` position (the grammar's `literal` production is a
+        // single token). The `-` will be seen as `Minus` punctuation
+        // where a literal token is expected.
+        match crate::parse("INSERT INTO events VALUES (-1, 0, 'click')") {
+            Err(_) => {} // any parse error is correct
+            Ok(stmt) => {
+                panic!("negative literal in VALUES should be a parse error, got {stmt:?}")
+            }
+        }
+    }
+
+    #[test]
     fn insert_from_missing_path_errors() {
         match crate::parse("INSERT INTO events FROM") {
             Err(ParseError::UnexpectedEof { .. }) => {}

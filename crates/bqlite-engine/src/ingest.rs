@@ -459,6 +459,66 @@ mod tests {
         assert_eq!(total_rows, 2);
     }
 
+    // ── INSERT VALUES: non-standard role column ordering ──────────
+
+    /// Exercises the property-bag exclusion path when the role columns
+    /// are NOT at positions 0, 1, 2. Table has a regular column first,
+    /// then entity key, then timestamp, then event type — so
+    /// `entity_key_index` = 1, `timestamp_index` = 2, `event_type_index` = 3.
+    #[test]
+    fn insert_values_non_default_role_column_ordering() {
+        let scratch = Scratch::new("insert-values-reordered");
+        let mut db = Database::create(scratch.path()).expect("create db");
+        let engine = crate::Engine::new();
+        engine
+            .query(
+                "CREATE TABLE readings (\
+                     value FLOAT, \
+                     device_id STRING NOT NULL ENTITY KEY, \
+                     ts TIMESTAMP NOT NULL EVENT TIME, \
+                     kind STRING NOT NULL EVENT TYPE\
+                 )",
+                &mut db,
+            )
+            .expect("create readings table");
+
+        let schema = db.manifest().tables["readings"].schema.clone();
+        // Confirm the non-standard ordering is what we expect.
+        assert_eq!(schema.entity_key_index(), 1);
+        assert_eq!(schema.timestamp_index(), 2);
+        assert_eq!(schema.event_type_index(), 3);
+
+        let plan = InsertPhysical {
+            table: schema,
+            body: InsertLogicalBody::Values(vec![
+                // value, device_id, ts, kind
+                vec![
+                    PropertyValue::Float(23.5),
+                    PropertyValue::String("sensor_1".into()),
+                    PropertyValue::Timestamp(1_700_000_000_000_000_000),
+                    PropertyValue::String("temperature".into()),
+                ],
+                vec![
+                    PropertyValue::Null, // nullable float
+                    PropertyValue::String("sensor_2".into()),
+                    PropertyValue::Timestamp(1_700_000_000_100_000_000),
+                    PropertyValue::String("humidity".into()),
+                ],
+            ]),
+            output_schema: empty_schema(),
+        };
+        execute_insert(&plan, &mut db).expect("VALUES with reordered roles must succeed");
+
+        let total_rows: u64 = db.manifest().tables["readings"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 2);
+    }
+
     // ── INSERT VALUES: empty rows is a no-op ───────────────────────
 
     #[test]
