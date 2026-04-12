@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-328",
   "claimed_at": "2026-04-12T17:08:25Z",
+  "completed_at": "2026-04-12T18:15:00Z",
   "branch": "task/TASK-328",
   "description": "Source time-range parsing + Wave 3 acceptance-query closure"
 }
