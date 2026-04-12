@@ -44,6 +44,7 @@ proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+smallvec = { version = "1", features = ["const_generics"] }
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 lz4_flex = { version = "0.13", default-features = false, features = ["safe-encode", "safe-decode", "std"] }
 # `postcard` is pinned to an exact version because the v1 segment file

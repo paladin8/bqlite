@@ -182,7 +182,7 @@ pub struct PartialMatch {
 /// `BooleanArray` for O(1) per-row lookups. Without this cache, every
 /// transition check would re-evaluate the full batch — O(rows²) for
 /// batches with predicates.
-struct PredicateCache {
+pub struct PredicateCache {
     /// Cached `BooleanArray` results, indexed to match the order
     /// predicates appear in NFA states. Stored as `Option` because
     /// evaluation can fail (in which case the predicate is treated as
@@ -195,7 +195,7 @@ impl PredicateCache {
     /// against the given batch. The returned cache maps each predicate
     /// (identified by a flat index across all transitions and poison
     /// transitions) to its evaluated `BooleanArray`.
-    fn build(nfa: &CompiledNfa, batch: &RecordBatch) -> Self {
+    pub fn build(nfa: &CompiledNfa, batch: &RecordBatch) -> Self {
         let mut results = Vec::new();
         for state in &nfa.states {
             for transition in &state.transitions {
@@ -217,7 +217,7 @@ impl PredicateCache {
     /// Check if a specific predicate result is true at `row`.
     /// Returns `false` if the evaluation failed or the value is null.
     #[inline]
-    fn check(&self, predicate_idx: usize, row: usize) -> bool {
+    pub fn check(&self, predicate_idx: usize, row: usize) -> bool {
         match &self.results[predicate_idx] {
             Some(arr) => !arr.is_null(row) && arr.value(row),
             None => false,
@@ -316,6 +316,80 @@ impl EntityNfaState {
             }
         }
         self.scan_from = Some(consumed_ts);
+    }
+
+    // ── Public helpers for binding-aware processing (TASK-306) ───────
+
+    /// Get the `scan_from` timestamp for MATCH ALL mode.
+    pub fn scan_from(&self) -> Option<i64> {
+        self.scan_from
+    }
+
+    /// Insert a candidate into a specific state's deque with dedup.
+    pub fn insert_candidate(&mut self, state_idx: usize, entry: CandidateEntry) {
+        self.state_deques[state_idx].insert_dedup(entry);
+    }
+
+    /// Update the farthest step reached.
+    pub fn update_max_step_reached(&mut self, step: u8) {
+        if step > self.max_step_reached {
+            self.max_step_reached = step;
+        }
+    }
+
+    /// Clear the propagation scratch buffer before a new event pass.
+    pub fn clear_propagation_buf(&mut self) {
+        self.propagation_buf.clear();
+    }
+
+    /// Collect candidate propagations from a source state into the
+    /// scratch buffer. Only candidates with strict timestamp ordering
+    /// and valid time windows are included.
+    pub fn propagate_candidates(
+        &mut self,
+        source_state: usize,
+        target_state: u16,
+        event_ts: i64,
+        global_window: Option<i64>,
+    ) {
+        let deque = &self.state_deques[source_state];
+        for candidate in &deque.candidates {
+            if event_ts <= candidate.last_step_ts {
+                continue;
+            }
+            if let Some(window) = global_window {
+                if event_ts - candidate.anchor_ts > window {
+                    continue;
+                }
+            }
+            self.propagation_buf.push((
+                target_state,
+                CandidateEntry {
+                    anchor_ts: candidate.anchor_ts,
+                    last_step_ts: event_ts,
+                },
+            ));
+        }
+    }
+
+    /// Apply all propagations from the scratch buffer.
+    pub fn apply_propagations(&mut self) {
+        for i in 0..self.propagation_buf.len() {
+            let (target, entry) = self.propagation_buf[i];
+            self.state_deques[target as usize].insert_dedup(entry);
+        }
+    }
+
+    /// Update max_step_reached from surviving candidates in deques.
+    pub fn update_max_step_from_deques(&mut self, state_to_step: &[u8]) {
+        for (idx, deque) in self.state_deques.iter().enumerate() {
+            if !deque.is_empty() {
+                let step = state_to_step[idx];
+                if step > self.max_step_reached {
+                    self.max_step_reached = step;
+                }
+            }
+        }
     }
 }
 
@@ -436,6 +510,138 @@ impl NfaSimulator {
     /// Access the underlying compiled NFA.
     pub fn nfa(&self) -> &CompiledNfa {
         &self.nfa
+    }
+
+    /// Whether this is a MATCH ALL query.
+    pub fn is_match_all(&self) -> bool {
+        self.match_all
+    }
+
+    // ── Public helpers for binding-aware processing (TASK-306) ───────
+
+    /// Build a predicate cache for the given batch.
+    pub fn build_predicate_cache(&self, batch: &RecordBatch) -> PredicateCache {
+        PredicateCache::build(&self.nfa, batch)
+    }
+
+    /// Check whether a forward transition's predicates match at `row`.
+    ///
+    /// `transition_idx` is the index of the transition within the state's
+    /// transition vec. This checks all compiled predicates but NOT variable
+    /// bindings (the caller handles those separately).
+    pub fn check_transition_predicates(
+        &self,
+        state_idx: usize,
+        transition_idx: usize,
+        transition: &Transition,
+        row: usize,
+        pred_cache: &PredicateCache,
+    ) -> bool {
+        let nfa_state = &self.nfa.states[state_idx];
+        for (p_idx, _) in transition.predicates.iter().enumerate() {
+            let cache_idx =
+                self.pred_map
+                    .forward_predicate_idx(state_idx, nfa_state, transition_idx, p_idx);
+            if !pred_cache.check(cache_idx, row) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Check if any poison transition at a state matches the event
+    /// (public counterpart of the internal `event_matches_poison`).
+    pub fn check_poison_transitions(
+        &self,
+        state_idx: usize,
+        nfa_state: &NfaState,
+        event_type: &str,
+        row: usize,
+        pred_cache: &PredicateCache,
+    ) -> bool {
+        self.event_matches_poison(state_idx, nfa_state, event_type, row, pred_cache)
+    }
+
+    /// Expire candidates at a state whose window has passed.
+    ///
+    /// When EMIT ALL is enabled, expired candidates are recorded as
+    /// partial matches before removal.
+    pub fn expire_candidates(
+        &self,
+        state: &mut EntityNfaState,
+        state_idx: usize,
+        event_ts: i64,
+        window: i64,
+    ) {
+        let deque = &mut state.state_deques[state_idx];
+        if self.nfa.emit_all {
+            let step = self.nfa.state_to_step[state_idx];
+            while let Some(front) = deque.candidates.front() {
+                if event_ts - front.anchor_ts > window {
+                    let entry = deque.candidates.pop_front().unwrap();
+                    state.partials.push(PartialMatch {
+                        anchor_ts: entry.anchor_ts,
+                        step_reached: step,
+                    });
+                } else {
+                    break;
+                }
+            }
+        } else {
+            deque.expire_window(event_ts, window);
+        }
+    }
+
+    /// Kill all candidates at a state (poison transition matched).
+    ///
+    /// When EMIT ALL is enabled, killed candidates are recorded as
+    /// partial matches before removal.
+    pub fn kill_candidates(&self, state: &mut EntityNfaState, state_idx: usize) {
+        let deque = &mut state.state_deques[state_idx];
+        if self.nfa.emit_all {
+            let step = self.nfa.state_to_step[state_idx];
+            for entry in deque.candidates.drain(..) {
+                state.partials.push(PartialMatch {
+                    anchor_ts: entry.anchor_ts,
+                    step_reached: step,
+                });
+            }
+        } else {
+            deque.kill_all();
+        }
+    }
+
+    /// Check the accept state for completed matches and handle
+    /// MATCH FIRST / MATCH ALL mode semantics.
+    pub fn check_accept_state(&self, state: &mut EntityNfaState) {
+        let accept = self.nfa.accept_state as usize;
+        let accept_deque = &mut state.state_deques[accept];
+        if !accept_deque.is_empty() {
+            if let Some(entry) = accept_deque.candidates.pop_front() {
+                let completion = MatchCompletion {
+                    anchor_ts: entry.anchor_ts,
+                    final_ts: entry.last_step_ts,
+                };
+                state.completions.push(completion);
+
+                let num_steps = self.nfa.state_to_step[accept];
+                if num_steps > state.max_step_reached {
+                    state.max_step_reached = num_steps;
+                }
+
+                if self.match_all {
+                    state.reset_for_match_all(
+                        entry.last_step_ts,
+                        self.nfa.emit_all,
+                        &self.nfa.state_to_step,
+                    );
+                } else {
+                    for deque in &mut state.state_deques {
+                        deque.candidates.clear();
+                    }
+                }
+            }
+        }
     }
 
     /// Process a sub-batch of events for a single entity.
@@ -759,7 +965,7 @@ impl NfaSimulator {
     }
 
     /// Enforce the active state limit by dropping oldest candidates.
-    fn enforce_active_state_limit(&self, state: &mut EntityNfaState) {
+    pub fn enforce_active_state_limit(&self, state: &mut EntityNfaState) {
         let mut total = state.total_candidates();
         if total <= self.active_state_limit {
             return;
@@ -808,7 +1014,10 @@ impl NfaSimulator {
 /// Resolve a timestamp column from the batch as an `i64` slice.
 ///
 /// Supports both `TimestampNanosecondArray` and plain `Int64Array`.
-fn resolve_timestamp_column<'a>(batch: &'a RecordBatch, col_name: &str) -> Option<&'a [i64]> {
+pub(super) fn resolve_timestamp_column<'a>(
+    batch: &'a RecordBatch,
+    col_name: &str,
+) -> Option<&'a [i64]> {
     use arrow::array::{Int64Array, TimestampNanosecondArray};
 
     let col = batch.column_by_name(col_name)?;

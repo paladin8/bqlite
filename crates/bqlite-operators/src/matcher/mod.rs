@@ -11,4 +11,5 @@
 //!   algorithm with candidate-deque propagation, poison transitions,
 //!   global time-window enforcement, and EMIT ALL support.
 
+pub mod bindings;
 pub mod nfa;

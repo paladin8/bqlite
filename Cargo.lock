@@ -389,6 +389,7 @@ dependencies = [
  "bqlite-core",
  "bqlite-planner",
  "bqlite-storage",
+ "smallvec",
  "thiserror",
 ]
 
@@ -431,8 +432,11 @@ name = "bqlite-tests"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bqlite-ast",
  "bqlite-core",
  "bqlite-engine",
+ "bqlite-operators",
+ "bqlite-planner",
  "bqlite-storage",
  "proptest",
  "serde_json",
