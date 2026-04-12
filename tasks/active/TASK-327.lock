@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-327",
+  "claimed_at": "2026-04-12T08:55:50Z",
+  "branch": "task/TASK-327",
+  "description": "DDSketch percentile accumulators (P50/P90/P95/P99)"
+}
