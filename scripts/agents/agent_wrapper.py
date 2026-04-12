@@ -597,7 +597,7 @@ def run_fleet_loop(
                 task = result["task"]
                 print(
                     f"=== {agent_name}: claimed {task['task_id']} — "
-                    f"{task['title']} (starting claude) ===",
+                    f"{task['title']} ===",
                     flush=True,
                 )
                 outcome = execute_task(
@@ -686,6 +686,20 @@ def run_fleet_loop(
                 print(f"    stderr: {stderr[:500]}", flush=True)
             if stdout:
                 print(f"    stdout: {stdout[:500]}", flush=True)
+            consecutive_failures += 1
+            sleep(60)
+            continue
+        except task_tool.TaskToolError as exc:
+            # Operational error from task_tool itself — typically a dirty
+            # worktree that `require_clean_worktree()` rejected before the
+            # claim flow could start. attach-fleet.sh's targeted mode runs
+            # reset-worktree.sh to prevent this at startup, but handle it
+            # defensively so a dirty-state scenario mid-run does not crash
+            # the wrapper either.
+            print(
+                f"=== {agent_name}: task_tool error mid-iteration: {exc} ===",
+                flush=True,
+            )
             consecutive_failures += 1
             sleep(60)
             continue
