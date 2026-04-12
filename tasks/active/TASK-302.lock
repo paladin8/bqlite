@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-302",
+  "claimed_at": "2026-04-12T07:08:47Z",
+  "branch": "task/TASK-302",
+  "description": "Sequence matcher strategy selection"
+}
