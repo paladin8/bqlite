@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-308",
   "claimed_at": "2026-04-12T06:52:39Z",
+  "completed_at": "2026-04-12T08:15:00Z",
   "branch": "task/TASK-308",
   "description": "Aggregate + hash-accumulator architecture"
 }
