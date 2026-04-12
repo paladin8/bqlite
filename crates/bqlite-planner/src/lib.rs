@@ -60,6 +60,7 @@
 use bqlite_ast::Statement;
 use bqlite_core::{Catalog, Result};
 
+pub mod compile;
 pub mod compiled;
 pub mod explain;
 pub mod expr;
@@ -67,6 +68,10 @@ pub mod logical;
 pub mod opt;
 pub mod physical;
 
+pub use compile::{
+    classify_pattern, compile_pattern, select_strategy, CompiledNfa, MatchExecutionConfig,
+    MatchStrategy, NfaState, PatternClass, PoisonTransition, Transition, VariableBindingDef,
+};
 pub use compiled::{
     ArithKernel, ArrowKernelId, CastKernel, CompareKernel, CompiledExpr, CompiledNode, FunctionId,
     FunctionKernel, InSetKernel, LogicalKernel, UnaryKernel,
