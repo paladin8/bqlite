@@ -76,9 +76,10 @@ pub enum LogicalPlan {
         /// The resolved catalog entry for the primary table.
         table: TableSchema,
         /// Optional `LAST <duration>` / `BETWEEN <ts> AND <ts>` range
-        /// from `Pipeline.source.time_range`. Always `None` until the
-        /// parser emits the syntax; the field exists so Wave 4 does
-        /// not have to retrofit the enum.
+        /// from `Pipeline.source.time_range`. Populated by the parser
+        /// when the source includes a time-range clause. May be widened
+        /// by `extend_scan_time_range()` per planner-pipeline.md §4.4
+        /// when a downstream MATCH has a WITHIN window.
         time_range: Option<TimeRange>,
         /// `JOIN <table>` tables. Empty in Wave 2; populated by Wave 4.
         joined_tables: Vec<TableSchema>,
@@ -574,6 +575,43 @@ impl LogicalPlan {
             output_schema: explain_output_schema(),
         }
     }
+
+    /// Extend the Scan node's time range by `extension_ns` nanoseconds on
+    /// the upper bound, per planner-pipeline.md §4.4.
+    ///
+    /// Walks through `Filter`/`Project`/`Limit` wrappers to reach the
+    /// deepest `Scan`. If the Scan has no time range (`None`), the method
+    /// is a no-op — there is nothing to extend.
+    ///
+    /// `LAST(d)` is extended to `Last(d + extension_ns)` (the scan must
+    /// fetch events beyond the user's stated duration so pattern
+    /// completions near the boundary remain visible).
+    ///
+    /// `BETWEEN { start, end }` is unchanged at the logical level — the
+    /// planner stores the raw user strings and the engine applies the
+    /// extension at bind time when it resolves them to timestamps.
+    pub(crate) fn extend_scan_time_range(&mut self, extension_ns: i64) {
+        match self {
+            LogicalPlan::Scan {
+                time_range: Some(TimeRange::Last(ns)),
+                ..
+            } => {
+                *ns = ns.saturating_add(extension_ns);
+            }
+            // BETWEEN: left as-is at the logical level; the engine
+            // applies the extension during timestamp resolution.
+            LogicalPlan::Scan { .. } => {}
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Limit { input, .. } => {
+                input.extend_scan_time_range(extension_ns);
+            }
+            // SequenceMatch / Aggregate / Sort / Distinct — no deeper
+            // scan to reach (the extension applies to the scan feeding
+            // the first MATCH in the pipeline).
+            _ => {}
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1054,6 +1092,32 @@ fn lower_match(
 
     // Carry brackets through from the AST (always None in Wave 3).
     let brackets = pattern.brackets.clone();
+
+    // ── Scan time-range extension (planner-pipeline.md §4.4) ─────────
+    // Extend the scan's upper time bound so events beyond the user's
+    // stated range can complete matches started near the boundary.
+    //
+    // Three rules:
+    //   1. WITHIN window only → extend by window_ns
+    //   2. BRACKETS only     → extend by max(bracket durations)
+    //   3. Both              → extend by max(window_ns, max_bracket)
+    //
+    // For BETWEEN ranges, `extend_scan_time_range` is a no-op at the
+    // logical level — the engine resolves the raw timestamp strings and
+    // applies the extension at bind time.
+    let mut acc = acc;
+    let window_ns = match &window {
+        Some(MatchWindowSpec::Duration(ns)) => *ns,
+        _ => 0,
+    };
+    let max_bracket = brackets
+        .as_ref()
+        .and_then(|b| b.durations.iter().copied().max())
+        .unwrap_or(0);
+    let extension = window_ns.max(max_bracket);
+    if extension > 0 {
+        acc.extend_scan_time_range(extension);
+    }
 
     Ok(LogicalPlan::SequenceMatch {
         pattern: SequencePattern { inner: pattern },
@@ -3903,5 +3967,186 @@ mod tests {
             msg.contains("signup"),
             "error must mention the colliding name; got: {msg}"
         );
+    }
+
+    // ── Source time-range lowering ──────────────────────────────────────
+
+    fn pipeline_with_time_range(
+        name: &str,
+        time_range: Option<TimeRange>,
+        stages: Vec<PipelineStage>,
+    ) -> Pipeline {
+        Pipeline {
+            source: Source {
+                primary: TableRef {
+                    name: Name::synthetic(name),
+                    span: Span::EMPTY,
+                },
+                joins: vec![],
+                time_range,
+                span: Span::EMPTY,
+            },
+            stages,
+            span: Span::EMPTY,
+        }
+    }
+
+    #[test]
+    fn scan_with_last_time_range_lowered() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_30d = 30 * 86_400_000_000_000_i64;
+        let pipeline = pipeline_with_time_range("purchases", Some(TimeRange::Last(ns_30d)), vec![]);
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::Scan { time_range, .. } => {
+                assert_eq!(*time_range, Some(TimeRange::Last(ns_30d)));
+            }
+            _ => panic!("expected Scan, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_with_between_time_range_lowered() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_time_range(
+            "purchases",
+            Some(TimeRange::Between {
+                start: "2024-01-01".into(),
+                end: "2024-02-01".into(),
+            }),
+            vec![],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::Scan { time_range, .. } => {
+                assert_eq!(
+                    *time_range,
+                    Some(TimeRange::Between {
+                        start: "2024-01-01".into(),
+                        end: "2024-02-01".into(),
+                    })
+                );
+            }
+            _ => panic!("expected Scan, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_time_range_extended_by_match_within_window() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_30d = 30 * 86_400_000_000_000_i64;
+        let ns_7d = 7 * 86_400_000_000_000_i64;
+        let pipeline = pipeline_with_time_range(
+            "purchases",
+            Some(TimeRange::Last(ns_30d)),
+            vec![PipelineStage::Match {
+                pattern: MatchPattern {
+                    mode: MatchMode::First,
+                    steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
+                    window: Some(MatchWindow::Within(ns_7d)),
+                    brackets: None,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        // The SequenceMatch wraps a Scan whose time_range should be
+        // extended by the 7d window: 30d + 7d = 37d.
+        match &plan {
+            LogicalPlan::SequenceMatch { input, .. } => match input.as_ref() {
+                LogicalPlan::Scan { time_range, .. } => {
+                    assert_eq!(*time_range, Some(TimeRange::Last(ns_30d + ns_7d)));
+                }
+                other => panic!("expected Scan under SequenceMatch, got {other:?}"),
+            },
+            _ => panic!("expected SequenceMatch, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_time_range_not_extended_when_no_window() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_30d = 30 * 86_400_000_000_000_i64;
+        let pipeline = pipeline_with_time_range(
+            "purchases",
+            Some(TimeRange::Last(ns_30d)),
+            vec![PipelineStage::Match {
+                pattern: MatchPattern {
+                    mode: MatchMode::First,
+                    steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
+                    window: None,
+                    brackets: None,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::SequenceMatch { input, .. } => match input.as_ref() {
+                LogicalPlan::Scan { time_range, .. } => {
+                    assert_eq!(*time_range, Some(TimeRange::Last(ns_30d)));
+                }
+                other => panic!("expected Scan under SequenceMatch, got {other:?}"),
+            },
+            _ => panic!("expected SequenceMatch, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_time_range_no_op_when_none() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_7d = 7 * 86_400_000_000_000_i64;
+        let pipeline = pipeline_with_time_range(
+            "purchases",
+            None,
+            vec![PipelineStage::Match {
+                pattern: MatchPattern {
+                    mode: MatchMode::First,
+                    steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
+                    window: Some(MatchWindow::Within(ns_7d)),
+                    brackets: None,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::SequenceMatch { input, .. } => match input.as_ref() {
+                LogicalPlan::Scan { time_range, .. } => {
+                    assert!(time_range.is_none());
+                }
+                other => panic!("expected Scan under SequenceMatch, got {other:?}"),
+            },
+            _ => panic!("expected SequenceMatch, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn extend_scan_time_range_reaches_through_filter() {
+        let schema = purchases_schema();
+        let ns_30d = 30 * 86_400_000_000_000_i64;
+        let ns_7d = 7 * 86_400_000_000_000_i64;
+        let scan = LogicalPlan::scan_with_time_range(schema.clone(), Some(TimeRange::Last(ns_30d)));
+        let predicate = TypedExpr {
+            kind: crate::expr::TypedExprKind::Literal(PropertyValue::Bool(true)),
+            result_type: BqlType::Bool,
+            nullable: false,
+            span: Span::EMPTY,
+        };
+        let mut plan = LogicalPlan::filter(predicate, scan).unwrap();
+        plan.extend_scan_time_range(ns_7d);
+        // Walk down to the scan to check.
+        match &plan {
+            LogicalPlan::Filter { input, .. } => match input.as_ref() {
+                LogicalPlan::Scan { time_range, .. } => {
+                    assert_eq!(*time_range, Some(TimeRange::Last(ns_30d + ns_7d)));
+                }
+                other => panic!("expected Scan under Filter, got {other:?}"),
+            },
+            _ => panic!("expected Filter, got {plan:?}"),
+        }
     }
 }

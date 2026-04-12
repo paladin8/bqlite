@@ -186,9 +186,9 @@ pub struct ScanPhysical {
     /// Catalog name of the table being scanned.
     pub table: String,
     /// Optional `LAST <dur>` / `BETWEEN <ts> AND <ts>` range from the
-    /// logical source. `None` in Wave 2 — the parser does not yet
-    /// emit the syntax — but the field exists so TASK-230 / TASK-243
-    /// (later waves) do not have to retrofit it.
+    /// logical source. May be widened by the planner's scan-extension
+    /// pass (planner-pipeline.md §4.4) when a downstream MATCH has a
+    /// WITHIN window.
     pub time_range: Option<TimeRange>,
     /// Scan-level predicates populated by the predicate-pushdown pass
     /// (TASK-227). Empty at lowering time; TASK-227 rewrites

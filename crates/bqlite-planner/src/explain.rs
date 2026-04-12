@@ -19,6 +19,7 @@
 //! these arms prevent panics when an `EXPLAIN` wraps a Wave 3 query.
 
 use bqlite_ast::expr::{BinaryOp, CompareOp, UnaryOp};
+use bqlite_ast::TimeRange;
 use bqlite_core::{AggFunction, PropertyValue};
 
 use crate::compiled::{CompiledExpr, CompiledNode};
@@ -128,7 +129,7 @@ pub fn build_explain_node(plan: &PhysicalPlan) -> ExplainNode {
             };
             ExplainNode::Scan {
                 table: scan.table.clone(),
-                time_range: "none".to_string(),
+                time_range: format_time_range(&scan.time_range),
                 predicates: scan.scan_predicates.iter().map(format_expr).collect(),
                 columns,
             }
@@ -377,6 +378,48 @@ pub fn format_expr(expr: &CompiledExpr) -> String {
                 format!("{} IN ({})", format_expr(input), set)
             }
         }
+    }
+}
+
+/// Format a `TimeRange` for EXPLAIN output. Uses human-readable
+/// duration for `LAST` (e.g., `LAST 30d`) and ISO-8601 strings for
+/// `BETWEEN`.
+fn format_time_range(tr: &Option<TimeRange>) -> String {
+    match tr {
+        None => "none".to_string(),
+        Some(TimeRange::Last(ns)) => {
+            format!("LAST {}", format_duration_ns(*ns))
+        }
+        Some(TimeRange::Between { start, end }) => {
+            format!("BETWEEN '{start}' AND '{end}'")
+        }
+    }
+}
+
+/// Format nanoseconds as a human-readable duration string. Picks the
+/// largest unit that divides evenly, falling back to nanoseconds.
+fn format_duration_ns(ns: i64) -> String {
+    const NS_PER_DAY: i64 = 86_400_000_000_000;
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+    const NS_PER_MIN: i64 = 60_000_000_000;
+    const NS_PER_SEC: i64 = 1_000_000_000;
+    const NS_PER_MS: i64 = 1_000_000;
+    const NS_PER_US: i64 = 1_000;
+
+    if ns > 0 && ns % NS_PER_DAY == 0 {
+        format!("{}d", ns / NS_PER_DAY)
+    } else if ns > 0 && ns % NS_PER_HOUR == 0 {
+        format!("{}h", ns / NS_PER_HOUR)
+    } else if ns > 0 && ns % NS_PER_MIN == 0 {
+        format!("{}m", ns / NS_PER_MIN)
+    } else if ns > 0 && ns % NS_PER_SEC == 0 {
+        format!("{}s", ns / NS_PER_SEC)
+    } else if ns > 0 && ns % NS_PER_MS == 0 {
+        format!("{}ms", ns / NS_PER_MS)
+    } else if ns > 0 && ns % NS_PER_US == 0 {
+        format!("{}us", ns / NS_PER_US)
+    } else {
+        format!("{ns}ns")
     }
 }
 
@@ -876,6 +919,95 @@ mod tests {
         assert!(
             text.is_ascii(),
             "format_explain must produce ASCII-only output: {text:?}"
+        );
+    }
+
+    // ── Time-range formatting ───────────────────────────────────────────
+
+    #[test]
+    fn format_time_range_none() {
+        assert_eq!(format_time_range(&None), "none");
+    }
+
+    #[test]
+    fn format_time_range_last_days() {
+        let tr = Some(TimeRange::Last(30 * 86_400_000_000_000));
+        assert_eq!(format_time_range(&tr), "LAST 30d");
+    }
+
+    #[test]
+    fn format_time_range_last_hours() {
+        let tr = Some(TimeRange::Last(12 * 3_600_000_000_000));
+        assert_eq!(format_time_range(&tr), "LAST 12h");
+    }
+
+    #[test]
+    fn format_time_range_between() {
+        let tr = Some(TimeRange::Between {
+            start: "2024-01-01".into(),
+            end: "2024-02-01".into(),
+        });
+        assert_eq!(
+            format_time_range(&tr),
+            "BETWEEN '2024-01-01' AND '2024-02-01'"
+        );
+    }
+
+    #[test]
+    fn format_duration_ns_picks_largest_unit() {
+        assert_eq!(format_duration_ns(86_400_000_000_000), "1d");
+        assert_eq!(format_duration_ns(3_600_000_000_000), "1h");
+        assert_eq!(format_duration_ns(60_000_000_000), "1m");
+        assert_eq!(format_duration_ns(1_000_000_000), "1s");
+        assert_eq!(format_duration_ns(1_000_000), "1ms");
+        assert_eq!(format_duration_ns(1_000), "1us");
+        assert_eq!(format_duration_ns(42), "42ns");
+    }
+
+    #[test]
+    fn explain_scan_shows_last_time_range() {
+        let cat = TestCatalog::default().with(events_schema());
+        let pipeline = Pipeline {
+            source: Source {
+                primary: table_ref("events"),
+                joins: vec![],
+                time_range: Some(TimeRange::Last(30 * 86_400_000_000_000)),
+                span: Span::EMPTY,
+            },
+            stages: vec![],
+            span: Span::EMPTY,
+        };
+        let physical = plan(Statement::Explain(pipeline), &cat).expect("plan must succeed");
+        let node = build_explain_node(&physical);
+        let text = format_explain(&node);
+        assert!(
+            text.contains("LAST 30d"),
+            "EXPLAIN output must show time range; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn explain_scan_shows_between_time_range() {
+        let cat = TestCatalog::default().with(events_schema());
+        let pipeline = Pipeline {
+            source: Source {
+                primary: table_ref("events"),
+                joins: vec![],
+                time_range: Some(TimeRange::Between {
+                    start: "2024-01-01".into(),
+                    end: "2024-02-01".into(),
+                }),
+                span: Span::EMPTY,
+            },
+            stages: vec![],
+            span: Span::EMPTY,
+        };
+        let physical = plan(Statement::Explain(pipeline), &cat).expect("plan must succeed");
+        let node = build_explain_node(&physical);
+        let text = format_explain(&node);
+        assert!(
+            text.contains("BETWEEN '2024-01-01' AND '2024-02-01'"),
+            "EXPLAIN output must show time range; got:\n{text}"
         );
     }
 }
