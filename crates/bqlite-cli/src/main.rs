@@ -820,13 +820,9 @@ mod tests {
     fn query_limit_flag_accepted_and_query_completes() {
         // Verify that --limit N is accepted by the CLI, the auto-limit
         // machinery runs (injecting | limit N+1 into the BQL), and the
-        // query completes without error.
-        //
-        // The truncation footer ("showing N rows; use --no-limit...") is not
-        // tested here because the Wave 2 scan path (EmptySegmentReader) always
-        // returns 0 rows regardless of ingested data — real segment reads land
-        // in a later wave.  The engine-level tests in
-        // bqlite-engine/src/render.rs cover the footer logic exhaustively.
+        // query completes without error against an empty table.
+        // The truncation footer is tested by
+        // `truncation_footer_shown_when_rows_exceed_display_cap` below.
         let scratch = Scratch::new("auto-limit");
         init_db_with_events(&scratch);
         let db_path_str = scratch.path().to_string_lossy().to_string();
@@ -901,6 +897,142 @@ mod tests {
         assert!(
             !out_text.contains("showing"),
             "no auto-limit footer expected when query has explicit LIMIT:\n{out_text}"
+        );
+    }
+
+    // ── Real-row integration (TASK-245) ─────────────────────────────
+
+    /// Helper: insert rows into `events` and return the db path string.
+    fn insert_events(scratch: &Scratch, values: &str) -> String {
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        let bql = format!("INSERT INTO events VALUES {values}");
+        let args = sv(&["query", &bql, "--db", &db_path_str]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("INSERT must succeed");
+        db_path_str
+    }
+
+    #[test]
+    fn query_returns_real_rows_after_insert_values() {
+        // After INSERT VALUES the scan must return the real rows from disk.
+        let scratch = Scratch::new("real-rows");
+        init_db_with_events(&scratch);
+        let db = insert_events(
+            &scratch,
+            "('alice', 1700000000000000000, 'login'), \
+             ('bob',   1700000001000000000, 'logout')",
+        );
+
+        let args = sv(&["query", "events", "--db", &db]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+        // Two rows must have been scanned from disk.
+        assert!(
+            out_text.contains("(2 rows)"),
+            "expected '(2 rows)' footer, got:\n{out_text}"
+        );
+    }
+
+    #[test]
+    fn truncation_footer_shown_when_rows_exceed_display_cap() {
+        // Insert 5 rows. Query with --limit 3: engine runs | limit 4,
+        // returns 4 rows, renderer truncates to 3 and appends the footer.
+        let scratch = Scratch::new("truncation-footer");
+        init_db_with_events(&scratch);
+        let db = insert_events(
+            &scratch,
+            "('u1', 1700000000000000000, 'e'), \
+             ('u2', 1700000001000000000, 'e'), \
+             ('u3', 1700000002000000000, 'e'), \
+             ('u4', 1700000003000000000, 'e'), \
+             ('u5', 1700000004000000000, 'e')",
+        );
+
+        let args = sv(&["query", "events", "--db", &db, "--limit", "3"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            out_text.contains("showing 3 rows"),
+            "expected truncation footer 'showing 3 rows', got:\n{out_text}"
+        );
+        assert!(
+            out_text.contains("--no-limit"),
+            "truncation footer must mention --no-limit, got:\n{out_text}"
+        );
+    }
+
+    #[test]
+    fn no_limit_with_real_rows_returns_all_without_footer() {
+        // Insert 3 rows. --no-limit must return all 3 with no truncation footer.
+        let scratch = Scratch::new("no-limit-real");
+        init_db_with_events(&scratch);
+        let db = insert_events(
+            &scratch,
+            "('x1', 1700000000000000000, 'click'), \
+             ('x2', 1700000001000000000, 'click'), \
+             ('x3', 1700000002000000000, 'click')",
+        );
+
+        let args = sv(&["query", "events", "--db", &db, "--no-limit"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            out_text.contains("(3 rows)"),
+            "expected '(3 rows)' footer, got:\n{out_text}"
+        );
+        assert!(
+            !out_text.contains("showing"),
+            "no truncation footer expected with --no-limit, got:\n{out_text}"
+        );
+    }
+
+    #[test]
+    fn default_limit_exceeded_shows_truncation_footer() {
+        // Insert DEFAULT_LIMIT+1 (1001) rows without an explicit --limit.
+        // The CLI auto-injects | limit 1002, gets 1001 rows back, truncates
+        // to 1000 and appends the truncation footer.
+        let scratch = Scratch::new("default-limit-exceeded");
+        init_db_with_events(&scratch);
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+
+        // Build a 1001-row INSERT VALUES in one shot.
+        let values: String = (0usize..1001)
+            .map(|i| {
+                format!(
+                    "('e{i:05}', {}, 'e')",
+                    1_700_000_000_000_000_000_i64 + i as i64
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_bql = format!("INSERT INTO events VALUES {values}");
+        let insert_args = sv(&["query", &insert_bql, "--db", &db_path_str]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&insert_args, &mut out, &mut err).expect("INSERT 1001 rows must succeed");
+
+        // Query with no explicit limit: auto-injection fires.
+        let args = sv(&["query", "events", "--db", &db_path_str]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+
+        // Truncation footer: "showing 1,000 rows; use --limit N or --no-limit".
+        assert!(
+            out_text.contains("showing 1,000 rows"),
+            "expected 'showing 1,000 rows' truncation footer, got:\n{out_text}"
+        );
+        assert!(
+            out_text.contains("--no-limit"),
+            "truncation footer must mention --no-limit, got:\n{out_text}"
         );
     }
 

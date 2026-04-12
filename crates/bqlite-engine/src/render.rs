@@ -194,7 +194,9 @@ pub fn format_result_as_text(result: &ExecutionResult) -> String {
 
     let count = result.row_count();
     let unit = if count == 1 { "row" } else { "rows" };
-    out.push_str(&format!("({count} {unit})\n"));
+    // Use format_count for comma-separated thousands, consistent with
+    // the truncation footer ("showing 1,000 rows; use ...").
+    out.push_str(&format!("({} {unit})\n", format_count(count)));
     out
 }
 
