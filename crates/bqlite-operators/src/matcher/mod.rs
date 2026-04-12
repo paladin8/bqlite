@@ -13,3 +13,4 @@
 
 pub mod bindings;
 pub mod nfa;
+pub mod step_counter;
