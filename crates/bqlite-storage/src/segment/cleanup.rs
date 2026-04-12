@@ -3,7 +3,7 @@
 //! Implements the crash-safety contract from `docs/reliability.md`
 //! §Crash Safety and `docs/design/storage-format.md` §7.4.
 //!
-//! [`reconcile_segments`] is called by `Database::open_or_create` after
+//! [`reconcile_segments`] is called by `Database::open` after
 //! the manifest is loaded but before any queries or ingests run. It
 //! walks every `(window, shard)` directory under the database root and:
 //!

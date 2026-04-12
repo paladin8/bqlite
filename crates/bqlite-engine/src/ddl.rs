@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn create_table_happy_path() {
         let scratch = Scratch::new("create");
-        let mut db = Database::open_or_create(scratch.path()).unwrap();
+        let mut db = Database::create(scratch.path()).unwrap();
 
         let plan = CreateTablePhysical {
             name: "clicks".into(),
@@ -296,9 +296,24 @@ mod tests {
     #[test]
     fn create_table_name_collision_errors() {
         let scratch = Scratch::new("create-dup");
-        let mut db = Database::open_or_create(scratch.path()).unwrap();
+        let mut db = Database::create(scratch.path()).unwrap();
 
-        // The bootstrap `events` table already exists.
+        // Create `events` table first so the duplicate attempt errors.
+        let first = CreateTablePhysical {
+            name: "events".into(),
+            columns: vec![
+                ColumnDef::required("e", BqlType::String),
+                ColumnDef::required("t", BqlType::Timestamp),
+                ColumnDef::required("ev", BqlType::String),
+            ],
+            entity_key: "e".into(),
+            event_time: "t".into(),
+            event_type: "ev".into(),
+            output_schema: OperatorSchema::new(Vec::new()).unwrap(),
+        };
+        execute_create_table(&first, &mut db).unwrap();
+
+        // Now attempt to create the same table again.
         let plan = CreateTablePhysical {
             name: "events".into(),
             columns: vec![
@@ -323,22 +338,37 @@ mod tests {
     #[test]
     fn drop_table_happy_path() {
         let scratch = Scratch::new("drop");
-        let mut db = Database::open_or_create(scratch.path()).unwrap();
+        let mut db = Database::create(scratch.path()).unwrap();
+
+        // Create a table so we can drop it.
+        let create_plan = CreateTablePhysical {
+            name: "clicks".into(),
+            columns: vec![
+                ColumnDef::required("user_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event", BqlType::String),
+            ],
+            entity_key: "user_id".into(),
+            event_time: "ts".into(),
+            event_type: "event".into(),
+            output_schema: OperatorSchema::new(Vec::new()).unwrap(),
+        };
+        execute_create_table(&create_plan, &mut db).unwrap();
 
         let plan = DropTablePhysical {
-            name: "events".into(),
+            name: "clicks".into(),
             output_schema: OperatorSchema::new(Vec::new()).unwrap(),
         };
         execute_drop_table(&plan, &mut db).unwrap();
 
         let catalog = db.catalog();
-        assert!(catalog.resolve_table("events").is_err());
+        assert!(catalog.resolve_table("clicks").is_err());
     }
 
     #[test]
     fn drop_table_missing_errors() {
         let scratch = Scratch::new("drop-missing");
-        let mut db = Database::open_or_create(scratch.path()).unwrap();
+        let mut db = Database::create(scratch.path()).unwrap();
 
         let plan = DropTablePhysical {
             name: "ghost".into(),
@@ -356,7 +386,22 @@ mod tests {
     #[test]
     fn alter_table_add_column_happy_path() {
         let scratch = Scratch::new("alter");
-        let mut db = Database::open_or_create(scratch.path()).unwrap();
+        let mut db = Database::create(scratch.path()).unwrap();
+
+        // Create events table first.
+        let create_plan = CreateTablePhysical {
+            name: "events".into(),
+            columns: vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+            ],
+            entity_key: "entity_id".into(),
+            event_time: "ts".into(),
+            event_type: "event_type".into(),
+            output_schema: OperatorSchema::new(Vec::new()).unwrap(),
+        };
+        execute_create_table(&create_plan, &mut db).unwrap();
 
         let plan = AlterTableAddColumnPhysical {
             name: "events".into(),
@@ -375,7 +420,7 @@ mod tests {
     #[test]
     fn alter_table_missing_table_errors() {
         let scratch = Scratch::new("alter-missing");
-        let mut db = Database::open_or_create(scratch.path()).unwrap();
+        let mut db = Database::create(scratch.path()).unwrap();
 
         let plan = AlterTableAddColumnPhysical {
             name: "ghost".into(),
@@ -392,7 +437,22 @@ mod tests {
     #[test]
     fn alter_table_duplicate_column_errors() {
         let scratch = Scratch::new("alter-dup");
-        let mut db = Database::open_or_create(scratch.path()).unwrap();
+        let mut db = Database::create(scratch.path()).unwrap();
+
+        // Create events table first.
+        let create_plan = CreateTablePhysical {
+            name: "events".into(),
+            columns: vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+            ],
+            entity_key: "entity_id".into(),
+            event_time: "ts".into(),
+            event_type: "event_type".into(),
+            output_schema: OperatorSchema::new(Vec::new()).unwrap(),
+        };
+        execute_create_table(&create_plan, &mut db).unwrap();
 
         let plan = AlterTableAddColumnPhysical {
             name: "events".into(),
@@ -411,7 +471,22 @@ mod tests {
     #[test]
     fn describe_happy_path() {
         let scratch = Scratch::new("describe");
-        let db = Database::open_or_create(scratch.path()).unwrap();
+        let mut db = Database::create(scratch.path()).unwrap();
+
+        // Create events table first.
+        let create_plan = CreateTablePhysical {
+            name: "events".into(),
+            columns: vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+            ],
+            entity_key: "entity_id".into(),
+            event_time: "ts".into(),
+            event_type: "event_type".into(),
+            output_schema: OperatorSchema::new(Vec::new()).unwrap(),
+        };
+        execute_create_table(&create_plan, &mut db).unwrap();
 
         let plan = DescribePhysical {
             name: "events".into(),
@@ -425,7 +500,7 @@ mod tests {
         };
         let batch = build_describe_batch(&plan, &db).unwrap();
 
-        // Bootstrap events table has 3 columns.
+        // Events table has 3 columns.
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 4);
 
@@ -461,7 +536,7 @@ mod tests {
     #[test]
     fn describe_missing_table_errors() {
         let scratch = Scratch::new("describe-missing");
-        let db = Database::open_or_create(scratch.path()).unwrap();
+        let db = Database::create(scratch.path()).unwrap();
 
         let plan = DescribePhysical {
             name: "ghost".into(),

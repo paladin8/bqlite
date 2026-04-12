@@ -211,6 +211,13 @@ mod tests {
         }
     }
 
+    fn create_db_with_bootstrap(path: &Path) -> Database {
+        let mut db = Database::create(path).expect("create db");
+        db.create_table("events".into(), bootstrap_events_schema())
+            .expect("create events");
+        db
+    }
+
     fn bootstrap_scan_descriptor() -> PhysicalPlan {
         PhysicalPlan::Scan(ScanPhysical {
             table: "events".to_string(),
@@ -224,7 +231,7 @@ mod tests {
     #[test]
     fn bind_scan_produces_a_drivable_operator() {
         let scratch = Scratch::new("happy");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_bootstrap(scratch.path());
         let descriptor = bootstrap_scan_descriptor();
 
         let mut op = bind_physical(&descriptor, &mut db).expect("bind must succeed");
@@ -256,7 +263,7 @@ mod tests {
         // at construction. This test pins both facts explicitly so a
         // regression in either side surfaces as a clean assertion.
         let scratch = Scratch::new("schema");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_bootstrap(scratch.path());
         let descriptor = bootstrap_scan_descriptor();
 
         let op = bind_physical(&descriptor, &mut db).expect("bind must succeed");
@@ -284,7 +291,7 @@ mod tests {
     #[test]
     fn bind_scan_reports_unknown_table_through_plan_error() {
         let scratch = Scratch::new("unknown");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_bootstrap(scratch.path());
         let descriptor = PhysicalPlan::Scan(ScanPhysical {
             table: "ghost".to_string(),
             time_range: None,
@@ -311,7 +318,7 @@ mod tests {
         // regression in the bind step is localized to *this* file
         // rather than surfacing as a generic smoke-test failure.
         let scratch = Scratch::new("compose");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_bootstrap(scratch.path());
         let stmt = bqlite_parser::parse("events").expect("parse events");
         let physical = {
             let catalog = db.catalog();

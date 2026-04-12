@@ -25,3 +25,9 @@ Compaction must not block reads. Background compaction merges segments while act
 ## Versioning
 
 Version everything (data format, schema format, API format, table schema, etc) that can change in the future and cause backwards-compatibility issues. During most of development, the version will be 1.
+
+## Migration Notes
+
+### Wave 1 → Wave 2: Bootstrap events table retirement (TASK-240)
+
+Wave 1 databases carry a manifest with `bootstrap_events_table: true` on the auto-seeded `events` table entry. Wave 2's `Database::create` no longer seeds this table — callers use explicit `CREATE TABLE` DDL instead. The `bootstrap_events_table` field remains in the manifest schema for read-compatibility: a Wave 1 manifest opened by Wave 2 code works without modification. Wave 2 databases never set this flag to `true`.

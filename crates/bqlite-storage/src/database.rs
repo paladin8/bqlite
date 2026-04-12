@@ -251,84 +251,6 @@ impl Database {
         })
     }
 
-    /// Open an existing database, or initialize a fresh one if `path`
-    /// does not yet contain a manifest.
-    ///
-    /// **Deprecated (TASK-240).** Use [`Database::create`] to initialize
-    /// and [`Database::open`] to reopen. This method is retained
-    /// temporarily for downstream callers that have not yet migrated.
-    pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_or_create_with_shards(path, DEFAULT_SHARD_COUNT)
-    }
-
-    /// Open an existing database, or initialize a fresh one with the
-    /// specified shard count.
-    ///
-    /// **Deprecated (TASK-240).** Use [`Database::create_with_shards`]
-    /// to initialize and [`Database::open`] to reopen.
-    pub fn open_or_create_with_shards(path: impl AsRef<Path>, shard_count: u16) -> Result<Self> {
-        if shard_count == 0 {
-            return Err(BqliteError::Schema("shard_count must be at least 1".into()));
-        }
-
-        let root = path.as_ref().to_path_buf();
-        fs::create_dir_all(&root).map_err(|e| io_ctx("create database directory", &root, e))?;
-
-        let lock = acquire_lock(&root)?;
-
-        clean_stale_tmp(&root);
-
-        // Read or initialize the manifest.
-        let manifest_path = root.join(MANIFEST_FILE_NAME);
-        let manifest = match fs::read(&manifest_path) {
-            Ok(bytes) => {
-                let m: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
-                    BqliteError::Execution(format!(
-                        "corrupted manifest at {}: {}",
-                        manifest_path.display(),
-                        e
-                    ))
-                })?;
-                if !m.is_supported_version() {
-                    return Err(BqliteError::Execution(format!(
-                        "manifest at {} has unsupported format_version {} (this build reads format_version {})",
-                        manifest_path.display(),
-                        m.format_version,
-                        MANIFEST_FORMAT_VERSION
-                    )));
-                }
-                m
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let mut m = Manifest::new_empty(shard_count);
-                m.tables.insert(
-                    crate::catalog::BOOTSTRAP_EVENTS_TABLE_NAME.to_string(),
-                    crate::manifest::TableEntry {
-                        schema: crate::catalog::bootstrap_events_schema(),
-                        next_sequence_id: 0,
-                        next_batch_id: 0,
-                        next_segment_id: 0,
-                        bootstrap_events_table: true,
-                        windows: Vec::new(),
-                    },
-                );
-                write_manifest_atomic(&root, &m)?;
-                m
-            }
-            Err(e) => {
-                return Err(io_ctx("read manifest", &manifest_path, e));
-            }
-        };
-
-        let _report = cleanup::reconcile_segments(&root, &manifest)?;
-
-        Ok(Self {
-            root,
-            manifest,
-            _lock: lock,
-        })
-    }
-
     /// Absolute path of the database root directory.
     pub fn root(&self) -> &Path {
         &self.root
@@ -881,7 +803,7 @@ mod tests {
             let mut path = std::env::temp_dir();
             path.push(format!("bqlite-storage-db-{label}-{pid}-{seq}"));
             // We explicitly do NOT create the directory here — the
-            // create / open_or_create path must be able to create it.
+            // Database::create must be able to create it itself.
             Self { path }
         }
 
@@ -894,6 +816,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// Create a fresh database with an `events` table. Many tests need
+    /// a table present before they can add segments / allocate IDs. Now
+    /// that `Database::create` no longer seeds the bootstrap events
+    /// table (TASK-240), this helper provides a one-liner replacement.
+    fn create_db_with_events(path: &Path) -> Database {
+        let mut db = Database::create(path).expect("create");
+        db.create_table("events".into(), sample_events_schema())
+            .expect("create events table");
+        db
     }
 
     fn sample_events_schema() -> TableSchema {
@@ -911,114 +844,7 @@ mod tests {
         .expect("minimal schema")
     }
 
-    // ── Fresh init ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn open_or_create_creates_missing_directory() {
-        let scratch = Scratch::new("creates-dir");
-        assert!(
-            !scratch.path().exists(),
-            "precondition: scratch directory should not yet exist"
-        );
-
-        let db = Database::open_or_create(scratch.path()).expect("init");
-        assert!(scratch.path().is_dir(), "root dir was created");
-        assert!(
-            scratch.path().join(LOCK_FILE_NAME).is_file(),
-            ".lock file was created"
-        );
-        assert!(
-            scratch.path().join(MANIFEST_FILE_NAME).is_file(),
-            "manifest.json was created"
-        );
-        assert!(
-            !scratch.path().join(MANIFEST_TMP_FILE_NAME).exists(),
-            "manifest.json.tmp is absent after atomic init"
-        );
-        drop(db);
-    }
-
-    #[test]
-    fn fresh_manifest_has_default_shape() {
-        let scratch = Scratch::new("default-shape");
-        let db = Database::open_or_create(scratch.path()).expect("init");
-        let m = db.manifest();
-        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
-        assert_eq!(m.shard_count, DEFAULT_SHARD_COUNT);
-        // UUIDv4 hyphenated form: 36 chars, 4 dashes.
-        assert_eq!(m.database_uuid.len(), 36);
-        assert_eq!(m.database_uuid.matches('-').count(), 4);
-
-        // TASK-125: fresh init seeds a single bootstrap `events`
-        // table so the planner has something to resolve on v0
-        // databases where CREATE TABLE DDL does not yet exist.
-        assert_eq!(m.tables.len(), 1, "exactly one bootstrap table");
-        let entry = m
-            .tables
-            .get(crate::catalog::BOOTSTRAP_EVENTS_TABLE_NAME)
-            .expect("events table was seeded");
-        assert_eq!(entry.schema, crate::catalog::bootstrap_events_schema());
-        assert_eq!(entry.next_sequence_id, 0);
-        assert_eq!(entry.next_batch_id, 0);
-        assert!(
-            entry.bootstrap_events_table,
-            "bootstrap entries must carry the flag so later waves can retire the shortcut"
-        );
-    }
-
-    #[test]
-    fn fresh_init_catalog_resolves_bootstrap_events_table() {
-        // End-to-end check: the TASK-125 catalog handle handed out
-        // from the Database must return the bootstrap schema and
-        // list the events table by name.
-        use bqlite_core::Catalog;
-
-        let scratch = Scratch::new("catalog-events");
-        let db = Database::open_or_create(scratch.path()).expect("init");
-        let cat = db.catalog();
-        let schema = cat.resolve_table("events").expect("events must resolve");
-        assert_eq!(schema, crate::catalog::bootstrap_events_schema());
-        assert_eq!(cat.list_tables(), vec!["events"]);
-    }
-
-    #[test]
-    fn catalog_from_reopened_database_still_sees_bootstrap() {
-        // The bootstrap runs only on fresh init (not on reopen), but
-        // the seeded entry must survive the round-trip to disk.
-        use bqlite_core::Catalog;
-
-        let scratch = Scratch::new("catalog-reopen");
-        {
-            let _db = Database::open_or_create(scratch.path()).expect("init");
-        }
-        let db = Database::open_or_create(scratch.path()).expect("reopen");
-        let cat = db.catalog();
-        assert!(cat.resolve_table("events").is_ok());
-        // The flag persists across reopen — important because later
-        // waves scan for it to distinguish seeded vs user-created
-        // tables.
-        let entry = db
-            .manifest()
-            .tables
-            .get("events")
-            .expect("events entry survived reopen");
-        assert!(entry.bootstrap_events_table);
-    }
-
-    #[test]
-    fn fresh_init_honours_custom_shard_count() {
-        let scratch = Scratch::new("custom-shards");
-        let db = Database::open_or_create_with_shards(scratch.path(), 16).expect("init");
-        assert_eq!(db.manifest().shard_count, 16);
-    }
-
-    #[test]
-    fn zero_shard_count_is_rejected() {
-        let scratch = Scratch::new("zero-shards");
-        let err = Database::open_or_create_with_shards(scratch.path(), 0)
-            .expect_err("zero shards must be rejected");
-        assert!(matches!(err, BqliteError::Schema(_)), "got {err:?}");
-    }
+    // ── Fresh init (TASK-240: uses Database::create) ─────────────────────
 
     // ── Database::create / Database::open (TASK-240) ──────────────────────
 
@@ -1127,13 +953,26 @@ mod tests {
 
     #[test]
     fn open_reads_wave1_bootstrap_database() {
-        // A Wave 1 database created with open_or_create (which seeds
-        // the bootstrap events table) must open successfully via the
-        // new Database::open. This tests read-compatibility.
+        // Simulate a Wave 1 database (which seeded a bootstrap events
+        // table with bootstrap_events_table: true) by writing the
+        // manifest directly. Database::open must read it successfully.
         let scratch = Scratch::new("open-wave1");
-        {
-            let _db = Database::open_or_create(scratch.path()).expect("wave1 init");
-        }
+        fs::create_dir_all(scratch.path()).unwrap();
+        let mut m = Manifest::new_empty(DEFAULT_SHARD_COUNT);
+        m.tables.insert(
+            crate::catalog::BOOTSTRAP_EVENTS_TABLE_NAME.to_string(),
+            TableEntry {
+                schema: crate::catalog::bootstrap_events_schema(),
+                next_sequence_id: 0,
+                next_batch_id: 0,
+                next_segment_id: 0,
+                bootstrap_events_table: true,
+                windows: Vec::new(),
+            },
+        );
+        let body = serde_json::to_vec_pretty(&m).unwrap();
+        fs::write(scratch.path().join(MANIFEST_FILE_NAME), body).unwrap();
+
         let db = Database::open(scratch.path()).expect("open wave1 db");
         assert_eq!(db.manifest().tables.len(), 1);
         let entry = db
@@ -1180,50 +1019,19 @@ mod tests {
         assert!(matches!(err, BqliteError::Execution(_)));
     }
 
-    // ── Reopen semantics (legacy open_or_create) ───────────────────────────
-
-    #[test]
-    fn reopening_preserves_database_uuid() {
-        let scratch = Scratch::new("uuid-stable");
-        let original_uuid = {
-            let db = Database::open_or_create(scratch.path()).expect("init");
-            db.manifest().database_uuid.clone()
-        };
-        let db2 = Database::open_or_create(scratch.path()).expect("reopen");
-        assert_eq!(db2.manifest().database_uuid, original_uuid);
-    }
-
-    #[test]
-    fn reopening_ignores_shard_count_override() {
-        let scratch = Scratch::new("shards-fixed");
-        {
-            let _db = Database::open_or_create_with_shards(scratch.path(), 4)
-                .expect("init with 4 shards");
-        }
-        let db2 = Database::open_or_create_with_shards(scratch.path(), 99).expect("reopen");
-        assert_eq!(
-            db2.manifest().shard_count,
-            4,
-            "reopen must honour the manifest's recorded shard count"
-        );
-    }
-
     // ── Atomicity and cleanup ───────────────────────────────────────────────
 
     #[test]
     fn stale_manifest_tmp_is_cleaned_up_on_open() {
         let scratch = Scratch::new("stale-tmp");
-        // Initialize a real manifest so the open path doesn't treat
-        // this directory as fresh.
         {
-            let _db = Database::open_or_create(scratch.path()).expect("init");
+            let _db = Database::create(scratch.path()).expect("create");
         }
-        // Simulate a crash mid-update: leave a stale tmp file behind.
         let tmp_path = scratch.path().join(MANIFEST_TMP_FILE_NAME);
         fs::write(&tmp_path, b"garbage left behind by a prior crash").unwrap();
         assert!(tmp_path.exists());
 
-        let _db = Database::open_or_create(scratch.path()).expect("reopen");
+        let _db = Database::open(scratch.path()).expect("open");
         assert!(
             !tmp_path.exists(),
             "stale manifest.json.tmp should be cleaned up on open"
@@ -1241,8 +1049,7 @@ mod tests {
             b"this is not valid json",
         )
         .unwrap();
-        let err =
-            Database::open_or_create(scratch.path()).expect_err("corrupted manifest must error");
+        let err = Database::open(scratch.path()).expect_err("corrupted manifest must error");
         match err {
             BqliteError::Execution(msg) => {
                 assert!(msg.contains("corrupted manifest"), "got: {msg}");
@@ -1255,15 +1062,14 @@ mod tests {
     fn unsupported_format_version_is_rejected() {
         let scratch = Scratch::new("bad-version");
         fs::create_dir_all(scratch.path()).unwrap();
-        // Hand-write a manifest with a future format_version.
         let future = format!(
             r#"{{"format_version":{},"database_uuid":"00000000-0000-4000-8000-000000000000","shard_count":32,"tables":{{}},"segments":[]}}"#,
             MANIFEST_FORMAT_VERSION + 1
         );
         fs::write(scratch.path().join(MANIFEST_FILE_NAME), future).unwrap();
 
-        let err = Database::open_or_create(scratch.path())
-            .expect_err("unsupported format_version must error");
+        let err =
+            Database::open(scratch.path()).expect_err("unsupported format_version must error");
         match err {
             BqliteError::Execution(msg) => {
                 assert!(msg.contains("unsupported format_version"), "got: {msg}");
@@ -1277,9 +1083,8 @@ mod tests {
     #[test]
     fn second_open_in_same_process_is_blocked() {
         let scratch = Scratch::new("lock-blocked");
-        let first = Database::open_or_create(scratch.path()).expect("first open");
-        let err =
-            Database::open_or_create(scratch.path()).expect_err("second concurrent open must fail");
+        let first = Database::create(scratch.path()).expect("create");
+        let err = Database::open(scratch.path()).expect_err("second concurrent open must fail");
         match err {
             BqliteError::Execution(msg) => {
                 assert!(msg.contains("already open"), "got: {msg}");
@@ -1293,10 +1098,10 @@ mod tests {
     fn lock_is_released_on_drop() {
         let scratch = Scratch::new("lock-released");
         {
-            let _first = Database::open_or_create(scratch.path()).expect("first open");
+            let _first = Database::create(scratch.path()).expect("create");
         }
         // After drop, a fresh open must succeed.
-        let _second = Database::open_or_create(scratch.path()).expect("reopen after drop");
+        let _second = Database::open(scratch.path()).expect("open after drop");
     }
 
     // ── SegmentReader stub ──────────────────────────────────────────────────
@@ -1304,7 +1109,7 @@ mod tests {
     #[test]
     fn segment_reader_unknown_table_returns_plan_error() {
         let scratch = Scratch::new("reader-unknown");
-        let db = Database::open_or_create(scratch.path()).expect("init");
+        let db = Database::create(scratch.path()).expect("create");
         // `Box<dyn SegmentReader>` is not Debug, so we can't use
         // `expect_err` here — pattern-match the Result directly.
         match db.segment_reader("nope") {
@@ -1335,7 +1140,7 @@ mod tests {
         // write path correctly.
         let scratch = Scratch::new("counter-roundtrip");
         {
-            let _db = Database::open_or_create(scratch.path()).expect("init");
+            let _db = Database::create(scratch.path()).expect("create");
         }
         let manifest_path = scratch.path().join(MANIFEST_FILE_NAME);
         let bytes = fs::read(&manifest_path).unwrap();
@@ -1353,7 +1158,7 @@ mod tests {
         );
         fs::write(&manifest_path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
 
-        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        let db = Database::open(scratch.path()).expect("open");
         let entry = db.manifest().tables.get("events").expect("events entry");
         assert_eq!(entry.next_sequence_id, 123_456);
         assert_eq!(entry.next_batch_id, 78);
@@ -1361,12 +1166,11 @@ mod tests {
     }
 
     #[test]
-    fn segment_reader_for_bootstrap_events_table_yields_zero_segments() {
-        // With TASK-125 merged, fresh init seeds the events table
-        // automatically — this test just opens a fresh database and
-        // asks for the reader directly.
-        let scratch = Scratch::new("reader-bootstrap");
-        let db = Database::open_or_create(scratch.path()).expect("init");
+    fn segment_reader_for_created_table_yields_zero_segments() {
+        let scratch = Scratch::new("reader-created");
+        let mut db = Database::create(scratch.path()).expect("create");
+        db.create_table("events".into(), sample_events_schema())
+            .expect("create table");
         let reader = db.segment_reader("events").expect("reader for events");
         assert_eq!(reader.schema().name(), "events");
         assert_eq!(reader.segments().count(), 0);
@@ -1410,7 +1214,7 @@ mod tests {
     fn add_segment_persists_across_reopen() {
         let scratch = Scratch::new("add-persists");
         {
-            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            let mut db = create_db_with_events(scratch.path());
             db.add_segment("events", 3, 1, sample_segment(42, 7, (0, 100)))
                 .expect("add_segment");
             // In-memory snapshot reflects the mutation immediately.
@@ -1421,7 +1225,7 @@ mod tests {
             assert_eq!(windows[0].shards[1][0].segment_id, 42);
         }
         // Reopen and confirm the mutation survived the fsync+rename.
-        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        let db = Database::open(scratch.path()).expect("open");
         let entry = db.manifest().tables.get("events").expect("events entry");
         assert_eq!(entry.windows.len(), 1);
         let win = &entry.windows[0];
@@ -1442,7 +1246,7 @@ mod tests {
     fn remove_segment_persists_across_reopen() {
         let scratch = Scratch::new("remove-persists");
         {
-            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            let mut db = create_db_with_events(scratch.path());
             db.add_segment("events", 0, 0, sample_segment(1, 1, (0, 50)))
                 .unwrap();
             db.add_segment("events", 0, 0, sample_segment(2, 1, (50, 100)))
@@ -1452,7 +1256,7 @@ mod tests {
             // In-memory snapshot reflects the removal.
             assert_eq!(db.manifest().tables["events"].windows[0].shards[0].len(), 1);
         }
-        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        let db = Database::open(scratch.path()).expect("open");
         let shard = &db.manifest().tables["events"].windows[0].shards[0];
         assert_eq!(shard.len(), 1);
         assert_eq!(shard[0].segment_id, 2);
@@ -1461,7 +1265,7 @@ mod tests {
     #[test]
     fn snapshot_for_query_reflects_committed_state() {
         let scratch = Scratch::new("snapshot-wiring");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = create_db_with_events(scratch.path());
         db.add_segment("events", 0, 0, sample_segment(1, 1, (0, 100)))
             .unwrap();
         db.add_segment("events", 0, 0, sample_segment(2, 1, (200, 300)))
@@ -1497,7 +1301,7 @@ mod tests {
         // test asserts it end-to-end by comparing the serialized
         // manifest before and after a failed call.
         let scratch = Scratch::new("add-unknown");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = Database::create(scratch.path()).expect("create");
         let before_mem = db.manifest().clone();
         let before_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
 
@@ -1516,7 +1320,7 @@ mod tests {
         // Second add with the same segment_id must error without
         // corrupting the first insert.
         let scratch = Scratch::new("add-duplicate");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = create_db_with_events(scratch.path());
         db.add_segment("events", 0, 0, sample_segment(7, 1, (0, 100)))
             .unwrap();
 
@@ -1546,7 +1350,7 @@ mod tests {
     #[test]
     fn remove_segment_missing_id_leaves_manifest_unchanged() {
         let scratch = Scratch::new("remove-missing");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = create_db_with_events(scratch.path());
         db.add_segment("events", 0, 0, sample_segment(1, 1, (0, 1)))
             .unwrap();
 
@@ -1568,7 +1372,7 @@ mod tests {
         // A successful atomic update renames the tmp file over the
         // real manifest, so no `manifest.json.tmp` should linger.
         let scratch = Scratch::new("no-tmp-leak");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = create_db_with_events(scratch.path());
         db.add_segment("events", 0, 0, sample_segment(1, 1, (0, 1)))
             .unwrap();
         assert!(
@@ -1583,7 +1387,7 @@ mod tests {
     fn allocate_batch_id_returns_monotonic_values_and_persists() {
         let scratch = Scratch::new("batch-id-persist");
         {
-            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            let mut db = create_db_with_events(scratch.path());
             let first = db.allocate_batch_id("events").expect("alloc 1");
             let second = db.allocate_batch_id("events").expect("alloc 2");
             let third = db.allocate_batch_id("events").expect("alloc 3");
@@ -1596,7 +1400,7 @@ mod tests {
             assert_eq!(db.manifest().tables["events"].next_batch_id, 3);
         }
         // Reopen and verify the counter persisted through fsync.
-        let mut db = Database::open_or_create(scratch.path()).expect("reopen");
+        let mut db = Database::open(scratch.path()).expect("open");
         assert_eq!(db.manifest().tables["events"].next_batch_id, 3);
         // Next allocation picks up from where the previous session
         // left off — the gap-tolerance contract.
@@ -1608,7 +1412,7 @@ mod tests {
     #[test]
     fn allocate_batch_id_unknown_table_leaves_state_untouched() {
         let scratch = Scratch::new("batch-id-unknown");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = Database::create(scratch.path()).expect("create");
         let before_mem = db.manifest().clone();
         let before_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
 
@@ -1634,7 +1438,7 @@ mod tests {
     fn allocate_segment_id_returns_monotonic_values_and_persists() {
         let scratch = Scratch::new("segment-id-persist");
         {
-            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            let mut db = create_db_with_events(scratch.path());
             let first = db.allocate_segment_id("events").expect("alloc 1");
             let second = db.allocate_segment_id("events").expect("alloc 2");
             let third = db.allocate_segment_id("events").expect("alloc 3");
@@ -1646,7 +1450,7 @@ mod tests {
         // Counter survives reopen — §5.2 requires `segment_id` to be
         // unique within a table, so its counter must be durable
         // across restarts.
-        let mut db = Database::open_or_create(scratch.path()).expect("reopen");
+        let mut db = Database::open(scratch.path()).expect("open");
         assert_eq!(db.manifest().tables["events"].next_segment_id, 3);
         let fourth = db.allocate_segment_id("events").expect("alloc 4");
         assert_eq!(fourth, 3);
@@ -1656,7 +1460,7 @@ mod tests {
     #[test]
     fn allocate_segment_id_unknown_table_leaves_state_untouched() {
         let scratch = Scratch::new("segment-id-unknown");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = Database::create(scratch.path()).expect("create");
         let before_mem = db.manifest().clone();
         let before_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
 
@@ -1681,7 +1485,7 @@ mod tests {
         // The two counters live side-by-side on TableEntry and must
         // not share state; bumping one must not observe the other.
         let scratch = Scratch::new("segment-id-vs-batch-id");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = create_db_with_events(scratch.path());
 
         let batch0 = db.allocate_batch_id("events").unwrap();
         let seg0 = db.allocate_segment_id("events").unwrap();
@@ -1700,7 +1504,7 @@ mod tests {
     fn allocate_sequence_id_range_reserves_contiguous_block_and_persists() {
         let scratch = Scratch::new("seq-range-persist");
         {
-            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            let mut db = create_db_with_events(scratch.path());
             let (lo, hi) = db.allocate_sequence_id_range("events", 10).unwrap();
             assert_eq!(lo, 0);
             assert_eq!(hi, 9);
@@ -1713,7 +1517,7 @@ mod tests {
             assert_eq!(db.manifest().tables["events"].next_sequence_id, 15);
         }
         // Reopen and verify the counter persisted through fsync.
-        let db = Database::open_or_create(scratch.path()).expect("reopen");
+        let db = Database::open(scratch.path()).expect("open");
         assert_eq!(db.manifest().tables["events"].next_sequence_id, 15);
     }
 
@@ -1722,7 +1526,7 @@ mod tests {
         // A one-row segment still produces a well-defined inclusive
         // range where `lo == hi`.
         let scratch = Scratch::new("seq-range-one");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = create_db_with_events(scratch.path());
         let (lo, hi) = db.allocate_sequence_id_range("events", 1).unwrap();
         assert_eq!(lo, 0);
         assert_eq!(hi, 0);
@@ -1732,7 +1536,7 @@ mod tests {
     #[test]
     fn allocate_sequence_id_range_zero_count_is_rejected() {
         let scratch = Scratch::new("seq-range-zero");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = create_db_with_events(scratch.path());
         let err = db
             .allocate_sequence_id_range("events", 0)
             .expect_err("zero count must error");
@@ -1749,7 +1553,7 @@ mod tests {
     #[test]
     fn allocate_sequence_id_range_unknown_table_leaves_state_untouched() {
         let scratch = Scratch::new("seq-range-unknown");
-        let mut db = Database::open_or_create(scratch.path()).expect("init");
+        let mut db = Database::create(scratch.path()).expect("create");
         let before_mem = db.manifest().clone();
         let before_disk = fs::read(scratch.path().join(MANIFEST_FILE_NAME)).unwrap();
 
@@ -1775,7 +1579,7 @@ mod tests {
         // manifest, then attempt a reservation that would overflow.
         let scratch = Scratch::new("seq-range-overflow");
         {
-            let _db = Database::open_or_create(scratch.path()).expect("init");
+            let _db = create_db_with_events(scratch.path());
         }
         let manifest_path = scratch.path().join(MANIFEST_FILE_NAME);
         let bytes = fs::read(&manifest_path).unwrap();
@@ -1783,7 +1587,7 @@ mod tests {
         m.tables.get_mut("events").unwrap().next_sequence_id = u64::MAX - 5;
         fs::write(&manifest_path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
 
-        let mut db = Database::open_or_create(scratch.path()).expect("reopen");
+        let mut db = Database::open(scratch.path()).expect("open");
         // Reserving exactly 5 is fine (yields [MAX-5, MAX-1]).
         let (lo, hi) = db.allocate_sequence_id_range("events", 5).unwrap();
         assert_eq!(lo, u64::MAX - 5);
@@ -1868,7 +1672,7 @@ mod tests {
         // manifest was never updated. On reopen the file must be gone.
         let scratch = Scratch::new("cleanup-tmp");
         {
-            let _db = Database::open_or_create(scratch.path()).expect("init");
+            let _db = create_db_with_events(scratch.path());
         }
 
         // Plant an orphan .tmp file in a shard directory.
@@ -1880,7 +1684,7 @@ mod tests {
 
         // Reopen — the reconciliation pass runs during open.
         {
-            let _db = Database::open_or_create(scratch.path()).expect("reopen");
+            let _db = Database::open(scratch.path()).expect("open");
             assert!(!orphan.exists(), ".tmp orphan must be deleted on open");
         }
     }
@@ -1892,7 +1696,7 @@ mod tests {
         // references only the merged output; the old inputs are orphans.
         let scratch = Scratch::new("cleanup-orphan-seg");
         {
-            let _db = Database::open_or_create(scratch.path()).expect("init");
+            let _db = create_db_with_events(scratch.path());
         }
 
         let shard = shard_dir_path(scratch.path(), "events", 1, 0);
@@ -1914,7 +1718,7 @@ mod tests {
         fs::write(shard.join("segment_11.seg"), b"orphan-old").unwrap();
 
         {
-            let _db = Database::open_or_create(scratch.path()).expect("reopen");
+            let _db = Database::open(scratch.path()).expect("open");
             assert!(
                 shard.join("segment_20.seg").exists(),
                 "active segment must survive"
@@ -1936,7 +1740,7 @@ mod tests {
         // must survive untouched.
         let scratch = Scratch::new("cleanup-happy");
         {
-            let _db = Database::open_or_create(scratch.path()).expect("init");
+            let _db = create_db_with_events(scratch.path());
         }
 
         let shard = shard_dir_path(scratch.path(), "events", 1, 0);
@@ -1953,7 +1757,7 @@ mod tests {
         fs::write(shard.join("segment_5.seg"), b"data").unwrap();
 
         {
-            let db = Database::open_or_create(scratch.path()).expect("reopen");
+            let db = Database::open(scratch.path()).expect("open");
             assert!(shard.join("segment_5.seg").exists());
             // The manifest itself is unchanged — still has the segment.
             let entry = db.manifest().tables.get("events").unwrap();
@@ -1968,7 +1772,7 @@ mod tests {
         // its segment files remain on disk. Reopen must clean them.
         let scratch = Scratch::new("cleanup-drop-table");
         {
-            let mut db = Database::open_or_create(scratch.path()).expect("init");
+            let mut db = Database::create(scratch.path()).expect("create");
             // Add a second table, register a segment, then drop it so
             // the manifest no longer references those segments.
             db.create_table("clicks".into(), sample_events_schema())
@@ -1984,13 +1788,13 @@ mod tests {
         // Now drop the table from the manifest (simulate: we write
         // directly because we don't have the segment in manifest).
         {
-            let mut db = Database::open_or_create(scratch.path()).expect("reopen-to-drop");
+            let mut db = Database::open(scratch.path()).expect("open-to-drop");
             db.drop_table("clicks").unwrap();
         }
 
         // Reopen — the reconciliation pass should clean up.
         {
-            let _db = Database::open_or_create(scratch.path()).expect("reopen-after-drop");
+            let _db = Database::open(scratch.path()).expect("open-after-drop");
             assert!(
                 !shard.join("segment_0.seg").exists(),
                 "orphan .seg must be removed"

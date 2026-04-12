@@ -24,7 +24,6 @@ use bqlite_core::property::PropertyValue;
 use bqlite_core::schema::{ColumnDef, TableSchema};
 use bqlite_core::time::Timestamp;
 use bqlite_core::BqlType;
-use bqlite_storage::manifest::TableEntry;
 use bqlite_storage::Database;
 use criterion::Criterion;
 
@@ -224,33 +223,12 @@ pub fn purchases_schema() -> TableSchema {
     .expect("purchases schema")
 }
 
-/// Open a database and register a table with the given schema.
-///
-/// Uses the same manifest-edit approach as the writer tests since the
-/// DDL surface (`CREATE TABLE`) is not yet wired to `Database`.
+/// Create a database and register a table with the given schema.
 pub fn open_db_with_table(path: &Path, table_name: &str, schema: TableSchema) -> Database {
-    let db = Database::open_or_create(path).expect("open db");
-    let manifest_path = path.join("manifest.json");
-    drop(db);
-    let bytes = std::fs::read(&manifest_path).unwrap();
-    let mut manifest: bqlite_storage::manifest::Manifest = serde_json::from_slice(&bytes).unwrap();
-    manifest.tables.insert(
-        table_name.to_string(),
-        TableEntry {
-            schema,
-            next_sequence_id: 0,
-            next_batch_id: 0,
-            next_segment_id: 0,
-            bootstrap_events_table: false,
-            windows: Vec::new(),
-        },
-    );
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-    Database::open_or_create(path).expect("reopen db")
+    let mut db = Database::create(path).expect("create db");
+    db.create_table(table_name.to_string(), schema)
+        .expect("create table");
+    db
 }
 
 /// Walk a directory tree, collecting all `.seg` segment files.

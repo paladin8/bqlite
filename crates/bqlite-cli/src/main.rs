@@ -28,8 +28,10 @@
 //! `docs/architecture.md` §"Dependency Direction"). Every crossing
 //! into the query pipeline goes through the engine's re-exports:
 //!
-//! - [`bqlite_engine::Database::open_or_create`] — opens/initializes a
-//!   database directory (storage-format.md §5 + §14).
+//! - [`bqlite_engine::Database::create`] — initializes a new database
+//!   directory (`bqlite init`).
+//! - [`bqlite_engine::Database::open`] — opens an existing database
+//!   (`bqlite query`).
 //! - [`bqlite_engine::Engine::query`] — parse → plan → bind → drive.
 //! - [`bqlite_engine::format_result_as_text`] — human-readable output.
 //! - [`bqlite_engine::init_tracing`] — installs the global tracing
@@ -95,9 +97,11 @@ fn main() -> ExitCode {
 /// Top-level usage string. Printed on usage errors and `--help`.
 const USAGE: &str = "\
 Usage:
+  bqlite init <path> [--shards N]
   bqlite query <bql> --db <path>
 
 Commands:
+  init     Initialize a new database directory.
   query    Run a BQL query against a database directory.
 
 Options:
@@ -148,10 +152,107 @@ fn run(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Result<(),
             let _ = writeln!(out, "{USAGE}");
             Ok(())
         }
+        "init" => run_init(rest, out),
         "query" => run_query(rest, out),
         other => Err(CliError::Usage(format!("unknown subcommand: {other}"))),
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// init subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parsed shape of `bqlite init <path> [--shards N]`.
+#[derive(Debug, PartialEq, Eq)]
+struct InitArgs {
+    path: PathBuf,
+    shards: Option<u16>,
+}
+
+/// Parse the argv tail of `bqlite init ...`.
+fn parse_init_args(rest: &[String]) -> Result<InitArgs, CliError> {
+    let mut path: Option<PathBuf> = None;
+    let mut shards: Option<u16> = None;
+
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        match arg.as_str() {
+            "--shards" => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| CliError::Usage("--shards requires a number".to_string()))?;
+                let n: u16 = value.parse().map_err(|_| {
+                    CliError::Usage(format!(
+                        "--shards value must be a positive integer: {value}"
+                    ))
+                })?;
+                if shards.is_some() {
+                    return Err(CliError::Usage(
+                        "--shards specified more than once".to_string(),
+                    ));
+                }
+                shards = Some(n);
+                i += 2;
+            }
+            arg_str if arg_str.starts_with("--shards=") => {
+                let value = &arg_str["--shards=".len()..];
+                let n: u16 = value.parse().map_err(|_| {
+                    CliError::Usage(format!(
+                        "--shards value must be a positive integer: {value}"
+                    ))
+                })?;
+                if shards.is_some() {
+                    return Err(CliError::Usage(
+                        "--shards specified more than once".to_string(),
+                    ));
+                }
+                shards = Some(n);
+                i += 1;
+            }
+            "-h" | "--help" => {
+                return Err(CliError::Usage(
+                    "help for 'init' not implemented yet — use `bqlite --help`".to_string(),
+                ));
+            }
+            arg_str if arg_str.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag: {arg_str}")));
+            }
+            _ => {
+                if path.is_some() {
+                    return Err(CliError::Usage(
+                        "init accepts exactly one positional path argument".to_string(),
+                    ));
+                }
+                path = Some(PathBuf::from(arg));
+                i += 1;
+            }
+        }
+    }
+
+    let path = path.ok_or_else(|| CliError::Usage("missing database path".to_string()))?;
+    Ok(InitArgs { path, shards })
+}
+
+/// Implementation of `bqlite init <path> [--shards N]`.
+fn run_init(rest: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+    let parsed = parse_init_args(rest)?;
+
+    let db = if let Some(shards) = parsed.shards {
+        Database::create_with_shards(&parsed.path, shards)
+    } else {
+        Database::create(&parsed.path)
+    };
+
+    db.map_err(|e| CliError::Runtime(format!("failed to initialize database: {e}")))?;
+
+    let _ = writeln!(out, "initialized database at {}", parsed.path.display());
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// query subcommand
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Parsed shape of `bqlite query <bql> --db <path>`.
 ///
@@ -250,8 +351,7 @@ fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
 fn run_query(rest: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let parsed = parse_query_args(rest)?;
 
-    let mut db = Database::open_or_create(&parsed.db_path)
-        .map_err(|e| CliError::Runtime(format!("failed to open database: {e}")))?;
+    let mut db = Database::open(&parsed.db_path).map_err(|e| CliError::Runtime(format!("{e}")))?;
 
     let engine = Engine::new();
     let result = engine
@@ -434,13 +534,84 @@ mod tests {
         }
     }
 
+    /// Helper: init a database and create the events table via CLI.
+    fn init_db_with_events(scratch: &Scratch) {
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&sv(&["init", &db_path_str]), &mut out, &mut err).expect("init must succeed");
+        run(
+            &sv(&[
+                "query",
+                "CREATE TABLE events (entity_id STRING NOT NULL ENTITY KEY, ts TIMESTAMP NOT NULL EVENT TIME, event_type STRING NOT NULL EVENT TYPE)",
+                "--db",
+                &db_path_str,
+            ]),
+            &mut out,
+            &mut err,
+        )
+        .expect("create table must succeed");
+    }
+
     #[test]
-    fn query_against_fresh_database_prints_schema_header_and_zero_rows() {
-        // This is the Wave 1 smoke-test shape (TASK-123) exercised
-        // through the CLI's `run` entry point: a fresh database
-        // directory plus the bare identifier `events` must print the
-        // bootstrap schema header and the `(0 rows)` footer.
+    fn init_creates_database_directory() {
+        let scratch = Scratch::new("init");
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&sv(&["init", &db_path_str]), &mut out, &mut err).expect("init must succeed");
+
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            out_text.contains("initialized"),
+            "expected confirmation message, got:\n{out_text}"
+        );
+        assert!(
+            scratch.path().join("manifest.json").is_file(),
+            "manifest.json should exist after init"
+        );
+    }
+
+    #[test]
+    fn init_with_shards() {
+        let scratch = Scratch::new("init-shards");
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(
+            &sv(&["init", &db_path_str, "--shards", "8"]),
+            &mut out,
+            &mut err,
+        )
+        .expect("init must succeed");
+        // Verify the shard count by opening the DB.
+        let db = Database::open(scratch.path()).expect("open");
+        assert_eq!(db.manifest().shard_count, 8);
+    }
+
+    #[test]
+    fn init_twice_is_runtime_error() {
+        let scratch = Scratch::new("init-twice");
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&sv(&["init", &db_path_str]), &mut out, &mut err).expect("first init");
+        match run(&sv(&["init", &db_path_str]), &mut out, &mut err) {
+            Err(CliError::Runtime(msg)) => {
+                assert!(
+                    msg.contains("manifest already exists"),
+                    "error should mention existing manifest: {msg}"
+                );
+            }
+            other => panic!("expected runtime error for double init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_against_initialized_database_prints_schema_header_and_zero_rows() {
         let scratch = Scratch::new("smoke");
+        init_db_with_events(&scratch);
+
         let db_path_str = scratch.path().to_string_lossy().to_string();
         let args = sv(&["query", "events", "--db", &db_path_str]);
 
@@ -451,7 +622,7 @@ mod tests {
         let out_text = String::from_utf8(out).unwrap();
         assert!(
             out_text.contains("entity_id"),
-            "expected bootstrap schema header, got:\n{out_text}"
+            "expected schema header, got:\n{out_text}"
         );
         assert!(
             out_text.contains("(0 rows)"),
@@ -460,11 +631,29 @@ mod tests {
     }
 
     #[test]
+    fn query_against_uninitialized_directory_reports_error() {
+        let scratch = Scratch::new("uninit");
+        fs::create_dir_all(scratch.path()).unwrap();
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        let args = sv(&["query", "events", "--db", &db_path_str]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        match run(&args, &mut out, &mut err) {
+            Err(CliError::Runtime(msg)) => {
+                assert!(
+                    msg.contains("bqlite init"),
+                    "error should suggest bqlite init: {msg}"
+                );
+            }
+            other => panic!("expected runtime error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn query_against_unknown_table_reports_plan_error() {
-        // Runtime errors (as opposed to usage errors) map to
-        // CliError::Runtime and the message should preserve the
-        // engine's typed error text.
         let scratch = Scratch::new("unknown-table");
+        init_db_with_events(&scratch);
         let db_path_str = scratch.path().to_string_lossy().to_string();
         let args = sv(&["query", "ghost", "--db", &db_path_str]);
 
@@ -490,10 +679,8 @@ mod tests {
 
     #[test]
     fn query_with_empty_bql_surfaces_parse_error_from_engine() {
-        // The parser rejects the empty string. The CLI must turn that
-        // into a Runtime error (not a Usage error — the user invoked
-        // the CLI correctly; the BQL itself is bad).
         let scratch = Scratch::new("empty-bql");
+        init_db_with_events(&scratch);
         let db_path_str = scratch.path().to_string_lossy().to_string();
         let args = sv(&["query", "", "--db", &db_path_str]);
 

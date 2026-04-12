@@ -25,7 +25,7 @@
 //!
 //! - [`TempDb`] — owns a fresh temporary directory for a single test
 //!   and cleans it up on drop. Intended as the argument source for the
-//!   eventual `Database::open_or_create(path)` entry point (TASK-116).
+//!   `Database::create(path)` / `Database::open(path)` entry points.
 //! - [`load_fixture`] — a deliberately unimplemented hook for loading
 //!   CSV/JSON/Parquet event fixtures. The signature is frozen now so
 //!   that fixture-driven test files can be written against a stable

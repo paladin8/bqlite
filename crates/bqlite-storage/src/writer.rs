@@ -1146,7 +1146,6 @@ fn current_timestamp_ns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::TableEntry;
     use crate::segment::reader::SegmentFileReader;
     use bqlite_core::storage::{ColumnProjection, SegmentScan};
     use bqlite_core::time::Timestamp;
@@ -1220,40 +1219,9 @@ mod tests {
     }
 
     fn open_db_with_events_table(path: &Path) -> Database {
-        let mut db = Database::open_or_create(path).expect("open db");
-        // The bootstrap `events` table seeded by Database::open_or_create
-        // has a single-column-property `event_type` shape. We replace it
-        // with the richer fixture schema by overwriting the table entry
-        // directly through the in-memory manifest accessor — the test
-        // helper `add_segment` paths exercise the rest.
-        //
-        // We do this by removing the bootstrap entry and re-adding ours
-        // through the public Database API, which means writing it via
-        // a clone-apply-persist-swap. Since the public DDL surface
-        // doesn't exist yet (TASK-232), we touch the manifest through
-        // the (also test-only) escape hatch of writing the manifest
-        // file directly while no Database is open. Drop, edit, reopen.
-        let manifest_path = path.join("manifest.json");
-        drop(db);
-        let bytes = fs::read(&manifest_path).unwrap();
-        let mut manifest: crate::manifest::Manifest = serde_json::from_slice(&bytes).unwrap();
-        manifest.tables.insert(
-            "events".to_string(),
-            TableEntry {
-                schema: events_schema(),
-                next_sequence_id: 0,
-                next_batch_id: 0,
-                next_segment_id: 0,
-                bootstrap_events_table: false,
-                windows: Vec::new(),
-            },
-        );
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        db = Database::open_or_create(path).expect("reopen");
+        let mut db = Database::create(path).expect("create db");
+        db.create_table("events".into(), events_schema())
+            .expect("create events table");
         db
     }
 

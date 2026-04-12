@@ -256,6 +256,22 @@ mod tests {
         }
     }
 
+    fn create_db_with_events(path: &Path) -> Database {
+        let mut db = Database::create(path).expect("create db");
+        let engine = Engine::new();
+        engine
+            .query(
+                "CREATE TABLE events (\
+                     entity_id STRING NOT NULL ENTITY KEY, \
+                     ts TIMESTAMP NOT NULL EVENT TIME, \
+                     event_type STRING NOT NULL EVENT TYPE\
+                 )",
+                &mut db,
+            )
+            .expect("create events table");
+        db
+    }
+
     // ── Happy path: the Wave 1 smoke test shape ─────────────────────
 
     #[test]
@@ -265,7 +281,7 @@ mod tests {
         // bare identifier `events` must return an empty ExecutionResult
         // — not an error, not a panic, just zero rows.
         let scratch = Scratch::new("smoke");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_events(scratch.path());
         let engine = Engine::new();
 
         let result = engine.query("events", &mut db).expect("query must succeed");
@@ -292,7 +308,7 @@ mod tests {
         // Defensive: the Wave 1 parser tolerates whitespace; the
         // engine wrapper must not over-trim or reject it.
         let scratch = Scratch::new("whitespace");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_events(scratch.path());
         let engine = Engine::new();
 
         let result = engine
@@ -306,7 +322,7 @@ mod tests {
     #[test]
     fn empty_query_returns_parse_error() {
         let scratch = Scratch::new("empty-parse");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_events(scratch.path());
         let engine = Engine::new();
 
         match engine.query("", &mut db) {
@@ -329,7 +345,7 @@ mod tests {
     #[test]
     fn garbage_query_returns_parse_error() {
         let scratch = Scratch::new("garbage-parse");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_events(scratch.path());
         let engine = Engine::new();
 
         match engine.query("42events", &mut db) {
@@ -343,7 +359,7 @@ mod tests {
     #[test]
     fn unknown_table_returns_plan_error() {
         let scratch = Scratch::new("unknown-plan");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_events(scratch.path());
         let engine = Engine::new();
 
         match engine.query("ghost", &mut db) {
@@ -375,7 +391,7 @@ mod tests {
     fn execution_result_row_count_and_is_empty_are_consistent() {
         // Empty result — row_count == 0, is_empty() true.
         let scratch = Scratch::new("rowcount");
-        let mut db = Database::open_or_create(scratch.path()).expect("open db");
+        let mut db = create_db_with_events(scratch.path());
         let engine = Engine::new();
         let result = engine.query("events", &mut db).expect("events must plan");
 

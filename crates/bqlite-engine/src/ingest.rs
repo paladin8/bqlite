@@ -149,13 +149,8 @@ mod tests {
 
     /// Create a database and use DDL to create the test events table.
     fn create_db_with_events(db_path: &Path) -> Database {
-        let mut db = Database::open_or_create(db_path).expect("open db");
+        let mut db = Database::create(db_path).expect("create db");
         let engine = crate::Engine::new();
-        // Drop the bootstrap events table, then create ours with the
-        // desired schema including a nullable `amount` column.
-        engine
-            .query("DROP TABLE events", &mut db)
-            .expect("drop bootstrap events");
         engine
             .query(
                 "CREATE TABLE events (\

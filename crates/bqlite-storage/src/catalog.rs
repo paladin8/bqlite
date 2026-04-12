@@ -1,21 +1,15 @@
 //! Manifest-backed [`Catalog`] implementation and the Wave 1 bootstrap
 //! events table schema.
 //!
-//! # Where the bootstrap rule comes from
+//! # Bootstrap schema (read-compatibility)
 //!
-//! TASK-125 resolves a gap between two constraints:
+//! The bootstrap events table schema was seeded by Wave 1's
+//! `Database::open_or_create` (retired in TASK-240). Wave 2 databases
+//! use explicit `CREATE TABLE` DDL instead. The schema definition and
+//! `bootstrap_events_table: bool` flag are retained for
+//! read-compatibility with Wave 1 manifests.
 //!
-//! 1. `docs/design/planner-pipeline.md` §4.1 requires the planner to
-//!    hold a `Catalog` handle and raise an error for unknown tables.
-//! 2. `docs/design/query-language.md` §29 forbids BQL DDL in v0 —
-//!    there is no `CREATE TABLE` statement, only CLI initialization.
-//!
-//! Without a seeded table, `bqlite query "events"` cannot parse,
-//! plan, and execute against a freshly-created database (the Wave 1
-//! smoke test in TASK-123). The resolution is to have
-//! [`crate::database::Database::open_or_create`] seed a single
-//! default `events` table in the manifest on a fresh init. The
-//! schema is the minimum required by `docs/design/type-system.md`
+//! The schema is the minimum required by `docs/design/type-system.md`
 //! §5.1 — exactly three mandatory columns, each non-nullable:
 //!
 //! - `entity_id STRING NOT NULL` (entity key role)

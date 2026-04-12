@@ -22,13 +22,13 @@
 //!   and the Wave 1 format-version / shard-count constants, extended
 //!   by TASK-217 with the real segment inventory ([`SegmentMeta`],
 //!   [`WindowManifest`], [`ColumnStats`]).
-//! - [`database`] — [`Database::open_or_create`], which implements the
-//!   v0 database-open contract: create the directory, acquire the
-//!   advisory lock, and read or initialize `manifest.json` atomically.
+//! - [`database`] — [`Database::create`] and [`Database::open`], which
+//!   implement the database lifecycle: create the directory, acquire
+//!   the advisory lock, and read or initialize `manifest.json`
+//!   atomically.
 //! - [`catalog`] — the [`ManifestCatalog`] implementation of
-//!   [`bqlite_core::Catalog`] and the TASK-125 bootstrap events table
-//!   schema. `Database::open_or_create` seeds the bootstrap entry on
-//!   fresh init so the planner has a resolvable `events` table.
+//!   [`bqlite_core::Catalog`] and the bootstrap events table schema
+//!   (retained for read-compatibility with Wave 1 databases).
 //! - [`encoding`] — the column [`Encoding`] trait and concrete v1
 //!   impls: [`Plain`] (TASK-206), [`Constant`] (TASK-210),
 //!   [`BitPacking`] (TASK-209), [`Delta`] (TASK-208),
