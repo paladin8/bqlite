@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-247",
   "claimed_at": "2026-04-12T04:54:32Z",
+  "completed_at": "2026-04-12T06:45:00Z",
   "branch": "task/TASK-247",
   "description": "Scan-path performance closure for the acceptance query"
 }
