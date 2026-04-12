@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-309",
+  "claimed_at": "2026-04-12T07:21:59Z",
+  "branch": "task/TASK-309",
+  "description": "Logical lowering + demand propagation for Match / Stats / OrderBy"
+}
