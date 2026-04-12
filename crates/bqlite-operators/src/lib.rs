@@ -48,6 +48,7 @@
 //! implementations driven by compiled expressions from
 //! [`bqlite_planner::compiled::CompiledExpr`].
 
+pub mod aggregate;
 pub mod eval;
 pub mod filter;
 pub mod limit;
@@ -55,6 +56,9 @@ pub mod operator;
 pub mod project;
 pub mod scan;
 
+pub use aggregate::{
+    Accumulator, AggState, GroupKey, HashAccumulator, SumState, DEFAULT_MAX_GROUPS,
+};
 pub use filter::FilterOperator;
 pub use limit::LimitOperator;
 pub use operator::{CancellationToken, EntityOperator, PhysicalOperator};

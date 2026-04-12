@@ -22,6 +22,7 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 - **operators/match-operator.md** — MATCH operator architecture: state layout, EntityOperator integration, output schema, emission points, active-state cap, demand-driven column reduction (TASK-301, Wave 3)
 - **operators/matcher-strategy.md** — Compile-time pattern classifier and strategy selection matrix: `PatternClass` enum, classification predicates, demand override rules, variable-binding interaction with step counter, fallback behavior, microbenchmark methodology (TASK-302, Wave 3)
 - **operators/sort-distinct.md** — `SortOperator` + `DistinctOperator` contracts: physical descriptors, key compilation, null-ordering rules, hard-cap overflow policy, plan-tree placement, no-spill rationale (TASK-310, Wave 3)
+- **operators/aggregate-operator.md** — `Accumulator` trait + `HashAccumulator` architecture: `AggState`/`GroupKey`/`SumState` types, per-function state and merge rules, null propagation, output schema rules, aggregate expression compilation through `CompiledExpr`, fused-downstream protocol via `finish_entity_into`, DDSketch extensibility contract for TASK-327 (TASK-308, Wave 3)
 
 ### Language
 

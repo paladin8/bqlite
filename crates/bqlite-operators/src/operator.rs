@@ -238,11 +238,14 @@ pub trait PhysicalOperator: Send {
 /// - **Invariant violations** panic — the engine catches panics at the
 ///   shard-task boundary and surfaces them as an execution error.
 ///
-/// # Wave 1 deferrals
+/// # Fused aggregation
 ///
-/// - `finish_entity_into` for fused aggregation — added when the
-///   `Accumulator` trait lands in a later wave with a default impl so
-///   existing implementors do not need to change.
+/// [`finish_entity_into`](Self::finish_entity_into) provides the fused
+/// aggregation path. When a fused accumulator is active, the
+/// `EntityOperatorAdapter` calls this INSTEAD of
+/// [`finish_entity`](Self::finish_entity). The default implementation
+/// calls `finish_entity()` and feeds the result into the accumulator —
+/// operators override for zero-materialization fusion.
 ///
 /// The [`supported_demands`](Self::supported_demands) scaffold method
 /// has landed via TASK-110 as an additive extension; its default body
@@ -285,6 +288,28 @@ pub trait EntityOperator: Send + Sync {
     /// rows for operators that emit one row per entity, one row per
     /// session, one row per match, etc.
     fn finish_entity(&self, state: Self::State) -> Option<RecordBatch>;
+
+    /// Fused aggregation path. If the operator has a fused accumulator,
+    /// the adapter calls this INSTEAD of `finish_entity()`. Updates the
+    /// accumulator directly without materializing per-entity rows.
+    ///
+    /// The default implementation calls `finish_entity()` and feeds the
+    /// result into the accumulator — operators override for
+    /// zero-materialization fusion (see execution-model.md §8.4).
+    ///
+    /// Returns `Err` if the accumulator hits its group-cardinality cap
+    /// during the update. The `EntityOperatorAdapter` (TASK-307) will
+    /// propagate this to abort the query.
+    fn finish_entity_into(
+        &self,
+        state: Self::State,
+        accumulator: &mut dyn crate::aggregate::Accumulator,
+    ) -> Result<()> {
+        if let Some(batch) = self.finish_entity(state) {
+            accumulator.update_batch(&batch)?;
+        }
+        Ok(())
+    }
 
     /// The set of input columns this operator actually reads.
     ///
