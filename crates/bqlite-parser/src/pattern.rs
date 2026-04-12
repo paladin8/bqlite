@@ -13,9 +13,9 @@
 //! - [`parse_match_modifiers`] — optional `WITHIN`/`BRACKETS`/`EMIT ALL` modifiers (TASK-313)
 //! - [`parse_event_ref`] — `(name ".")? name` event reference (TASK-316, RETENTION)
 
-// All pub(crate) functions in this module are consumed by the MATCH, FUNNEL,
-// and RETENTION pipeline stage parsers (TASK-313, TASK-316) which have not
-// landed yet. Suppress dead_code until they do.
+// `parse_step_list` and `parse_event_ref` are consumed by the FUNNEL and
+// RETENTION pipeline stage parsers (TASK-316) which have not landed yet.
+// Suppress dead_code until those tasks ship.
 #![allow(dead_code)]
 
 use bqlite_ast::pattern::{
@@ -121,16 +121,20 @@ pub(crate) fn parse_step_list(p: &mut Parser) -> Result<Vec<Step>, ParseError> {
 /// in canonical order.
 ///
 /// `base_mode` is the already-parsed `MatchMode::First` or `MatchMode::All`.
-/// Returns `(window, brackets, final_mode)`.
+/// Returns `(window, brackets, final_mode, modifier_end_span)`.
+///
+/// `modifier_end_span` is the [`Span`] of the last token consumed by any
+/// modifier, or [`Span::EMPTY`] when no modifiers are present. Callers use it
+/// to extend the MATCH stage span through the last modifier token.
 ///
 /// Errors if modifiers appear out of canonical order or if the mode /
 /// modifier combination is unsupported (e.g. `MATCH ALL EMIT ALL`).
 pub(crate) fn parse_match_modifiers(
     p: &mut Parser,
     base_mode: MatchMode,
-) -> Result<(Option<MatchWindow>, Option<BracketSpec>, MatchMode), ParseError> {
+) -> Result<(Option<MatchWindow>, Option<BracketSpec>, MatchMode, Span), ParseError> {
     // 1. Optional WITHIN clause.
-    let window = parse_within(p)?;
+    let (window, window_end) = parse_within(p)?;
 
     // 2. Optional BRACKETS clause.
     // Check for out-of-order: if BRACKETS appears here, WITHIN must have
@@ -148,9 +152,16 @@ pub(crate) fn parse_match_modifiers(
     }
 
     // 3. Optional EMIT ALL.
-    let final_mode = parse_emit_all(p, base_mode)?;
+    let (final_mode, emit_end) = parse_emit_all(p, base_mode)?;
 
-    Ok((window, brackets, final_mode))
+    // Compute the end span: the last consumed modifier wins.  Merging with
+    // Span::EMPTY is a no-op (see Span::merged), so this correctly handles
+    // the case where only a subset of modifiers are present.
+    let modifier_end = window_end
+        .merged(brackets.as_ref().map(|b| b.span).unwrap_or(Span::EMPTY))
+        .merged(emit_end);
+
+    Ok((window, brackets, final_mode, modifier_end))
 }
 
 /// Parse `(name ".")? name` into an [`EventRef`].
@@ -442,21 +453,25 @@ fn parse_repetition_with_span(p: &mut Parser) -> (Option<Repetition>, Span) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Parse the optional `WITHIN (duration | SESSION)` clause.
-fn parse_within(p: &mut Parser) -> Result<Option<MatchWindow>, ParseError> {
+///
+/// Returns `(window, end_span)` where `end_span` is the span of the last
+/// consumed token (the duration or `SESSION` keyword), or [`Span::EMPTY`]
+/// when the `WITHIN` keyword is absent.
+fn parse_within(p: &mut Parser) -> Result<(Option<MatchWindow>, Span), ParseError> {
     if p.try_kw(Keyword::Within).is_none() {
-        return Ok(None);
+        return Ok((None, Span::EMPTY));
     }
 
     // WITHIN SESSION
-    if p.try_kw(Keyword::Session).is_some() {
-        return Ok(Some(MatchWindow::WithinSession));
+    if let Some(session_tok) = p.try_kw(Keyword::Session) {
+        return Ok((Some(MatchWindow::WithinSession), token_span(&session_tok)));
     }
 
     // WITHIN <duration>
     let tok = p.peek();
     if let TokenKind::Duration(ns) = tok.kind {
-        p.bump();
-        Ok(Some(MatchWindow::Within(ns)))
+        let consumed = p.bump();
+        Ok((Some(MatchWindow::Within(ns)), token_span(&consumed)))
     } else {
         Err(p.error_unexpected(
             Expected::Literal,
@@ -518,19 +533,24 @@ fn parse_brackets(p: &mut Parser) -> Result<Option<BracketSpec>, ParseError> {
 /// `base_mode` is the `MatchMode::First` or `MatchMode::All` that was
 /// parsed before the step list.
 ///
+/// Returns `(final_mode, end_span)` where `end_span` is the span of the
+/// `ALL` keyword when `EMIT ALL` was consumed, or [`Span::EMPTY`] when
+/// neither keyword was present.
+///
 /// Errors:
 /// - `EMIT` not followed by `ALL` → `Expected::Keyword("ALL")`
 /// - `MATCH ALL ... EMIT ALL` → `Expected::EndOfModifiers` (unsupported)
 /// - `EMIT ALL` followed by `WITHIN` or `BRACKETS` → out-of-order error
-fn parse_emit_all(p: &mut Parser, base_mode: MatchMode) -> Result<MatchMode, ParseError> {
+fn parse_emit_all(p: &mut Parser, base_mode: MatchMode) -> Result<(MatchMode, Span), ParseError> {
     let emit_tok = match p.try_kw(Keyword::Emit) {
         Some(tok) => tok,
-        None => return Ok(base_mode),
+        None => return Ok((base_mode, Span::EMPTY)),
     };
     let emit_span = token_span(&emit_tok);
 
     // `EMIT` must be followed by `ALL`.
-    p.expect_kw(Keyword::All)?;
+    let all_tok = p.expect_kw(Keyword::All)?;
+    let all_span = token_span(&all_tok);
 
     // Detect out-of-order modifiers after EMIT ALL.
     match p.peek_kind() {
@@ -552,7 +572,7 @@ fn parse_emit_all(p: &mut Parser, base_mode: MatchMode) -> Result<MatchMode, Par
     // `MATCH ALL EMIT ALL` is not representable in the current AST.
     // See pattern-grammar.md §7.1 for the encoding decision.
     match base_mode {
-        MatchMode::First | MatchMode::EmitAll => Ok(MatchMode::EmitAll),
+        MatchMode::First | MatchMode::EmitAll => Ok((MatchMode::EmitAll, all_span)),
         MatchMode::All => Err(ParseError::Unexpected {
             offset: emit_span.start,
             line: emit_span.line,
@@ -956,7 +976,7 @@ mod tests {
     #[test]
     fn modifiers_none() {
         let mut p = make_parser("");
-        let (window, brackets, mode) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (window, brackets, mode, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         assert!(window.is_none());
         assert!(brackets.is_none());
         assert_eq!(mode, MatchMode::First);
@@ -965,7 +985,7 @@ mod tests {
     #[test]
     fn modifiers_within_duration() {
         let mut p = make_parser("WITHIN 7d");
-        let (window, _, mode) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (window, _, mode, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         assert_eq!(
             window,
             Some(MatchWindow::Within(7 * 24 * 3_600_000_000_000))
@@ -976,21 +996,21 @@ mod tests {
     #[test]
     fn modifiers_within_session() {
         let mut p = make_parser("WITHIN SESSION");
-        let (window, _, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (window, _, _, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         assert_eq!(window, Some(MatchWindow::WithinSession));
     }
 
     #[test]
     fn modifiers_emit_all_with_first_produces_emit_all_mode() {
         let mut p = make_parser("EMIT ALL");
-        let (_, _, mode) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (_, _, mode, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         assert_eq!(mode, MatchMode::EmitAll);
     }
 
     #[test]
     fn modifiers_all_mode_no_emit_all_stays_all() {
         let mut p = make_parser("");
-        let (_, _, mode) = parse_match_modifiers(&mut p, MatchMode::All).unwrap();
+        let (_, _, mode, _) = parse_match_modifiers(&mut p, MatchMode::All).unwrap();
         assert_eq!(mode, MatchMode::All);
     }
 
@@ -1013,7 +1033,7 @@ mod tests {
     #[test]
     fn modifiers_within_and_emit_all() {
         let mut p = make_parser("WITHIN 7d EMIT ALL");
-        let (window, _, mode) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (window, _, mode, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         assert!(window.is_some());
         assert_eq!(mode, MatchMode::EmitAll);
     }
@@ -1038,7 +1058,7 @@ mod tests {
     #[test]
     fn modifiers_brackets() {
         let mut p = make_parser("BRACKETS [1d, 7d, 30d]");
-        let (_, brackets, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (_, brackets, _, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         let b = brackets.unwrap();
         assert_eq!(b.durations.len(), 3);
         assert!(!b.cumulative);
@@ -1047,7 +1067,7 @@ mod tests {
     #[test]
     fn modifiers_brackets_cumulative() {
         let mut p = make_parser("BRACKETS CUMULATIVE [1d, 7d]");
-        let (_, brackets, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (_, brackets, _, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         let b = brackets.unwrap();
         assert!(b.cumulative);
         assert_eq!(b.durations.len(), 2);
@@ -1056,7 +1076,7 @@ mod tests {
     #[test]
     fn modifiers_within_and_brackets() {
         let mut p = make_parser("WITHIN SESSION BRACKETS [1d, 7d]");
-        let (window, brackets, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (window, brackets, _, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         assert_eq!(window, Some(MatchWindow::WithinSession));
         assert!(brackets.is_some());
     }

@@ -23,13 +23,15 @@
 #![allow(dead_code)] // TASK-221 / TASK-222 productions reach this module later.
 
 use bqlite_ast::{
-    AggItem, Expr, GroupItem, Name, OrderItem, PipelineStage, SelectItem, SelectItemKind, SortDir,
+    AggItem, Expr, GroupItem, MatchMode, MatchPattern, Name, OrderItem, PipelineStage, SelectItem,
+    SelectItemKind, SortDir,
 };
 
 use crate::error::{Expected, NameRole, ParseError};
 use crate::expr::parse_expression;
 use crate::lex::{token_span, Keyword, TokenKind};
 use crate::parser::Parser;
+use crate::pattern::{parse_match_modifiers, parse_sequence};
 
 /// Parse the `("|" stage)*` tail of a pipeline, returning the ordered
 /// stage list. Stops at the first token that is not a `|`. The caller
@@ -52,6 +54,8 @@ fn parse_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
         TokenKind::Kw(Keyword::Stats) => parse_stats_stage(p),
         // `ORDER BY …` and its `SORT …` alias (query-language.md §15).
         TokenKind::Kw(Keyword::Order) | TokenKind::Kw(Keyword::Sort) => parse_order_by_stage(p),
+        // `MATCH (FIRST | ALL) SEQUENCE(…) [modifiers]` — sequence pattern (§4).
+        TokenKind::Kw(Keyword::Match) => parse_match_stage(p),
 
         // Every other first token is either a later-wave verb that
         // TASK-223 does not yet implement, or an error. The error
@@ -587,6 +591,92 @@ fn parse_order_item(p: &mut Parser) -> Result<OrderItem, ParseError> {
         direction,
         span,
     })
+}
+
+// ----------------------------------------------------------------------
+// MATCH
+// ----------------------------------------------------------------------
+
+/// `MATCH (FIRST | ALL) SEQUENCE(…) [WITHIN …] [BRACKETS …] [EMIT ALL]`
+/// — §4 / §26 line ~1555.
+///
+/// Grammar:
+/// ```text
+/// match_op        := MATCH match_mode SEQUENCE "(" step_list ")" match_modifiers
+/// match_mode      := FIRST | ALL
+/// match_modifiers := (WITHIN (duration | SESSION))?
+///                    (BRACKETS CUMULATIVE? "[" duration_list "]")?
+///                    (EMIT ALL)?
+/// ```
+///
+/// Delegates `SEQUENCE(…)` and modifier parsing to `crate::pattern`.
+/// Emits `PipelineStage::Match { pattern: MatchPattern { … }, span }`.
+///
+/// Error sites:
+/// - Neither `FIRST` nor `ALL` after `MATCH` → `Expected::Keyword("FIRST or ALL")`
+/// - Missing `SEQUENCE` after mode → `Expected::Keyword("SEQUENCE")`
+/// - Empty `SEQUENCE()` → `Expected::Keyword("step")`
+/// - Modifier order violations → `Expected::EndOfModifiers`
+/// - `MATCH ALL EMIT ALL` → `Expected::EndOfModifiers` (unsupported, §7.1)
+fn parse_match_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    // Consume `MATCH` keyword — span anchor (start of the whole stage).
+    let match_tok = p.expect_kw(Keyword::Match)?;
+    let start_span = token_span(&match_tok);
+
+    // Parse match mode: FIRST or ALL. Both are required; anything else is
+    // a parse error (pattern-grammar.md §3.2).
+    let base_mode = match p.peek_kind() {
+        TokenKind::Kw(Keyword::First) => {
+            p.bump();
+            MatchMode::First
+        }
+        TokenKind::Kw(Keyword::All) => {
+            p.bump();
+            MatchMode::All
+        }
+        _ => {
+            return Err(p.error_unexpected(
+                Expected::Keyword("FIRST or ALL"),
+                Some("MATCH requires a mode: MATCH FIRST ... or MATCH ALL ..."),
+            ));
+        }
+    };
+
+    // Guard: emit a user-friendly hint when SEQUENCE is missing.
+    // `parse_sequence` itself emits `Expected::Keyword("SEQUENCE")` but
+    // without a detail message. Intercepting here lets us add the hint
+    // from pattern-grammar.md §3.1 before delegating to `parse_sequence`.
+    if !matches!(p.peek_kind(), TokenKind::Kw(Keyword::Sequence)) {
+        return Err(p.error_unexpected(
+            Expected::Keyword("SEQUENCE"),
+            Some("MATCH requires SEQUENCE(...) — did you mean MATCH FIRST SEQUENCE(...) ?"),
+        ));
+    }
+
+    // Parse `SEQUENCE "(" step_list ")"` — delegates to crate::pattern.
+    // Errors if `(`, step list, or `)` are missing.
+    let (steps, seq_span) = parse_sequence(p)?;
+
+    // Parse optional modifiers in canonical order: WITHIN, BRACKETS, EMIT ALL.
+    // `modifier_end` is the span of the last modifier token consumed, or
+    // `Span::EMPTY` when no modifiers are present.
+    let (window, brackets, final_mode, modifier_end) = parse_match_modifiers(p, base_mode)?;
+
+    // Full stage span: from `MATCH` through the last modifier (or through the
+    // closing `)` of SEQUENCE when no modifiers are present).
+    // `Span::merged` treats EMPTY as a no-op, so `modifier_end = EMPTY`
+    // correctly leaves the span ending at `seq_span`.
+    let span = start_span.merged(seq_span).merged(modifier_end);
+
+    let pattern = MatchPattern {
+        steps,
+        mode: final_mode,
+        window,
+        brackets,
+        span,
+    };
+
+    Ok(PipelineStage::Match { pattern, span })
 }
 
 // ----------------------------------------------------------------------
@@ -1698,5 +1788,268 @@ mod tests {
             }
             other => panic!("expected OrderBy, got {other:?}"),
         }
+    }
+
+    // --- MATCH --------------------------------------------------------
+
+    use bqlite_ast::{MatchMode, MatchWindow};
+
+    /// Extract the `MatchPattern` from the first stage (must be `Match`).
+    fn match_pattern_of(stages: &[PipelineStage]) -> &bqlite_ast::MatchPattern {
+        match &stages[0] {
+            PipelineStage::Match { pattern, .. } => pattern,
+            other => panic!("expected Match stage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_first_single_step() {
+        // `MATCH FIRST SEQUENCE(signup)` — one step, no modifiers.
+        let stmt = parse_stmt("events | MATCH FIRST SEQUENCE(signup)");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.mode, MatchMode::First);
+        assert_eq!(pat.steps.len(), 1);
+        assert!(pat.window.is_none());
+        assert!(pat.brackets.is_none());
+    }
+
+    #[test]
+    fn match_all_mode_multi_step() {
+        // `MATCH ALL SEQUENCE(a THEN b THEN c)` — three steps.
+        let stmt = parse_stmt("events | MATCH ALL SEQUENCE(a THEN b THEN c)");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.mode, MatchMode::All);
+        assert_eq!(pat.steps.len(), 3);
+    }
+
+    #[test]
+    fn match_first_with_within_duration() {
+        // `MATCH FIRST SEQUENCE(signup THEN purchase) WITHIN 7d`
+        let stmt = parse_stmt("events | MATCH FIRST SEQUENCE(signup THEN purchase) WITHIN 7d");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.mode, MatchMode::First);
+        assert_eq!(pat.steps.len(), 2);
+        assert_eq!(
+            pat.window,
+            Some(MatchWindow::Within(7 * 24 * 3_600_000_000_000))
+        );
+        assert!(pat.brackets.is_none());
+    }
+
+    #[test]
+    fn match_first_with_within_session() {
+        let stmt = parse_stmt("events | MATCH FIRST SEQUENCE(a) WITHIN SESSION");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.window, Some(MatchWindow::WithinSession));
+    }
+
+    #[test]
+    fn match_first_emit_all_produces_emit_all_mode() {
+        // `MATCH FIRST … EMIT ALL` → `MatchMode::EmitAll` (§7.1).
+        let stmt = parse_stmt("events | MATCH FIRST SEQUENCE(signup THEN purchase) EMIT ALL");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.mode, MatchMode::EmitAll);
+        assert!(pat.window.is_none());
+    }
+
+    #[test]
+    fn match_first_with_within_and_emit_all() {
+        let stmt = parse_stmt("events | MATCH FIRST SEQUENCE(signup) WITHIN 30d EMIT ALL");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.mode, MatchMode::EmitAll);
+        assert_eq!(
+            pat.window,
+            Some(MatchWindow::Within(30 * 24 * 3_600_000_000_000))
+        );
+    }
+
+    #[test]
+    fn match_all_without_emit_all_stays_all() {
+        let stmt = parse_stmt("events | MATCH ALL SEQUENCE(a THEN b)");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.mode, MatchMode::All);
+    }
+
+    #[test]
+    fn match_all_emit_all_is_error() {
+        // `MATCH ALL … EMIT ALL` is unsupported per pattern-grammar.md §7.1.
+        match crate::parse("events | MATCH ALL SEQUENCE(signup) EMIT ALL") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::EndOfModifiers);
+                assert!(detail
+                    .unwrap_or("")
+                    .contains("MATCH ALL EMIT ALL is not supported"));
+            }
+            other => panic!("expected EndOfModifiers error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_missing_mode_errors() {
+        // `MATCH SEQUENCE(signup)` — missing FIRST or ALL.
+        // The parser sees SEQUENCE where it expects FIRST/ALL and
+        // emits `Expected::Keyword("FIRST or ALL")`.
+        match crate::parse("events | MATCH SEQUENCE(signup)") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Keyword("FIRST or ALL"));
+            }
+            other => panic!("expected Unexpected(FIRST or ALL) error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_missing_sequence_keyword_errors() {
+        // `MATCH FIRST signup` — missing SEQUENCE.
+        // The parser intercepts this and emits a user-friendly detail hint
+        // per pattern-grammar.md §3.1.
+        match crate::parse("events | MATCH FIRST signup") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("SEQUENCE"));
+                assert!(
+                    detail
+                        .unwrap_or("")
+                        .contains("MATCH requires SEQUENCE(...)"),
+                    "detail message should contain hint about SEQUENCE"
+                );
+            }
+            other => panic!("expected Unexpected(SEQUENCE) error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_empty_sequence_errors() {
+        // `MATCH FIRST SEQUENCE()` — empty step list is rejected.
+        match crate::parse("events | MATCH FIRST SEQUENCE()") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Keyword("step"));
+            }
+            other => panic!("expected empty-step-list error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_emit_all_before_within_is_out_of_order_error() {
+        // Modifiers must appear in canonical order: WITHIN then EMIT ALL.
+        match crate::parse("events | MATCH FIRST SEQUENCE(a) EMIT ALL WITHIN 7d") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::EndOfModifiers);
+                assert!(detail
+                    .unwrap_or("")
+                    .contains("WITHIN must appear before EMIT ALL"));
+            }
+            other => panic!("expected out-of-order modifier error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_brackets_after_emit_all_is_out_of_order_error() {
+        // `EMIT ALL BRACKETS [1d, 7d]` — BRACKETS must appear before EMIT ALL
+        // per the canonical modifier order in pattern-grammar.md §3.11.
+        match crate::parse("events | MATCH FIRST SEQUENCE(a) EMIT ALL BRACKETS [1d, 7d]") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::EndOfModifiers);
+                assert!(detail
+                    .unwrap_or("")
+                    .contains("BRACKETS must appear before EMIT ALL"));
+            }
+            other => panic!("expected out-of-order BRACKETS error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_case_insensitive_keywords() {
+        // All keywords are case-insensitive per §2.2.
+        let stmt = parse_stmt("events | match first sequence(signup then purchase)");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.mode, MatchMode::First);
+        assert_eq!(pat.steps.len(), 2);
+    }
+
+    #[test]
+    fn match_span_starts_at_match_keyword() {
+        // The stage span must begin at the `M` of `MATCH`.
+        let src = "events | MATCH FIRST SEQUENCE(signup)";
+        let stmt = parse_stmt(src);
+        match &stages_of(&stmt)[0] {
+            PipelineStage::Match { span, .. } => {
+                let match_start = src.find("MATCH").unwrap();
+                assert_eq!(span.start, match_start);
+                // Span must end at or after the closing `)`.
+                let rparen = src.rfind(')').unwrap();
+                assert!(span.end > match_start);
+                assert_eq!(span.end, rparen + 1);
+            }
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_span_extends_through_modifier_when_present() {
+        // When WITHIN is present the span should extend past the sequence `)`.
+        let src = "events | MATCH FIRST SEQUENCE(signup) WITHIN 7d";
+        let stmt = parse_stmt(src);
+        match &stages_of(&stmt)[0] {
+            PipelineStage::Match { span, .. } => {
+                // Span must end at end of `7d`, not at `)` of SEQUENCE.
+                let rparen = src.rfind(')').unwrap();
+                assert!(
+                    span.end > rparen + 1,
+                    "span.end ({}) should extend past `)` at {}",
+                    span.end,
+                    rparen + 1
+                );
+            }
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_in_multi_stage_pipeline() {
+        // MATCH followed by STATS — common Wave 3 pipeline shape.
+        let stmt =
+            parse_stmt("events | MATCH FIRST SEQUENCE(signup THEN purchase) | STATS n = COUNT(*)");
+        let stages = stages_of(&stmt);
+        assert_eq!(stages.len(), 2);
+        assert!(matches!(stages[0], PipelineStage::Match { .. }));
+        assert!(matches!(stages[1], PipelineStage::Stats { .. }));
+    }
+
+    #[test]
+    fn match_step_name_is_parsed() {
+        // Named step: `myname: event_type`.
+        let stmt = parse_stmt("events | MATCH FIRST SEQUENCE(s: signup THEN p: purchase)");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.steps.len(), 2);
+        assert_eq!(pat.steps[0].name.as_ref().unwrap().text, "s");
+        assert_eq!(pat.steps[1].name.as_ref().unwrap().text, "p");
+    }
+
+    #[test]
+    fn match_arrow_separator_is_equivalent_to_then() {
+        // `->` is an alias for `THEN` in step separators (pattern-grammar.md §3.4).
+        let stmt_then = parse_stmt("events | MATCH FIRST SEQUENCE(a THEN b)");
+        let stmt_arrow = parse_stmt("events | MATCH FIRST SEQUENCE(a -> b)");
+        let pat_then = match_pattern_of(stages_of(&stmt_then));
+        let pat_arrow = match_pattern_of(stages_of(&stmt_arrow));
+        assert_eq!(pat_then.steps.len(), pat_arrow.steps.len());
+        assert_eq!(pat_then.mode, pat_arrow.mode);
+    }
+
+    #[test]
+    fn match_with_brackets_modifier() {
+        let stmt = parse_stmt("events | MATCH FIRST SEQUENCE(signup) BRACKETS [1d, 7d, 30d]");
+        let pat = match_pattern_of(stages_of(&stmt));
+        let b = pat.brackets.as_ref().expect("brackets should be Some");
+        assert_eq!(b.durations.len(), 3);
+        assert!(!b.cumulative);
+        assert!(pat.window.is_none());
     }
 }
