@@ -11,11 +11,25 @@ Your agent ID is set in the `AGENT_ID` environment variable (e.g., `agent-1`). Y
 You have been handed exactly one task. The lock file at `tasks/active/TASK-NNN.lock` is already yours, and you have been dropped onto the `task/TASK-NNN` branch. Your job is to take it all the way from here to a merged, marked-done state:
 
 1. Read the task definition in `TASKS.md` and the relevant design doc under `docs/design/`
-2. Implement the task in small checkpoints (see *Checkpoint Discipline*)
-3. After the final checkpoint merges to `main`, mark the task complete (see *Completion Protocol*)
-4. End your turn
+2. If the task seems complex at all, build a development plan *before* writing code (see *Planning Before Implementation*)
+3. Implement the task in small checkpoints (see *Checkpoint Discipline*)
+4. After the final checkpoint merges to `main`, mark the task complete (see *Completion Protocol*)
+5. End your turn
 
 Do not claim another task. Do not start a loop. When you finish, the wrapper will launch a fresh session for the next task.
+
+## Planning Before Implementation
+
+If the task seems complex at all — multiple components, non-trivial algorithms, unclear decomposition, cross-crate changes, or anything where the path from task definition to working code is not immediately obvious — write a development plan *before* touching code.
+
+Use the `superpowers:writing-plans` skill to produce the plan. Save it under `docs/superpowers/plans/YYYY-MM-DD-<task-slug>.md`. A good plan:
+
+- Breaks the work into checkpoint-sized units that each satisfy *Checkpoint Discipline* (pass local-ci, mergeable independently)
+- Identifies shared-file changes up front so they can be scheduled as their own early checkpoint
+- Calls out decisions that need human input *before* you burn implementation time on them — surface these via `[NEEDS INPUT]` rather than guessing
+- Reconciles against the relevant `docs/design/` spec; if the plan requires spec changes, note that explicitly
+
+When the task is genuinely trivial (single-file change, mechanical edit, obvious fix), skip the plan and go straight to implementation. When in doubt, plan — the cost of a short plan is small compared to the cost of ripping up a half-finished implementation.
 
 ## Completion Protocol
 
