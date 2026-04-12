@@ -754,19 +754,274 @@ fn immediately_reanchors_after_intervening_relevant_event() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Variable bindings ($var)
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// NOTE: Variable binding syntax (`category = $cat`) in MATCH step predicates
-// is not yet fully supported through the end-to-end pipeline. The planner's
-// TypedExpr::from_ast type-checks step predicates against the input schema
-// (the raw table columns), and `$var` references are not in the input schema
-// at that point — they exist only in the MATCH output schema. The pattern
-// compiler (TASK-311) and the operator-level tests validate binding semantics
-// at the operator level. Full E2E binding tests will land when the planner's
-// step-predicate type-checking is extended to recognize `$var` references
-// (tracked as a follow-up).
-//
-// The operator-level binding tests in crates/bqlite-operators/src/matcher/
-// and tests/tests/prop_bindings.rs validate the binding semantics thoroughly.
+
+/// Create a table with a `plan` column for variable binding tests.
+const CREATE_EVENTS_WITH_PLAN: &str = "\
+    CREATE TABLE events (\
+        user_id STRING NOT NULL ENTITY KEY, \
+        ts TIMESTAMP NOT NULL EVENT TIME, \
+        event_type STRING NOT NULL EVENT TYPE, \
+        plan STRING, \
+        category STRING\
+    )";
+
+fn setup_events_with_plan(db: &TempDb) -> (Database, Engine) {
+    let mut database = Database::create(db.path()).expect("Database::create");
+    let engine = Engine::new();
+    engine
+        .query(CREATE_EVENTS_WITH_PLAN, &mut database)
+        .expect("CREATE TABLE events");
+    (database, engine)
+}
+
+/// Collect string column values from a result set.
+fn string_column_values(result: &ExecutionResult, col_name: &str) -> Vec<String> {
+    let mut vals = Vec::new();
+    for batch in &result.rows {
+        let col = batch
+            .column_by_name(col_name)
+            .unwrap_or_else(|| panic!("column `{col_name}` not found"));
+        let arr = col
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap_or_else(|| panic!("column `{col_name}` is not StringViewArray"));
+        for i in 0..arr.len() {
+            vals.push(arr.value(i).to_string());
+        }
+    }
+    vals
+}
+
+#[test]
+fn single_variable_binding_filters_by_plan() {
+    // signup(plan=free) THEN purchase(plan=free) → track $plan=free matches.
+    // signup(plan=pro) THEN purchase(plan=pro) → track $plan=pro matches.
+    // Cross-plan (signup free, purchase pro) does NOT match.
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup', 'free', NULL), \
+         ('u1', 200, 'purchase', 'free', NULL), \
+         ('u2', 100, 'signup', 'pro', NULL), \
+         ('u2', 200, 'purchase', 'free', NULL)",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(\
+             signup WHERE plan = $plan \
+             THEN purchase WHERE plan = $plan\
+         )",
+    );
+    // u1 matches (free→free), u2 does NOT (pro→free is a cross-plan mismatch).
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(entity_ids_sorted(&result), vec!["u1"]);
+    // Output should include the $plan binding column.
+    assert_eq!(string_column_values(&result, "$plan"), vec!["free"]);
+}
+
+#[test]
+fn single_binding_commuted_form() {
+    // Test `$plan = plan` (variable on the left side).
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup', 'free', NULL), \
+         ('u1', 200, 'purchase', 'free', NULL)",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(\
+             signup WHERE $plan = plan \
+             THEN purchase WHERE $plan = plan\
+         )",
+    );
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(string_column_values(&result, "$plan"), vec!["free"]);
+}
+
+#[test]
+fn single_binding_multiple_entities_different_plans() {
+    // Multiple entities with different plan values.
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup', 'free', NULL), \
+         ('u1', 200, 'purchase', 'free', NULL), \
+         ('u2', 100, 'signup', 'pro', NULL), \
+         ('u2', 200, 'purchase', 'pro', NULL), \
+         ('u3', 100, 'signup', 'enterprise', NULL), \
+         ('u3', 200, 'purchase', 'starter', NULL)",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(\
+             signup WHERE plan = $plan \
+             THEN purchase WHERE plan = $plan\
+         )",
+    );
+    // u1 matches (free→free), u2 matches (pro→pro), u3 does NOT (enterprise→starter).
+    assert_eq!(total_rows(&result), 2);
+    let ids = entity_ids_sorted(&result);
+    assert_eq!(ids, vec!["u1", "u2"]);
+}
+
+#[test]
+fn multi_variable_binding() {
+    // Two variables: plan = $plan AND category = $cat.
+    // Both must match across steps.
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup', 'free', 'web'), \
+         ('u1', 200, 'purchase', 'free', 'web'), \
+         ('u2', 100, 'signup', 'free', 'web'), \
+         ('u2', 200, 'purchase', 'free', 'mobile')",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(\
+             signup WHERE plan = $plan AND category = $cat \
+             THEN purchase WHERE plan = $plan AND category = $cat\
+         )",
+    );
+    // u1 matches (both plan and category match), u2 does NOT (category differs).
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(entity_ids_sorted(&result), vec!["u1"]);
+    assert_eq!(string_column_values(&result, "$plan"), vec!["free"]);
+    assert_eq!(string_column_values(&result, "$cat"), vec!["web"]);
+}
+
+#[test]
+fn null_binding_short_circuits() {
+    // When the binding column is NULL, the step predicate evaluates to NULL
+    // under three-valued logic and the step does NOT match.
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup', NULL, NULL), \
+         ('u1', 200, 'purchase', 'free', NULL)",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(\
+             signup WHERE plan = $plan \
+             THEN purchase WHERE plan = $plan\
+         )",
+    );
+    // signup has plan=NULL → no binding created → no match.
+    assert_eq!(total_rows(&result), 0);
+}
+
+#[test]
+fn match_all_with_variable_rebinding() {
+    // MATCH ALL: after first match completes, the track resets and can
+    // match again with the same or different binding values.
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup', 'free', NULL), \
+         ('u1', 200, 'purchase', 'free', NULL), \
+         ('u1', 300, 'signup', 'free', NULL), \
+         ('u1', 400, 'purchase', 'free', NULL)",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH ALL SEQUENCE(\
+             signup WHERE plan = $plan \
+             THEN purchase WHERE plan = $plan\
+         )",
+    );
+    // Two matches for the $plan=free track: (100,200) and (300,400).
+    assert_eq!(total_rows(&result), 2);
+}
+
+#[test]
+fn mixed_binding_and_negation() {
+    // Variable binding combined with WITHOUT negation.
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup', 'free', NULL), \
+         ('u1', 200, 'purchase', 'free', NULL), \
+         ('u2', 100, 'signup', 'pro', NULL), \
+         ('u2', 150, 'churn', NULL, NULL), \
+         ('u2', 200, 'purchase', 'pro', NULL)",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(\
+             signup WHERE plan = $plan \
+             WITHOUT churn \
+             THEN purchase WHERE plan = $plan\
+         )",
+    );
+    // u1 matches (no churn), u2 killed by churn poison transition.
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(entity_ids_sorted(&result), vec!["u1"]);
+    assert_eq!(string_column_values(&result, "$plan"), vec!["free"]);
+}
+
+#[test]
+fn variable_in_non_equality_context_is_rejected() {
+    // $var must only appear in `column = $var` or `$var = column`.
+    // Using $plan in a non-equality context (e.g., $plan > 'free') is an error.
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES ('u1', 100, 'signup', 'free', NULL)",
+    );
+
+    let err = engine
+        .query(
+            "events | MATCH FIRST SEQUENCE(\
+                 signup WHERE $plan > plan \
+                 THEN purchase WHERE plan = $plan\
+             )",
+            &mut database,
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("equality"),
+        "error should mention equality constraint: {err}"
+    );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Entity sub-batch streaming (oversized entities, multiple sub-batches)

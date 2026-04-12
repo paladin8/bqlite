@@ -930,6 +930,11 @@ fn lower_match(
         )));
     }
 
+    // Validate that all $var references in step predicates appear only in
+    // equality comparisons. This catches misuse (e.g., `$var > 100`) at
+    // logical lowering, before physical planning.
+    crate::compile::validate_variable_usage(&pattern)?;
+
     // Pre-collect variable binding columns from step predicates BEFORE
     // type-checking. Step predicates may reference `$var` variables that
     // are not in the input schema — they are created by the MATCH operator.
@@ -1140,7 +1145,9 @@ fn lower_match(
 /// with a default `String` type. This ensures variables compared against
 /// typed columns get the correct type regardless of expression tree order.
 ///
-/// Returns columns named `$<name>` in deterministic (sorted) order.
+/// Returns columns named `$<name>` in first-occurrence order matching
+/// the pattern compiler's `resolve_variable_bindings` so that binding key
+/// indices align with output schema column positions.
 ///
 /// Full variable type inference and validation is deferred to the pattern
 /// compiler (TASK-311's `compile_pattern`).
@@ -1156,17 +1163,17 @@ fn collect_variable_columns(
         }
     }
 
-    // Pass 2: collect all variable names, using refined types when available.
-    let mut seen_vars: HashSet<String> = HashSet::new();
+    // Pass 2: collect all variable names in first-occurrence order.
+    // The order must match the pattern compiler's `resolve_variable_bindings`
+    // so that binding key indices align with output schema column positions.
+    let mut seen_set: HashSet<String> = HashSet::new();
+    let mut var_list: Vec<String> = Vec::new();
     for step in &pattern.steps {
         if let Some(pred) = &step.predicate {
-            collect_all_variables(&pred.node, &mut seen_vars);
+            collect_all_variables_ordered(&pred.node, &mut seen_set, &mut var_list);
         }
     }
 
-    // Emit columns in deterministic order.
-    let mut var_list: Vec<String> = seen_vars.into_iter().collect();
-    var_list.sort();
     var_list
         .into_iter()
         .map(|var_name| {
@@ -1259,49 +1266,57 @@ fn collect_refined_variable_types(
     }
 }
 
-/// Pass 2: Collect all `$var` names from an expression tree.
-fn collect_all_variables(expr: &Expr, seen: &mut HashSet<String>) {
+/// Pass 2: Collect all `$var` names from an expression tree in first-occurrence
+/// order. Uses `seen` for dedup and `ordered` for output order.
+fn collect_all_variables_ordered(
+    expr: &Expr,
+    seen: &mut HashSet<String>,
+    ordered: &mut Vec<String>,
+) {
     match expr {
         Expr::Variable(name) => {
-            seen.insert(format!("${}", name.text));
+            let key = format!("${}", name.text);
+            if seen.insert(key.clone()) {
+                ordered.push(key);
+            }
         }
         Expr::Compare { left, right, .. } | Expr::Binary { left, right, .. } => {
-            collect_all_variables(&left.node, seen);
-            collect_all_variables(&right.node, seen);
+            collect_all_variables_ordered(&left.node, seen, ordered);
+            collect_all_variables_ordered(&right.node, seen, ordered);
         }
         Expr::And(exprs) | Expr::Or(exprs) => {
             for e in exprs {
-                collect_all_variables(&e.node, seen);
+                collect_all_variables_ordered(&e.node, seen, ordered);
             }
         }
         Expr::Not(inner) | Expr::Paren(inner) => {
-            collect_all_variables(&inner.node, seen);
+            collect_all_variables_ordered(&inner.node, seen, ordered);
         }
         Expr::Unary { operand, .. } => {
-            collect_all_variables(&operand.node, seen);
+            collect_all_variables_ordered(&operand.node, seen, ordered);
         }
         Expr::IsNull { expr: inner, .. } | Expr::Cast { expr: inner, .. } => {
-            collect_all_variables(&inner.node, seen);
+            collect_all_variables_ordered(&inner.node, seen, ordered);
         }
         Expr::FunctionCall { args, .. } => {
             for arg in args {
-                collect_all_variables(&arg.node, seen);
+                collect_all_variables_ordered(&arg.node, seen, ordered);
             }
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            collect_all_variables(&expr.node, seen);
-            collect_all_variables(&low.node, seen);
-            collect_all_variables(&high.node, seen);
+            collect_all_variables_ordered(&expr.node, seen, ordered);
+            collect_all_variables_ordered(&low.node, seen, ordered);
+            collect_all_variables_ordered(&high.node, seen, ordered);
         }
         Expr::In { lhs, rhs, .. } => {
             for e in lhs {
-                collect_all_variables(&e.node, seen);
+                collect_all_variables_ordered(&e.node, seen, ordered);
             }
             if let bqlite_ast::expr::InRhs::List(exprs) = rhs {
                 for e in exprs {
-                    collect_all_variables(&e.node, seen);
+                    collect_all_variables_ordered(&e.node, seen, ordered);
                 }
             }
         }
@@ -1309,11 +1324,11 @@ fn collect_all_variables(expr: &Expr, seen: &mut HashSet<String>) {
             arms, else_expr, ..
         } => {
             for arm in arms {
-                collect_all_variables(&arm.condition.node, seen);
-                collect_all_variables(&arm.value.node, seen);
+                collect_all_variables_ordered(&arm.condition.node, seen, ordered);
+                collect_all_variables_ordered(&arm.value.node, seen, ordered);
             }
             if let Some(else_e) = else_expr {
-                collect_all_variables(&else_e.node, seen);
+                collect_all_variables_ordered(&else_e.node, seen, ordered);
             }
         }
         _ => {}

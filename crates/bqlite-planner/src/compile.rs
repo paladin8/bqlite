@@ -277,6 +277,26 @@ pub fn compile_pattern(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Variable binding validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Validate that all `$var` references in a pattern's step predicates appear
+/// only in equality comparisons (`column = $var` or `$var = column`).
+///
+/// Returns an error if a variable is used in a non-equality context (e.g.,
+/// `$var > 100`). Called during logical lowering so the error surfaces before
+/// physical planning.
+pub fn validate_variable_usage(pattern: &MatchPattern) -> Result<()> {
+    let mut comparisons = Vec::new();
+    for (step_idx, step) in pattern.steps.iter().enumerate() {
+        if let Some(ref pred) = step.predicate {
+            collect_variable_comparisons(&pred.node, step_idx as u8, &mut comparisons)?;
+        }
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Variable binding resolution
 // ─────────────────────────────────────────────────────────────────────────────
 

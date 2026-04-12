@@ -462,6 +462,7 @@ impl StepCounterSimulator {
                 state.partials.push(PartialMatch {
                     anchor_ts: track.anchor_ts,
                     step_reached: track.max_step_reached,
+                    bindings: Vec::new(),
                 });
             }
         }
@@ -532,6 +533,7 @@ impl StepCounterSimulator {
                             state.partials.push(PartialMatch {
                                 anchor_ts,
                                 step_reached,
+                                bindings: Vec::new(),
                             });
                         }
                         to_remove.push(track_idx);
@@ -550,6 +552,7 @@ impl StepCounterSimulator {
                     state.partials.push(PartialMatch {
                         anchor_ts,
                         step_reached,
+                        bindings: Vec::new(),
                     });
                 }
                 to_remove.push(track_idx);
@@ -619,6 +622,7 @@ impl StepCounterSimulator {
         state.completions.push(MatchCompletion {
             anchor_ts: state.tracks[track_idx].anchor_ts,
             final_ts: event_ts,
+            bindings: Vec::new(),
         });
         state.tracks[track_idx].match_count += 1;
 

@@ -12,12 +12,16 @@
 
 use std::sync::Arc;
 
-use arrow::array::{new_null_array, ArrayRef, Int64Array, StringViewBuilder};
-use arrow::datatypes::DataType;
+use arrow::array::{
+    new_null_array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringViewBuilder,
+    TimestampNanosecondArray,
+};
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::OperatorSchema;
 
+use super::bindings::BindingValue;
 use super::nfa::{MatchCompletion, PartialMatch};
 
 /// Build an output `RecordBatch` from completions and partials.
@@ -48,15 +52,41 @@ pub fn build_output_batch(
     let arrow_schema = output_schema.to_arrow_schema();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());
 
-    for field in arrow_schema.fields() {
+    // Identify which variable binding columns exist in the schema. Variable
+    // binding columns are named `$<name>` and their values come from the
+    // `bindings` field on MatchCompletion/PartialMatch.
+    let var_col_indices: Vec<(usize, usize)> = arrow_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.name().starts_with('$'))
+        .enumerate()
+        .map(|(binding_idx, (field_idx, _))| (field_idx, binding_idx))
+        .collect();
+
+    for (field_idx, field) in arrow_schema.fields().iter().enumerate() {
         let col = match field.name().as_str() {
             "entity_id" => build_entity_id_column(total_rows, field.data_type()),
             "match_duration" => build_match_duration_column(completions, partials, emit_all),
             "step_reached" => build_step_reached_column(completions, partials, emit_all, num_steps),
+            name if name.starts_with('$') => {
+                // Variable binding column — extract binding values.
+                let binding_idx = var_col_indices
+                    .iter()
+                    .find(|(fi, _)| *fi == field_idx)
+                    .map(|(_, bi)| *bi)
+                    .unwrap();
+                build_binding_column(
+                    completions,
+                    partials,
+                    emit_all,
+                    binding_idx,
+                    field.data_type(),
+                )
+            }
             _ => {
-                // Unimplemented column (match_events, step properties,
-                // variable bindings) — emit typed NULL array matching the
-                // schema field's data type.
+                // Unimplemented column (match_events, step properties) —
+                // emit typed NULL array matching the schema field's data type.
                 build_null_column(total_rows, field.data_type())
             }
         };
@@ -144,6 +174,94 @@ fn build_step_reached_column(
     Arc::new(builder.finish())
 }
 
+/// Build a variable binding column from completion/partial binding values.
+///
+/// Each `MatchCompletion` and `PartialMatch` carries a `bindings: Vec<BindingValue>`.
+/// `binding_idx` selects which binding to extract. The Arrow data type
+/// is determined by the schema field.
+fn build_binding_column(
+    completions: &[MatchCompletion],
+    partials: &[PartialMatch],
+    emit_all: bool,
+    binding_idx: usize,
+    data_type: &DataType,
+) -> ArrayRef {
+    let total = completions.len() + if emit_all { partials.len() } else { 0 };
+
+    // Collect all binding values in row order: completions first, then partials.
+    let iter_completions = completions.iter().map(|c| c.bindings.get(binding_idx));
+    let iter_partials = if emit_all {
+        Some(partials.iter().map(|p| p.bindings.get(binding_idx)))
+    } else {
+        None
+    };
+
+    match data_type {
+        DataType::Utf8View => {
+            let mut builder = StringViewBuilder::with_capacity(total);
+            for bv in iter_completions.chain(iter_partials.into_iter().flatten()) {
+                match bv {
+                    Some(BindingValue::String(s)) => builder.append_value(s.as_ref()),
+                    _ => builder.append_value(""),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Int64 => {
+            let mut builder = Int64Array::builder(total);
+            for bv in iter_completions.chain(iter_partials.into_iter().flatten()) {
+                match bv {
+                    Some(BindingValue::Int(v)) => builder.append_value(*v),
+                    _ => builder.append_value(0),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Float64 => {
+            let mut builder = Float64Array::builder(total);
+            for bv in iter_completions.chain(iter_partials.into_iter().flatten()) {
+                match bv {
+                    Some(BindingValue::Float(f)) => builder.append_value(f.0),
+                    _ => builder.append_value(0.0),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Boolean => {
+            let mut builder = BooleanArray::builder(total);
+            for bv in iter_completions.chain(iter_partials.into_iter().flatten()) {
+                match bv {
+                    Some(BindingValue::Bool(b)) => builder.append_value(*b),
+                    _ => builder.append_value(false),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let mut builder = TimestampNanosecondArray::builder(total);
+            for bv in iter_completions.chain(iter_partials.into_iter().flatten()) {
+                match bv {
+                    Some(BindingValue::Timestamp(t)) => builder.append_value(*t),
+                    _ => builder.append_value(0),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        _ => {
+            // Fallback for unknown data types — should not be reached
+            // for valid plans since the planner constrains binding types.
+            let mut builder = StringViewBuilder::with_capacity(total);
+            for bv in iter_completions.chain(iter_partials.into_iter().flatten()) {
+                match bv {
+                    Some(bv) => builder.append_value(format!("{bv:?}")),
+                    None => builder.append_value(""),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+    }
+}
+
 /// Build a typed NULL column for unimplemented output fields.
 ///
 /// Uses `new_null_array` to produce a null array matching the schema
@@ -215,10 +333,12 @@ mod tests {
             MatchCompletion {
                 anchor_ts: 100,
                 final_ts: 400,
+                bindings: Vec::new(),
             },
             MatchCompletion {
                 anchor_ts: 500,
                 final_ts: 900,
+                bindings: Vec::new(),
             },
         ];
         let batch = build_output_batch(&schema, &completions, &[], false, 2);
@@ -240,10 +360,12 @@ mod tests {
         let completions = vec![MatchCompletion {
             anchor_ts: 100,
             final_ts: 300,
+            bindings: Vec::new(),
         }];
         let partials = vec![PartialMatch {
             anchor_ts: 400,
             step_reached: 2, // 2 steps completed
+            bindings: Vec::new(),
         }];
         let batch = build_output_batch(&schema, &completions, &partials, true, 3);
         assert_eq!(batch.num_rows(), 2);
@@ -266,10 +388,12 @@ mod tests {
         let completions = vec![MatchCompletion {
             anchor_ts: 100,
             final_ts: 300,
+            bindings: Vec::new(),
         }];
         let partials = vec![PartialMatch {
             anchor_ts: 400,
             step_reached: 1,
+            bindings: Vec::new(),
         }];
         // emit_all = false: partials should be excluded.
         let batch = build_output_batch(&schema, &completions, &partials, false, 3);

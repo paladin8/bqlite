@@ -445,7 +445,7 @@ impl EntityBindingState {
         let mut result = Vec::new();
         for (key, &idx) in &self.track_index {
             for completion in self.tracks[idx].nfa_state.completions() {
-                result.push((key.clone(), *completion));
+                result.push((key.clone(), completion.clone()));
             }
         }
         result
@@ -456,7 +456,7 @@ impl EntityBindingState {
         let mut result = Vec::new();
         for (key, &idx) in &self.track_index {
             for partial in self.tracks[idx].nfa_state.partials() {
-                result.push((key.clone(), *partial));
+                result.push((key.clone(), partial.clone()));
             }
         }
         result

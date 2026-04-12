@@ -157,6 +157,7 @@ fn brute_force_with_binding(
                 MatchCompletion {
                     anchor_ts: *ts_a,
                     final_ts: *ts_b,
+                    bindings: Vec::new(),
                 },
             );
             break; // First match for this anchor+plan.
@@ -382,7 +383,7 @@ proptest! {
             prop_assert!(nfa_match.is_some(),
                 "Brute-force found match for plan={:?}: {:?} but NFA found none.\nEvents: {:?}\nWindow: {:?}",
                 plan, brute_match, events, window);
-            prop_assert_eq!(*nfa_match.unwrap(), *brute_match,
+            prop_assert_eq!(nfa_match.unwrap(), brute_match,
                 "Match mismatch for plan={:?}.\nNFA: {:?}\nBrute: {:?}\nEvents: {:?}\nWindow: {:?}",
                 plan, nfa_match.unwrap(), brute_match, events, window);
         }
@@ -442,7 +443,7 @@ proptest! {
 
             match (brute_match, nfa_match) {
                 (Some(b), Some((_, n))) => {
-                    prop_assert_eq!(*n, *b,
+                    prop_assert_eq!(n, b,
                         "Match mismatch for plan={:?}", plan);
                 }
                 (None, None) => {}

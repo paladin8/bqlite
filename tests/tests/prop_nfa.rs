@@ -177,6 +177,7 @@ fn brute_force_a_then_b(events: &[(&str, i64)], window: Option<i64>) -> Option<M
             return Some(MatchCompletion {
                 anchor_ts: *ts_a,
                 final_ts: *ts_b,
+                bindings: Vec::new(),
             });
         }
     }
@@ -220,6 +221,7 @@ fn brute_force_a_then_b_then_c(
                 return Some(MatchCompletion {
                     anchor_ts: *ts_a,
                     final_ts: *ts_c,
+                    bindings: Vec::new(),
                 });
             }
         }
@@ -267,6 +269,7 @@ fn brute_force_a_then_b_without_c(
                 return Some(MatchCompletion {
                     anchor_ts: *ts_a,
                     final_ts: *ts_b,
+                    bindings: Vec::new(),
                 });
             }
         }
@@ -325,12 +328,12 @@ proptest! {
         sim.process_batch(&mut state, &batch, "event_type", "ts");
 
         let brute = brute_force_a_then_b(&events, window);
-        let nfa_result = state.completions().first().copied();
+        let nfa_result = state.completions().first().cloned();
 
         // NFA and brute-force must produce the same result (both
         // find the first match with earliest anchor, or both find
         // no match).
-        prop_assert_eq!(nfa_result, brute,
+        prop_assert_eq!(nfa_result.clone(), brute.clone(),
             "NFA/brute-force mismatch.\nNFA: {:?}\nBrute: {:?}\nEvents: {:?}\nWindow: {:?}",
             nfa_result, brute, events, window);
     }
@@ -349,9 +352,9 @@ proptest! {
         sim.process_batch(&mut state, &batch, "event_type", "ts");
 
         let brute = brute_force_a_then_b_then_c(&events, window);
-        let nfa_result = state.completions().first().copied();
+        let nfa_result = state.completions().first().cloned();
 
-        prop_assert_eq!(nfa_result, brute,
+        prop_assert_eq!(nfa_result.clone(), brute.clone(),
             "NFA/brute-force mismatch.\nNFA: {:?}\nBrute: {:?}\nEvents: {:?}\nWindow: {:?}",
             nfa_result, brute, events, window);
     }
@@ -418,7 +421,7 @@ proptest! {
         sim.process_batch(&mut state, &batch, "event_type", "ts");
 
         let brute = brute_force_a_then_b_without_c(&events, window);
-        let nfa_result = state.completions().first().copied();
+        let nfa_result = state.completions().first().cloned();
 
         if brute.is_some() {
             prop_assert!(nfa_result.is_some(),

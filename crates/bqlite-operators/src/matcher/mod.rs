@@ -36,7 +36,7 @@ use bqlite_planner::physical::SequenceMatchPhysical;
 use crate::aggregate::Accumulator;
 use crate::operator::EntityOperator;
 
-use self::bindings::EntityBindingState;
+use self::bindings::{BindingValue, EntityBindingState};
 use self::nfa::{MatchCompletion, NfaSimulator, PartialMatch};
 use self::output::build_output_batch;
 use self::step_counter::StepCounterSimulator;
@@ -401,13 +401,16 @@ impl SequenceMatchOperator {
                 let mut partials = Vec::new();
                 let mut total_dropped: u64 = binding_state.dropped_track_count();
 
-                for (_key, completion) in binding_state.all_completions() {
+                for (key, mut completion) in binding_state.all_completions() {
+                    // Populate binding values from the track's binding key.
+                    completion.bindings = key.to_vec();
                     completions.push(completion);
                 }
 
                 // Collect already-emitted partials (from window expiry).
-                for (_key, partial) in binding_state.all_partials() {
+                for (key, mut partial) in binding_state.all_partials() {
                     if self.emit_all {
+                        partial.bindings = key.to_vec();
                         partials.push(partial);
                     }
                 }
@@ -419,12 +422,23 @@ impl SequenceMatchOperator {
                 for track in binding_state.tracks_mut() {
                     total_dropped += track.nfa_state.dropped_count();
                     if self.emit_all {
+                        // Extract binding values from this track before
+                        // draining its NFA state.
+                        // Use a default for unbound variables (late-bind
+                        // steps not yet reached) to keep positional alignment.
+                        let track_bindings: Vec<_> = track
+                            .bound_values
+                            .iter()
+                            .map(|v| v.clone().unwrap_or(BindingValue::String("".into())))
+                            .collect();
                         let final_state = sim.finish_entity(std::mem::replace(
                             &mut track.nfa_state,
                             nfa::EntityNfaState::new(0),
                         ));
                         for partial in final_state.partials() {
-                            partials.push(*partial);
+                            let mut p = partial.clone();
+                            p.bindings = track_bindings.clone();
+                            partials.push(p);
                         }
                     }
                 }

@@ -38,6 +38,7 @@ use arrow::record_batch::RecordBatch;
 
 use bqlite_planner::compile::{CompiledNfa, NfaState, Transition};
 
+use super::bindings::BindingValue;
 use crate::eval;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,12 +152,15 @@ impl StateCandidates {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Result from completing a match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchCompletion {
     /// The anchor timestamp of the completed match.
     pub anchor_ts: i64,
     /// The timestamp of the final step.
     pub final_ts: i64,
+    /// Binding values for this completion's track. Empty when the pattern
+    /// has no variable bindings.
+    pub bindings: Vec<BindingValue>,
 }
 
 /// Information about an incomplete candidate emitted under EMIT ALL.
@@ -164,12 +168,15 @@ pub struct MatchCompletion {
 /// `step_reached` is **0-indexed** (matches `CompiledNfa::state_to_step`).
 /// The operator integration layer (TASK-321) adds 1 when producing the
 /// user-facing output column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartialMatch {
     /// The anchor timestamp.
     pub anchor_ts: i64,
     /// The farthest logical step reached (0-indexed).
     pub step_reached: u8,
+    /// Binding values for this partial's track. Empty when the pattern
+    /// has no variable bindings.
+    pub bindings: Vec<BindingValue>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -301,6 +308,7 @@ impl EntityNfaState {
                 self.partials.push(PartialMatch {
                     anchor_ts: entry.anchor_ts,
                     step_reached: step,
+                    bindings: Vec::new(),
                 });
             }
         }
@@ -582,6 +590,7 @@ impl NfaSimulator {
                     state.partials.push(PartialMatch {
                         anchor_ts: entry.anchor_ts,
                         step_reached: step,
+                        bindings: Vec::new(),
                     });
                 } else {
                     break;
@@ -604,6 +613,7 @@ impl NfaSimulator {
                 state.partials.push(PartialMatch {
                     anchor_ts: entry.anchor_ts,
                     step_reached: step,
+                    bindings: Vec::new(),
                 });
             }
         } else {
@@ -621,6 +631,7 @@ impl NfaSimulator {
                 let completion = MatchCompletion {
                     anchor_ts: entry.anchor_ts,
                     final_ts: entry.last_step_ts,
+                    bindings: Vec::new(),
                 };
                 state.completions.push(completion);
 
@@ -755,6 +766,7 @@ impl NfaSimulator {
                             state.partials.push(PartialMatch {
                                 anchor_ts: entry.anchor_ts,
                                 step_reached: step,
+                                bindings: Vec::new(),
                             });
                         } else {
                             break;
@@ -774,6 +786,7 @@ impl NfaSimulator {
                         state.partials.push(PartialMatch {
                             anchor_ts: entry.anchor_ts,
                             step_reached: step,
+                            bindings: Vec::new(),
                         });
                     }
                 } else {
@@ -868,6 +881,7 @@ impl NfaSimulator {
                 let completion = MatchCompletion {
                     anchor_ts: entry.anchor_ts,
                     final_ts: entry.last_step_ts,
+                    bindings: Vec::new(),
                 };
                 state.completions.push(completion);
 
