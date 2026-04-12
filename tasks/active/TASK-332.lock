@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-332",
+  "claimed_at": "2026-04-12T17:55:32Z",
+  "branch": "task/TASK-332",
+  "description": "CompactString evaluation for matcher hot paths"
+}
