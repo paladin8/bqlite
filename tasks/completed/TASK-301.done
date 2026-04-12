@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-301",
   "claimed_at": "2026-04-12T06:52:34Z",
+  "completed_at": "2026-04-12T07:35:00Z",
   "branch": "task/TASK-301",
   "description": "MATCH operator architecture"
 }
