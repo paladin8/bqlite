@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-311",
+  "claimed_at": "2026-04-12T07:20:29Z",
+  "branch": "task/TASK-311",
+  "description": "Pattern compiler: SequencePattern \u2192 CompiledNfa"
+}
