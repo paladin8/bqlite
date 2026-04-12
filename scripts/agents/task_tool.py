@@ -108,21 +108,40 @@ def sync_main() -> None:
     git("pull", "--ff-only", "origin", "main", check=True)
 
 
-def cleanup_after_failed_push() -> None:
-    """Recover from a push race by discarding the in-flight local commit and
-    resyncing the worktree to match origin/main exactly.
+def reset_to_origin() -> None:
+    """Force the worktree to match origin/main exactly, discarding any
+    uncommitted changes, untracked files, in-progress merges/rebases, and
+    local-only commits.
 
-    The old implementation did `reset --mixed HEAD~1` + `restore tasks/` +
-    `pull --ff-only origin main`, which could legitimately fail (local out of
-    sync, transient network blip, non-ff because an earlier iteration left
-    an extra commit behind) and bubble all the way up through claim_next,
-    killing the wrapper. At this point we do not care about any local
-    commits beyond what is on origin — we only called this because our push
-    failed — so a hard reset to origin/main is both simpler and strictly
-    more robust than trying to fast-forward.
+    Called by agent_wrapper.run_fleet_loop at the top of every iteration so
+    a partial task from a prior iteration cannot leave scraps in the
+    worktree that would trip require_clean_worktree() on the next claim.
+    Also used by cleanup_after_failed_push on the commit-race path. Safe to
+    run on a clean tree — it's a no-op in practice.
     """
     git("fetch", "origin", "main", check=True)
+    # Abort any merge/rebase/am left hanging by a crashed process.
+    git("merge", "--abort", check=False)
+    git("rebase", "--abort", check=False)
+    git("am", "--abort", check=False)
+    # Drop uncommitted changes on whatever branch we are currently on, then
+    # drop untracked files and directories so the tree is fully clean.
+    git("reset", "--hard", "HEAD", check=True)
+    git("clean", "-fd", check=True)
+    # Switch to main at origin/main (creates main if it does not exist, or
+    # resets it if it does). -B handles both cases idempotently.
+    git("checkout", "-B", "main", "origin/main", check=True)
+    # Belt-and-suspenders: make sure main matches origin/main exactly.
     git("reset", "--hard", "origin/main", check=True)
+
+
+def cleanup_after_failed_push() -> None:
+    """Recover from a push race by resyncing the worktree to origin/main.
+
+    Thin wrapper around reset_to_origin(); kept as a named entry point so
+    the commit-race path in commit_and_push reads clearly.
+    """
+    reset_to_origin()
 
 
 def commit_and_push(commit_message: str) -> bool:
@@ -471,8 +490,12 @@ def release_lock(task_id: str, agent_id: str, note: str) -> bool:
     stale-lock timer. Returns True if the release was pushed successfully,
     False if the push lost a race (caller should re-sync and decide what to
     do next).
+
+    Uses reset_to_origin rather than sync_main so an incomplete claude run
+    that left uncommitted scraps on the task branch cannot trip
+    require_clean_worktree() before we get a chance to release the lock.
     """
-    sync_main()
+    reset_to_origin()
     lock_path = task_lock_path(task_id)
     if not lock_path.exists():
         return True

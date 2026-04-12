@@ -412,6 +412,67 @@ class TaskToolIntegrationTests(unittest.TestCase):
         self.assertIn("TASK-102=lock_held", result.stdout)
         self.assertIn("TASK-103=missing", result.stdout)  # local-only file ignored
 
+    def test_release_lock_works_when_worktree_is_dirty(self) -> None:
+        """release_lock must not crash when the worktree has uncommitted
+        scraps — e.g. a claude run that exited mid-task. Without the switch
+        from sync_main to reset_to_origin, the release path would trip
+        require_clean_worktree() before it could remove the lock file."""
+        repo = self.make_repo(
+            """
+            ### TASK-101: [EASY][IMPL] Releasable task
+            **Depends on**: none
+            """
+        )
+        claim = self.run_task_tool(
+            repo,
+            "claim-next",
+            "--wave",
+            "1",
+            "--difficulty",
+            "EASY",
+            "--agent-id",
+            "agent-1",
+        )
+        self.assertEqual(claim["status"], "claimed")
+
+        # Simulate a crashed claude run: uncommitted tracked change +
+        # untracked file + still on the task branch.
+        run_git(repo, "checkout", "task/TASK-101")
+        (repo / "stale_work.txt").write_text("half-done edit\n")
+        (repo / "uncommitted.rs").write_text("fn wip() {}\n")
+        status = run_git(repo, "status", "--porcelain").stdout.strip()
+        self.assertNotEqual(status, "", "expected a dirty worktree for the test setup")
+
+        env = os.environ.copy()
+        env["BQLITE_TASK_TOOL_ROOT"] = str(repo)
+        script = (
+            f"import sys; sys.path.insert(0, {str(SCRIPT_PATH.parent)!r}); "
+            "import task_tool; "
+            "ok = task_tool.release_lock('TASK-101', 'agent-1', 'claude crashed'); "
+            "print('release_ok=' + str(ok))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            self.fail(
+                f"release_lock failed against a dirty worktree "
+                f"({result.returncode}):\nstdout:\n{result.stdout}\n\n"
+                f"stderr:\n{result.stderr}"
+            )
+        self.assertIn("release_ok=True", result.stdout)
+
+        run_git(repo, "checkout", "main")
+        run_git(repo, "pull", "--ff-only", "origin", "main")
+        lock_path = repo / "tasks" / "active" / "TASK-101.lock"
+        self.assertFalse(lock_path.exists())
+        log = run_git(repo, "log", "--format=%s", "-3", "main").stdout
+        self.assertIn("TASK-101: released by agent-1 (claude crashed)", log)
+
     def test_release_lock_removes_lock_and_pushes(self) -> None:
         repo = self.make_repo(
             """

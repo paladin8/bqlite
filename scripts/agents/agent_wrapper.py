@@ -553,7 +553,16 @@ def run_fleet_loop(
     execute_task: Callable[..., str],
     release_lock: Callable[..., bool],
     sleep: Callable[[float], None],
+    reset_worktree: Optional[Callable[[], None]] = None,
 ) -> str:
+    """Run the autonomous fleet loop until quota/wave-drain/failure-cap.
+
+    `reset_worktree` is called at the top of every loop iteration before
+    claiming a task, to wipe any scraps from a prior iteration so dirty
+    state cannot accumulate across tasks and trip require_clean_worktree().
+    Production passes task_tool.reset_to_origin; unit tests default to
+    None (no-op) so they can drive the loop against their fake git state.
+    """
     completed = 0
     consecutive_failures = 0
     backoff_idx = 0
@@ -577,14 +586,22 @@ def run_fleet_loop(
             return "too_many_failures"
 
         try:
+            if reset_worktree is not None:
+                reset_worktree()
             # difficulty=None: the wrapper no longer belongs to a pool —
             # it claims whatever tagged, dep-satisfied task is next in the
             # wave and selects the claude model based on the task's own tag.
+            #
+            # no_sync=True: reset_worktree above already fetched origin/main
+            # and forced the worktree to match it, so claim_next's internal
+            # sync_main would just re-fetch for no gain. task_tool's own
+            # commit-race cleanup still re-fetches on retry iterations
+            # inside claim_next, so this does not widen the race window.
             result = claim_next(
                 wave=config.wave,
                 difficulty=None,
                 agent_id=agent_name,
-                no_sync=False,
+                no_sync=True,
                 max_attempts=5,
             )
             status = result.get("status")
@@ -771,6 +788,7 @@ def main(argv: list[str]) -> int:
             execute_task=execute_task,
             release_lock=task_tool.release_lock,
             sleep=_sleep_with_tty_drain,
+            reset_worktree=task_tool.reset_to_origin,
         )
     except KeyboardInterrupt:
         print(f"\n=== {agent_name}: interrupted. Exiting. ===", flush=True)

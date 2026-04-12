@@ -590,6 +590,42 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
         self.assertEqual(call_count[0], 2)  # retried once after the error
         self.assertEqual(sleeps, [60])  # 60s error backoff, no no_claimable ladder
 
+    def test_run_fleet_loop_calls_reset_worktree_before_each_claim(self) -> None:
+        """The wrapper must wipe worktree state at the top of every
+        iteration so dirty scraps from a prior task can't trip
+        require_clean_worktree() on the next claim."""
+        config = agent_wrapper.parse_args(["1", "2"])
+        test_self = self
+        claim_calls = iter([
+            {"status": "claimed", "task": test_self._make_task("TASK-101")},
+            {"status": "claimed", "task": test_self._make_task("TASK-102")},
+        ])
+        reset_calls: list[int] = []
+        claim_count = [0]
+
+        def fake_reset() -> None:
+            # Snapshot the claim count at the moment of the reset so we
+            # can assert reset happens BEFORE each claim, not after.
+            reset_calls.append(claim_count[0])
+
+        def fake_claim_next(**kwargs) -> dict:
+            claim_count[0] += 1
+            return next(claim_calls)
+
+        outcome = agent_wrapper.run_fleet_loop(
+            config,
+            agent_name="agent-1",
+            claim_next=fake_claim_next,
+            execute_task=lambda *a, **k: "completed",
+            release_lock=lambda *a, **k: True,
+            sleep=lambda _: None,
+            reset_worktree=fake_reset,
+        )
+        self.assertEqual(outcome, "batch_complete")
+        # Two reset calls, each recorded BEFORE its matching claim.
+        self.assertEqual(reset_calls, [0, 1])
+        self.assertEqual(claim_count[0], 2)
+
     def test_run_fleet_loop_recovers_from_task_tool_error(self) -> None:
         """A TaskToolError from task_tool (e.g. dirty worktree rejected by
         require_clean_worktree) must not crash the wrapper — it should log,
