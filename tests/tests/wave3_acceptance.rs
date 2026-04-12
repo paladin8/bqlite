@@ -1,5 +1,5 @@
 //! Wave 3 acceptance test — the correctness gate for the full Wave 3
-//! pipeline end-to-end (TASK-326).
+//! pipeline end-to-end (TASK-326, TASK-328).
 //!
 //! This test exercises:
 //!
@@ -8,12 +8,14 @@
 //!    event type)
 //! 3. `INSERT FROM` — ingest a deterministic CSV fixture with known funnel
 //!    behavior (signup → activation → purchase) across 20 entities
-//! 4. `FUNNEL` sugar — run `events | FUNNEL(signup THEN activation THEN
-//!    purchase) WITHIN 7d` and assert per-step conversion counts match
+//! 4. `FUNNEL` sugar — run `events LAST 30d | FUNNEL(signup THEN activation
+//!    THEN purchase) WITHIN 7d` and assert per-step conversion counts match
 //!    hand-computed expected values
 //! 5. Desugared equivalence — run the equivalent `MATCH FIRST SEQUENCE(...)
 //!    WITHIN 7d EMIT ALL | STATS ...` form and assert result equality with
 //!    the FUNNEL form (validates TASK-319's desugaring)
+//! 6. `EXPLAIN` — assert the scan time range is preserved and widened by
+//!    the WITHIN window (TASK-328, planner-pipeline.md §4.4)
 //!
 //! ## Fixture data
 //!
@@ -27,15 +29,6 @@
 //! | user_15..user_19| browse only (no funnel entry)  | —         |
 //!
 //! Expected funnel: signup = 15, activation = 10, purchase = 5.
-//!
-//! ## Note on `LAST 30d`
-//!
-//! The task spec calls for `events LAST 30d | FUNNEL(...)`. The parser
-//! does not yet support the `LAST <duration>` source-level time range
-//! filter (the `time_range` field is always `None`). All fixture data
-//! fits within any reasonable window, so omitting `LAST 30d` does not
-//! affect correctness. When the parser gains time-range support, the
-//! queries here should be updated to include `LAST 30d`.
 
 use arrow::array::Int64Array;
 use bqlite_engine::{Database, Engine, ExecutionResult};
@@ -110,7 +103,7 @@ fn funnel_sugar_produces_correct_counts() {
     let result = run(
         &engine,
         &mut database,
-        "events | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d",
+        "events LAST 30d | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d",
     );
 
     // FUNNEL produces a single aggregate row with one column per step.
@@ -144,7 +137,7 @@ fn desugared_match_stats_produces_correct_counts() {
     let result = run(
         &engine,
         &mut database,
-        "events \
+        "events LAST 30d \
          | MATCH FIRST SEQUENCE(signup THEN activation THEN purchase) WITHIN 7d EMIT ALL \
          | STATS \
              signup = SUM(CAST(step_reached >= 1 AS INT)), \
@@ -186,13 +179,13 @@ fn funnel_equals_desugared_form() {
     let funnel_result = run(
         &engine,
         &mut database,
-        "events | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d",
+        "events LAST 30d | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d",
     );
 
     let desugared_result = run(
         &engine,
         &mut database,
-        "events \
+        "events LAST 30d \
          | MATCH FIRST SEQUENCE(signup THEN activation THEN purchase) WITHIN 7d EMIT ALL \
          | STATS \
              signup = SUM(CAST(step_reached >= 1 AS INT)), \
@@ -225,4 +218,90 @@ fn funnel_equals_desugared_form() {
         funnel_purchase, desugar_purchase,
         "purchase: FUNNEL={funnel_purchase} vs desugared={desugar_purchase}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TASK-328: Time-range end-to-end tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// EXPLAIN must show the LAST time range, widened by the WITHIN window.
+/// `LAST 30d` + `WITHIN 7d` → scan should show `LAST 37d`.
+///
+/// Note: `LAST 30d` is planner-level metadata — the scan reads all
+/// data regardless until storage-level time-range pushdown is
+/// implemented. The fixture timestamps predate the relative window
+/// but the planner correctly threads and widens the range.
+#[test]
+fn explain_shows_widened_time_range() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_funnel(&db);
+
+    let result = run(
+        &engine,
+        &mut database,
+        "EXPLAIN events LAST 30d | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d",
+    );
+
+    assert_eq!(result.row_count(), 1, "EXPLAIN returns a single row");
+    let plan_text = result.rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringViewArray>()
+        .expect("plan column must be StringView")
+        .value(0);
+
+    assert!(
+        plan_text.contains("LAST 37d"),
+        "EXPLAIN must show the widened time range (30d + 7d = 37d); got:\n{plan_text}"
+    );
+}
+
+/// FUNNEL with BETWEEN time range produces correct results.
+#[test]
+fn funnel_with_between_time_range() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_funnel(&db);
+    let (expected_signup, expected_activation, expected_purchase) = csv::expected_funnel_counts();
+
+    // Use a BETWEEN range that covers all fixture data (Nov 2023).
+    // Note: the time range is planner-level metadata — storage-level
+    // enforcement is a later-wave concern.
+    let result = run(
+        &engine,
+        &mut database,
+        "events BETWEEN '2023-01-01T00:00:00Z' AND '2025-12-31T00:00:00Z' \
+         | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d",
+    );
+
+    assert_eq!(result.row_count(), 1, "FUNNEL must produce exactly one row");
+    let signup = extract_i64_column(&result, "signup");
+    let activation = extract_i64_column(&result, "activation");
+    let purchase = extract_i64_column(&result, "purchase");
+
+    assert_eq!(signup, expected_signup);
+    assert_eq!(activation, expected_activation);
+    assert_eq!(purchase, expected_purchase);
+}
+
+/// FUNNEL without time range still works (backward compatibility).
+#[test]
+fn funnel_without_time_range() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_funnel(&db);
+    let (expected_signup, expected_activation, expected_purchase) = csv::expected_funnel_counts();
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d",
+    );
+
+    assert_eq!(result.row_count(), 1);
+    let signup = extract_i64_column(&result, "signup");
+    let activation = extract_i64_column(&result, "activation");
+    let purchase = extract_i64_column(&result, "purchase");
+
+    assert_eq!(signup, expected_signup);
+    assert_eq!(activation, expected_activation);
+    assert_eq!(purchase, expected_purchase);
 }
