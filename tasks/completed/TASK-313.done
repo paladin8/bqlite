@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-313",
   "claimed_at": "2026-04-12T07:32:02Z",
+  "completed_at": "2026-04-12T08:15:00Z",
   "branch": "task/TASK-313",
   "description": "Parser MATCH pipeline stage"
 }
