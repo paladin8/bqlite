@@ -58,7 +58,7 @@ pub mod render;
 
 pub use bind::bind_physical;
 pub use query::{Engine, ExecutionResult};
-pub use render::format_result_as_text;
+pub use render::{format_result_as_text, format_result_as_text_limited};
 
 // Convenience re-exports so downstream crates only need to depend on
 // `bqlite-engine`. This matches the architecture.md rule

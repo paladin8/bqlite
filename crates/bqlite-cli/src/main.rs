@@ -16,7 +16,7 @@
 //!
 //! - `bqlite init <path>` — initialize a new database
 //! - `bqlite schema <path> <ddl>` — create a table with a schema
-//! - `bqlite ingest <path> <table> --from <file>` — ingest data
+//! - `bqlite ingest <file> --table <name> --db <path> [--format csv] [--map src=dst,...]` — ingest data
 //! - `bqlite query <bql> --db <path>` — run a BQL query **(Wave 1)**
 //! - `bqlite inspect <path> [table]` — inspect database/table metadata
 //! - `bqlite compact <path>` — compact storage segments
@@ -33,7 +33,8 @@
 //! - [`bqlite_engine::Database::open`] — opens an existing database
 //!   (`bqlite query`).
 //! - [`bqlite_engine::Engine::query`] — parse → plan → bind → drive.
-//! - [`bqlite_engine::format_result_as_text`] — human-readable output.
+//! - [`bqlite_engine::format_result_as_text_limited`] — human-readable
+//!   output with optional auto-limit truncation.
 //! - [`bqlite_engine::init_tracing`] — installs the global tracing
 //!   subscriber from TASK-122.
 //!
@@ -59,11 +60,16 @@
 //!   flag). This matches the convention Unix CLIs use for bad
 //!   invocation vs. bad data.
 
+mod format;
+mod ingest;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bqlite_engine::{format_result_as_text, init_tracing, Database, Engine};
+use bqlite_engine::{format_result_as_text_limited, init_tracing, Database, Engine};
+
+use format::{has_explicit_limit, maybe_inject_limit, DEFAULT_LIMIT};
 
 /// Entry point. Delegates to [`run`] so error handling stays
 /// centralised and the tests (see the module below) can exercise the
@@ -97,15 +103,26 @@ fn main() -> ExitCode {
 /// Top-level usage string. Printed on usage errors and `--help`.
 const USAGE: &str = "\
 Usage:
-  bqlite init <path> [--shards N]
-  bqlite query <bql> --db <path>
+  bqlite init   <path> [--shards N]
+  bqlite query  <bql> --db <path> [--limit N | --no-limit]
+  bqlite ingest <file> --table <name> --db <path> [--format csv] [--map src=dst,...]
 
 Commands:
   init     Initialize a new database directory.
   query    Run a BQL query against a database directory.
+  ingest   Load a data file into a table.
 
 Options:
-  -h, --help    Show this message.
+  -h, --help      Show this message.
+
+Query options:
+  --limit N       Cap output at N rows (default: 1000). Overrides auto-limit.
+  --no-limit      Disable row cap; return all rows.
+
+Ingest options:
+  --table <name>  Target table name (required).
+  --format <fmt>  Source format: csv (default).
+  --map <map>     Column rename map: src1=dst1,src2=dst2,...
 
 Environment:
   BQLITE_LOG    tracing filter directive (default: warn).
@@ -153,7 +170,8 @@ fn run(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Result<(),
             Ok(())
         }
         "init" => run_init(rest, out),
-        "query" => run_query(rest, out),
+        "query" => run_query(rest, out, _err),
+        "ingest" => ingest::run_ingest(rest, out, _err),
         other => Err(CliError::Usage(format!("unknown subcommand: {other}"))),
     }
 }
@@ -254,41 +272,38 @@ fn run_init(rest: &[String], out: &mut dyn Write) -> Result<(), CliError> {
 // query subcommand
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parsed shape of `bqlite query <bql> --db <path>`.
+/// Parsed shape of `bqlite query <bql> --db <path> [--limit N | --no-limit]`.
 ///
 /// A dedicated struct (instead of a tuple) keeps the tests readable
-/// and makes it obvious which field is which when we extend with
-/// additional flags (`--no-limit`, `--limit N`, `--format json`, etc.)
-/// in Wave 2+.
+/// and makes it obvious which field is which.
 #[derive(Debug, PartialEq, Eq)]
 struct QueryArgs {
-    /// The BQL text. Wave 1's parser only accepts a bare identifier,
-    /// but the CLI does not enforce that — the engine returns a typed
-    /// parse error we surface verbatim.
+    /// The BQL text.
     bql: String,
     /// Database directory path.
     db_path: PathBuf,
+    /// Custom row cap from `--limit N`. `None` means use `DEFAULT_LIMIT`.
+    limit: Option<usize>,
+    /// `--no-limit` flag: disables the auto-limit row cap entirely.
+    no_limit: bool,
 }
 
 /// Parse the argv tail of `bqlite query ...`.
 ///
-/// Accepts the BQL text and `--db <path>` in either order. Wave 1 has
-/// exactly one positional and one flag, so there's no ambiguity — the
-/// first non-flag token is the BQL text, the `--db` flag consumes the
-/// next token as the path.
+/// Accepts the BQL text, `--db <path>`, and the optional `--limit N` /
+/// `--no-limit` flags in any order. The first non-flag token is the BQL
+/// text; a second positional is a usage error.
 fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
     let mut bql: Option<String> = None;
     let mut db_path: Option<PathBuf> = None;
+    let mut limit: Option<usize> = None;
+    let mut no_limit = false;
 
     let mut i = 0;
     while i < rest.len() {
         let arg = &rest[i];
         match arg.as_str() {
             "--db" => {
-                // `--db` requires a following token. If it's missing,
-                // error immediately with a specific message rather
-                // than falling through to an obscure downstream
-                // failure.
                 let value = rest
                     .get(i + 1)
                     .ok_or_else(|| CliError::Usage("--db requires a path argument".to_string()))?;
@@ -298,9 +313,6 @@ fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
                 db_path = Some(PathBuf::from(value));
                 i += 2;
             }
-            // `--db=<path>` — accept the GNU long-option convention
-            // too. It's a small ergonomic win and costs almost nothing
-            // to support.
             arg_str if arg_str.starts_with("--db=") => {
                 let value = &arg_str["--db=".len()..];
                 if db_path.is_some() {
@@ -309,21 +321,56 @@ fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
                 db_path = Some(PathBuf::from(value));
                 i += 1;
             }
+            "--limit" => {
+                let value = rest.get(i + 1).ok_or_else(|| {
+                    CliError::Usage("--limit requires a numeric argument".to_string())
+                })?;
+                if limit.is_some() {
+                    return Err(CliError::Usage(
+                        "--limit specified more than once".to_string(),
+                    ));
+                }
+                let n: usize = value.parse().map_err(|_| {
+                    CliError::Usage(format!(
+                        "--limit value must be a non-negative integer, got {value:?}"
+                    ))
+                })?;
+                limit = Some(n);
+                i += 2;
+            }
+            arg_str if arg_str.starts_with("--limit=") => {
+                let value = &arg_str["--limit=".len()..];
+                if limit.is_some() {
+                    return Err(CliError::Usage(
+                        "--limit specified more than once".to_string(),
+                    ));
+                }
+                let n: usize = value.parse().map_err(|_| {
+                    CliError::Usage(format!(
+                        "--limit value must be a non-negative integer, got {value:?}"
+                    ))
+                })?;
+                limit = Some(n);
+                i += 1;
+            }
+            "--no-limit" => {
+                if no_limit {
+                    return Err(CliError::Usage(
+                        "--no-limit specified more than once".to_string(),
+                    ));
+                }
+                no_limit = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 return Err(CliError::Usage(
                     "help for 'query' not implemented yet — use `bqlite --help`".to_string(),
                 ));
             }
-            // Any other `--flag` is a usage error so typos don't
-            // silently get interpreted as the BQL text.
             arg_str if arg_str.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag: {arg_str}")));
             }
             _ => {
-                // Positional argument = the BQL text. Only the first
-                // positional is accepted; a second positional is a
-                // usage error to avoid accidentally eating a trailing
-                // shell-split fragment.
                 if bql.is_some() {
                     return Err(CliError::Usage(
                         "query accepts exactly one positional BQL argument".to_string(),
@@ -335,32 +382,62 @@ fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
         }
     }
 
+    if limit.is_some() && no_limit {
+        return Err(CliError::Usage(
+            "--limit and --no-limit are mutually exclusive".to_string(),
+        ));
+    }
+
     let bql = bql.ok_or_else(|| CliError::Usage("missing BQL text".to_string()))?;
     let db_path = db_path.ok_or_else(|| CliError::Usage("missing --db <path>".to_string()))?;
 
-    Ok(QueryArgs { bql, db_path })
+    Ok(QueryArgs {
+        bql,
+        db_path,
+        limit,
+        no_limit,
+    })
 }
 
-/// Implementation of `bqlite query <bql> --db <path>`.
+/// Implementation of `bqlite query <bql> --db <path> [--limit N | --no-limit]`.
 ///
 /// Parses the arguments, opens the database, runs the query through
-/// the engine, and writes the rendered result to `out`. Any failure
-/// along the way turns into a `CliError::Runtime` with the underlying
-/// error message preserved — we do not wrap with extra context because
-/// `BqliteError` already includes enough information.
-fn run_query(rest: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+/// the engine, and writes the rendered result to `out`.
+///
+/// Auto-limit behaviour (TASK-234):
+/// - When the BQL already has a `| limit` stage, or `--no-limit` was
+///   given, no auto-injection happens and all rows are shown.
+/// - Otherwise the CLI injects `| limit N+1` (where N is
+///   `DEFAULT_LIMIT` or the `--limit N` value) before handing the
+///   query to the engine. If the engine returns N+1 rows, the result
+///   is truncated to N and a footer is appended.
+fn run_query(rest: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Result<(), CliError> {
     let parsed = parse_query_args(rest)?;
 
     let mut db = Database::open(&parsed.db_path).map_err(|e| CliError::Runtime(format!("{e}")))?;
 
+    // Determine whether to inject an auto-limit and what the display cap
+    // should be passed to the renderer.
+    let (query_to_run, display_limit): (String, Option<usize>) =
+        if parsed.no_limit || has_explicit_limit(&parsed.bql) {
+            // No auto-injection: user opted out or the query is already
+            // limited. Render with no truncation footer.
+            (parsed.bql.clone(), None)
+        } else {
+            let cap = parsed.limit.unwrap_or(DEFAULT_LIMIT);
+            // Inject N+1 so the renderer can detect truncation.
+            let q = maybe_inject_limit(&parsed.bql, cap);
+            (q, Some(cap))
+        };
+
     let engine = Engine::new();
     let result = engine
-        .query(&parsed.bql, &mut db)
+        .query(&query_to_run, &mut db)
         .map_err(|e| CliError::Runtime(format!("query failed: {e}")))?;
 
-    let rendered = format_result_as_text(&result);
-    // `format_result_as_text` always ends with a newline, so we use
+    // `format_result_as_text_limited` always ends with a newline; use
     // `write!` (not `writeln!`) to avoid doubling it.
+    let rendered = format_result_as_text_limited(&result, display_limit);
     out.write_all(rendered.as_bytes())
         .map_err(|e| CliError::Runtime(format!("failed to write output: {e}")))?;
 
@@ -674,6 +751,172 @@ mod tests {
         match run(&sv(&["query", "events"]), &mut out, &mut err) {
             Err(CliError::Usage(msg)) => assert!(msg.contains("--db")),
             other => panic!("expected usage error, got {other:?}"),
+        }
+    }
+
+    // ── --limit / --no-limit argument parsing ───────────────────────
+
+    #[test]
+    fn parse_query_args_accepts_limit_flag() {
+        let parsed =
+            parse_query_args(&sv(&["events", "--db", "/tmp/db", "--limit", "50"])).unwrap();
+        assert_eq!(parsed.limit, Some(50));
+        assert!(!parsed.no_limit);
+    }
+
+    #[test]
+    fn parse_query_args_accepts_limit_equals_syntax() {
+        let parsed = parse_query_args(&sv(&["events", "--db", "/tmp/db", "--limit=200"])).unwrap();
+        assert_eq!(parsed.limit, Some(200));
+    }
+
+    #[test]
+    fn parse_query_args_accepts_no_limit_flag() {
+        let parsed = parse_query_args(&sv(&["events", "--db", "/tmp/db", "--no-limit"])).unwrap();
+        assert!(parsed.no_limit);
+        assert_eq!(parsed.limit, None);
+    }
+
+    #[test]
+    fn parse_query_args_limit_and_no_limit_mutually_exclusive() {
+        match parse_query_args(&sv(&[
+            "events",
+            "--db",
+            "/db",
+            "--limit",
+            "10",
+            "--no-limit",
+        ])) {
+            Err(CliError::Usage(msg)) => assert!(msg.contains("mutually exclusive")),
+            other => panic!("expected usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_query_args_non_numeric_limit_is_usage_error() {
+        match parse_query_args(&sv(&["events", "--db", "/db", "--limit", "foo"])) {
+            Err(CliError::Usage(msg)) => assert!(msg.contains("--limit")),
+            other => panic!("expected usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_query_args_limit_without_value_is_usage_error() {
+        match parse_query_args(&sv(&["events", "--db", "/db", "--limit"])) {
+            Err(CliError::Usage(msg)) => assert!(msg.contains("--limit")),
+            other => panic!("expected usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_query_args_limit_zero_is_accepted() {
+        let parsed = parse_query_args(&sv(&["events", "--db", "/tmp/db", "--limit", "0"])).unwrap();
+        assert_eq!(parsed.limit, Some(0));
+    }
+
+    // ── Auto-limit end-to-end ────────────────────────────────────────
+
+    #[test]
+    fn query_limit_flag_accepted_and_query_completes() {
+        // Verify that --limit N is accepted by the CLI, the auto-limit
+        // machinery runs (injecting | limit N+1 into the BQL), and the
+        // query completes without error.
+        //
+        // The truncation footer ("showing N rows; use --no-limit...") is not
+        // tested here because the Wave 2 scan path (EmptySegmentReader) always
+        // returns 0 rows regardless of ingested data — real segment reads land
+        // in a later wave.  The engine-level tests in
+        // bqlite-engine/src/render.rs cover the footer logic exhaustively.
+        let scratch = Scratch::new("auto-limit");
+        init_db_with_events(&scratch);
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+
+        // Query with --limit 1 against an empty DB. Zero rows returned,
+        // which is within the cap, so no truncation footer.
+        let args = sv(&["query", "events", "--db", &db_path_str, "--limit", "1"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            out_text.contains("entity_id"),
+            "schema header expected, got:\n{out_text}"
+        );
+        assert!(
+            out_text.contains("(0 rows)"),
+            "zero-rows footer expected (empty table), got:\n{out_text}"
+        );
+        assert!(
+            !out_text.contains("showing"),
+            "no truncation footer expected when rows ≤ limit, got:\n{out_text}"
+        );
+    }
+
+    #[test]
+    fn query_no_limit_flag_no_footer_when_rows_within_limit() {
+        // With --limit 100 and only 0 rows, no footer should appear.
+        let scratch = Scratch::new("auto-limit-none");
+        init_db_with_events(&scratch);
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        let args = sv(&["query", "events", "--db", &db_path_str, "--limit", "100"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            !out_text.contains("showing"),
+            "no truncation footer expected for empty result:\n{out_text}"
+        );
+    }
+
+    #[test]
+    fn query_with_no_limit_flag_does_not_add_footer() {
+        let scratch = Scratch::new("no-limit-flag");
+        init_db_with_events(&scratch);
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        let args = sv(&["query", "events", "--db", &db_path_str, "--no-limit"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            !out_text.contains("showing"),
+            "no footer expected with --no-limit:\n{out_text}"
+        );
+    }
+
+    #[test]
+    fn query_with_explicit_limit_in_bql_suppresses_injection() {
+        // If the BQL already has `| limit`, no auto-injection should happen
+        // and no truncation footer should appear.
+        let scratch = Scratch::new("explicit-limit");
+        init_db_with_events(&scratch);
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        // Use LIMIT 5 in the BQL — even with 0 rows, no footer expected.
+        let args = sv(&["query", "events | limit 5", "--db", &db_path_str]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            !out_text.contains("showing"),
+            "no auto-limit footer expected when query has explicit LIMIT:\n{out_text}"
+        );
+    }
+
+    // ── ingest subcommand dispatcher ─────────────────────────────────
+
+    #[test]
+    fn run_dispatches_to_ingest_subcommand() {
+        let scratch = Scratch::new("ingest-dispatch");
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+        // Missing --table → usage error propagated from ingest module.
+        let args = sv(&["ingest", "data.csv", "--db", &db_path_str]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        match run(&args, &mut out, &mut err) {
+            Err(CliError::Usage(msg)) => assert!(msg.contains("--table")),
+            other => panic!("expected usage error from ingest dispatch, got {other:?}"),
         }
     }
 
