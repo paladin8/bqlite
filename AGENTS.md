@@ -11,12 +11,26 @@ Your agent ID is set in the `AGENT_ID` environment variable (e.g., `agent-1`). Y
 You have been handed exactly one task. The lock file at `tasks/active/TASK-NNN.lock` is already yours, and you have been dropped onto the `task/TASK-NNN` branch. Your job is to take it all the way from here to a merged, marked-done state:
 
 1. Read the task definition in `TASKS.md` and the relevant design doc under `docs/design/`
-2. If the task seems complex at all, build a development plan *before* writing code (see *Planning Before Implementation*)
-3. Implement the task in small checkpoints (see *Checkpoint Discipline*)
-4. After the final checkpoint merges to `main`, mark the task complete (see *Completion Protocol*)
-5. End your turn
+2. Check for a task note at `tasks/notes/TASK-NNN.md` and read it in full if present (see *Task Notes*)
+3. If the task seems complex at all, build a development plan *before* writing code (see *Planning Before Implementation*)
+4. Implement the task in small checkpoints (see *Checkpoint Discipline*)
+5. After the final checkpoint merges to `main`, mark the task complete (see *Completion Protocol*)
+6. End your turn
 
 Do not claim another task. Do not start a loop. When you finish, the wrapper will launch a fresh session for the next task.
+
+## Task Notes
+
+Before planning or implementation, check `tasks/notes/TASK-NNN.md` for a task note. These are human-authored, task-scoped briefings that capture semantics decisions, constraints, or context that are *not* in `TASKS.md` or the design docs — typically the output of a human-assisted semantics discussion held before the task was handed to an agent.
+
+If a task note exists:
+
+- Read it in full before writing a plan or touching code.
+- Treat its decisions as authoritative. They override your own judgment on the points they cover, and they take precedence over inferences you would otherwise draw from `TASKS.md` or a design doc that has not yet been updated to reflect them.
+- If the note contradicts the existing design doc, the note wins; reconcile the design doc in the same checkpoint as the code change.
+- If the note leaves a sub-question open, surface it via `[NEEDS INPUT]` rather than guessing — the note's existence means a human is engaged on the semantics for this task.
+
+If no task note exists, proceed normally. Absence is not a blocker.
 
 ## Planning Before Implementation
 
