@@ -52,6 +52,21 @@ cargo fmt --check                                         # formatting check
 - Every operator respects configurable memory budgets
 - All errors must be typed and recoverable
 
+## Performance Conventions
+
+- Preserve entity locality: storage, scan, and operator code must not silently break `(entity_id, timestamp)` ordering or split an entity across row groups / batches unless the design doc explicitly allows a streaming boundary for oversized entities.
+- Treat Arrow `Utf8View` / `StringViewArray` as the canonical materialized string form. Do not round-trip through `StringArray` (`Utf8`) for convenience in hot paths.
+- Preserve dictionary / compressed representations as far down the pipeline as practical. For low-cardinality string predicates, prefer code-based filtering or precomputed dictionary bitsets over per-row string comparisons.
+- Avoid eager materialization in stateless operators. Prefer batch slices, views, selection vectors, and pre-sized builders; copying rows into fresh buffers should be an explicit, justified choice.
+- Avoid per-row heap work in hot loops. Pre-size `Vec`s and Arrow builders, reuse scratch buffers across tiles/batches where possible, and keep working sets cache-friendly.
+- Keep operator memory bounded by design. Any new buffering/stateful path must define its memory accounting and spill/overflow behavior up front rather than growing unboundedly.
+- Follow the pipeline schema conventions from `docs/design/execution-model.md`: reference columns by name through `OperatorSchema`, keep timestamps as `Timestamp(Nanosecond, UTC)`, and preserve non-nullability guarantees for core columns.
+
+## Testing And Benchmarking
+
+- Hot-path changes should come with benchmark coverage or benchmark updates in `benches/`. If a change affects scan, filter, encoding, ingest, merge, or sequence-matching performance, measure it.
+- Use property tests for components with large input spaces and clear invariants: codecs, planner rewrites, merge/order guarantees, compaction, and sequence evaluation. Example tests alone are not enough for these surfaces; `docs/core-beliefs.md` §11 is the default bar, and `tests/src/strategies.rs` is the canonical source of Arrow-shaped generators to reuse.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) — crate map, dependency direction, data flow
