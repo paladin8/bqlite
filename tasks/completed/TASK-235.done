@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-235",
   "claimed_at": "2026-04-12T03:04:18Z",
+  "completed_at": "2026-04-12T03:45:00Z",
   "branch": "task/TASK-235",
   "description": "Wave 2 acceptance test + CSV fixture loader"
 }
