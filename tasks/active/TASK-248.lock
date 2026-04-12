@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-248",
+  "claimed_at": "2026-04-12T04:37:57Z",
+  "branch": "task/TASK-248",
+  "description": "CSV ingest throughput closure"
+}
