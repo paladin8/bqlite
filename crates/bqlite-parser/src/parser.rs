@@ -11,7 +11,7 @@
 //! TASK-238) plug into the same dispatcher by peeking the first token
 //! and branching into their own entry points.
 
-use bqlite_ast::{Name, Pipeline, Source, Span, Statement, TableRef};
+use bqlite_ast::{Name, Pipeline, Source, Span, Statement, TableRef, TimeRange};
 
 use crate::error::{Expected, NameRole, ParseError};
 use crate::lex::{lex, token_span, Keyword, Token, TokenKind};
@@ -314,9 +314,10 @@ pub(crate) fn statement(p: &mut Parser) -> Result<Statement, ParseError> {
 /// Parse a `source ("|" operator)*` pipeline body and return the
 /// resulting [`Pipeline`].
 ///
-/// The source is a single bare table name for now (joins and time
-/// ranges are later-wave productions). Pipeline stages are delegated
-/// to [`crate::pipeline::parse_pipeline_stages`].
+/// The source is a bare table name followed by an optional time-range
+/// filter (`LAST <duration>` or `BETWEEN '<ts>' AND '<ts>'`), per
+/// query-language.md §3.1. Joins are deferred to Wave 4. Pipeline
+/// stages are delegated to [`crate::pipeline::parse_pipeline_stages`].
 ///
 /// Consumers:
 /// - [`parse_query_pipeline`] wraps the result in `Statement::Query`.
@@ -328,11 +329,16 @@ pub(crate) fn parse_pipeline_body(p: &mut Parser) -> Result<Pipeline, ParseError
         name,
         span: primary_span,
     };
+    let (time_range, tr_span) = parse_time_range(p)?;
+    let source_span = match tr_span {
+        Some(s) => primary_span.merged(s),
+        None => primary_span,
+    };
     let source = Source {
         primary,
         joins: vec![],
-        time_range: None,
-        span: primary_span,
+        time_range,
+        span: source_span,
     };
 
     let stages = crate::pipeline::parse_pipeline_stages(p)?;
@@ -344,14 +350,75 @@ pub(crate) fn parse_pipeline_body(p: &mut Parser) -> Result<Pipeline, ParseError
     // rather than a silent drift here.
     let pipeline_span = stages
         .last()
-        .map(|s| primary_span.merged(s.span()))
-        .unwrap_or(primary_span);
+        .map(|s| source_span.merged(s.span()))
+        .unwrap_or(source_span);
 
     Ok(Pipeline {
         source,
         stages,
         span: pipeline_span,
     })
+}
+
+/// Parse an optional source time-range: `LAST <duration>` or
+/// `BETWEEN '<ts>' AND '<ts>'` (query-language.md §3.1, §26).
+///
+/// Returns `(None, None)` if the current token is not `LAST` or
+/// `BETWEEN`, leaving the cursor untouched so the caller can proceed
+/// with pipeline stages.
+fn parse_time_range(p: &mut Parser) -> Result<(Option<TimeRange>, Option<Span>), ParseError> {
+    if let Some(last_tok) = p.try_kw(Keyword::Last) {
+        // LAST <duration>
+        let tok = p.peek().clone();
+        let dur_span = token_span(&tok);
+        match tok.kind {
+            TokenKind::Duration(ns) => {
+                p.bump();
+                let span = token_span(&last_tok).merged(dur_span);
+                Ok((Some(TimeRange::Last(ns)), Some(span)))
+            }
+            _ => Err(p.error_unexpected(
+                Expected::Literal,
+                Some("expected a duration after LAST (e.g. `LAST 30d`)"),
+            )),
+        }
+    } else if let Some(between_tok) = p.try_kw(Keyword::Between) {
+        // BETWEEN '<start>' AND '<end>'
+        let start_tok = p.peek().clone();
+        let start = match &start_tok.kind {
+            TokenKind::String(s) => {
+                let s = s.clone();
+                p.bump();
+                s
+            }
+            _ => {
+                return Err(p.error_unexpected(
+                    Expected::Literal,
+                    Some("expected a string literal after BETWEEN (e.g. `BETWEEN '2024-01-01' AND '2024-02-01'`)"),
+                ));
+            }
+        };
+        p.expect_kw(Keyword::And)?;
+        let end_tok = p.peek().clone();
+        let end_span = token_span(&end_tok);
+        let end = match &end_tok.kind {
+            TokenKind::String(s) => {
+                let s = s.clone();
+                p.bump();
+                s
+            }
+            _ => {
+                return Err(p.error_unexpected(
+                    Expected::Literal,
+                    Some("expected a string literal after AND (e.g. `BETWEEN '2024-01-01' AND '2024-02-01'`)"),
+                ));
+            }
+        };
+        let span = token_span(&between_tok).merged(end_span);
+        Ok((Some(TimeRange::Between { start, end }), Some(span)))
+    } else {
+        Ok((None, None))
+    }
 }
 
 /// Parse a pipeline body and wrap it in `Statement::Query`.
@@ -529,5 +596,144 @@ mod tests {
             }
             other => panic!("expected ReservedKeyword, got {other:?}"),
         }
+    }
+
+    // ── Time-range parsing ───────────────────────────────────────────
+
+    #[test]
+    fn source_last_duration_parsed() {
+        let mut p = Parser::new("events LAST 30d").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert_eq!(
+                    pipe.source.time_range,
+                    Some(TimeRange::Last(30 * 86_400_000_000_000))
+                );
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn source_last_duration_with_pipeline() {
+        let mut p = Parser::new("events LAST 7d | LIMIT 10").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert_eq!(
+                    pipe.source.time_range,
+                    Some(TimeRange::Last(7 * 86_400_000_000_000))
+                );
+                assert_eq!(pipe.stages.len(), 1);
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn source_between_timestamps_parsed() {
+        let mut p = Parser::new("events BETWEEN '2024-01-01T00:00:00Z' AND '2024-02-01T00:00:00Z'")
+            .unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert_eq!(
+                    pipe.source.time_range,
+                    Some(TimeRange::Between {
+                        start: "2024-01-01T00:00:00Z".into(),
+                        end: "2024-02-01T00:00:00Z".into(),
+                    })
+                );
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn source_between_with_pipeline() {
+        let mut p = Parser::new("events BETWEEN '2024-01-01' AND '2024-02-01' | LIMIT 5").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert!(matches!(
+                    pipe.source.time_range,
+                    Some(TimeRange::Between { .. })
+                ));
+                assert_eq!(pipe.stages.len(), 1);
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn source_no_time_range_remains_none() {
+        let mut p = Parser::new("events | LIMIT 5").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert!(pipe.source.time_range.is_none());
+                assert_eq!(pipe.stages.len(), 1);
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn last_without_duration_is_error() {
+        let mut p = Parser::new("events LAST | LIMIT 5").unwrap();
+        assert!(statement(&mut p).is_err());
+    }
+
+    #[test]
+    fn between_missing_end_is_error() {
+        let mut p = Parser::new("events BETWEEN '2024-01-01'").unwrap();
+        assert!(statement(&mut p).is_err());
+    }
+
+    #[test]
+    fn between_missing_and_is_error() {
+        let mut p = Parser::new("events BETWEEN '2024-01-01' '2024-02-01'").unwrap();
+        assert!(statement(&mut p).is_err());
+    }
+
+    #[test]
+    fn source_last_span_covers_both_tokens() {
+        let mut p = Parser::new("events LAST 30d").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                // Source span should cover "events LAST 30d" (byte 0..15).
+                assert_eq!(pipe.source.span.start, 0);
+                assert_eq!(pipe.source.span.end, 15);
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn source_between_span_covers_all_tokens() {
+        let input = "events BETWEEN '2024-01-01' AND '2024-02-01'";
+        let mut p = Parser::new(input).unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.span.start, 0);
+                assert_eq!(pipe.source.span.end, input.len());
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn last_with_string_literal_is_error() {
+        let mut p = Parser::new("events LAST '7d'").unwrap();
+        assert!(statement(&mut p).is_err());
+    }
+
+    #[test]
+    fn between_with_non_string_start_is_error() {
+        let mut p = Parser::new("events BETWEEN 42 AND '2024-02-01'").unwrap();
+        assert!(statement(&mut p).is_err());
     }
 }
