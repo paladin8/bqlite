@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-306",
   "claimed_at": "2026-04-12T08:28:33Z",
+  "completed_at": "2026-04-12T09:15:00Z",
   "branch": "task/TASK-306",
   "description": "Variable binding tracks"
 }
