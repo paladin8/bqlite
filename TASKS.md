@@ -699,52 +699,167 @@ This task is intentionally tiny (~half a day) and exists to keep the implementat
 
 ## Wave 3: Pattern Matching MVP
 
-**Goal.** Funnel queries work end-to-end. MATCH operator, aggregates, limit, sort.
-**Size.** ~22-28 tasks.
+**Goal.** Funnel queries work end-to-end. MATCH operator over entity-sorted batches, hash aggregate with GROUP BY, sort, distinct, FUNNEL terminal sugar desugared in the planner into `MATCH FIRST ... EMIT ALL → Aggregate(SUM(CAST(step_reached >= N AS INT)))`, returning correct per-step conversion counts over a CSV fixture. Step-counter fast path benchmarked against NFA baseline.
+
+**Scope exclusions.**
+- **RETENTION sugar** is deferred to Wave 4 alongside `BRACKETS` and `WITHIN SESSION` — the AST models `PipelineStage::Retention`, but session windows and retention brackets both depend on SESSIONIZE and the cohort-join story landing in Wave 4.
+- **Cohorts, aliases, `IN QUERY`** are deferred to Wave 4 per TASK-407.
+- **SESSIONIZE and attribution** are Wave 4 (TASK-405, TASK-406).
+- **Percentile aggregates (`P50`/`P90`/`P95`/`P99`)** are deferred to TASK-327, which ships after the core aggregate machinery (TASK-307) stabilizes. DDSketch integration is complex enough to merit its own task, and funnels (the Wave 3 acceptance gate) do not use percentiles. The v1 aggregate set (query-language.md §7.1) is complete only after TASK-327 lands.
+- **Spill-to-disk for hash aggregate and sort** is deferred to Wave 5 (TASK-502); Wave 3 operators are hard-capped and return a typed error on overflow.
+- **Fused push segments and `StatelessKernel`** are Wave 5 (TASK-503); Wave 3's new operators ship as plain `PhysicalOperator` / `EntityOperator` impls like TASK-231's filter/project/limit.
+
+**Size.** ~28 tasks.
 **Parallelism.** 6-10 agents.
-**Acceptance.** A 3-step funnel query over an ingested CSV returns correct conversion counts per step.
+**Acceptance.** (1) A 3-step funnel query (`events LAST 30d | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d`) over an ingested CSV returns correct per-step conversion counts (named `signup`, `activation`, `purchase` per query-language.md §6.1). (2) The step-counter fast path benchmarks within 2× of the Wave 2 scan-only baseline on the same dataset (validates TASK-302's perf expectation). EMIT ALL, negation, variable bindings, and time-window expiry all covered by integration tests.
 
-### TASK-301: [DESIGN] MATCH operator architecture
+Wave 3 is a strategy wave: the design anchors (301, 302, 308, 309, 310) land first and front-load almost all the risk — after them, the parser, pattern compiler, NFA, aggregate, sort/distinct, lowering, and operator tracks run in parallel. The pattern AST and `PipelineStage::{Match, Stats, OrderBy, Funnel, Retention}` variants were already shipped by Wave 2's TASK-221 / TASK-224; Wave 3 does not re-build them.
+
+### TASK-301: [HARD][DESIGN] MATCH operator architecture
 **Output**: docs/design/operators/match-operator.md
-**Depends on**: TASK-204, TASK-230
-**Description**: Connects the Wave 0 sequence-matching direction to an actual operator implementation. Operator state, input expectations, output schema, how bindings are surfaced, EMIT ALL semantics. Risky.
+**Depends on**: TASK-108, TASK-204, TASK-230
+**Description**: Connects sequence-matching.md to an implementable operator. Pins down: operator state layout (per-entity NFA candidate deques vs. step-counter tracks), the `EntityOperator` integration (entity boundary detection, `finish_entity()` semantics, sub-batch streaming of oversized entities per execution-model.md §5), output schema including `entity_id`, `$var` binding columns, step-property columns, `step_reached` under EMIT ALL, and the emission points (match completion, window expiry, entity end). Specifies the active-state cap (execution-model.md §16.1, default 10,000 candidates per entity) and the typed error returned on overflow. Also specifies how demand-driven column reduction (execution-model.md §8) avoids materializing unreferenced step properties. Risky anchor — unblocks TASK-304, TASK-306, TASK-311, TASK-321.
 
-### TASK-302: [DESIGN] Sequence matcher strategy selection
+### TASK-302: [HARD][DESIGN] Sequence matcher strategy selection
 **Output**: docs/design/operators/matcher-strategy.md
 **Depends on**: TASK-301
-**Description**: When the step-counter fast path applies vs the general NFA path. Selection rules at plan time, fallback behavior, performance expectations for each. Risky.
+**Description**: The compile-time classifier that decides step-counter vs. general NFA path. Spells out the pattern-class predicates (linear, no branching, no repetition, no negation → step counter; everything else → NFA), variable-binding interaction (step counter supports bindings via `StepCounterTrack.bindings`), the classification output type (`PatternClass` enum) carried on `CompiledNfa`, and the fallback behavior when a step-counter-eligible pattern has unsupported predicates. Includes the microbenchmark methodology TASK-325 follows to validate the per-strategy perf expectations. Risky — directly controls Wave 3's perf story.
 
-### TASK-303: [DESIGN] Pattern AST and MATCH grammar production
+### TASK-303: [EASY][DESIGN] Pattern grammar surface + AST reconciliation
 **Output**: docs/design/language/pattern-grammar.md
 **Depends on**: TASK-203
-**Description**: Pattern syntax, repetition/negation/variable-binding AST nodes, how patterns compose with pipe stages. Unblocks all parser MATCH work.
+**Description**: Reconciliation note, not a new AST. Wave 2 already shipped the pattern AST in `bqlite-ast/src/pattern.rs` (`MatchPattern`, `Step`, `StepEvent`, `MatchMode`, `Repetition`, `Exclusion`, `MatchWindow`, `BracketSpec`) and the `PipelineStage::{Match, Stats, OrderBy, Funnel, Retention}` variants in `operator.rs` as part of TASK-221 / TASK-224. This task produces the grammar-facing design doc: the concrete syntax for `MATCH (FIRST|ALL) [EMIT ALL] SEQUENCE(step THEN step THEN ...) [WITHIN d]`, step syntax (`[name:] event [WHERE predicate] [IMMEDIATELY] [+|*] [WITHOUT excl]`), alternation inside sequences, `$var` binding references, and a gap analysis identifying any shipped-AST field that the design doc does not cover (or vice versa). Precise token-to-AST map that TASK-312 / TASK-313 implement directly. Unblocks all parser pattern work.
 
-### TASK-304: [IMPL] NFA builder + Thompson simulation
+### TASK-304: [HARD][IMPL] NFA runtime simulator
 **Output**: crates/bqlite-operators/src/matcher/nfa.rs
-**Depends on**: TASK-301
-**Description**: General NFA path — Thompson construction from pattern AST, simulation with poison transitions for negation, time window enforcement. Risky core.
+**Depends on**: TASK-301, TASK-311
+**Description**: General-path NFA runtime per sequence-matching.md §9-10. Consumes the `CompiledNfa` (types + Thompson construction owned by TASK-311) and implements the three-phase per-event simulation: phase 1 processes existing candidates in reverse-order (expiry checks, poison-transition kills for `WITHOUT` negation, forward propagation on matching transitions); phase 2 starts new candidates when the current event matches step 0; phase 3 deduplicates per `(state, binding_track)` and checks accept state. Global time-window enforcement via `anchor_ts` — candidates whose `event.ts - anchor_ts > global_window` are expired front-of-deque O(1) amortized. No binding logic (that's TASK-306). No step-counter code (that's TASK-305). Unit tests cover every transition shape in the sequence-matching design doc including multi-step forward, poison kill mid-sequence, and window expiry at boundary. Risky core.
 
-### TASK-305: [IMPL] Step counter fast path
+### TASK-305: [EASY][IMPL] Step counter fast path
 **Output**: crates/bqlite-operators/src/matcher/step_counter.rs
-**Depends on**: TASK-302
-**Description**: Fast path for linear patterns — no NFA, just a step counter with time-window checks. Implementation parallel to TASK-304.
+**Depends on**: TASK-302, TASK-306, TASK-311
+**Description**: `StepCounterTrack { bindings, current_step, anchor_ts, last_step_ts, match_count, max_step_reached, scan_from }` and its per-event advance function, selected when `CompiledNfa.pattern_class == Linear`. Implements exactly the scan-from rebinding behavior from sequence-matching.md §10.3 — MATCH ALL resets `scan_from` to the last-advanced event, MATCH FIRST returns after first match. Supports variable bindings via the shared `BindingValue` type (TASK-306 ships the type; the step counter consumes it). No NFA path. Unit-test perf smoke: sanity that a 3-step linear pattern beats the NFA path on the same input.
 
-### TASK-306: [IMPL] Variable binding tracks
+### TASK-306: [HARD][IMPL] Variable binding tracks
 **Output**: crates/bqlite-operators/src/matcher/bindings.rs
 **Depends on**: TASK-304
-**Description**: Independent match tracks for $-variable bindings per the Wave 0 sequence-matching design. Risky — semantics are subtle.
+**Description**: Independent-per-binding match tracks per sequence-matching.md §8. Defines `BindingValue` (`Bool | Int | Float(FloatOrd<f64>) | String(CompactString) | Timestamp(i64)`), the `BindingKey = SmallVec<[BindingValue; 2]>` track identity, the `HashMap<BindingKey, Track>` per entity, bind-on-first-reference / check-on-subsequent-reference semantics (including NULL → fail-predicate → no track created), and the active-track limit enforcement. Plumbs into both the NFA (TASK-304) and the step counter (TASK-305). Risky — semantics are the trickiest part of the matcher, and the property tests are the primary correctness evidence.
 
-### TASK-307: [IMPL] Hash aggregate operator
+### TASK-307: [HARD][IMPL] Hash aggregate operator
 **Output**: crates/bqlite-operators/src/aggregate.rs
-**Depends on**: TASK-108, TASK-230
-**Description**: Foundational operator for funnel output and most analytics queries. count/sum/avg/min/max/distinct_count. Works on columnar batches.
+**Depends on**: TASK-108, TASK-205, TASK-308, TASK-317
+**Description**: `AggregateOperator` — hash-grouped aggregation implementing `PhysicalOperator`. Per TASK-308, ships the `HashAccumulator` trait and built-in accumulators for `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`, `COUNT_DISTINCT(col)`. Percentile accumulators (`P50`/`P90`/`P95`/`P99`) are deferred to TASK-327. Group keys derived from a `Vec<CompiledExpr>` via TASK-205's expression kernel. State is `HashMap<GroupKey, AccumulatorState>` with the `max_groups` hard cap (default 1M per execution-model.md §9.4) returning `AggregateError::GroupLimitExceeded` on overflow — no spill in Wave 3. Works on columnar Arrow batches; pre-sizes builders per CLAUDE.md performance conventions. Supports both standalone use and the fused-downstream path emitted by MATCH/SESSIONIZE in later waves (Wave 3 only wires the standalone path end-to-end). Foundational — every funnel output and every `STATS` stage routes through it.
 
-Additional Wave 3 tasks: individual pattern grammar productions, limit/sort operators, EMIT ALL output assembly, MATCH lowering in the planner, matcher microbenchmarks, integration tests for common funnel shapes.
+### TASK-308: [HARD][DESIGN][TRAIT] Aggregate + hash-accumulator architecture
+**Output**: docs/design/operators/aggregate-operator.md
+**Depends on**: TASK-108, TASK-204, TASK-205
+**Description**: The design note TASK-307 and TASK-320 both consume. Pins down: the `HashAccumulator` trait surface (`init`, `update_batch`, `merge`, `finalize`, `size_bytes`), the built-in accumulator set for Wave 3 (`COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`, `COUNT_DISTINCT(col)` — percentiles deferred to TASK-327), state-sizing rules feeding `max_groups` accounting, null-propagation per type-system.md, how aggregate expressions are compiled through TASK-205's `CompiledExpr` kernel, the output schema rules (`output_schema`: group columns + one column per aggregate with stable synthetic names), and the fused-downstream protocol that lets MATCH/SESSIONIZE feed entities directly into an accumulator without a standalone Aggregate operator node (the protocol ships as a hook in Wave 3; the matcher consumes it in TASK-321). Also specifies the `HashAccumulator` extensibility contract that TASK-327 uses to add DDSketch-based percentile accumulators without modifying existing code. Merge-first — blocks TASK-307, TASK-317, TASK-318, TASK-320, TASK-321.
 
-### TASK-399: [IMPL] Wave 3 quality audit
+### TASK-309: [HARD][DESIGN] Logical lowering + demand propagation for Match / Stats / OrderBy
+**Output**: docs/design/planner/wave3-lowering.md
+**Depends on**: TASK-204, TASK-301, TASK-308
+**Description**: Spec-level design for the AST → logical lowering that TASK-318 implements. Covers: (1) `PipelineStage::Match` → `LogicalPlan::SequenceMatch { pattern, mode, emit_all, window, brackets: None, step_properties, fused_downstream: None, input, output_schema }`, (2) `PipelineStage::Stats` → `LogicalPlan::Aggregate { aggregates, group_by, input, output_schema }`, (3) `PipelineStage::OrderBy` → `LogicalPlan::Sort`, (4) `PipelineStage::Select { distinct: true }` → `LogicalPlan::Distinct(Project(...))`. Specifies the `DemandSet { columns, needs_match_detail, needs_step_reached, step_properties: Vec<(step_name, column_name)>, fused_aggregate }` shape, the backward-propagation algorithm (consumer → producer, stopping at `Scan`), and how `fused_downstream` is populated by TASK-320 after demand resolves. Schema-validation rules for `step_name.column` references, for `$var` references surviving through aggregate group-by, and for the `step_reached` synthetic column under EMIT ALL. Risky because the demand-set shape persists into Waves 4-5.
+
+### TASK-310: [EASY][DESIGN] Sort + Distinct operator contracts
+**Output**: docs/design/operators/sort-distinct.md
+**Depends on**: TASK-108, TASK-204
+**Description**: Smaller design note for the two non-matching stateful operators Wave 3 ships. `SortOperator` — key compilation via TASK-205, stable vs unstable (Wave 3 ships stable), in-memory-only with a hard `max_rows` cap and typed overflow error (spill is Wave 5 TASK-502), null-ordering rules from type-system.md, output schema unchanged from input. `DistinctOperator` — hash-set dedup reusing TASK-307's hash-key kernel, `max_groups` cap matching aggregate, output schema unchanged from input. Specifies how both operators interact with entity ordering — neither preserves `(entity_id, ts)` order, which is fine because they sit above any entity-aware operator in the Wave 3 plan tree. Unblocks TASK-317 + TASK-322.
+
+### TASK-311: [HARD][IMPL] Pattern compiler: SequencePattern → CompiledNfa
+**Output**: crates/bqlite-planner/src/compile.rs
+**Depends on**: TASK-301, TASK-302
+**Description**: Plan-time pattern compilation per sequence-matching.md §14.3 (crate placement: `CompiledNfa`, `PatternClass` → `bqlite-planner`). Takes a `SequencePattern` AST node (defined in `bqlite-ast::pattern` as `MatchPattern`) and produces `CompiledNfa { states: Vec<NfaState>, accept_state, relevant_event_types, pattern_class, variable_bindings, global_window, emit_all, state_to_step }`. Implements Thompson construction (step → state, alternation → branching, repetition → self-loops, epsilon elimination), adds poison transitions for `WITHOUT` negation scopes, computes `state_to_step` via BFS, runs the pattern classifier from TASK-302 (`PatternClass::{Linear, Branching, Repeating, Negating, WithBindings}` — composed flags), collects event-type filters for scan-level pushdown, resolves `$var` references to `BindingRef` indices, validates negation targets are in-scope, and emits structured errors for malformed patterns. Lives in `bqlite-planner` because compilation requires schema access for validation and the result is carried on the physical descriptor (never on the logical node — that carries the AST `SequencePattern` per planner-pipeline.md §5.2). Invoked during logical→physical lowering in TASK-318. Unit tests include one-step-to-many-step patterns, every pattern-class bucket, and every validation error.
+
+### TASK-312: [EASY][IMPL] Parser pattern productions
+**Output**: crates/bqlite-parser/src/pattern.rs
+**Depends on**: TASK-220, TASK-303
+**Description**: Hand-rolled productions for pattern syntax that feed the `MatchPattern` AST. Covers: `SEQUENCE ( step ( THEN step )+ )`, step shape `[name :] event [WHERE expr] [IMMEDIATELY] [+|*] [WITHOUT event]`, event alternation `( e1 OR e2 OR ... )` inside a step slot, `$var` binding references inside WHERE predicates, `WITHIN <duration>` window clause, and precise span tracking for diagnostics. Reuses TASK-220's expression parser for WHERE predicates. Halt-on-first-error per language-doc §policy. Separate from TASK-313 so the pattern sub-grammar can be unit-tested in isolation, matching the separation Wave 2 used for `expr.rs` vs `pipeline.rs`.
+
+### TASK-313: [EASY][IMPL] Parser MATCH pipeline stage
+**Output**: crates/bqlite-parser/src/pipeline.rs (extension)
+**Depends on**: TASK-312
+**Description**: `MATCH (FIRST | ALL) [EMIT ALL] <sequence>` pipeline stage production — delegates to TASK-312 for the `<sequence>` non-terminal and emits `PipelineStage::Match { pattern: MatchPattern, span }`. Lands the `mode` + `emit_all` flags (`MatchMode::{First, All}` in the AST, with `emit_all: bool` as a sibling field). Unit tests cover every mode combination plus error cases for missing keywords.
+
+### TASK-314: [EASY][IMPL] Parser STATS stage
+**Output**: crates/bqlite-parser/src/pipeline.rs (extension)
+**Depends on**: TASK-220
+**Description**: `STATS <agg_list> [BY <group_list>]` production emitting `PipelineStage::Stats { aggregates: Vec<AggItem>, group_by: Vec<GroupItem>, span }`. Supports the full v1 aggregate keyword set: `COUNT`, `COUNT_DISTINCT`, `SUM`, `MIN`, `MAX`, `AVG`, `P50`, `P90`, `P95`, `P99` per query-language.md §7.1. Arg expressions compiled through TASK-220's expression parser. `COUNT_DISTINCT(col)` is the only distinct form — `COUNT(DISTINCT col)` is a parse error per query-language.md §7.3. The `AggItem`, `GroupItem`, and the `Stats` variant already exist in `bqlite-ast::operator`; this task lands the surface-to-AST production only. (Percentile runtime is TASK-327; the parser accepts the keywords regardless.)
+
+### TASK-315: [EASY][IMPL] Parser ORDER BY stage + SORT alias
+**Output**: crates/bqlite-parser/src/pipeline.rs (extension)
+**Depends on**: TASK-220
+**Description**: `ORDER BY <expr> [ASC|DESC] (, <expr> [ASC|DESC])*` and the `SORT` alias per query-language.md §13. Emits `PipelineStage::OrderBy { items: Vec<OrderItem>, span }`. Unit tests cover default-direction-is-ASC, mixed direction, and the `SORT`/`ORDER BY` equivalence.
+
+### TASK-316: [EASY][IMPL] Parser FUNNEL stage
+**Output**: crates/bqlite-parser/src/pipeline.rs (extension)
+**Depends on**: TASK-220, TASK-303, TASK-312
+**Description**: `FUNNEL( step THEN step [THEN step]... ) WITHIN <duration>` production per query-language.md §6.1, emitting `PipelineStage::Funnel(Funnel { steps, window, span })`. Reuses TASK-312's pattern step sub-grammar — FUNNEL accepts the full MATCH step grammar (named steps, property constraints, variable bindings, WITHOUT exclusions, alternation, repetition, IMMEDIATELY). The `Funnel` struct and the variant already exist in `bqlite-ast::operator`. FUNNEL is **terminal sugar** — it cannot be followed by `| STATS` or any downstream pipe stage; the parser emits an error if the user attempts to pipe after FUNNEL. Desugaring lives in TASK-319. RETENTION is explicitly out of scope — its AST variant stays unparsed in Wave 3 per the scope exclusions.
+
+### TASK-317: [EASY][IMPL] Logical + physical plan variants for Wave 3
+**Output**: crates/bqlite-planner/src/{logical.rs,physical.rs}
+**Depends on**: TASK-309, TASK-310, TASK-311
+**Description**: Adds the four Wave 3 logical nodes per planner-pipeline.md §5.2: `SequenceMatch { pattern: SequencePattern, mode, emit_all, window, brackets: None, step_properties, fused_downstream: Option<FusedDownstream>, input, output_schema }` (carries the **AST** pattern — compilation to `CompiledNfa` happens during logical→physical lowering in TASK-318), `Aggregate { aggregates: Vec<(String, AggFunc, Expr)>, group_by: Vec<Expr>, input, output_schema }`, `Sort { keys: Vec<(Expr, SortDirection)>, input, output_schema }`, `Distinct { input, output_schema }`. Adds the four physical descriptors per planner-pipeline.md §10: `SequenceMatchPhysical { compiled_nfa: CompiledNfa, strategy: MatchStrategy, demand: DemandSet, execution_config, fused_aggregate }`, `AggregatePhysical`, `SortPhysical`, `DistinctPhysical` — materialized into operators by the engine bind step (TASK-323). Replaces the "later waves" comment blocks in `logical.rs` and `physical.rs`. Schema-validation implementations follow logical-plan-nodes.md §5.1. Also extends the EXPLAIN tree builder (TASK-229) with pretty-print arms for all four new plan variants — otherwise `EXPLAIN` on a Wave 3 query panics or prints `<unknown>`.
+
+### TASK-318: [HARD][IMPL] AST → logical lowering + logical → physical lowering for Wave 3
+**Output**: crates/bqlite-planner/src/{logical.rs,physical.rs}
+**Depends on**: TASK-311, TASK-313, TASK-314, TASK-315, TASK-317
+**Description**: Two-phase extension of the planner for Wave 3 nodes.
+
+**Phase 1 — AST → logical.** Extends Wave 2's lowering (TASK-224) per TASK-309: `PipelineStage::Match` → `LogicalPlan::SequenceMatch { pattern: SequencePattern, ... }` (carries the AST pattern, NOT the compiled NFA), `PipelineStage::Stats` → `Aggregate`, `PipelineStage::OrderBy` → `Sort`, and `SELECT DISTINCT` → `Distinct(Project(...))` (the existing Wave 2 TODO in `logical.rs:508`). Ships backward demand propagation that fills the `step_properties` field on `SequenceMatch` by walking the consumer chain for `step_name.column` references and writing a `DemandSet` through to the scan node.
+
+**Phase 2 — logical → physical.** Extends Wave 2's physical lowering (TASK-226) for the four new nodes. For `SequenceMatch`: invokes TASK-311's pattern compiler (`SequencePattern` → `CompiledNfa`) with schema context, writes the compiled form onto `SequenceMatchPhysical` alongside strategy selection and demand, and pushes `CompiledNfa.relevant_event_types` into the scan's predicate list via Wave 2's pushdown pass (TASK-227) so the matcher never sees irrelevant events per sequence-matching.md §12. For `Aggregate`, `Sort`, `Distinct`: straightforward descriptor mapping.
+
+Error cases: unknown step names, binding references crossing an aggregate group-by boundary, type errors in aggregate arg expressions. Integration tests cover every Wave 3 pipeline shape end-to-end through both lowering phases.
+
+### TASK-319: [EASY][IMPL] FUNNEL desugaring pass
+**Output**: crates/bqlite-planner/src/opt/desugar_funnel.rs
+**Depends on**: TASK-316, TASK-318
+**Description**: AST-level rewrite pass run before TASK-318's logical lowering, per query-language.md §6.1 and planner-pipeline.md §4.3. Rewrites `PipelineStage::Funnel(steps, window)` into two pipeline stages: `MATCH FIRST SEQUENCE(steps) WITHIN <window> EMIT ALL` followed by `STATS step1_name = SUM(CAST(step_reached >= 1 AS INT)), step2_name = SUM(CAST(step_reached >= 2 AS INT)), ...` — one named `SUM(CAST(...))` per step, with aggregate output names derived from step names or event types per query-language.md §6.1 naming rules. Raises `TypeError::NameCollision` when two steps produce the same output name without explicit step names. Downstream lowering sees only `SequenceMatch + Aggregate`. Unit tests cover 2-step and 3-step funnels, named steps (`s: signup`), and the name-collision error case.
+
+### TASK-320: [EASY][IMPL] Match-aggregate fusion optimizer pass
+**Output**: crates/bqlite-planner/src/opt/fuse_match_aggregate.rs
+**Depends on**: TASK-308, TASK-318
+**Description**: Detects `Aggregate(SequenceMatch(...))` where the aggregate's demand set can be fulfilled directly from the match's per-match output (the desugared funnel shape: `SUM(CAST(step_reached >= N AS INT))` per step), populates `SequenceMatch.fused_downstream` with the compiled aggregate, and elides the standalone `Aggregate` node. Conservative — only fuses when the match and aggregate reference no columns outside the set surfaced by the match's output schema (`entity_id`, `step_reached`, bound variables). Unit tests cover the fused-funnel shape, the unfused "match then arbitrary project then aggregate" shape, and the mixed case with filters between match and aggregate (must not fuse).
+
+### TASK-321: [HARD][IMPL] SequenceMatchOperator
+**Output**: crates/bqlite-operators/src/sequence_match.rs
+**Depends on**: TASK-304, TASK-305, TASK-306, TASK-307, TASK-317
+**Description**: The physical `SequenceMatchOperator` that ties the three matcher pieces (TASK-304 NFA, TASK-305 step counter, TASK-306 bindings) into an `EntityOperator` implementation. Receives a `CompiledNfa` (produced by TASK-311 during physical lowering and carried on `SequenceMatchPhysical`) via the engine bind step. On construction, dispatches on `CompiledNfa.pattern_class` to pick the strategy per TASK-302. Implements `process_sub_batch()` honoring the entity-alignment contract from execution-model.md §4-5 (state persists across sub-batches for oversized entities), calls `finish_entity()` on boundary detection, and assembles per-match output rows into an Arrow `RecordBatch` builder sized per TASK-301's output schema rules. Consumes `fused_aggregate` (TASK-308) when populated by TASK-320 to feed matches into the hash aggregator without materializing the intermediate `match_events` map. Enforces the active-candidate cap from TASK-301 and returns the typed overflow error. Note: `bqlite-operators` depends on `bqlite-planner` per architecture.md, so importing `CompiledNfa` from the planner crate is legal.
+
+### TASK-322: [EASY][IMPL] Sort + Distinct operators
+**Output**: crates/bqlite-operators/src/{sort.rs,distinct.rs}
+**Depends on**: TASK-307, TASK-310, TASK-317
+**Description**: Two small `PhysicalOperator` implementations per TASK-310. `SortOperator` collects input batches into a single materialized `RecordBatch`, compiles sort keys through TASK-205's kernel, and emits Arrow `lexsort` output in stable form. `DistinctOperator` reuses TASK-307's hash-key kernel to dedup incoming rows against a `HashSet<GroupKey>`, emitting only first-occurrence rows. Both honor the hard-cap overflow error from TASK-310 — no spill. Output schemas unchanged from input.
+
+### TASK-323: [EASY][IMPL] Engine bind step extension for Wave 3 nodes
+**Output**: crates/bqlite-engine/src/bind.rs
+**Depends on**: TASK-307, TASK-317, TASK-318, TASK-321, TASK-322
+**Description**: Extends TASK-232's bind step to materialize `Box<dyn PhysicalOperator>` for `SequenceMatchPhysical`, `AggregatePhysical`, `SortPhysical`, and `DistinctPhysical`. Each bind arm instantiates the corresponding operator from the descriptor, wires in the child operator, and forwards the `output_schema` through. No new planner or storage logic — pure bind wiring. End-to-end engine tests confirm every Wave 3 pipeline shape (`events | WHERE | MATCH | STATS`, `events | STATS BY`, `events | ORDER BY LIMIT`, `SELECT DISTINCT`) executes and returns a non-empty result set over a fixture.
+
+### TASK-324: [HARD][IMPL] Matcher integration test suite
+**Output**: tests/integration/matcher/
+**Depends on**: TASK-318, TASK-321, TASK-323
+**Description**: Integration-level test suite reusing the TASK-120 fixture framework. Covers the full matcher semantics matrix from sequence-matching.md: linear patterns, branching alternation, one-or-more repetition, zero-or-more repetition, `WITHOUT` negation (including eager kill inside the negation scope), `$var` binding tracks (single binding, multiple bindings per track, NULL binding short-circuit), `IMMEDIATELY` modifier, time-window expiry (before, at boundary, after), EMIT ALL with each step reached, MATCH ALL rebinding per entity, and the entity-sub-batch streaming path for oversized entities. Each test ingests a small CSV fixture, runs the query through the engine, and asserts the exact result set. Pattern-class coverage forms the Tests-dimension evidence for TASK-399's audit.
+
+### TASK-325: [HARD][IMPL] Wave 3 benchmark suite + matcher microbenchmarks
+**Output**: benches/wave3/
+**Depends on**: TASK-321, TASK-307, TASK-322
+**Description**: Criterion benches per CLAUDE.md performance conventions, following the TASK-236 Wave 2 bench layout. Covers: (1) NFA vs. step-counter fast path on the same linear 3-step funnel pattern (validates the TASK-302 perf expectation), (2) hash aggregate throughput by group count (10, 1k, 1M), (3) sort throughput by row count, (4) distinct throughput by dedup ratio, (5) end-to-end 3-step funnel over a 100M-event synthetic dataset from `tests/src/strategies.rs`. Reuses the TASK-241 CI bench infrastructure with Wave 3 targets. Wave 3 budgets are captured inline in the suite's README and promoted into the `bench.yml` regression gate.
+
+### TASK-326: [HARD][IMPL] Wave 3 acceptance test
+**Output**: tests/wave3_acceptance.rs
+**Depends on**: TASK-307, TASK-319, TASK-321, TASK-323
+**Description**: The Wave 3 correctness gate per the header. Ingests a synthetic CSV event stream via the TASK-233 ingest path, runs `events LAST 30d | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d`, and asserts the per-step conversion counts (`signup`, `activation`, `purchase` output columns per query-language.md §6.1 naming rules) match hand-computed expected values. Also runs the equivalent desugared form `events LAST 30d | MATCH FIRST SEQUENCE(signup THEN activation THEN purchase) WITHIN 7d EMIT ALL | STATS signup = SUM(CAST(step_reached >= 1 AS INT)), activation = SUM(CAST(step_reached >= 2 AS INT)), purchase = SUM(CAST(step_reached >= 3 AS INT))` and asserts result equality with the FUNNEL form (validating TASK-319's desugaring). Wave 3 is done when this test passes in CI on both macOS and Linux.
+
+### TASK-327: [HARD][IMPL] DDSketch percentile accumulators (P50/P90/P95/P99)
+**Output**: crates/bqlite-operators/src/aggregate/percentile.rs
+**Depends on**: TASK-307, TASK-308
+**Description**: Implements the `P50`, `P90`, `P95`, `P99` aggregate functions via DDSketch per type-system.md §6.4 and planner-pipeline.md §7.2. DDSketch's bounded relative error (~1–2 KB per group) and constant-time `merge` are load-bearing for the fused-downstream protocol: percentile accumulators must be incrementally computable so they never block fusion (planner-pipeline.md §7.2 line 668). Ships four `HashAccumulator` implementations sharing one `DdSketch` backend: `P50Accumulator`, `P90Accumulator`, `P95Accumulator`, `P99Accumulator`. Each wraps a `DdSketch` (relative accuracy 0.01 default, configurable) with the `init`/`update_batch`/`merge`/`finalize`/`size_bytes` surface from TASK-308. Input must be `Int` or `Float` per type-system.md §6.4; other types are a type-check error in the planner. Null values skipped. `finalize` returns `Float` (nullable — empty sketch returns NULL). Unit tests verify relative accuracy on known distributions (uniform, exponential, bimodal), merge associativity, and that sketch size stays within 2 KB per group up to 10M observations. Benchmark: percentile throughput by group count alongside TASK-325's aggregate suite.
+
+### TASK-399: [HARD][IMPL] Wave 3 quality audit
 **Output**: docs/quality-score.md
-**Depends on**: TASK-301, TASK-302, TASK-303, TASK-304, TASK-305, TASK-306, TASK-307
-**Description**: Same audit pattern as TASK-199, rescored after Wave 3. Focus on the crates Wave 3 grew substantially — bqlite-operators (MATCH + hash aggregate + matcher strategies) and bqlite-parser (pattern grammar). The Tests dimension specifically checks coverage of matcher edge cases: variable-binding tracks, negation, repetition, time-window expiry, EMIT ALL semantics, and the step-counter vs NFA strategy-selection boundary. Any crate slipping vs. Wave 2 is flagged. Below-C grades get follow-up tasks; Wave 4 does not start until those are filed.
+**Depends on**: TASK-301, TASK-302, TASK-303, TASK-304, TASK-305, TASK-306, TASK-307, TASK-308, TASK-309, TASK-310, TASK-311, TASK-318, TASK-321, TASK-323, TASK-324, TASK-325, TASK-326, TASK-327
+**Description**: Same audit pattern as TASK-199 / TASK-299, rescored after Wave 3. Focus on the crates Wave 3 grew substantially — `bqlite-operators` (MATCH, matcher strategies, hash aggregate, DDSketch percentiles, sort, distinct), `bqlite-parser` (pattern + MATCH + STATS + ORDER BY + FUNNEL productions), and `bqlite-planner` (four new logical plan variants + four physical descriptors + pattern compilation + FUNNEL desugaring + match-aggregate fusion pass). The Tests dimension specifically checks the matcher edge-case coverage from TASK-324: variable-binding tracks, negation, repetition, time-window expiry, EMIT ALL semantics, and the step-counter vs NFA strategy-selection boundary. The Benchmarks dimension specifically checks that TASK-325 lands on both tracks and that the perf expectation from TASK-302 is evidenced. Any crate slipping vs. Wave 2 is flagged. Below-C grades get follow-up tasks; Wave 4 does not start until those are filed.
 
 ---
 
