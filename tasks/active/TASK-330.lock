@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-330",
+  "claimed_at": "2026-04-12T17:08:29Z",
+  "branch": "task/TASK-330",
+  "description": "Matcher benchmark matrix + perf-gate alignment closure"
+}
