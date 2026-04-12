@@ -8,6 +8,11 @@
 //! 65,536-row column chunk (the default row-group size) and reports
 //! the `gb_per_sec_scanned` and `bytes_decoded_to_scanned` metrics
 //! required by execution-model.md §14.1.
+//!
+//! ## Hard targets (reference mode only, TASK-246)
+//!
+//! Int64 decode throughput floors are enforced via `BenchResultCollector`
+//! in reference mode. CI mode uses Criterion's statistical comparison only.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -371,6 +376,9 @@ fn bench_encoding_with_metrics(c: &mut Criterion) {
     let chunk = plain.encode(array.as_ref()).unwrap();
     let payload_bytes = chunk.payload.len() as u64;
 
+    let mode = BenchMode::from_env();
+    let mut collector = BenchResultCollector::new(mode);
+
     let mut group = c.benchmark_group("encoding/metrics");
     group.throughput(Throughput::Bytes(payload_bytes));
 
@@ -389,11 +397,31 @@ fn bench_encoding_with_metrics(c: &mut Criterion) {
     });
 
     group.finish();
+
+    // In reference mode, measure int64 decode throughput and enforce floor.
+    if mode.is_reference() {
+        let start = Instant::now();
+        let n_iters = 100u64;
+        for _ in 0..n_iters {
+            let _ = plain.decode(black_box(&chunk), &BqlType::Int).unwrap();
+        }
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        let total_rows = ROW_GROUP_SIZE as f64 * n_iters as f64;
+        let rows_per_sec = total_rows / elapsed_secs;
+        collector.record(
+            "encoding/int64_decode_rows_per_sec",
+            rows_per_sec,
+            "rows/s",
+            Some(BenchTarget::at_least(200_000_000.0)),
+        );
+    }
+
+    collector.finish();
 }
 
 criterion_group! {
     name = encoding_benches;
-    config = wave2_criterion();
+    config = criterion_for_mode(BenchMode::from_env());
     targets =
         bench_plain_int64,
         bench_plain_float64,

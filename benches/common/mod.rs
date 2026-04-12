@@ -13,7 +13,24 @@
 //!   acceptance benchmarks.
 //! - Criterion configuration helpers ([`wave2_criterion`]) that apply
 //!   the workspace-standard sample size and measurement time.
+//!
+//! ## Dual-mode dataset strategy (TASK-246)
+//!
+//! The bench harness supports two modes controlled by the
+//! `BQLITE_BENCH_MODE` environment variable:
+//!
+//! - **`ci`** (default): CI-scaled fixtures (50k rows) for
+//!   regression-noise control on shared runners. Targets are not
+//!   enforced — only Criterion's statistical comparison applies.
+//!
+//! - **`reference`**: Reference-mode runs execute the true 100M-row
+//!   acceptance query on the pinned reference hardware (Apple M3 Pro).
+//!   Hard performance targets are enforced: the bench panics if any
+//!   target is missed. Results are written to a machine-readable JSON
+//!   file at `target/bench-results.json`.
 
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -40,6 +57,85 @@ pub fn identity<T>(x: T) -> T {
     x
 }
 
+// ── Bench mode ──────────────────────────────────────────────────────────────
+
+/// Bench execution mode, selected via `BQLITE_BENCH_MODE` env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchMode {
+    /// CI-scaled fixtures (default). Small datasets, no hard targets.
+    Ci,
+    /// Reference-hardware mode. Full 100M-row dataset, hard targets enforced.
+    Reference,
+}
+
+impl BenchMode {
+    /// Read the mode from `BQLITE_BENCH_MODE`. Defaults to `Ci`.
+    pub fn from_env() -> Self {
+        match std::env::var("BQLITE_BENCH_MODE").as_deref() {
+            Ok("reference") => BenchMode::Reference,
+            Ok("ci") | Err(_) => BenchMode::Ci,
+            Ok(other) => {
+                eprintln!(
+                    "WARNING: unknown BQLITE_BENCH_MODE={other:?}, \
+                     expected \"ci\" or \"reference\". Falling back to ci mode."
+                );
+                BenchMode::Ci
+            }
+        }
+    }
+
+    pub fn is_reference(self) -> bool {
+        self == BenchMode::Reference
+    }
+}
+
+/// Dataset sizing parameters that vary by mode.
+pub struct BenchSizing {
+    /// Total events for acceptance / ingest benchmarks.
+    pub acceptance_events: usize,
+    /// Entity count for acceptance benchmarks.
+    pub acceptance_entities: usize,
+    /// Total events for scan benchmarks.
+    pub scan_events: usize,
+    /// Entity count for scan benchmarks.
+    pub scan_entities: usize,
+    /// Total events for ingest benchmarks (small batch).
+    pub ingest_events_small: usize,
+    /// Entity count for ingest benchmarks (small batch).
+    pub ingest_entities_small: usize,
+    /// Total events for ingest benchmarks (large batch).
+    pub ingest_events_large: usize,
+    /// Entity count for ingest benchmarks (large batch).
+    pub ingest_entities_large: usize,
+}
+
+impl BenchSizing {
+    pub fn for_mode(mode: BenchMode) -> Self {
+        match mode {
+            BenchMode::Ci => BenchSizing {
+                acceptance_events: 50_000,
+                acceptance_entities: 500,
+                scan_events: 50_000,
+                scan_entities: 500,
+                ingest_events_small: 10_000,
+                ingest_entities_small: 100,
+                ingest_events_large: 50_000,
+                ingest_entities_large: 500,
+            },
+            BenchMode::Reference => BenchSizing {
+                acceptance_events: 100_000_000,
+                acceptance_entities: REF_ENTITY_COUNT,
+                scan_events: 100_000_000,
+                scan_entities: REF_ENTITY_COUNT,
+                ingest_events_small: 100_000,
+                ingest_entities_small: 1_000,
+                ingest_events_large: 1_000_000,
+                ingest_entities_large: REF_ENTITY_COUNT,
+            },
+        }
+    }
+}
+
 // ── Criterion configuration ─────────────────────────────────────────────────
 
 /// Standard Criterion config for Wave 2 benches: reduced sample size
@@ -50,6 +146,228 @@ pub fn wave2_criterion() -> Criterion {
         .sample_size(20)
         .warm_up_time(std::time::Duration::from_secs(1))
         .measurement_time(std::time::Duration::from_secs(3))
+}
+
+/// Criterion config for reference-mode: fewer samples but longer
+/// measurement to reduce noise on large datasets.
+pub fn reference_criterion() -> Criterion {
+    Criterion::default()
+        .sample_size(10)
+        .warm_up_time(std::time::Duration::from_secs(3))
+        .measurement_time(std::time::Duration::from_secs(10))
+}
+
+/// Return the appropriate Criterion configuration for the current mode.
+pub fn criterion_for_mode(mode: BenchMode) -> Criterion {
+    match mode {
+        BenchMode::Ci => wave2_criterion(),
+        BenchMode::Reference => reference_criterion(),
+    }
+}
+
+// ── Hard target enforcement (TASK-246) ──────────────────────────────────────
+
+/// A single bench result with its name and measured value.
+#[derive(Debug, Clone)]
+pub struct BenchResult {
+    pub name: String,
+    pub value: f64,
+    pub unit: String,
+    pub target: Option<BenchTarget>,
+}
+
+/// A hard performance target: the bench fails if the measured value
+/// violates the constraint.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchTarget {
+    pub limit: f64,
+    pub direction: TargetDirection,
+}
+
+/// Whether the measured value must be at-most or at-least the limit.
+#[derive(Debug, Clone, Copy)]
+pub enum TargetDirection {
+    /// Value must be <= limit (e.g. latency, compression ratio).
+    AtMost,
+    /// Value must be >= limit (e.g. throughput, pruning rate).
+    AtLeast,
+}
+
+impl BenchTarget {
+    pub fn at_most(limit: f64) -> Self {
+        BenchTarget {
+            limit,
+            direction: TargetDirection::AtMost,
+        }
+    }
+
+    pub fn at_least(limit: f64) -> Self {
+        BenchTarget {
+            limit,
+            direction: TargetDirection::AtLeast,
+        }
+    }
+
+    pub fn passes(self, value: f64) -> bool {
+        match self.direction {
+            TargetDirection::AtMost => value <= self.limit,
+            TargetDirection::AtLeast => value >= self.limit,
+        }
+    }
+}
+
+/// Collect bench results and enforce hard targets in reference mode.
+///
+/// In CI mode, results are collected but targets are not enforced.
+/// In reference mode, the harness panics if any target is missed.
+///
+/// Results are always written to `target/bench-results.json` (appending
+/// to any existing file) so both CI and reference numbers can be
+/// uploaded as artifacts.
+pub struct BenchResultCollector {
+    mode: BenchMode,
+    results: Vec<BenchResult>,
+}
+
+impl BenchResultCollector {
+    pub fn new(mode: BenchMode) -> Self {
+        Self {
+            mode,
+            results: Vec::new(),
+        }
+    }
+
+    /// Record a result. If in reference mode and a target is set, the
+    /// target is checked immediately and the violation is recorded (but
+    /// enforcement is deferred to [`finish`]).
+    pub fn record(&mut self, name: &str, value: f64, unit: &str, target: Option<BenchTarget>) {
+        let direction_str = target.map(|t| match t.direction {
+            TargetDirection::AtMost => "at_most",
+            TargetDirection::AtLeast => "at_least",
+        });
+        let pass = target.map(|t| t.passes(value));
+        eprintln!(
+            "  [bench-result] {name} = {value:.4} {unit}\
+             {}{}\
+             {}",
+            target
+                .map(|t| format!("  (target: {} {})", direction_str.unwrap(), t.limit))
+                .unwrap_or_default(),
+            pass.map(|p| if p { "  PASS" } else { "  **MISS**" })
+                .unwrap_or(""),
+            if self.mode.is_reference() {
+                "  [reference]"
+            } else {
+                "  [ci]"
+            },
+        );
+        self.results.push(BenchResult {
+            name: name.to_string(),
+            value,
+            unit: unit.to_string(),
+            target,
+        });
+    }
+
+    /// Write results to JSON and enforce targets in reference mode.
+    /// Panics if any target is missed in reference mode.
+    pub fn finish(self) {
+        self.write_json();
+
+        if !self.mode.is_reference() {
+            return;
+        }
+
+        let mut failures = Vec::new();
+        for r in &self.results {
+            if let Some(target) = r.target {
+                if !target.passes(r.value) {
+                    failures.push(format!(
+                        "{}: measured {:.4} {} (target: {} {:.4})",
+                        r.name,
+                        r.value,
+                        r.unit,
+                        match target.direction {
+                            TargetDirection::AtMost => "<=",
+                            TargetDirection::AtLeast => ">=",
+                        },
+                        target.limit,
+                    ));
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            let msg = format!(
+                "Reference-mode hard target failures:\n{}",
+                failures.join("\n")
+            );
+            panic!("{msg}");
+        }
+    }
+
+    fn write_json(&self) {
+        // Cargo bench binaries run with CWD = package root, but CI expects
+        // output at the workspace target dir. CARGO_TARGET_DIR is set when
+        // Cargo uses a non-default target directory; fall back to resolving
+        // relative to CARGO_MANIFEST_DIR's parent (the workspace root).
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .or_else(|_| {
+                std::env::var("CARGO_MANIFEST_DIR").map(|m| {
+                    PathBuf::from(m)
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .join("target")
+                })
+            })
+            .unwrap_or_else(|_| PathBuf::from("target"));
+        let results_path = target_dir.join("bench-results.json");
+
+        // Read existing results if the file exists, so multiple bench
+        // binaries append to the same file.
+        let mut all: BTreeMap<String, serde_json::Value> = std::fs::read_to_string(&results_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let mode_key = if self.mode.is_reference() {
+            "reference"
+        } else {
+            "ci"
+        };
+
+        for r in &self.results {
+            let mut entry = serde_json::Map::new();
+            entry.insert("value".to_string(), serde_json::json!(r.value));
+            entry.insert("unit".to_string(), serde_json::json!(r.unit));
+            entry.insert("mode".to_string(), serde_json::json!(mode_key));
+            if let Some(target) = r.target {
+                entry.insert(
+                    "target".to_string(),
+                    serde_json::json!({
+                        "limit": target.limit,
+                        "direction": match target.direction {
+                            TargetDirection::AtMost => "at_most",
+                            TargetDirection::AtLeast => "at_least",
+                        },
+                        "pass": target.passes(r.value),
+                    }),
+                );
+            }
+            all.insert(
+                format!("{mode_key}/{}", r.name),
+                serde_json::Value::Object(entry),
+            );
+        }
+
+        if let Ok(json) = serde_json::to_string_pretty(&all) {
+            // Best-effort write — don't fail the bench if the file can't be written.
+            let _ = std::fs::create_dir_all(&target_dir);
+            let _ =
+                std::fs::File::create(&results_path).and_then(|mut f| f.write_all(json.as_bytes()));
+        }
+    }
 }
 
 // ── Arrow array generators ──────────────────────────────────────────────────
@@ -319,5 +637,83 @@ mod tests {
         for ev in &events {
             assert_eq!(ev.properties.len(), 7, "expected 7 property columns");
         }
+    }
+
+    // ── BenchTarget tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn bench_target_at_most_passes_below_and_equal() {
+        let t = BenchTarget::at_most(1.0);
+        assert!(t.passes(0.5));
+        assert!(t.passes(1.0));
+        assert!(!t.passes(1.01));
+    }
+
+    #[test]
+    fn bench_target_at_least_passes_above_and_equal() {
+        let t = BenchTarget::at_least(100.0);
+        assert!(t.passes(200.0));
+        assert!(t.passes(100.0));
+        assert!(!t.passes(99.9));
+    }
+
+    // ── BenchMode tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn bench_mode_default_is_ci() {
+        // Without BQLITE_BENCH_MODE set, defaults to Ci.
+        // Note: this test may be affected by the env in the test runner,
+        // but the standard CI doesn't set BQLITE_BENCH_MODE.
+        let mode = BenchMode::from_env();
+        // We just verify the function doesn't panic; the actual value
+        // depends on the test environment.
+        let _ = mode.is_reference();
+    }
+
+    #[test]
+    fn bench_sizing_ci_has_small_datasets() {
+        let s = BenchSizing::for_mode(BenchMode::Ci);
+        assert_eq!(s.acceptance_events, 50_000);
+        assert_eq!(s.acceptance_entities, 500);
+        assert_eq!(s.scan_events, 50_000);
+    }
+
+    #[test]
+    fn bench_sizing_reference_has_large_datasets() {
+        let s = BenchSizing::for_mode(BenchMode::Reference);
+        assert_eq!(s.acceptance_events, 100_000_000);
+        assert_eq!(s.acceptance_entities, REF_ENTITY_COUNT);
+        assert_eq!(s.scan_events, 100_000_000);
+    }
+
+    // ── BenchResultCollector tests ─────────────────────────────────────────
+
+    #[test]
+    fn collector_ci_mode_does_not_panic_on_target_miss() {
+        let mut c = BenchResultCollector::new(BenchMode::Ci);
+        c.record("test/metric", 999.0, "ns", Some(BenchTarget::at_most(1.0)));
+        // finish() should NOT panic in CI mode even though target is missed.
+        c.finish();
+    }
+
+    #[test]
+    #[should_panic(expected = "Reference-mode hard target failures")]
+    fn collector_reference_mode_panics_on_target_miss() {
+        let mut c = BenchResultCollector::new(BenchMode::Reference);
+        c.record("test/metric", 999.0, "ns", Some(BenchTarget::at_most(1.0)));
+        c.finish();
+    }
+
+    #[test]
+    fn collector_reference_mode_passes_when_targets_met() {
+        let mut c = BenchResultCollector::new(BenchMode::Reference);
+        c.record("test/latency", 0.5, "s", Some(BenchTarget::at_most(1.0)));
+        c.record(
+            "test/throughput",
+            200.0,
+            "MB/s",
+            Some(BenchTarget::at_least(100.0)),
+        );
+        c.finish();
     }
 }

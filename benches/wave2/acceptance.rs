@@ -2,9 +2,10 @@
 //!
 //! Covers the Wave 2 performance gate "acceptance" line: the full
 //! ingest → scan → decode round-trip that the 100M-row acceptance
-//! test exercises. The bench uses a scaled-down dataset (50k rows)
-//! to keep CI runtimes reasonable while still exercising every layer
-//! of the storage pipeline end-to-end.
+//! test exercises. In CI mode the bench uses a scaled-down dataset
+//! (50k rows) to keep runtimes reasonable; in reference mode
+//! (`BQLITE_BENCH_MODE=reference`) it runs the full 100M-row dataset
+//! and enforces hard performance targets.
 //!
 //! The acceptance bench measures:
 //! - Full round-trip: ingest events → write segments → read segments
@@ -13,6 +14,12 @@
 //!
 //! Per execution-model.md §14.1, the bench reports `gb_per_sec_scanned`
 //! and `bytes_decoded_to_scanned` per iteration.
+//!
+//! ## Hard targets (reference mode only, TASK-246)
+//!
+//! - Acceptance query (cold-cache full scan): < 1 s
+//! - Compression ratio (segment bytes / raw CSV bytes): ≤ 0.10
+//! - Zone-map pruning effectiveness: ≥ 0.80
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,19 +66,31 @@ fn setup_acceptance_db(
 // ── Full round-trip benchmark ────────────────────────────────────────────────
 
 fn bench_acceptance_round_trip(c: &mut Criterion) {
-    let (_scratch, seg_paths, schema, raw_bytes) = setup_acceptance_db(50_000, 500);
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let (_scratch, seg_paths, schema, raw_bytes) =
+        setup_acceptance_db(sizing.acceptance_events, sizing.acceptance_entities);
 
     let total_segment_bytes: u64 = seg_paths
         .iter()
         .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
         .sum();
 
+    let mut collector = BenchResultCollector::new(mode);
+
+    // Report compression ratio.
     if raw_bytes > 0 {
         let ratio = (total_segment_bytes as f64) / (raw_bytes as f64);
         eprintln!(
             "  acceptance: compression_ratio = {ratio:.3} \
              (segment_bytes={total_segment_bytes}, raw_bytes={raw_bytes})"
         );
+        let target = if mode.is_reference() {
+            Some(BenchTarget::at_most(0.10))
+        } else {
+            None
+        };
+        collector.record("acceptance/compression_ratio", ratio, "ratio", target);
     }
 
     let mut group = c.benchmark_group("acceptance/round_trip");
@@ -105,12 +124,42 @@ fn bench_acceptance_round_trip(c: &mut Criterion) {
     });
 
     group.finish();
+
+    // In reference mode, measure a single cold-cache pass and enforce
+    // the < 1s target on that measurement.
+    if mode.is_reference() {
+        let start = Instant::now();
+        let mut total_rows = 0u64;
+        for path in &seg_paths {
+            let bytes = std::fs::read(path).unwrap();
+            let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+            let projection = ColumnProjection::all();
+            let mut scan = reader.scan(&projection, None).unwrap();
+            while let Some(batch) = scan.next_row_group().unwrap() {
+                total_rows += batch.num_rows() as u64;
+                black_box(&batch);
+            }
+        }
+        black_box(total_rows);
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        collector.record(
+            "acceptance/query_time_secs",
+            elapsed_secs,
+            "s",
+            Some(BenchTarget::at_most(1.0)),
+        );
+    }
+
+    collector.finish();
 }
 
 // ── Zone-map pruning effectiveness ───────────────────────────────────────────
 
 fn bench_acceptance_pruning(c: &mut Criterion) {
-    let (_scratch, seg_paths, schema, _raw_bytes) = setup_acceptance_db(50_000, 500);
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let (_scratch, seg_paths, schema, _raw_bytes) =
+        setup_acceptance_db(sizing.acceptance_events, sizing.acceptance_entities);
 
     let total_segment_bytes: u64 = seg_paths
         .iter()
@@ -123,8 +172,7 @@ fn bench_acceptance_pruning(c: &mut Criterion) {
         value: PropertyValue::Int(4500),
     }]));
 
-    let mut group = c.benchmark_group("acceptance/pruning");
-    group.throughput(Throughput::Bytes(total_segment_bytes));
+    let mut collector = BenchResultCollector::new(mode);
 
     {
         let mut total_rgs = 0usize;
@@ -152,7 +200,21 @@ fn bench_acceptance_pruning(c: &mut Criterion) {
             "  acceptance: zone_map_pruning_rate = {pruning_rate:.2} \
              (accepted={accepted_rgs}/{total_rgs})"
         );
+        let target = if mode.is_reference() {
+            Some(BenchTarget::at_least(0.80))
+        } else {
+            None
+        };
+        collector.record(
+            "acceptance/zone_map_pruning_rate",
+            pruning_rate,
+            "ratio",
+            target,
+        );
     }
+
+    let mut group = c.benchmark_group("acceptance/pruning");
+    group.throughput(Throughput::Bytes(total_segment_bytes));
 
     group.bench_function("selective_scan", |b| {
         b.iter_custom(|iters| {
@@ -182,18 +244,24 @@ fn bench_acceptance_pruning(c: &mut Criterion) {
     });
 
     group.finish();
+    collector.finish();
 }
 
 // ── Ingest throughput ────────────────────────────────────────────────────────
 
 fn bench_acceptance_ingest(c: &mut Criterion) {
-    let events = generate_events(50_000, 500);
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let events = generate_events(sizing.acceptance_events, sizing.acceptance_entities);
     let event_bytes: u64 = events.len() as u64 * 120;
+
+    let mut collector = BenchResultCollector::new(mode);
 
     let mut group = c.benchmark_group("acceptance/ingest");
     group.throughput(Throughput::Bytes(event_bytes));
 
-    group.bench_function("50k_events", |b| {
+    let label = format!("{}k_events", events.len() / 1000);
+    group.bench_function(&label, |b| {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
@@ -218,11 +286,40 @@ fn bench_acceptance_ingest(c: &mut Criterion) {
     });
 
     group.finish();
+
+    // In reference mode, measure ingest throughput and enforce >= 100 MB/s.
+    if mode.is_reference() {
+        let start = Instant::now();
+        let scratch = ScratchDir::new("acceptance-ingest-target");
+        let schema = purchases_schema();
+        let mut db = open_db_with_table(scratch.path(), "purchases", schema);
+
+        let batch_id = db.allocate_batch_id("purchases").unwrap();
+        let mut partitioner = Partitioner::new(4, 30, batch_id, 512 * 1024 * 1024).unwrap();
+        for event in &events {
+            partitioner.push_event(event.clone()).unwrap();
+        }
+
+        let mut writer = SegmentWriter::new(&mut db);
+        let metas = writer.write_partitioner("purchases", partitioner).unwrap();
+        black_box(metas.len());
+
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        let mb_per_sec = (event_bytes as f64) / elapsed_secs / (1024.0 * 1024.0);
+        collector.record(
+            "acceptance/ingest_mb_per_sec",
+            mb_per_sec,
+            "MB/s",
+            Some(BenchTarget::at_least(100.0)),
+        );
+    }
+
+    collector.finish();
 }
 
 criterion_group! {
     name = acceptance_benches;
-    config = wave2_criterion();
+    config = criterion_for_mode(BenchMode::from_env());
     targets =
         bench_acceptance_round_trip,
         bench_acceptance_pruning,

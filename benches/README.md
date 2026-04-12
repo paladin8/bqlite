@@ -55,7 +55,7 @@ Cargo does **not** auto-discover benches recursively.
 ## Running benches locally
 
 ```bash
-# Run every bench in the suite.
+# Run every bench in the suite (CI mode — scaled-down datasets).
 cargo bench -p bqlite-benches
 
 # Run a single bench group by name.
@@ -63,11 +63,42 @@ cargo bench -p bqlite-benches --bench smoke
 
 # Run every bench matching a Criterion regex filter.
 cargo bench -p bqlite-benches -- 'smoke/noop'
+
+# Run in reference mode (100M rows, hard targets enforced).
+# Only meaningful on the pinned reference hardware (Apple M3 Pro).
+BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches \
+    --bench scan --bench encoding --bench ingest --bench acceptance
 ```
 
 Criterion writes HTML reports and historical baselines under
 `target/criterion/` — those files are gitignored and are not part of
 CI artifacts.
+
+## Dual-mode dataset strategy (TASK-246)
+
+The bench harness supports two modes controlled by the
+`BQLITE_BENCH_MODE` environment variable:
+
+- **`ci`** (default): CI-scaled fixtures (50k rows) for
+  regression-noise control on shared runners. Targets are not
+  enforced — only Criterion's statistical regression gate applies.
+
+- **`reference`**: Full 100M-row acceptance query on the pinned
+  reference hardware. Hard performance targets are enforced — the
+  bench panics if any target is missed:
+
+  | Metric | Target |
+  |--------|--------|
+  | Acceptance query (cold-cache full scan) | < 1 s |
+  | Compression ratio (segment / raw CSV) | ≤ 10% |
+  | Zone-map pruning effectiveness | ≥ 80% |
+  | Int64 decode throughput | ≥ 200M rows/s |
+  | Pushed-down equality (dictionary column) | ≥ 500M rows/s effective |
+  | Ingest throughput (parse → sort → encode → write) | ≥ 100 MB/s |
+
+Both modes write machine-readable results to `target/bench-results.json`
+so CI regression gating and manual release sign-off compare the same
+metrics. The CI workflow uploads separate artifacts for each mode.
 
 ## CI contract
 
@@ -87,11 +118,16 @@ which is enough to catch:
   per function and exit with an error on failure — without this, a
   bench that panics at startup would silently pass CI.
 
-Actual wall-time regression gating is *not* wired up yet. There is no
-dedicated `cargo bench` job in CI today. The Wave 2 work referenced by
-`TASKS.md` §"Wave 2" performance gate is what introduces per-metric
-baselines (≥10% slip blocks merges); until then, benches are collected
-and compiled but their numbers are advisory only.
+The bench CI workflow (`.github/workflows/bench.yml`) provides:
+
+- **Baseline capture** (`bench-baseline`): On every push to main,
+  captures Criterion estimates as the `bench-baseline-main` artifact.
+- **Regression gate** (`bench-gate`): On non-draft PRs, downloads the
+  latest baseline and runs `scripts/bench-compare.sh`. Fails if any
+  metric regresses >10% on 3+ consecutive Criterion samples.
+- **Reference benchmark** (`bench-reference`): Manual dispatch with
+  `BQLITE_BENCH_MODE=reference` for full 100M-row runs with hard
+  target enforcement.
 
 ## Wave 1 status
 

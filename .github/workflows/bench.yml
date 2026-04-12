@@ -1,17 +1,26 @@
 name: Bench
 
-# Wave 2 benchmark CI job (TASK-241).
+# Wave 2 benchmark CI job (TASK-241, updated by TASK-246).
 #
-# Two jobs:
+# Three jobs:
 #   bench-baseline  — runs on every push to main, captures Criterion
 #                     estimates as the "bench-baseline-main" artifact.
 #   bench-gate      — runs on non-draft, non-bench-skip PRs; downloads the
 #                     latest baseline and calls scripts/bench-compare.sh.
 #                     Fails the PR if any metric regresses >10% on 3+
 #                     consecutive Criterion samples (see bench-compare.sh).
+#   bench-reference — manual dispatch only; runs the full reference-mode
+#                     dataset (100M rows) with hard target enforcement on
+#                     the pinned reference hardware.
 #
-# Reference-hardware (Apple M3 Pro) verification remains manual; the CI gate
-# uses the 1.5×-relaxed targets that are achievable on ubuntu-latest 4 vCPU.
+# Dual-mode strategy (TASK-246):
+#   CI jobs (bench-baseline, bench-gate) run in default CI mode with
+#   scaled-down datasets. The bench-reference job sets
+#   BQLITE_BENCH_MODE=reference to run the full 100M-row acceptance
+#   query and enforce hard performance targets. Both modes write
+#   machine-readable results to target/bench-results.json, uploaded
+#   as separate artifacts so regression gating and manual release
+#   sign-off compare the same metrics.
 
 on:
   push:
@@ -23,12 +32,22 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - 'tasks/**'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Bench mode: ci (default) or reference (100M rows, hard targets)'
+        required: false
+        default: 'ci'
+        type: choice
+        options:
+          - ci
+          - reference
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Baseline capture (main only) ────────────────────────────────────────────
+  # ── Baseline capture (main only) ───────────────────────────────────��────────
   bench-baseline:
     name: Capture bench baseline
     if: github.event_name == 'push'
@@ -66,6 +85,14 @@ jobs:
           path: target/criterion/
           retention-days: 90
           if-no-files-found: error
+
+      - name: Upload CI bench results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-ci
+          path: target/bench-results.json
+          retention-days: 90
+          if-no-files-found: warn
 
   # ── Regression gate (PRs only) ──────────────────────────────────────────────
   bench-gate:
@@ -144,3 +171,56 @@ jobs:
           echo "Skipping regression gate — no bench-baseline-main artifact"
           echo "found on main yet. The gate will be active once a baseline"
           echo "has been captured by a push to main."
+
+      - name: Upload PR bench results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-pr
+          path: target/bench-results.json
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ── Reference-hardware benchmark (manual dispatch) ──────────────────────────
+  bench-reference:
+    name: Reference benchmark (100M rows)
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.mode == 'reference'
+    # Hard targets (< 1s query, 500M rows/s equality, etc.) are calibrated
+    # for the pinned Apple M3 Pro reference machine. On ubuntu-latest they
+    # will likely fail. When a self-hosted runner is available, change this
+    # to: runs-on: [self-hosted, bench-reference]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      BQLITE_BENCH_MODE: reference
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Run reference-mode benchmarks
+        run: >
+          cargo bench -p bqlite-benches
+          --bench scan
+          --bench encoding
+          --bench ingest
+          --bench acceptance
+
+      - name: Upload reference Criterion output
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-reference-criterion
+          path: target/criterion/
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload reference bench results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-reference
+          path: target/bench-results.json
+          retention-days: 90
+          if-no-files-found: error

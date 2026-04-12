@@ -8,6 +8,13 @@
 //! through the SegmentFileReader, and measures end-to-end decode
 //! throughput. The `gb_per_sec_scanned` and `bytes_decoded_to_scanned`
 //! metrics from execution-model.md §14.1 are reported per iteration.
+//!
+//! ## Hard targets (reference mode only, TASK-246)
+//!
+//! - Int64 decode throughput (no predicate): floor enforced via
+//!   `BenchResultCollector`
+//! - Pushed-down equality scan: floor enforced via
+//!   `BenchResultCollector`
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -46,7 +53,9 @@ fn write_test_segment(
 // ── Full-scan decode throughput ──────────────────────────────────────────────
 
 fn bench_scan_full(c: &mut Criterion) {
-    let (bytes, schema) = write_test_segment(50_000, 500);
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let (bytes, schema) = write_test_segment(sizing.scan_events, sizing.scan_entities);
     let file_bytes = bytes.len() as u64;
 
     let mut group = c.benchmark_group("scan/full");
@@ -76,7 +85,9 @@ fn bench_scan_full(c: &mut Criterion) {
 }
 
 fn bench_scan_projected(c: &mut Criterion) {
-    let (bytes, schema) = write_test_segment(50_000, 500);
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let (bytes, schema) = write_test_segment(sizing.scan_events, sizing.scan_entities);
     let file_bytes = bytes.len() as u64;
 
     let mut group = c.benchmark_group("scan/projected");
@@ -105,7 +116,9 @@ fn bench_scan_projected(c: &mut Criterion) {
 // ── Zone-map pruning throughput ──────────────────────────────────────────────
 
 fn bench_scan_with_zone_map_pruning(c: &mut Criterion) {
-    let (bytes, schema) = write_test_segment(50_000, 500);
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let (bytes, schema) = write_test_segment(sizing.scan_events, sizing.scan_entities);
     let file_bytes = bytes.len() as u64;
 
     let mut group = c.benchmark_group("scan/zone_map_pruning");
@@ -161,8 +174,13 @@ fn bench_scan_with_zone_map_pruning(c: &mut Criterion) {
 // ── Per-type decode throughput ───────────────────────────────────────────────
 
 fn bench_scan_int64_column(c: &mut Criterion) {
-    let (bytes, schema) = write_test_segment(50_000, 500);
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let (bytes, schema) = write_test_segment(sizing.scan_events, sizing.scan_entities);
     let file_bytes = bytes.len() as u64;
+    let n_events = sizing.scan_events;
+
+    let mut collector = BenchResultCollector::new(mode);
 
     let mut group = c.benchmark_group("scan/column_type/int64");
     group.throughput(Throughput::Bytes(file_bytes));
@@ -179,10 +197,37 @@ fn bench_scan_int64_column(c: &mut Criterion) {
     });
 
     group.finish();
+
+    // In reference mode, measure int64 decode throughput and enforce floor.
+    // Target: >= 200M rows/sec (from TASKS.md Wave 2 perf gate).
+    if mode.is_reference() {
+        let start = Instant::now();
+        let reader = SegmentFileReader::from_bytes(bytes.clone(), schema.clone()).unwrap();
+        let projection = ColumnProjection::with_columns(["amount"]);
+        let mut scan = reader.scan(&projection, None).unwrap();
+        let mut total_rows = 0u64;
+        while let Some(batch) = scan.next_row_group().unwrap() {
+            total_rows += batch.num_rows() as u64;
+            black_box(&batch);
+        }
+        black_box(total_rows);
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        let rows_per_sec = n_events as f64 / elapsed_secs;
+        collector.record(
+            "scan/int64_decode_rows_per_sec",
+            rows_per_sec,
+            "rows/s",
+            Some(BenchTarget::at_least(200_000_000.0)),
+        );
+    }
+
+    collector.finish();
 }
 
 fn bench_scan_string_column(c: &mut Criterion) {
-    let (bytes, schema) = write_test_segment(50_000, 500);
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let (bytes, schema) = write_test_segment(sizing.scan_events, sizing.scan_entities);
     let file_bytes = bytes.len() as u64;
 
     let mut group = c.benchmark_group("scan/column_type/string");
@@ -203,7 +248,9 @@ fn bench_scan_string_column(c: &mut Criterion) {
 }
 
 fn bench_scan_float64_column(c: &mut Criterion) {
-    let (bytes, schema) = write_test_segment(50_000, 500);
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let (bytes, schema) = write_test_segment(sizing.scan_events, sizing.scan_entities);
     let file_bytes = bytes.len() as u64;
 
     let mut group = c.benchmark_group("scan/column_type/float64");
@@ -223,9 +270,77 @@ fn bench_scan_float64_column(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Pushed-down equality scan ───────────────────────────────────────────────
+
+fn bench_scan_pushed_equality(c: &mut Criterion) {
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let (bytes, schema) = write_test_segment(sizing.scan_events, sizing.scan_entities);
+    let file_bytes = bytes.len() as u64;
+    let n_events = sizing.scan_events;
+
+    let mut collector = BenchResultCollector::new(mode);
+
+    let predicate = Arc::new(ScanPredicate::new(vec![ScanConjunct::Equal {
+        column: "event_type".to_string(),
+        value: PropertyValue::String("event_0".to_string()),
+    }]));
+
+    let mut group = c.benchmark_group("scan/pushed_equality");
+    group.throughput(Throughput::Bytes(file_bytes));
+
+    group.bench_function("event_type_eq", |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let reader = SegmentFileReader::from_bytes(bytes.clone(), schema.clone()).unwrap();
+                let projection = ColumnProjection::all();
+                let mut scan = reader.scan(&projection, Some(predicate.clone())).unwrap();
+                let mut total_rows = 0u64;
+                while let Some(batch) = scan.next_row_group().unwrap() {
+                    total_rows += batch.num_rows() as u64;
+                    black_box(&batch);
+                }
+                black_box(total_rows);
+            }
+            let elapsed = start.elapsed();
+            report_metrics(file_bytes * iters, file_bytes * iters, elapsed);
+            elapsed
+        })
+    });
+
+    group.finish();
+
+    // In reference mode, measure pushed-down equality effective throughput.
+    // Target: >= 500M rows/sec effective (from TASKS.md Wave 2 perf gate).
+    if mode.is_reference() {
+        let start = Instant::now();
+        let reader = SegmentFileReader::from_bytes(bytes.clone(), schema.clone()).unwrap();
+        let projection = ColumnProjection::all();
+        let mut scan = reader.scan(&projection, Some(predicate.clone())).unwrap();
+        let mut total_rows = 0u64;
+        while let Some(batch) = scan.next_row_group().unwrap() {
+            total_rows += batch.num_rows() as u64;
+            black_box(&batch);
+        }
+        black_box(total_rows);
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        // Effective throughput counts total input rows, not just matched rows.
+        let effective_rows_per_sec = n_events as f64 / elapsed_secs;
+        collector.record(
+            "scan/pushed_equality_effective_rows_per_sec",
+            effective_rows_per_sec,
+            "rows/s",
+            Some(BenchTarget::at_least(500_000_000.0)),
+        );
+    }
+
+    collector.finish();
+}
+
 criterion_group! {
     name = scan_benches;
-    config = wave2_criterion();
+    config = criterion_for_mode(BenchMode::from_env());
     targets =
         bench_scan_full,
         bench_scan_projected,
@@ -233,5 +348,6 @@ criterion_group! {
         bench_scan_int64_column,
         bench_scan_string_column,
         bench_scan_float64_column,
+        bench_scan_pushed_equality,
 }
 criterion_main!(scan_benches);

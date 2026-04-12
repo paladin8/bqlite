@@ -2,6 +2,9 @@
 # bench-compare.sh — Compare Criterion estimates.json files between a baseline
 # and the current bench run. Fails if any metric regresses more than 10%.
 #
+# Also checks target/bench-results.json (TASK-246) for hard target violations
+# when present: any result where target.pass == false causes a failure.
+#
 # Usage:
 #   scripts/bench-compare.sh <baseline_dir> <current_dir>
 #
@@ -19,7 +22,8 @@
 #
 # Exit codes:
 #   0  all metrics within threshold (or no comparable baseline for a metric)
-#   1  one or more metrics have 3+ consecutive samples regressing >10%
+#   1  one or more metrics have 3+ consecutive samples regressing >10%,
+#      or one or more hard targets failed
 
 set -euo pipefail
 
@@ -138,9 +142,51 @@ while IFS= read -r -d '' current_file; do
     fi
 done < <(find "${CURRENT_DIR}" -path "*/new/estimates.json" -print0 | sort -z)
 
+# ── Hard target check (TASK-246) ─────────────────────────────────────────────
+# If target/bench-results.json exists, check for any failed hard targets.
+BENCH_RESULTS="target/bench-results.json"
+target_pass_count=0
+target_fail_count=0
+
+if [[ -f "${BENCH_RESULTS}" ]]; then
+    echo ""
+    echo "Checking hard targets from ${BENCH_RESULTS}..."
+
+    # Extract entries that have a target object and check pass/fail.
+    while IFS=$'\t' read -r key pass value unit limit direction; do
+        if [[ "${pass}" == "true" ]]; then
+            printf "TARGET PASS  %s  value=%.4f %s  (%s %s)\n" \
+                "${key}" "${value}" "${unit}" "${direction}" "${limit}"
+            summary_lines+=("| 🟢 TARGET | \`${key}\` | \`${value}\` ${unit} (${direction} ${limit}) |")
+            ((target_pass_count++)) || true
+        else
+            printf "TARGET FAIL  %s  value=%.4f %s  (%s %s)\n" \
+                "${key}" "${value}" "${unit}" "${direction}" "${limit}"
+            summary_lines+=("| 🔴 TARGET | \`${key}\` | \`${value}\` ${unit} (**FAILED** ${direction} ${limit}) |")
+            ((target_fail_count++)) || true
+            failed=1
+        fi
+    done < <(jq -r '
+        to_entries[]
+        | select(.value.target != null)
+        | [
+            .key,
+            (.value.target.pass | tostring),
+            (.value.value | tostring),
+            .value.unit,
+            (.value.target.limit | tostring),
+            .value.target.direction
+          ]
+        | @tsv
+    ' "${BENCH_RESULTS}" 2>/dev/null || true)
+fi
+
 # ── Summary output ────────────────────────────────────────────────────────────
 echo ""
 echo "Results: ${pass_count} OK, ${skip_count} skipped"
+if [[ ${target_pass_count} -gt 0 || ${target_fail_count} -gt 0 ]]; then
+    echo "Targets: ${target_pass_count} passed, ${target_fail_count} failed"
+fi
 
 # Write a markdown table to $GITHUB_STEP_SUMMARY when running in GitHub Actions.
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
@@ -158,11 +204,15 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         done
         echo ""
         echo "_Threshold: >10% regression on 3+ consecutive Criterion samples_"
+        if [[ ${target_pass_count} -gt 0 || ${target_fail_count} -gt 0 ]]; then
+            echo ""
+            echo "_Hard targets: ${target_pass_count} passed, ${target_fail_count} failed_"
+        fi
     } >> "${GITHUB_STEP_SUMMARY}"
 fi
 
 if [[ ${failed} -ne 0 ]]; then
-    echo "FAILED: one or more benchmarks regressed >10% vs baseline."
+    echo "FAILED: one or more benchmarks regressed >10% vs baseline, or hard targets missed."
     exit 1
 fi
 
