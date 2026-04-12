@@ -728,6 +728,19 @@ fn fold_stage(
 
         PipelineStage::OrderBy { items, .. } => lower_order_by(items, acc, registry),
 
+        // ── Wave 3 desugaring ─────────────────────────────────────────
+        // FUNNEL is syntactic sugar that expands into a MATCH (EMIT ALL)
+        // followed by a STATS stage. Desugaring is deferred to the
+        // planner (not the parser) because the aggregate output names are
+        // derived from the step list — a schema-aware operation.
+        // See opt::desugar_funnel and planner-pipeline.md §4.3.
+        PipelineStage::Funnel(f) => {
+            let (match_stage, stats_stage) = crate::opt::desugar_funnel(f)?;
+            // Fold the two desugared stages in order (MATCH first, then STATS).
+            let after_match = fold_stage(match_stage, acc, registry, catalog, source_table)?;
+            fold_stage(stats_stage, after_match, registry, catalog, source_table)
+        }
+
         // Everything else is a later-wave shape.
         other => Err(BqliteError::Plan(format!(
             "pipeline stage `{}` is not yet supported — see TASKS.md for the implementation wave",
@@ -3719,5 +3732,156 @@ mod tests {
         );
         let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
         assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("at least one sort key")));
+    }
+
+    // ── Wave 3: FUNNEL desugaring (integration through lower_statement) ───────
+    //
+    // These tests verify that `PipelineStage::Funnel` flowing through
+    // `fold_stage` → `desugar_funnel` → `fold_stage(Match)` → `fold_stage(Stats)`
+    // produces the correct LogicalPlan tree.  Pure unit tests for the AST rewrite
+    // live in `opt::desugar_funnel::tests`.
+
+    #[test]
+    fn funnel_two_steps_lowers_to_aggregate_over_sequence_match() {
+        use bqlite_ast::Funnel;
+        use bqlite_core::AggFunction;
+
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Funnel(Funnel {
+                steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
+                window: Some(604_800_000_000_000), // 7 days in ns
+                span: Span::EMPTY,
+            })],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+
+        // Outer node is Aggregate.
+        let LogicalPlan::Aggregate {
+            aggregates,
+            group_by,
+            input,
+            ..
+        } = plan
+        else {
+            panic!("expected Aggregate at top level, got {plan:?}");
+        };
+
+        // No group-by — FUNNEL produces a bare aggregate.
+        assert!(
+            group_by.is_empty(),
+            "FUNNEL aggregate must have no GROUP BY"
+        );
+
+        // Two aggregates: one per step.
+        assert_eq!(aggregates.len(), 2, "two steps → two aggregates");
+        assert_eq!(aggregates[0].output_name, "signup");
+        assert_eq!(aggregates[0].function, AggFunction::Sum);
+        assert_eq!(aggregates[1].output_name, "purchase");
+        assert_eq!(aggregates[1].function, AggFunction::Sum);
+
+        // Inner node is SequenceMatch with emit_all: true and 7d window.
+        let LogicalPlan::SequenceMatch {
+            emit_all,
+            window,
+            output_schema,
+            ..
+        } = *input
+        else {
+            panic!("expected SequenceMatch inside Aggregate");
+        };
+        assert!(emit_all, "FUNNEL MATCH must have emit_all = true");
+        assert_eq!(
+            window,
+            Some(MatchWindowSpec::Duration(604_800_000_000_000)),
+            "7d window must be preserved"
+        );
+        assert!(
+            output_schema.column("step_reached").is_some(),
+            "emit_all → step_reached column present"
+        );
+    }
+
+    #[test]
+    fn funnel_named_steps_use_step_names_as_aggregate_output_names() {
+        use bqlite_ast::Funnel;
+        use bqlite_core::AggFunction;
+
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Funnel(Funnel {
+                steps: vec![
+                    match_step(Some("s"), "signup"),
+                    match_step(Some("p"), "purchase"),
+                ],
+                window: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+
+        let LogicalPlan::Aggregate { aggregates, .. } = plan else {
+            panic!("expected Aggregate, got {plan:?}");
+        };
+        assert_eq!(aggregates.len(), 2);
+        // Step names, not event type names.
+        assert_eq!(aggregates[0].output_name, "s");
+        assert_eq!(aggregates[0].function, AggFunction::Sum);
+        assert_eq!(aggregates[1].output_name, "p");
+        assert_eq!(aggregates[1].function, AggFunction::Sum);
+    }
+
+    #[test]
+    fn funnel_three_steps_produces_three_aggregates() {
+        use bqlite_ast::Funnel;
+
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Funnel(Funnel {
+                steps: vec![
+                    match_step(None, "signup"),
+                    match_step(None, "activation"),
+                    match_step(None, "purchase"),
+                ],
+                window: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+
+        let LogicalPlan::Aggregate { aggregates, .. } = plan else {
+            panic!("expected Aggregate, got {plan:?}");
+        };
+        assert_eq!(aggregates.len(), 3);
+        assert_eq!(aggregates[0].output_name, "signup");
+        assert_eq!(aggregates[1].output_name, "activation");
+        assert_eq!(aggregates[2].output_name, "purchase");
+    }
+
+    #[test]
+    fn funnel_duplicate_step_names_rejected_at_lowering_time() {
+        use bqlite_ast::Funnel;
+
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Funnel(Funnel {
+                // Both steps would produce "signup" — should be rejected.
+                steps: vec![match_step(None, "signup"), match_step(None, "signup")],
+                window: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        let BqliteError::Plan(msg) = err else {
+            panic!("expected Plan error, got {err:?}");
+        };
+        assert!(
+            msg.contains("signup"),
+            "error must mention the colliding name; got: {msg}"
+        );
     }
 }
