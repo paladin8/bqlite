@@ -150,7 +150,6 @@ class ClaudeRunResult:
 class _StreamState:
     assistant_text_parts: list[str] = dataclasses.field(default_factory=list)
     in_text_stream: bool = False
-    thinking_active: bool = False
 
     def assistant_text(self) -> str:
         return "".join(self.assistant_text_parts)
@@ -215,13 +214,9 @@ def _format_stream_event(event: dict, state: _StreamState) -> Optional[tuple[str
         if it == "content_block_start":
             block = inner.get("content_block", {}) or {}
             if block.get("type") == "thinking":
-                state.thinking_active = True
                 return ("line", "◇ thinking…")
             return None
         if it == "content_block_stop":
-            # Any block boundary ends the "currently thinking" state so the
-            # next thinking block in the same turn gets its own indicator.
-            state.thinking_active = False
             return None
         if it == "content_block_delta":
             delta = inner.get("delta", {})
