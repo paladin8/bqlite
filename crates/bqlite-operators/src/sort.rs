@@ -140,6 +140,10 @@ impl PhysicalOperator for SortOperator {
         &self.schema
     }
 
+    fn open(&mut self) -> Result<()> {
+        self.child.open()
+    }
+
     /// Drive the two-phase sort algorithm.
     ///
     /// Phase 1 calls return `Ok(Some(_))` only after the full sort

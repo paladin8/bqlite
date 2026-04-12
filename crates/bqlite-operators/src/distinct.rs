@@ -118,6 +118,10 @@ impl PhysicalOperator for DistinctOperator {
         &self.schema
     }
 
+    fn open(&mut self) -> Result<()> {
+        self.child.open()
+    }
+
     /// Pull the next batch of deduplicated rows.
     ///
     /// Loops over input batches, skipping entirely-duplicate batches (rather

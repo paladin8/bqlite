@@ -25,21 +25,412 @@
 //!   [`crate::ddl::ResultOperator`] wrapping the batch.
 //! - **INSERT** (`From`): execute via the CSV ingest pipeline
 //!   (TASK-233). `Values` deferred to TASK-238.
+//!
+//! ## Wave 3 scope (TASK-323)
+//!
+//! Extends the bind step with Wave 3 physical operators:
+//!
+//! - **`SequenceMatch`**: wraps [`SequenceMatchOperator`] (an
+//!   [`EntityOperator`]) in a `SequenceMatchAdapter` that detects entity
+//!   boundaries in the child's output and drives the per-entity protocol.
+//!   When `fused_aggregate` is set, routes each entity's match output into
+//!   a [`HashAccumulator`] and emits a single aggregate result batch after
+//!   all entities are processed.
+//! - **`Aggregate`**: materializes a [`HashAggregateOperator`].
+//! - **`Sort`**: materializes a [`SortOperator`].
+//! - **`Distinct`**: materializes a [`DistinctOperator`].
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
-use bqlite_core::{Result, SegmentReader};
+use arrow::array::{ArrayRef, Int64Array, StringViewBuilder};
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
+
+use bqlite_core::{BqliteError, EntityId, OperatorSchema, Result, SegmentReader};
+use bqlite_operators::matcher::SequenceMatchState;
+use bqlite_operators::operator::EntityOperator;
 use bqlite_operators::{
-    CancellationToken, FilterOperator, LimitOperator, PhysicalOperator, ProjectOperator,
-    ScanOperator,
+    Accumulator, CancellationToken, DistinctOperator, FilterOperator, HashAccumulator,
+    HashAggregateOperator, LimitOperator, PhysicalOperator, ProjectOperator, ScanOperator,
+    SequenceMatchOperator, SortOperator,
 };
-use bqlite_planner::{PhysicalPlan, ScanPhysical};
+use bqlite_planner::{PhysicalPlan, ScanPhysical, SequenceMatchPhysical};
 use bqlite_storage::Database;
 
 use crate::ddl::{
     build_describe_batch, build_explain_batch, execute_alter_table_add_column,
     execute_create_table, execute_drop_table, ResultOperator,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SequenceMatchAdapter
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Accumulated state for the fused aggregate path.
+///
+/// When `SequenceMatchPhysical.fused_aggregate` is `Some`, the adapter
+/// routes every entity's match output into this accumulator rather than
+/// buffering per-entity batches. After the child is exhausted the adapter
+/// emits one aggregate result batch from `finish`.
+struct FusedAccState {
+    accumulator: HashAccumulator,
+    /// True when the accumulator has no GROUP BY clauses. Used to call
+    /// `ensure_default_group` after processing all entities so that a
+    /// zero-input `COUNT(*)` still emits one row with count = 0.
+    ungrouped: bool,
+    /// True once the aggregate result batch has been returned.
+    emitted: bool,
+}
+
+/// Adapts a [`SequenceMatchOperator`] (which implements [`EntityOperator`])
+/// into a [`PhysicalOperator`] suitable for the engine's pull pipeline.
+///
+/// The adapter:
+/// 1. Opens and closes the child operator.
+/// 2. Detects entity-id transitions in the child's output (the input is
+///    entity-sorted).
+/// 3. Routes each entity's rows through `create_state` →
+///    `process_sub_batch*` → `finish_entity`.
+/// 4. In the **non-fused** path, fills the placeholder `entity_id` column
+///    in the match output batch with the actual entity id and buffers the
+///    result.
+/// 5. In the **fused** path, calls `finish_entity_into` to feed the match
+///    results directly into a [`HashAccumulator`], then emits the
+///    accumulator's aggregate result once after all entities are processed.
+struct SequenceMatchAdapter {
+    operator: SequenceMatchOperator,
+    child: Box<dyn PhysicalOperator>,
+    output_schema: OperatorSchema,
+    /// Index of the `entity_id` column in the *child's* output schema.
+    entity_id_col_idx: usize,
+    current_entity: Option<EntityId>,
+    current_state: Option<SequenceMatchState>,
+    /// Non-fused path: output batches waiting to be returned.
+    pending: VecDeque<RecordBatch>,
+    /// Set once the child has been fully drained and the last entity
+    /// finalized.
+    exhausted: bool,
+    fused: Option<FusedAccState>,
+}
+
+impl SequenceMatchAdapter {
+    fn new(desc: &SequenceMatchPhysical, child: Box<dyn PhysicalOperator>) -> Result<Self> {
+        // The entity key column in the child's output uses the original name
+        // from the table schema (e.g. "user_id"), not the "entity_id" alias
+        // that the SequenceMatch output schema uses.
+        let ek_col_name = entity_key_col_name(&desc.input);
+        let entity_id_col_idx = child
+            .output_schema()
+            .columns()
+            .iter()
+            .position(|c| c.name == ek_col_name)
+            .ok_or_else(|| {
+                BqliteError::Schema(format!(
+                    "SequenceMatchAdapter: entity key column '{ek_col_name}' \
+                     not found in child output schema"
+                ))
+            })?;
+
+        let operator = SequenceMatchOperator::new(desc);
+
+        let fused = match &desc.fused_aggregate {
+            None => None,
+            Some(fa) => {
+                // Build HashAccumulator from the fused aggregate descriptor.
+                // The accumulator is driven via `finish_entity_into` which
+                // calls `finish_entity` → produces an N-row match output
+                // batch → calls `update_batch`. For COUNT(*) without GROUP BY,
+                // this correctly counts N completions per entity.
+                let functions = fa.aggregates.iter().map(|a| a.function).collect();
+                // input_types: None for COUNT(*); None is used as a fallback
+                // for other functions (the update_batch path doesn't need this).
+                let input_types = fa.aggregates.iter().map(|_| None).collect();
+                let group_by_columns = fa
+                    .group_by
+                    .iter()
+                    .map(|(_, name)| name.clone())
+                    .collect::<Vec<_>>();
+                // agg_arg_columns: the column name in the INPUT batch (the
+                // match output batch) to read the aggregate argument from.
+                // For COUNT(*), arg is None. For other functions the output_name
+                // is used as a best-effort column name; unsupported cases will
+                // surface as a panic in update_batch if the column is absent.
+                let agg_arg_columns = fa
+                    .aggregates
+                    .iter()
+                    .map(|a| a.arg.as_ref().map(|_| a.output_name.clone()))
+                    .collect::<Vec<_>>();
+                let ungrouped = group_by_columns.is_empty();
+                let accumulator = HashAccumulator::new(
+                    functions,
+                    input_types,
+                    fa.output_schema.clone(),
+                    group_by_columns,
+                    agg_arg_columns,
+                    fa.max_groups,
+                );
+                Some(FusedAccState {
+                    accumulator,
+                    ungrouped,
+                    emitted: false,
+                })
+            }
+        };
+
+        Ok(Self {
+            operator,
+            child,
+            output_schema: desc.output_schema.clone(),
+            entity_id_col_idx,
+            current_entity: None,
+            current_state: None,
+            pending: VecDeque::new(),
+            exhausted: false,
+            fused,
+        })
+    }
+
+    /// Finalize a completed entity: route its match output to the pending
+    /// batch queue (non-fused) or into the aggregate accumulator (fused).
+    fn finalize_entity(&mut self, entity: EntityId, state: SequenceMatchState) -> Result<()> {
+        if let Some(fused) = &mut self.fused {
+            // Fused path: the default EntityOperator::finish_entity_into
+            // materializes the match output via finish_entity and calls
+            // accumulator.update_batch. For COUNT(*) without GROUP BY this
+            // correctly counts one row per completion.
+            let acc: &mut dyn Accumulator = &mut fused.accumulator;
+            self.operator.finish_entity_into(state, acc)?;
+        } else {
+            // Non-fused path: collect per-entity output batches.
+            if let Some(batch) = self.operator.finish_entity(state) {
+                let batch = fill_entity_id(batch, &entity)?;
+                self.pending.push_back(batch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume a child batch, splitting at entity boundaries and driving
+    /// the per-entity `create_state` → `process_sub_batch*` protocol.
+    fn process_child_batch(&mut self, child_batch: RecordBatch) -> Result<()> {
+        let entity_col = child_batch.column(self.entity_id_col_idx).clone();
+        let num_rows = child_batch.num_rows();
+        let mut start = 0;
+
+        while start < num_rows {
+            let row_entity = extract_entity_id(&entity_col, start);
+
+            // Detect entity boundary.
+            if self.current_entity.as_ref() != Some(&row_entity) {
+                // Finalize the previous entity (if any).
+                if let (Some(prev_entity), Some(prev_state)) =
+                    (self.current_entity.take(), self.current_state.take())
+                {
+                    self.finalize_entity(prev_entity, prev_state)?;
+                }
+                // Start a new entity.
+                let new_state = self.operator.create_state(&row_entity);
+                self.current_entity = Some(row_entity.clone());
+                self.current_state = Some(new_state);
+            }
+
+            // Find the end of this entity's contiguous rows.
+            let end = find_entity_end(&entity_col, start, &row_entity, num_rows);
+
+            // Process sub-batch for the current entity.
+            let sub_batch = child_batch.slice(start, end - start);
+            // Safety: current_state was just set above or was already Some.
+            let state = self.current_state.as_mut().expect("state must be set");
+            self.operator.process_sub_batch(state, &sub_batch);
+
+            start = end;
+        }
+
+        Ok(())
+    }
+}
+
+impl PhysicalOperator for SequenceMatchAdapter {
+    fn output_schema(&self) -> &OperatorSchema {
+        &self.output_schema
+    }
+
+    fn open(&mut self) -> Result<()> {
+        self.child.open()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.child.close()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            // Return any buffered non-fused output batches.
+            if let Some(batch) = self.pending.pop_front() {
+                return Ok(Some(batch));
+            }
+
+            if self.exhausted {
+                // Fused path: emit the accumulator result once after all
+                // entities have been processed.
+                if let Some(fused) = &mut self.fused {
+                    if !fused.emitted {
+                        fused.emitted = true;
+                        if fused.ungrouped {
+                            fused.accumulator.ensure_default_group()?;
+                        }
+                        let result = fused.accumulator.finish()?;
+                        if result.num_rows() > 0 {
+                            return Ok(Some(result));
+                        }
+                    }
+                }
+                return Ok(None);
+            }
+
+            match self.child.next_batch()? {
+                None => {
+                    // Child exhausted: finalize the last entity.
+                    if let (Some(entity), Some(state)) =
+                        (self.current_entity.take(), self.current_state.take())
+                    {
+                        self.finalize_entity(entity, state)?;
+                    }
+                    self.exhausted = true;
+                    // Loop once more to drain pending / emit fused result.
+                }
+                Some(batch) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.process_child_batch(batch)?;
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plan-tree helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Walk the input plan tree to find the entity key column name declared by
+/// the innermost `Scan` node.
+///
+/// The `SequenceMatch` logical lowering renames the entity key column to
+/// `"entity_id"` in the operator's *output* schema, but the *child*
+/// operator (Scan / Filter) still exposes the column under its original
+/// name (e.g. `"user_id"`). The adapter must detect entity boundaries by
+/// looking for that original name in the child's output batches.
+fn entity_key_col_name(plan: &PhysicalPlan) -> &str {
+    match plan {
+        PhysicalPlan::Scan(scan) => scan.entity_key_col.as_str(),
+        PhysicalPlan::Filter(filter) => entity_key_col_name(&filter.input),
+        PhysicalPlan::Project(proj) => entity_key_col_name(&proj.input),
+        PhysicalPlan::Limit(limit) => entity_key_col_name(&limit.input),
+        // For other plan shapes (unusual but forward-compat), fall back to
+        // the renamed column name used in the match output schema.
+        _ => "entity_id",
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Column-level helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extract an [`EntityId`] from a column array at the given row index.
+///
+/// Dispatches on the Arrow data type: `Int64` → `EntityId::Int`,
+/// everything else (assumed `Utf8View`) → `EntityId::String`.
+fn extract_entity_id(col: &ArrayRef, row: usize) -> EntityId {
+    match col.data_type() {
+        DataType::Int64 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("entity_id column declared as Int64 must be Int64Array");
+            EntityId::Int(arr.value(row))
+        }
+        _ => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .expect("entity_id column must be StringViewArray for non-Int64 type");
+            EntityId::String(arr.value(row).to_owned())
+        }
+    }
+}
+
+/// Return the exclusive end index of the contiguous run of `entity` rows
+/// starting at `start` in `col`.
+fn find_entity_end(col: &ArrayRef, start: usize, entity: &EntityId, total: usize) -> usize {
+    let mut end = start + 1;
+    match entity {
+        EntityId::String(s) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .expect("string entity_id column must be StringViewArray");
+            while end < total && arr.value(end) == s.as_str() {
+                end += 1;
+            }
+        }
+        EntityId::Int(n) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int entity_id column must be Int64Array");
+            while end < total && arr.value(end) == *n {
+                end += 1;
+            }
+        }
+    }
+    end
+}
+
+/// Replace the placeholder `entity_id` column in a match output batch with
+/// the actual entity id value.
+///
+/// `build_output_batch` (in `bqlite-operators::matcher::output`) fills the
+/// `entity_id` column with an empty string or zero. This function rebuilds
+/// that column with the real entity id before the batch is returned to the
+/// caller.
+///
+/// Returns the original batch unchanged if no `entity_id` field is present.
+fn fill_entity_id(batch: RecordBatch, entity: &EntityId) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let entity_id_idx = match schema.fields().iter().position(|f| f.name() == "entity_id") {
+        Some(idx) => idx,
+        None => return Ok(batch),
+    };
+
+    let num_rows = batch.num_rows();
+    let new_col: ArrayRef = match entity {
+        EntityId::String(s) => {
+            let mut builder = StringViewBuilder::with_capacity(num_rows);
+            for _ in 0..num_rows {
+                builder.append_value(s.as_str());
+            }
+            Arc::new(builder.finish())
+        }
+        EntityId::Int(n) => {
+            let mut builder = Int64Array::builder(num_rows);
+            for _ in 0..num_rows {
+                builder.append_value(*n);
+            }
+            Arc::new(builder.finish())
+        }
+    };
+
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns[entity_id_idx] = new_col;
+    RecordBatch::try_new(schema, columns).map_err(BqliteError::from)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bind entry point
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Bind a plain-data [`PhysicalPlan`] into an executable
 /// `Box<dyn PhysicalOperator>` tree rooted at the plan's top node.
@@ -54,6 +445,13 @@ use crate::ddl::{
 ///
 /// `Scan`, `Filter`, `Project`, `Limit` — recursively bind children
 /// and construct the corresponding operator.
+///
+/// ## Wave 3 descriptors (TASK-323)
+///
+/// `Aggregate`, `Sort`, `Distinct` — bind the child and construct the
+/// corresponding stateless operator. `SequenceMatch` — bind the child
+/// and wrap in a [`SequenceMatchAdapter`] that drives the per-entity
+/// `EntityOperator` protocol.
 ///
 /// ## DDL descriptors
 ///
@@ -98,6 +496,42 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
             Ok(Box::new(LimitOperator::new(child, limit.count)))
         }
 
+        // ── Wave 3 operators (TASK-323) ───────────────────────────
+        PhysicalPlan::Sort(sort) => {
+            let child = bind_physical(&sort.input, db)?;
+            Ok(Box::new(SortOperator::new(
+                child,
+                sort.keys.clone(),
+                sort.max_rows,
+                CancellationToken::new(),
+            )))
+        }
+
+        PhysicalPlan::Distinct(distinct) => {
+            let child = bind_physical(&distinct.input, db)?;
+            Ok(Box::new(DistinctOperator::new(
+                child,
+                distinct.max_groups,
+                CancellationToken::new(),
+            )))
+        }
+
+        PhysicalPlan::Aggregate(agg) => {
+            let child = bind_physical(&agg.input, db)?;
+            Ok(Box::new(HashAggregateOperator::new(
+                child,
+                agg.aggregates.clone(),
+                agg.group_by.clone(),
+                agg.max_groups,
+                agg.output_schema.clone(),
+            )))
+        }
+
+        PhysicalPlan::SequenceMatch(seq) => {
+            let child = bind_physical(&seq.input, db)?;
+            Ok(Box::new(SequenceMatchAdapter::new(seq, child)?))
+        }
+
         // ── DDL ──────────────────────────────────────────────────
         PhysicalPlan::CreateTable(ct) => {
             execute_create_table(ct, db)?;
@@ -138,20 +572,6 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
                 insert.output_schema.clone(),
             )))
         }
-
-        // Wave 3 operators — engine bind step is implemented in TASK-323.
-        // These variants are unreachable in Wave 2: the planner's
-        // `lower_physical` already panics with `unreachable!` for these
-        // logical variants, so they can never appear in a Wave 2 physical
-        // plan. TASK-323 will add real implementations for each.
-        PhysicalPlan::SequenceMatch(_)
-        | PhysicalPlan::Aggregate(_)
-        | PhysicalPlan::Sort(_)
-        | PhysicalPlan::Distinct(_) => unreachable!(
-            "Wave 3 physical variants are not yet bound to operators in Wave 2; \
-             TASK-323 implements the engine bind step for \
-             SequenceMatch / Aggregate / Sort / Distinct"
-        ),
     }
 }
 
@@ -478,5 +898,229 @@ mod tests {
             .query("events | limit 2", &mut db)
             .expect("query with LIMIT");
         assert_eq!(result.row_count(), 2, "LIMIT 2 should cap at 2 rows");
+    }
+
+    // ── TASK-323: Wave 3 pipeline shape end-to-end tests ────────────────
+
+    #[test]
+    fn wave3_stats_count_by_event_type() {
+        // events | STATS COUNT(*) GROUP BY event_type
+        // Tests the Aggregate bind arm (HashAggregateOperator).
+        let scratch = Scratch::new("wave3-agg");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 1), \
+                 ('alice', 1700000000100000000, 'click', 2), \
+                 ('bob',   1700000000200000000, 'view',  3), \
+                 ('carol', 1700000000300000000, 'click', 4)",
+                &mut db,
+            )
+            .expect("insert");
+
+        let result = engine
+            .query("events | stats n = count(*) group by event_type", &mut db)
+            .expect("aggregate query");
+
+        // Should have 2 groups: click (3 rows) and view (1 row).
+        assert_eq!(result.row_count(), 2, "expect 2 groups (click, view)");
+
+        // Collect (event_type, count) pairs and sort for determinism.
+        let mut pairs: Vec<(String, i64)> = Vec::new();
+        for batch in &result.rows {
+            let event_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .expect("event_type column must be StringView");
+            let count_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("count column must be Int64");
+            for i in 0..batch.num_rows() {
+                pairs.push((event_col.value(i).to_string(), count_col.value(i)));
+            }
+        }
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![("click".to_string(), 3), ("view".to_string(), 1),],
+            "aggregate counts must match"
+        );
+    }
+
+    #[test]
+    fn wave3_order_by_ts_desc_limit() {
+        // events | ORDER BY ts DESC | LIMIT 3
+        // Tests the Sort + Limit bind arms (SortOperator + LimitOperator).
+        let scratch = Scratch::new("wave3-sort-limit");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 10), \
+                 ('bob',   1700000000100000000, 'view',  20), \
+                 ('carol', 1700000000200000000, 'click', 30), \
+                 ('dave',  1700000000300000000, 'view',  40)",
+                &mut db,
+            )
+            .expect("insert");
+
+        let result = engine
+            .query("events | order by ts desc | limit 3", &mut db)
+            .expect("sort-limit query");
+
+        assert_eq!(result.row_count(), 3, "LIMIT 3 must cap at 3 rows");
+
+        // Collect timestamps — should be descending.
+        // The ts column is stored as Timestamp(Nanosecond, UTC).
+        let mut timestamps: Vec<i64> = Vec::new();
+        for batch in &result.rows {
+            let ts_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .expect("ts column must be TimestampNanosecondArray");
+            for i in 0..batch.num_rows() {
+                timestamps.push(ts_col.value(i));
+            }
+        }
+        // Verify strict descending order.
+        for window in timestamps.windows(2) {
+            assert!(
+                window[0] >= window[1],
+                "timestamps must be non-increasing (desc order): {:?}",
+                timestamps
+            );
+        }
+        // Top row must be the highest timestamp.
+        assert_eq!(
+            timestamps[0], 1700000000300000000,
+            "first row after ORDER BY ts DESC must have the largest ts"
+        );
+    }
+
+    #[test]
+    fn wave3_select_distinct_event_type() {
+        // events | SELECT DISTINCT event_type
+        // Tests the Distinct bind arm (DistinctOperator).
+        let scratch = Scratch::new("wave3-distinct");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 1), \
+                 ('bob',   1700000000100000000, 'click', 2), \
+                 ('carol', 1700000000200000000, 'view',  3), \
+                 ('dave',  1700000000300000000, 'click', 4)",
+                &mut db,
+            )
+            .expect("insert");
+
+        let result = engine
+            .query("events | select distinct event_type", &mut db)
+            .expect("distinct query");
+
+        // Collect all event_type values.
+        let mut seen: Vec<String> = Vec::new();
+        for batch in &result.rows {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .expect("event_type column must be StringView");
+            for i in 0..batch.num_rows() {
+                seen.push(col.value(i).to_string());
+            }
+        }
+        seen.sort();
+        seen.dedup();
+
+        // After dedup, must still have exactly the unique values.
+        assert_eq!(
+            seen,
+            vec!["click".to_string(), "view".to_string()],
+            "DISTINCT must produce unique event_type values"
+        );
+
+        // No duplicate rows in the raw output (before dedup).
+        let mut raw: Vec<String> = Vec::new();
+        for batch in &result.rows {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .expect("event_type column must be StringView");
+            for i in 0..batch.num_rows() {
+                raw.push(col.value(i).to_string());
+            }
+        }
+        let raw_deduped = {
+            let mut d = raw.clone();
+            d.dedup();
+            d.sort();
+            d
+        };
+        assert_eq!(
+            raw.len(),
+            raw_deduped.len(),
+            "DISTINCT output must have no duplicate rows, got: {:?}",
+            raw
+        );
+    }
+
+    #[test]
+    fn wave3_match_then_stats_count() {
+        // events | WHERE event_type = 'click' | MATCH FIRST SEQUENCE(click) | STATS COUNT(*)
+        // Tests the fused SequenceMatch + aggregate bind arm.
+        // Inserts 3 entities: alice and carol match the pattern, bob does not.
+        // Expected result: COUNT(*) = 2 (entities that matched).
+        let scratch = Scratch::new("wave3-match-stats");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 1), \
+                 ('bob',   1700000000100000000, 'view',  2), \
+                 ('carol', 1700000000200000000, 'click', 3)",
+                &mut db,
+            )
+            .expect("insert");
+
+        let result = engine
+            .query(
+                "events | match first sequence(click) | stats n = count(*)",
+                &mut db,
+            )
+            .expect("match-stats query");
+
+        // Should return exactly one row with count = 2 (alice + carol matched).
+        assert_eq!(
+            result.row_count(),
+            1,
+            "COUNT(*) must produce exactly one row"
+        );
+
+        let mut total_count: i64 = 0;
+        for batch in &result.rows {
+            let count_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("count column must be Int64");
+            for i in 0..batch.num_rows() {
+                total_count += count_col.value(i);
+            }
+        }
+        assert_eq!(
+            total_count, 2,
+            "COUNT(*) of matched entities must equal 2 (alice + carol)"
+        );
     }
 }

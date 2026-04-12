@@ -28,7 +28,7 @@ pub mod step_counter;
 
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::{EntityId, OperatorSchema};
+use bqlite_core::{EntityId, OperatorSchema, ScalarValue};
 use bqlite_planner::compile::{CompiledNfa, MatchStrategy};
 use bqlite_planner::demand::CompiledFusableAggregate;
 use bqlite_planner::physical::SequenceMatchPhysical;
@@ -73,7 +73,12 @@ pub struct SequenceMatchOperator {
     /// Number of variable bindings (0 for no-binding patterns).
     num_variables: usize,
     /// Fused aggregate descriptor (if match-aggregate fusion is active).
-    _fused_aggregate: Option<CompiledFusableAggregate>,
+    ///
+    /// When set, `finish_entity_into` uses `finalize_state` directly rather
+    /// than `finish_entity`, because `self.output_schema` has been replaced
+    /// with the aggregate schema and `build_output_batch` cannot produce
+    /// valid values for aggregate result columns.
+    fused_aggregate: Option<CompiledFusableAggregate>,
 }
 
 /// The underlying strategy driver selected at plan time.
@@ -130,7 +135,7 @@ impl SequenceMatchOperator {
             output_schema: desc.output_schema.clone(),
             required_column_names,
             num_variables,
-            _fused_aggregate: desc.fused_aggregate.clone(),
+            fused_aggregate: desc.fused_aggregate.clone(),
         }
     }
 
@@ -172,7 +177,7 @@ impl SequenceMatchOperator {
             output_schema,
             required_column_names,
             num_variables,
-            _fused_aggregate: None,
+            fused_aggregate: None,
         }
     }
 
@@ -288,7 +293,28 @@ impl EntityOperator for SequenceMatchOperator {
         state: Self::State,
         accumulator: &mut dyn Accumulator,
     ) -> bqlite_core::Result<()> {
-        // Default path: materialize and feed into accumulator.
+        // Fused path: when the match-aggregate fusion optimizer is active,
+        // `self.output_schema` has been replaced with the aggregate schema.
+        // Calling `finish_entity` → `build_output_batch(agg_schema)` would
+        // panic because `build_output_batch` cannot populate aggregate result
+        // columns (e.g. `n INT NOT NULL`) with non-null values.
+        //
+        // Instead, finalize the NFA state directly, count completions, and
+        // call `accumulator.update` once per completion with a null placeholder
+        // per aggregate function. For COUNT(*) (the primary fused use case),
+        // the `AggState::Count` branch calls `update_count_star()` and ignores
+        // the value — so the null placeholder is safe.
+        if let Some(fa) = &self.fused_aggregate {
+            let (completions, _partials, _dropped) = self.finalize_state(state);
+            if !completions.is_empty() {
+                let null_row: Vec<ScalarValue> = vec![ScalarValue::Null; fa.aggregates.len()];
+                for _ in &completions {
+                    accumulator.update(None, &null_row)?;
+                }
+            }
+            return Ok(());
+        }
+        // Non-fused path: materialize match output batch and feed into accumulator.
         if let Some(batch) = self.finish_entity(state) {
             accumulator.update_batch(&batch)?;
         }
