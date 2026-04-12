@@ -21,10 +21,10 @@
 //!
 //! `Accumulator` is object-safe so fused operators can hold
 //! `Box<dyn Accumulator>` without knowing the concrete type.
-//! `HashAccumulator` is the only built-in implementor; TASK-327 will
-//! add DDSketch-based percentile accumulators by extending `AggState`
-//! with a `Percentile` variant — the `Accumulator` trait itself does
-//! not change.
+//! `HashAccumulator` is the only built-in implementor. TASK-327 added
+//! DDSketch-based percentile accumulators by extending `AggState` with
+//! a `Percentile` variant — the `Accumulator` trait itself did not
+//! change.
 //!
 //! ## Crate placement
 //!
@@ -39,6 +39,8 @@
 //! The `max_groups` hard cap (default 1,000,000) is the sole overflow
 //! defense in v1 — there is no spill-to-disk for aggregation state.
 //! See execution-model.md §10.3–§10.4.
+
+pub mod percentile;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -185,10 +187,10 @@ impl SumState {
 /// inside a `HashAccumulator`. Each variant is incrementally updatable
 /// and supports pairwise merging for cross-shard reduction.
 ///
-/// The `Percentile` variant (DDSketch) is stubbed here and implemented
-/// by TASK-327. The `Variance` variant uses Welford's online algorithm
-/// with a parallel merge formula — it is defined here for completeness
-/// but not yet exposed as a BQL surface function.
+/// The `Variance` variant uses Welford's online algorithm with a
+/// parallel merge formula — it is defined here for completeness but
+/// not yet exposed as a BQL surface function. The `Percentile` variant
+/// wraps a DDSketch for P50/P90/P95/P99 (TASK-327).
 #[derive(Debug, Clone)]
 pub enum AggState {
     /// `COUNT(*)` — counts all rows.
@@ -208,6 +210,8 @@ pub enum AggState {
     /// `VARIANCE(col)` — Welford's online algorithm.
     /// Not yet exposed as a BQL function; defined for completeness.
     Variance { count: u64, mean: f64, m2: f64 },
+    /// `P50`/`P90`/`P95`/`P99` — DDSketch-based percentile (TASK-327).
+    Percentile(percentile::PercentileState),
 }
 
 impl AggState {
@@ -229,11 +233,7 @@ impl AggState {
             AggFunction::Max => AggState::Max(None),
             AggFunction::Avg => AggState::Avg { sum: 0.0, count: 0 },
             AggFunction::P50 | AggFunction::P90 | AggFunction::P95 | AggFunction::P99 => {
-                // DDSketch placeholder — TASK-327 replaces this.
-                // For now, fall back to tracking sum/count (wrong but
-                // compiles). The real percentile variant will be a
-                // separate `Percentile(DDSketch)` added by TASK-327.
-                AggState::Avg { sum: 0.0, count: 0 }
+                AggState::Percentile(percentile::PercentileState::new(function))
             }
         }
     }
@@ -289,6 +289,9 @@ impl AggState {
                 *mean += delta / *count as f64;
                 let delta2 = v - *mean;
                 *m2 += delta * delta2;
+            }
+            AggState::Percentile(state) => {
+                state.update(value);
             }
         }
     }
@@ -350,6 +353,9 @@ impl AggState {
                 *m1 = (*m1 * (*n1 as f64) + *m2 * (*n2 as f64)) / (total as f64);
                 *n1 = total;
             }
+            (AggState::Percentile(a), AggState::Percentile(b)) => {
+                a.merge(b);
+            }
             _ => panic!("AggState::merge variant mismatch"),
         }
     }
@@ -377,6 +383,7 @@ impl AggState {
                     ScalarValue::Float(*m2 / (*count - 1) as f64)
                 }
             }
+            AggState::Percentile(state) => state.finalize(),
         }
     }
 
@@ -393,6 +400,7 @@ impl AggState {
                 let payload: usize = set.iter().map(scalar_heap_size).sum();
                 bucket_overhead + payload
             }
+            AggState::Percentile(state) => state.heap_size(),
         }
     }
 }
@@ -2405,5 +2413,252 @@ mod tests {
                 .unwrap();
             assert_eq!(col.value(0), 4); // distinct: 1, 2, 3, 4
         }
+    }
+
+    // ── AggState::Percentile integration ─────────────────────────────────
+
+    #[test]
+    fn agg_state_p50_basic() {
+        let mut state = AggState::new(AggFunction::P50, Some(&BqlType::Int));
+        for i in 1..=1000 {
+            state.update(&ScalarValue::Int(i));
+        }
+        if let ScalarValue::Float(v) = state.finalize() {
+            let relative_error = (v - 500.0).abs() / 500.0;
+            assert!(
+                relative_error < 0.02,
+                "P50 relative error {relative_error} exceeds 2%"
+            );
+        } else {
+            panic!("expected Float from P50 finalize");
+        }
+    }
+
+    #[test]
+    fn agg_state_p90_basic() {
+        let mut state = AggState::new(AggFunction::P90, Some(&BqlType::Float));
+        for i in 1..=1000 {
+            state.update(&ScalarValue::Float(i as f64));
+        }
+        if let ScalarValue::Float(v) = state.finalize() {
+            let relative_error = (v - 900.0).abs() / 900.0;
+            assert!(
+                relative_error < 0.02,
+                "P90 relative error {relative_error} exceeds 2%"
+            );
+        } else {
+            panic!("expected Float from P90 finalize");
+        }
+    }
+
+    #[test]
+    fn agg_state_p95_basic() {
+        let mut state = AggState::new(AggFunction::P95, Some(&BqlType::Int));
+        for i in 1..=1000 {
+            state.update(&ScalarValue::Int(i));
+        }
+        if let ScalarValue::Float(v) = state.finalize() {
+            let relative_error = (v - 950.0).abs() / 950.0;
+            assert!(
+                relative_error < 0.02,
+                "P95 relative error {relative_error} exceeds 2%"
+            );
+        } else {
+            panic!("expected Float from P95 finalize");
+        }
+    }
+
+    #[test]
+    fn agg_state_p99_basic() {
+        let mut state = AggState::new(AggFunction::P99, Some(&BqlType::Int));
+        for i in 1..=1000 {
+            state.update(&ScalarValue::Int(i));
+        }
+        if let ScalarValue::Float(v) = state.finalize() {
+            let relative_error = (v - 990.0).abs() / 990.0;
+            assert!(
+                relative_error < 0.02,
+                "P99 relative error {relative_error} exceeds 2%"
+            );
+        } else {
+            panic!("expected Float from P99 finalize");
+        }
+    }
+
+    #[test]
+    fn agg_state_percentile_empty_is_null() {
+        let state = AggState::new(AggFunction::P50, Some(&BqlType::Int));
+        assert_eq!(state.finalize(), ScalarValue::Null);
+    }
+
+    #[test]
+    fn agg_state_percentile_skips_nulls() {
+        let mut state = AggState::new(AggFunction::P50, Some(&BqlType::Int));
+        state.update(&ScalarValue::Null);
+        state.update(&ScalarValue::Null);
+        assert_eq!(state.finalize(), ScalarValue::Null);
+    }
+
+    #[test]
+    fn agg_state_percentile_merge() {
+        let mut a = AggState::new(AggFunction::P50, Some(&BqlType::Int));
+        let mut b = AggState::new(AggFunction::P50, Some(&BqlType::Int));
+        for i in 1..=500 {
+            a.update(&ScalarValue::Int(i));
+        }
+        for i in 501..=1000 {
+            b.update(&ScalarValue::Int(i));
+        }
+        a.merge(&b);
+        if let ScalarValue::Float(v) = a.finalize() {
+            let relative_error = (v - 500.0).abs() / 500.0;
+            assert!(
+                relative_error < 0.02,
+                "merged P50 relative error {relative_error} exceeds 2%"
+            );
+        } else {
+            panic!("expected Float from merged P50 finalize");
+        }
+    }
+
+    #[test]
+    fn agg_state_percentile_heap_size_positive() {
+        let mut state = AggState::new(AggFunction::P95, Some(&BqlType::Int));
+        for i in 1..=100 {
+            state.update(&ScalarValue::Int(i));
+        }
+        assert!(state.heap_size() > 0);
+    }
+
+    // ── HashAccumulator with percentile ──────────────────────────────────
+
+    #[test]
+    fn hash_accumulator_ungrouped_p50() {
+        let schema = make_output_schema(&[], &[("p50", BqlType::Float, true)]);
+        let mut acc = HashAccumulator::new(
+            vec![AggFunction::P50],
+            vec![Some(BqlType::Int)],
+            schema,
+            vec![],
+            vec![Some("value".into())],
+            DEFAULT_MAX_GROUPS,
+        );
+
+        for i in 1..=100 {
+            acc.update(None, &[ScalarValue::Int(i)]).unwrap();
+        }
+
+        let batch = acc.finish().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let p50 = col.value(0);
+        let relative_error = (p50 - 50.0).abs() / 50.0;
+        assert!(
+            relative_error < 0.02,
+            "ungrouped P50 relative error {relative_error} exceeds 2%"
+        );
+    }
+
+    #[test]
+    fn hash_accumulator_grouped_p99() {
+        let schema = make_output_schema(
+            &[("region", BqlType::String, false)],
+            &[("latency_p99", BqlType::Float, true)],
+        );
+        let mut acc = HashAccumulator::new(
+            vec![AggFunction::P99],
+            vec![Some(BqlType::Float)],
+            schema,
+            vec!["region".into()],
+            vec![Some("latency".into())],
+            DEFAULT_MAX_GROUPS,
+        );
+
+        // Group A: latencies 1..=1000
+        for i in 1..=1000 {
+            acc.update(
+                Some(&[ScalarValue::String("A".into())]),
+                &[ScalarValue::Float(i as f64)],
+            )
+            .unwrap();
+        }
+        // Group B: latencies 1..=100
+        for i in 1..=100 {
+            acc.update(
+                Some(&[ScalarValue::String("B".into())]),
+                &[ScalarValue::Float(i as f64)],
+            )
+            .unwrap();
+        }
+
+        let batch = acc.finish().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let region_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let p99_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        // Sorted by GroupKey: A < B
+        assert_eq!(region_col.value(0), "A");
+        let a_p99 = p99_col.value(0);
+        let a_error = (a_p99 - 990.0).abs() / 990.0;
+        assert!(a_error < 0.02, "group A P99 error {a_error} exceeds 2%");
+
+        assert_eq!(region_col.value(1), "B");
+        let b_p99 = p99_col.value(1);
+        let b_error = (b_p99 - 99.0).abs() / 99.0;
+        assert!(b_error < 0.02, "group B P99 error {b_error} exceeds 2%");
+    }
+
+    #[test]
+    fn hash_accumulator_merge_percentile() {
+        let schema = make_output_schema(&[], &[("p50", BqlType::Float, true)]);
+        let mut acc1 = HashAccumulator::new(
+            vec![AggFunction::P50],
+            vec![Some(BqlType::Int)],
+            schema.clone(),
+            vec![],
+            vec![Some("v".into())],
+            DEFAULT_MAX_GROUPS,
+        );
+        let mut acc2 = HashAccumulator::new(
+            vec![AggFunction::P50],
+            vec![Some(BqlType::Int)],
+            schema,
+            vec![],
+            vec![Some("v".into())],
+            DEFAULT_MAX_GROUPS,
+        );
+
+        for i in 1..=500 {
+            acc1.update(None, &[ScalarValue::Int(i)]).unwrap();
+        }
+        for i in 501..=1000 {
+            acc2.update(None, &[ScalarValue::Int(i)]).unwrap();
+        }
+
+        acc1.merge(Box::new(acc2)).unwrap();
+        let batch = acc1.finish().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let p50 = col.value(0);
+        let relative_error = (p50 - 500.0).abs() / 500.0;
+        assert!(
+            relative_error < 0.02,
+            "merged P50 relative error {relative_error} exceeds 2%"
+        );
     }
 }

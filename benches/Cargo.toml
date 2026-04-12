@@ -17,6 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 bqlite-core = { workspace = true }
 bqlite-storage = { workspace = true }
+bqlite-operators = { workspace = true }
 arrow = { workspace = true }
 criterion = { workspace = true }
 serde_json = { workspace = true }
@@ -50,4 +51,10 @@ harness = false
 [[bench]]
 name = "acceptance"
 path = "wave2/acceptance.rs"
+harness = false
+
+# Wave 3 benchmark: DDSketch percentile throughput (TASK-327).
+[[bench]]
+name = "percentile"
+path = "wave3/percentile.rs"
 harness = false
