@@ -375,6 +375,13 @@ fn build_scan_plan(
     let mut entries: Vec<PlannedColumn> = Vec::new();
     let mut arrow_fields: Vec<Field> = Vec::new();
 
+    // Always iterate columns in table-schema order so that
+    // `CompiledNode::Column { index }` values (which are compiled
+    // against the full table-schema ordinals) remain valid for any
+    // pruned subset. For the "all columns" case this is the natural
+    // order; for an explicit projection we filter the full schema
+    // to the requested names, preserving schema order rather than
+    // the projection's (potentially sorted) order.
     let column_names: Vec<String> = if projection.is_all() {
         current_schema
             .columns()
@@ -382,10 +389,35 @@ fn build_scan_plan(
             .map(|c| c.name.clone())
             .collect()
     } else {
-        projection.columns().to_vec()
+        let projected: std::collections::HashSet<&str> =
+            projection.columns().iter().map(String::as_str).collect();
+        current_schema
+            .columns()
+            .iter()
+            .filter(|c| projected.contains(c.name.as_str()))
+            .map(|c| c.name.clone())
+            .collect()
     };
+    // Validate that every explicitly requested name appears in the
+    // current schema (the schema-order iteration above silently drops
+    // unknown names, so we need an explicit check).
+    if !projection.is_all() {
+        for name in projection.columns() {
+            if current_schema.columns().iter().all(|c| c.name != *name) {
+                return Err(BqliteError::Schema(format!(
+                    "segment reader: column `{name}` not found in current schema `{}`",
+                    current_schema.name()
+                )));
+            }
+        }
+    }
 
     for name in column_names {
+        // `column_names` is built by filtering `current_schema.columns()` in
+        // both the `is_all()` and explicit projection paths, so every name
+        // here is guaranteed to be present in `current_schema`. The
+        // `.ok_or_else()` below is unreachable for well-formed inputs and
+        // exists only as a defensive guard against future code changes.
         let current_col = current_schema
             .columns()
             .iter()
@@ -3304,7 +3336,12 @@ mod tests {
     }
 
     #[test]
-    fn projection_selects_subset_and_reorders_columns() {
+    fn projection_selects_subset_in_schema_order() {
+        // Projection requests columns in non-schema order (amount, entity_id)
+        // but the reader always returns them in table-schema order so that
+        // CompiledNode::Column { index } values remain valid after pruning.
+        // roundtrip_schema order: entity_id(0), ts(1), event_type(2), amount(3).
+        // Requesting [amount, entity_id] yields output [entity_id, amount].
         let schema = roundtrip_schema();
         let request = SegmentWriteRequest {
             schema: schema.clone(),
@@ -3359,15 +3396,17 @@ mod tests {
 
         let bytes = encode_segment(&request).unwrap();
         let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        // Request in non-schema order: amount before entity_id.
         let projection = ColumnProjection::with_columns(["amount", "entity_id"]);
         let mut scan = reader.scan(&projection, None).unwrap();
         let batch = scan.next_row_group().unwrap().unwrap();
         assert_eq!(batch.num_columns(), 2);
-        assert_eq!(batch.schema().field(0).name(), "amount");
-        assert_eq!(batch.schema().field(1).name(), "entity_id");
+        // Output is in table-schema order: entity_id(0) < amount(3).
+        assert_eq!(batch.schema().field(0).name(), "entity_id");
+        assert_eq!(batch.schema().field(1).name(), "amount");
         assert_eq!(
             batch
-                .column(1)
+                .column(0)
                 .as_any()
                 .downcast_ref::<ArrowStringView>()
                 .unwrap()

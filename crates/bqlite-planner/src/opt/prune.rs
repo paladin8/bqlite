@@ -86,6 +86,8 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
                 scan_predicates,
                 projected_columns: _,
                 output_schema,
+                entity_key_col,
+                timestamp_col,
             } = scan;
 
             // Include columns referenced by scan-level pushed predicates
@@ -96,8 +98,23 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
                 collect_column_names(pred, &mut all_demand);
             }
 
+            // Always include entity-key and timestamp — required by the k-way
+            // merge scan regardless of downstream demand.
+            all_demand.insert(entity_key_col.clone());
+            all_demand.insert(timestamp_col.clone());
+
+            // System columns (names starting with `__`, e.g. `__seq_id`,
+            // `__batch_id`) appear in the planner-level `OperatorSchema`
+            // produced by `OperatorSchema::from_table`, but they are NOT part
+            // of the physical table schema on disk. The scan operator validates
+            // that every name in `projected_columns` maps to a real table
+            // column, so system column names must be excluded here.
+            //
             // Sort for deterministic plan shape (regression-friendly).
-            let mut cols: Vec<String> = all_demand.into_iter().collect();
+            let mut cols: Vec<String> = all_demand
+                .into_iter()
+                .filter(|c| !c.starts_with("__"))
+                .collect();
             cols.sort_unstable();
 
             PhysicalPlan::Scan(ScanPhysical {
@@ -106,6 +123,8 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
                 scan_predicates,
                 projected_columns: cols,
                 output_schema,
+                entity_key_col,
+                timestamp_col,
             })
         }
 
@@ -288,6 +307,8 @@ mod tests {
             scan_predicates: vec![],
             projected_columns: vec![],
             output_schema: schema,
+            entity_key_col: "entity_id".to_string(),
+            timestamp_col: "ts".to_string(),
         }
     }
 
@@ -476,6 +497,8 @@ mod tests {
             scan_predicates: vec![pushable_pred("col3", 5)],
             projected_columns: vec![],
             output_schema: ten_col_schema(),
+            entity_key_col: "entity_id".to_string(),
+            timestamp_col: "ts".to_string(),
         };
         let two_out = two_col_schema();
 
@@ -545,10 +568,12 @@ mod tests {
         let PhysicalPlan::Scan(scan) = *proj.input else {
             panic!("expected Scan under Project");
         };
+        // entity_id and ts are always included by the pruning pass
+        // (required for k-way merge in the scan operator).
         assert_eq!(
             scan.projected_columns,
-            vec!["col1", "col2"],
-            "expression referencing two input columns demands both from scan"
+            vec!["col1", "col2", "entity_id", "ts"],
+            "expression referencing two input columns demands both from scan (plus mandatory merge columns)"
         );
     }
 
@@ -671,10 +696,12 @@ mod tests {
         let PhysicalPlan::Scan(scan) = *proj.input else {
             panic!("expected Scan under Project");
         };
+        // entity_id and ts are always included by the pruning pass
+        // (required for k-way merge in the scan operator).
         assert_eq!(
             scan.projected_columns,
-            vec!["col1", "col2", "col3"],
-            "projected_columns must be sorted regardless of expression order"
+            vec!["col1", "col2", "col3", "entity_id", "ts"],
+            "projected_columns must be sorted regardless of expression order (plus mandatory merge columns)"
         );
     }
 

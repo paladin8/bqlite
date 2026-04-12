@@ -183,6 +183,14 @@ pub struct ScanPhysical {
     /// the resolved logical node. TASK-228 may shrink this to match
     /// `projected_columns`; lowering always preserves the full shape.
     pub output_schema: OperatorSchema,
+    /// Name of the entity-key column. Populated during lowering from the
+    /// `TableSchema::entity_key_column()`. Required by the scan operator
+    /// for k-way merge; the pruning pass always includes this column.
+    pub entity_key_col: String,
+    /// Name of the timestamp column. Populated during lowering from the
+    /// `TableSchema::timestamp_column()`. Required by the scan operator
+    /// for k-way merge; the pruning pass always includes this column.
+    pub timestamp_col: String,
 }
 
 /// Plain-data description of a vectorized row filter.
@@ -406,6 +414,8 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                 scan_predicates: compiled_predicates,
                 projected_columns,
                 output_schema,
+                entity_key_col: table.entity_key_column().name.clone(),
+                timestamp_col: table.timestamp_column().name.clone(),
             })
         }
 
@@ -725,6 +735,8 @@ mod tests {
             scan_predicates: Vec::new(),
             projected_columns: Vec::new(),
             output_schema: OperatorSchema::from_table(&events_schema()),
+            entity_key_col: "entity_id".to_string(),
+            timestamp_col: "ts".to_string(),
         });
         let pred = CompiledExpr {
             node: CompiledNode::Literal(bqlite_core::PropertyValue::Bool(true)),

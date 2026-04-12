@@ -377,17 +377,29 @@ fn build_output_schema(
     let columns: Vec<ColumnDef> = if projection.is_all() {
         table.columns().to_vec()
     } else {
-        let mut resolved = Vec::with_capacity(projection.len());
+        // Validate every requested name first so callers get a clear
+        // error before we iterate the table schema.
         for name in projection.columns() {
-            let (_, col) = table.column(name).ok_or_else(|| {
-                BqliteError::Schema(format!(
+            if table.column(name).is_none() {
+                return Err(BqliteError::Schema(format!(
                     "scan: projected column `{name}` not in table `{}`",
                     table.name()
-                ))
-            })?;
-            resolved.push(col.clone());
+                )));
+            }
         }
-        resolved
+        // Output columns in *table-schema order*, not in the order they
+        // appear in `projected_columns`. This preserves the column indices
+        // that `CompiledNode::Column { index }` was compiled against (the
+        // full-schema position), so pushed-down predicates and project
+        // expressions remain correct after the pruning pass trims the set.
+        let projected: std::collections::HashSet<&str> =
+            projection.columns().iter().map(String::as_str).collect();
+        table
+            .columns()
+            .iter()
+            .filter(|col| projected.contains(col.name.as_str()))
+            .cloned()
+            .collect()
     };
     OperatorSchema::new(columns)
 }
@@ -899,6 +911,10 @@ mod tests {
 
     #[test]
     fn explicit_projection_narrows_output_schema_and_preserves_order() {
+        // Columns are always returned in table-schema order regardless
+        // of the order they appear in the projection list. This keeps
+        // CompiledNode::Column { index } values (compiled against the
+        // full schema ordinals) stable across pruning.
         let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
         let projection = vec![
             "ts".to_string(),
@@ -913,7 +929,10 @@ mod tests {
             .iter()
             .map(|c| c.name.as_str())
             .collect();
-        assert_eq!(names, vec!["ts", "entity_id", "event_type"]);
+        // minimal_schema order: entity_id, ts, event_type — so even
+        // though we requested [ts, entity_id, event_type], the output
+        // reflects the table schema order.
+        assert_eq!(names, vec!["entity_id", "ts", "event_type"]);
     }
 
     #[test]

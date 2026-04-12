@@ -573,6 +573,8 @@ mod tests {
                     ColumnDef::required("event_type", BqlType::String),
                 ])
                 .unwrap(),
+                entity_key_col: "entity_id".to_string(),
+                timestamp_col: "ts".to_string(),
             })),
             output_schema: OperatorSchema::new(vec![ColumnDef::required("plan", BqlType::String)])
                 .unwrap(),

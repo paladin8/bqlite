@@ -70,8 +70,12 @@ pub enum ExplainNode {
 pub fn build_explain_node(plan: &PhysicalPlan) -> ExplainNode {
     match plan {
         PhysicalPlan::Scan(scan) => {
-            // If projected_columns is empty the scan reads all columns
-            // from the output schema; mirror that here.
+            // In the normal engine path `projected_columns` is always
+            // non-empty after `plan()` runs the pruning pass (at minimum
+            // it contains the mandatory entity-key and timestamp columns).
+            // The `is_empty()` fallback is only reachable for manually
+            // constructed `ScanPhysical` descriptors that bypass `plan()`,
+            // e.g., unit tests that build descriptors directly.
             let columns = if scan.projected_columns.is_empty() {
                 scan.output_schema
                     .columns()

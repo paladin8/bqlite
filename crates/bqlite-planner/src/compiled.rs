@@ -104,9 +104,20 @@ pub enum CompiledNode {
     /// kernel broadcasting.
     Literal(PropertyValue),
 
-    /// A column read. `index` is the position in the runtime
-    /// `RecordBatch` built from the scan's projected columns, and
+    /// A column read. `index` is the full table-schema ordinal of the
+    /// column (0-based position in `TableSchema::columns()`). The scan
+    /// and storage reader always emit columns in **table-schema order**
+    /// so this ordinal maps directly to the batch column position,
+    /// provided no column with a lower ordinal has been pruned away
+    /// (which would create a gap). The pruning pass (TASK-228) avoids
+    /// gaps for the expressions it tracks by including every column
+    /// referenced by any predicate or projection expression.
     /// `name` is kept alongside for pushdown / diagnostics.
+    ///
+    /// **Limitation**: index remapping for pruned batches is not yet
+    /// implemented (deferred per TASK-228 doc comment §5.3). A future
+    /// pass will rewrite indices to batch-position ordinals at bind
+    /// time, eliminating the gap constraint entirely.
     Column { index: usize, name: String },
 
     /// Arithmetic binary op.

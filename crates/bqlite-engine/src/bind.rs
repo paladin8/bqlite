@@ -150,11 +150,13 @@ fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOpera
     let reader: Arc<dyn SegmentReader> = Arc::from(reader_box);
 
     // Thread the descriptor's projection and pushed predicates into
-    // the scan operator. Both fields are empty at lowering time in
-    // Wave 2 (TASK-228's projection pruning and TASK-227's predicate
-    // pushdown populate them during optimization), so this reduces
-    // to `ColumnProjection::all()` with no zone-map predicate until
-    // those passes run.
+    // the scan operator. Both passes (TASK-227 predicate pushdown and
+    // TASK-228 column pruning) run unconditionally in `plan()` before
+    // `bind_scan` is reached, so `projected_columns` and
+    // `scan_predicates` are already populated in the normal engine
+    // path. `projected_columns` is empty only for manually constructed
+    // `ScanPhysical` descriptors (e.g., unit tests that bypass `plan()`),
+    // in which case `ScanOperator::new` falls back to `ColumnProjection::all()`.
     let op = ScanOperator::new(
         reader,
         &scan.projected_columns,
@@ -225,6 +227,8 @@ mod tests {
             scan_predicates: Vec::new(),
             projected_columns: Vec::new(),
             output_schema: OperatorSchema::from_table(&bootstrap_events_schema()),
+            entity_key_col: "entity_id".to_string(),
+            timestamp_col: "ts".to_string(),
         })
     }
 
@@ -298,6 +302,8 @@ mod tests {
             scan_predicates: Vec::new(),
             projected_columns: Vec::new(),
             output_schema: OperatorSchema::from_table(&bootstrap_events_schema()),
+            entity_key_col: "entity_id".to_string(),
+            timestamp_col: "ts".to_string(),
         });
 
         match bind_physical(&descriptor, &mut db) {

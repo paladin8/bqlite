@@ -92,7 +92,7 @@ pub use physical::{
 /// resolve table references.
 ///
 /// This is the single public entry point for the planner. It runs the
-/// full AST → logical → physical pipeline:
+/// full AST → logical → physical → optimization pipeline:
 ///
 /// 1. [`logical::lower_statement`] — catalog resolution, expression
 ///    typing, DDL / DML validation. Any failure surfaces here as
@@ -100,6 +100,14 @@ pub use physical::{
 ///    [`bqlite_core::BqliteError::Schema`].
 /// 2. [`physical::lower_physical`] — infallible one-to-one lowering
 ///    that swaps `TypedExpr` for `CompiledExpr`.
+/// 3. [`opt::pushdown::pushdown_predicates`] (TASK-227) — moves
+///    `Filter(Scan)` conjuncts into `ScanPhysical::scan_predicates`
+///    and elides the `Filter` node when all conjuncts are pushable.
+///    DDL / DML leaf nodes are returned unchanged.
+/// 4. [`opt::prune::prune_columns`] (TASK-228) — propagates a
+///    backward demand set from the root to the scan and writes
+///    `ScanPhysical::projected_columns` with the minimal sorted column
+///    list. DDL / DML leaf nodes are returned unchanged.
 ///
 /// # Errors
 ///
@@ -111,7 +119,13 @@ pub use physical::{
 ///   columns, missing role columns, invalid `ALTER` action).
 pub fn plan(statement: Statement, catalog: &dyn Catalog) -> Result<PhysicalPlan> {
     let logical = lower_statement(statement, catalog)?;
-    Ok(lower_physical(logical))
+    let physical = lower_physical(logical);
+    // Apply Wave 2 optimizer passes in order (TASK-227, TASK-228).
+    // Both passes treat DDL / DML leaves as identity, so it is safe to
+    // apply them unconditionally regardless of statement kind.
+    let physical = opt::pushdown::pushdown_predicates(physical);
+    let physical = opt::prune::prune_columns(physical);
+    Ok(physical)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
