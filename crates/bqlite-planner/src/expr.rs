@@ -326,15 +326,36 @@ impl TypedExpr {
                 Ok(TypedExpr::column(column_index, col_def, expr.span))
             }
 
-            Expr::Qualified { .. } => Err(unsupported(
-                "qualified column references `table.col` are deferred to Wave 4 joins (TASK-407)",
-                expr.span,
-            )),
+            Expr::Qualified { table, column } => {
+                // Wave 3: qualified references resolve to step-property
+                // columns (e.g., `s.plan` → column named `s.plan` in the
+                // SequenceMatch output schema). The MATCH lowering eagerly
+                // adds all step-property columns with dot-notation names.
+                let qualified_name = format!("{}.{}", table.text, column.text);
+                match schema.column(&qualified_name) {
+                    Some((column_index, col_def)) => {
+                        Ok(TypedExpr::column(column_index, col_def, expr.span))
+                    }
+                    None => {
+                        // Check if `table.text` might be a step name that
+                        // doesn't exist, vs a Wave 4 table join reference.
+                        Err(unknown_column(&qualified_name, expr.span))
+                    }
+                }
+            }
 
-            Expr::Variable(_) => Err(unsupported(
-                "pattern-bound `$variable` references are only valid inside a MATCH pattern (Wave 3)",
-                expr.span,
-            )),
+            Expr::Variable(name) => {
+                // Wave 3: $variable references resolve to columns named
+                // `$<name>` in the MATCH output schema (variable binding
+                // columns are added during MATCH lowering).
+                let var_col_name = format!("${}", name.text);
+                match schema.column(&var_col_name) {
+                    Some((column_index, col_def)) => {
+                        Ok(TypedExpr::column(column_index, col_def, expr.span))
+                    }
+                    None => Err(unknown_column(&var_col_name, expr.span)),
+                }
+            }
 
             Expr::Binary { op, left, right } => {
                 let l = TypedExpr::from_ast(left, schema, registry)?;
@@ -394,7 +415,10 @@ impl TypedExpr {
                 })
             }
 
-            Expr::IsNull { expr: inner, negated } => {
+            Expr::IsNull {
+                expr: inner,
+                negated,
+            } => {
                 let typed = TypedExpr::from_ast(inner, schema, registry)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::IsNull {
@@ -451,9 +475,14 @@ impl TypedExpr {
                 expr: input,
                 pattern,
                 negated,
-            } => lower_string_fn(input, pattern, *negated, "like", schema, registry, expr.span),
+            } => lower_string_fn(
+                input, pattern, *negated, "like", schema, registry, expr.span,
+            ),
 
-            Expr::Regex { expr: input, pattern } => {
+            Expr::Regex {
+                expr: input,
+                pattern,
+            } => {
                 // `~=` has no negation form in the AST.
                 lower_string_fn(input, pattern, false, "regex", schema, registry, expr.span)
             }
@@ -513,7 +542,10 @@ impl TypedExpr {
                 expr.span,
             )),
 
-            Expr::Cast { expr: inner, target } => {
+            Expr::Cast {
+                expr: inner,
+                target,
+            } => {
                 let input = TypedExpr::from_ast(inner, schema, registry)?;
                 // Wave 2 permits explicit casts between any scalar
                 // pair; the full legality matrix from type-system.md
@@ -544,9 +576,9 @@ impl TypedExpr {
                     .collect::<Result<Vec<_>>>()?;
                 let arg_types: Vec<BqlType> =
                     typed_args.iter().map(|a| a.result_type.clone()).collect();
-                let signature = registry.resolve(&name.text, &arg_types).ok_or_else(|| {
-                    no_matching_overload(&name.text, &arg_types, expr.span)
-                })?;
+                let signature = registry
+                    .resolve(&name.text, &arg_types)
+                    .ok_or_else(|| no_matching_overload(&name.text, &arg_types, expr.span))?;
                 // Apply Int→Float implicit coercions where the
                 // signature declares Float and the actual arg is Int.
                 let coerced_args: Vec<TypedExpr> = typed_args
@@ -554,8 +586,7 @@ impl TypedExpr {
                     .zip(signature.params.iter())
                     .map(|(arg, expected)| maybe_coerce_to(arg, expected))
                     .collect();
-                let nullable =
-                    signature.nullable || coerced_args.iter().any(|a| a.nullable);
+                let nullable = signature.nullable || coerced_args.iter().any(|a| a.nullable);
                 let result_type = signature.return_type.clone();
                 Ok(TypedExpr {
                     kind: TypedExprKind::FunctionCall {
@@ -1392,11 +1423,15 @@ mod tests {
     // ── Rejected Wave 3+ shapes ─────────────────────────────────────────────
 
     #[test]
-    fn variable_reference_is_rejected_in_non_match_context() {
+    fn variable_reference_without_match_reports_unknown_column() {
+        // $product is not in the schema (no MATCH produced $product columns)
         let expr = spanned(Expr::Variable(Name::synthetic("product")));
         let err = from_ast_with_purchases(expr).unwrap_err();
         match err {
-            BqliteError::Plan(msg) => assert!(msg.contains("MATCH")),
+            BqliteError::Plan(msg) => {
+                assert!(msg.contains("$product"), "got: {msg}");
+                assert!(msg.contains("unknown column"), "got: {msg}");
+            }
             other => panic!("expected Plan error, got {other:?}"),
         }
     }
@@ -1415,14 +1450,18 @@ mod tests {
     }
 
     #[test]
-    fn qualified_column_is_rejected_until_wave_4() {
+    fn qualified_column_without_match_reports_unknown_column() {
+        // orders.amount is not in the schema (no MATCH with step name "orders")
         let expr = spanned(Expr::Qualified {
             table: Name::synthetic("orders"),
             column: Name::synthetic("amount"),
         });
         let err = from_ast_with_purchases(expr).unwrap_err();
         match err {
-            BqliteError::Plan(msg) => assert!(msg.contains("Wave 4")),
+            BqliteError::Plan(msg) => {
+                assert!(msg.contains("orders.amount"), "got: {msg}");
+                assert!(msg.contains("unknown column"), "got: {msg}");
+            }
             other => panic!("expected Plan error, got {other:?}"),
         }
     }

@@ -1,4 +1,4 @@
-//! Wave 2 logical plan enum + AST → logical lowering.
+//! Logical plan enum + AST → logical lowering (Wave 2 + Wave 3).
 //!
 //! This module is the runtime counterpart to
 //! `docs/design/planner/logical-plan-nodes.md` (TASK-204). Every
@@ -40,8 +40,8 @@
 
 use std::collections::HashSet;
 
-use bqlite_ast::expr::{Expr, Literal};
-use bqlite_ast::pattern::{BracketSpec, MatchMode, MatchPattern};
+use bqlite_ast::expr::{Expr, Literal, SortDir};
+use bqlite_ast::pattern::{BracketSpec, MatchMode, MatchPattern, MatchWindow, StepEvent};
 use bqlite_ast::pipeline::{Pipeline, TimeRange};
 use bqlite_ast::{
     AlterAction, AlterTableStmt, ColumnDef as AstColumnDef, ColumnRole, CreateTableStmt,
@@ -665,7 +665,8 @@ fn lower_query_pipeline(pipeline: Pipeline, catalog: &dyn Catalog) -> Result<Log
     // AST's `source.time_range` field — the parser already decodes
     // `LAST <duration>` into nanoseconds and `BETWEEN ... AND ...`
     // into `(String, String)` (query-language.md §16).
-    let mut plan = LogicalPlan::scan_with_time_range(table_schema, pipeline.source.time_range);
+    let mut plan =
+        LogicalPlan::scan_with_time_range(table_schema.clone(), pipeline.source.time_range);
 
     // Function registry for expression-level type checking. Wave 2
     // ships the built-in set (`like`, `regex`); later waves extend
@@ -675,7 +676,7 @@ fn lower_query_pipeline(pipeline: Pipeline, catalog: &dyn Catalog) -> Result<Log
     // Fold pipeline stages in order. Each stage wraps `plan` in a
     // new logical node whose input is the previous `plan`.
     for stage in pipeline.stages {
-        plan = fold_stage(stage, plan, &registry)?;
+        plan = fold_stage(stage, plan, &registry, catalog, &table_schema)?;
     }
 
     Ok(plan)
@@ -686,6 +687,8 @@ fn fold_stage(
     stage: PipelineStage,
     acc: LogicalPlan,
     registry: &FunctionRegistry,
+    catalog: &dyn Catalog,
+    source_table: &TableSchema,
 ) -> Result<LogicalPlan> {
     match stage {
         PipelineStage::Where { predicate, .. } => {
@@ -696,23 +699,38 @@ fn fold_stage(
         PipelineStage::Select {
             distinct, items, ..
         } => {
+            let project = lower_select(items, acc, registry)?;
             if distinct {
-                return Err(BqliteError::Plan(
-                    "SELECT DISTINCT lowers to `Distinct(Project(...))` in Wave 3 — \
-                     Wave 2 does not yet support the `distinct` flag"
-                        .into(),
-                ));
+                // SELECT DISTINCT lowers to Distinct(Project(...))
+                // per wave3-lowering.md §2.4.
+                let output_schema = project.output_schema().clone();
+                Ok(LogicalPlan::Distinct {
+                    input: Box::new(project),
+                    output_schema,
+                })
+            } else {
+                Ok(project)
             }
-            lower_select(items, acc, registry)
         }
 
         PipelineStage::Limit { count, .. } => Ok(LogicalPlan::limit(count, acc)),
 
-        // Everything else is a later-wave shape. Each rejection names
-        // the stage and the wave it lands in so the error message
-        // doubles as documentation for users who run into it.
+        // ── Wave 3 stages ────────────────────────────────────────────
+        PipelineStage::Match { pattern, .. } => {
+            lower_match(pattern, acc, registry, catalog, source_table)
+        }
+
+        PipelineStage::Stats {
+            aggregates,
+            group_by,
+            ..
+        } => lower_stats(aggregates, group_by, acc, registry),
+
+        PipelineStage::OrderBy { items, .. } => lower_order_by(items, acc, registry),
+
+        // Everything else is a later-wave shape.
         other => Err(BqliteError::Plan(format!(
-            "pipeline stage `{}` is not yet supported in Wave 2 — see the Wave 2 scope in TASKS.md",
+            "pipeline stage `{}` is not yet supported — see TASKS.md for the implementation wave",
             stage_kind_name(&other)
         ))),
     }
@@ -817,6 +835,620 @@ fn lower_select(
     }
 
     LogicalPlan::project(project_items, acc)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 3 MATCH lowering — wave3-lowering.md §2.1
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `| MATCH <pattern>` into a `SequenceMatch` logical node.
+///
+/// Validates event-type references against the catalog, type-checks step
+/// predicates, converts the AST `MatchPattern` into a planner-owned
+/// `SequencePattern`, and builds the output schema per §2.1.3.
+///
+/// Step-property columns (`s.plan`, `p.amount`) are eagerly added to the
+/// output schema for all named steps so that downstream type-checking can
+/// resolve qualified references. The demand propagation pass (Pass 4) later
+/// prunes unused columns.
+fn lower_match(
+    pattern: MatchPattern,
+    acc: LogicalPlan,
+    registry: &FunctionRegistry,
+    _catalog: &dyn Catalog,
+    source_table: &TableSchema,
+) -> Result<LogicalPlan> {
+    if pattern.steps.is_empty() {
+        return Err(BqliteError::Plan(
+            "MATCH pattern must have at least one step".into(),
+        ));
+    }
+
+    let input_schema = acc.output_schema();
+
+    // Resolve role column names from the source table schema, not hardcoded.
+    let entity_key_name = source_table.entity_key_column().name.clone();
+    let timestamp_name = source_table.timestamp_column().name.clone();
+    let event_type_name_col = source_table.event_type_column().name.clone();
+
+    // Validate the event_type column exists on the input schema (required for
+    // the NFA to dispatch events to the correct step).
+    if input_schema.column(&event_type_name_col).is_none() {
+        return Err(BqliteError::Plan(format!(
+            "MATCH requires the input to have an event type column (`{event_type_name_col}`)"
+        )));
+    }
+
+    // Collect step name → event type mapping. Validate event types against
+    // the catalog and check for duplicate step names.
+    let mut step_names: Vec<(String, String)> = Vec::new(); // (step_name, event_type)
+    let mut seen_step_names: HashSet<String> = HashSet::new();
+
+    for step in &pattern.steps {
+        // Resolve the event type name. For Wave 3, only Single events are
+        // validated against the catalog schema (alternations and cross-table
+        // references are validated structurally by the pattern compiler).
+        let event_type_name = match &step.event {
+            StepEvent::Single(event_ref) => event_ref.event.text.clone(),
+            StepEvent::Alternation(refs) => {
+                // Use the first event type for step-property resolution.
+                // (All alternatives must have the same step name if named.)
+                refs[0].event.text.clone()
+            }
+        };
+
+        // Type-check step predicates against the input schema.
+        // Step predicates can reference columns from the input schema
+        // (which includes entity_id, ts, event_type, and any declared columns).
+        if let Some(pred) = &step.predicate {
+            let typed = TypedExpr::from_ast(pred, input_schema, registry)?;
+            if typed.result_type != BqlType::Bool {
+                return Err(BqliteError::Plan(format!(
+                    "MATCH step predicate must have type `Bool`, got `{}`",
+                    typed.result_type
+                )));
+            }
+        }
+
+        // Record named steps for step-property resolution.
+        if let Some(name) = &step.name {
+            if !seen_step_names.insert(name.text.clone()) {
+                return Err(BqliteError::Plan(format!(
+                    "MATCH: duplicate step name `{}`",
+                    name.text
+                )));
+            }
+            step_names.push((name.text.clone(), event_type_name));
+        }
+    }
+
+    // Determine match mode and emit_all per §2.1.2.
+    let (mode, emit_all) = match pattern.mode {
+        MatchMode::First => (MatchMode::First, false),
+        MatchMode::All => (MatchMode::All, false),
+        MatchMode::EmitAll => (MatchMode::First, true),
+    };
+
+    // Convert AST MatchWindow to planner MatchWindowSpec per §2.1.1.
+    let window = pattern.window.map(|w| match w {
+        MatchWindow::Within(ns) => MatchWindowSpec::Duration(ns),
+        MatchWindow::WithinSession => MatchWindowSpec::Session,
+    });
+
+    // Build the output schema per §2.1.3.
+    let mut output_columns: Vec<ColumnDef> = Vec::new();
+
+    // 1. entity_id is always present — use the table's entity key column.
+    if let Some((_, col_def)) = input_schema.column(&entity_key_name) {
+        output_columns.push(ColumnDef {
+            name: "entity_id".to_string(),
+            bql_type: col_def.bql_type.clone(),
+            nullable: false,
+            default_value: None,
+        });
+    } else {
+        return Err(BqliteError::Plan(format!(
+            "MATCH requires the input to have an entity key column (`{entity_key_name}`)"
+        )));
+    }
+
+    // 2. Variable binding columns — collect $var bindings from step predicates.
+    // We use a two-pass approach: first collect refined types from Compare
+    // expressions (Variable = Column), then fill in remaining variables with
+    // defaults. This ensures the best type inference ordering.
+    collect_variable_binding_columns(&pattern, input_schema, &mut output_columns);
+
+    // 3. step_reached column when emit_all is true.
+    if emit_all {
+        output_columns.push(ColumnDef {
+            name: "step_reached".to_string(),
+            bql_type: BqlType::Int,
+            nullable: false,
+            default_value: None,
+        });
+    }
+
+    // 4. match_duration and match_events: demand-dependent columns added to
+    // the maximum schema per §2.1.3 item 4. Pruned by demand analysis if unused.
+    output_columns.push(ColumnDef {
+        name: "match_duration".to_string(),
+        bql_type: BqlType::Int,
+        nullable: true,
+        default_value: None,
+    });
+    output_columns.push(ColumnDef {
+        name: "match_events".to_string(),
+        bql_type: BqlType::Map(Box::new(BqlType::Timestamp)),
+        nullable: true,
+        default_value: None,
+    });
+
+    // 5. Step-property columns for all named steps.
+    // Eagerly added so downstream type-checking can resolve qualified references
+    // (e.g., `s.plan`). Demand analysis prunes unused ones.
+    // NOTE: deviates from §2.1.3 item 5 which says step properties are NOT added
+    // at construction time. We add them eagerly so TypedExpr::from_ast can resolve
+    // qualified references in downstream expressions without a second pass.
+    let role_columns: HashSet<&str> = [
+        entity_key_name.as_str(),
+        timestamp_name.as_str(),
+        event_type_name_col.as_str(),
+    ]
+    .into_iter()
+    .collect();
+
+    for (step_name, _) in &step_names {
+        for col in input_schema.columns() {
+            if col.is_system() || role_columns.contains(col.name.as_str()) {
+                continue;
+            }
+            let qualified_name = format!("{}.{}", step_name, col.name);
+            output_columns.push(ColumnDef {
+                name: qualified_name,
+                bql_type: col.bql_type.clone(),
+                nullable: true, // nullable because entity may not reach this step
+                default_value: None,
+            });
+        }
+        // Also include timestamp as a step property for time-based operations
+        // (e.g., QUANTIZE(s.ts, 1d) in a GROUP BY after MATCH).
+        let ts_name = format!("{}.{}", step_name, timestamp_name);
+        output_columns.push(ColumnDef {
+            name: ts_name,
+            bql_type: BqlType::Timestamp,
+            nullable: true,
+            default_value: None,
+        });
+    }
+
+    let output_schema = OperatorSchema::new(output_columns)?;
+
+    // Carry brackets through from the AST (always None in Wave 3).
+    let brackets = pattern.brackets.clone();
+
+    Ok(LogicalPlan::SequenceMatch {
+        pattern: SequencePattern { inner: pattern },
+        mode,
+        emit_all,
+        window,
+        brackets,
+        step_properties: Vec::new(), // filled by demand analysis (Pass 4)
+        fused_downstream: None,      // filled by fusion optimizer (TASK-320)
+        input: Box::new(acc),
+        output_schema,
+    })
+}
+
+/// Collect `$var` binding declarations from the MATCH pattern's step
+/// predicates and add corresponding columns to the output schema.
+///
+/// Uses a two-pass approach: first collects type-refined bindings from
+/// `Compare(Variable, Column)` patterns, then fills in remaining variables
+/// with a default `String` type. This ensures variables compared against
+/// typed columns get the correct type regardless of expression tree order.
+///
+/// Full variable type inference and validation is deferred to the pattern
+/// compiler (TASK-311's `compile_pattern`).
+fn collect_variable_binding_columns(
+    pattern: &MatchPattern,
+    input_schema: &OperatorSchema,
+    output_columns: &mut Vec<ColumnDef>,
+) {
+    // Pass 1: collect type-refined bindings from Compare(Variable, Column).
+    let mut refined: std::collections::HashMap<String, BqlType> = std::collections::HashMap::new();
+    for step in &pattern.steps {
+        if let Some(pred) = &step.predicate {
+            collect_refined_variable_types(&pred.node, input_schema, &mut refined);
+        }
+    }
+
+    // Pass 2: collect all variable names, using refined types when available.
+    let mut seen_vars: HashSet<String> = HashSet::new();
+    for step in &pattern.steps {
+        if let Some(pred) = &step.predicate {
+            collect_all_variables(&pred.node, &mut seen_vars);
+        }
+    }
+
+    // Emit columns in deterministic order.
+    let mut var_list: Vec<String> = seen_vars.into_iter().collect();
+    var_list.sort();
+    for var_name in var_list {
+        let bql_type = refined.get(&var_name).cloned().unwrap_or(BqlType::String);
+        output_columns.push(ColumnDef {
+            name: var_name,
+            bql_type,
+            nullable: false, // bindings are non-nullable per §2.1.3
+            default_value: None,
+        });
+    }
+}
+
+/// Pass 1: Scan expressions for `Compare($var, column)` patterns and record
+/// the column's type as the variable's refined type.
+fn collect_refined_variable_types(
+    expr: &Expr,
+    input_schema: &OperatorSchema,
+    refined: &mut std::collections::HashMap<String, BqlType>,
+) {
+    match expr {
+        Expr::Compare { left, right, .. } => {
+            if let (Expr::Variable(var_name), Expr::Column(col_name))
+            | (Expr::Column(col_name), Expr::Variable(var_name)) = (&left.node, &right.node)
+            {
+                let key = format!("${}", var_name.text);
+                if let std::collections::hash_map::Entry::Vacant(e) = refined.entry(key) {
+                    if let Some((_, col)) = input_schema.column(&col_name.text) {
+                        e.insert(col.bql_type.clone());
+                    }
+                }
+            }
+            // Recurse into sub-expressions.
+            collect_refined_variable_types(&left.node, input_schema, refined);
+            collect_refined_variable_types(&right.node, input_schema, refined);
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_refined_variable_types(&left.node, input_schema, refined);
+            collect_refined_variable_types(&right.node, input_schema, refined);
+        }
+        Expr::And(exprs) | Expr::Or(exprs) => {
+            for e in exprs {
+                collect_refined_variable_types(&e.node, input_schema, refined);
+            }
+        }
+        Expr::Not(inner) | Expr::Paren(inner) => {
+            collect_refined_variable_types(&inner.node, input_schema, refined);
+        }
+        Expr::Unary { operand, .. } => {
+            collect_refined_variable_types(&operand.node, input_schema, refined);
+        }
+        Expr::IsNull { expr: inner, .. } | Expr::Cast { expr: inner, .. } => {
+            collect_refined_variable_types(&inner.node, input_schema, refined);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_refined_variable_types(&arg.node, input_schema, refined);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_refined_variable_types(&expr.node, input_schema, refined);
+            collect_refined_variable_types(&low.node, input_schema, refined);
+            collect_refined_variable_types(&high.node, input_schema, refined);
+        }
+        Expr::In { lhs, rhs, .. } => {
+            for e in lhs {
+                collect_refined_variable_types(&e.node, input_schema, refined);
+            }
+            if let bqlite_ast::expr::InRhs::List(exprs) = rhs {
+                for e in exprs {
+                    collect_refined_variable_types(&e.node, input_schema, refined);
+                }
+            }
+        }
+        Expr::Case {
+            arms, else_expr, ..
+        } => {
+            for arm in arms {
+                collect_refined_variable_types(&arm.condition.node, input_schema, refined);
+                collect_refined_variable_types(&arm.value.node, input_schema, refined);
+            }
+            if let Some(else_e) = else_expr {
+                collect_refined_variable_types(&else_e.node, input_schema, refined);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pass 2: Collect all `$var` names from an expression tree.
+fn collect_all_variables(expr: &Expr, seen: &mut HashSet<String>) {
+    match expr {
+        Expr::Variable(name) => {
+            seen.insert(format!("${}", name.text));
+        }
+        Expr::Compare { left, right, .. } | Expr::Binary { left, right, .. } => {
+            collect_all_variables(&left.node, seen);
+            collect_all_variables(&right.node, seen);
+        }
+        Expr::And(exprs) | Expr::Or(exprs) => {
+            for e in exprs {
+                collect_all_variables(&e.node, seen);
+            }
+        }
+        Expr::Not(inner) | Expr::Paren(inner) => {
+            collect_all_variables(&inner.node, seen);
+        }
+        Expr::Unary { operand, .. } => {
+            collect_all_variables(&operand.node, seen);
+        }
+        Expr::IsNull { expr: inner, .. } | Expr::Cast { expr: inner, .. } => {
+            collect_all_variables(&inner.node, seen);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_all_variables(&arg.node, seen);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_all_variables(&expr.node, seen);
+            collect_all_variables(&low.node, seen);
+            collect_all_variables(&high.node, seen);
+        }
+        Expr::In { lhs, rhs, .. } => {
+            for e in lhs {
+                collect_all_variables(&e.node, seen);
+            }
+            if let bqlite_ast::expr::InRhs::List(exprs) = rhs {
+                for e in exprs {
+                    collect_all_variables(&e.node, seen);
+                }
+            }
+        }
+        Expr::Case {
+            arms, else_expr, ..
+        } => {
+            for arm in arms {
+                collect_all_variables(&arm.condition.node, seen);
+                collect_all_variables(&arm.value.node, seen);
+            }
+            if let Some(else_e) = else_expr {
+                collect_all_variables(&else_e.node, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 3 STATS lowering — wave3-lowering.md §2.2
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `| STATS <aggregates> [GROUP BY <keys>]` into an `Aggregate` logical node.
+///
+/// Type-checks each aggregate expression and group-by key against the input
+/// schema. Builds the output schema with group-by columns first, then
+/// aggregate result columns, per §2.2.2.
+fn lower_stats(
+    agg_items: Vec<bqlite_ast::AggItem>,
+    group_items: Vec<bqlite_ast::GroupItem>,
+    acc: LogicalPlan,
+    registry: &FunctionRegistry,
+) -> Result<LogicalPlan> {
+    if agg_items.is_empty() {
+        return Err(BqliteError::Plan(
+            "STATS must have at least one aggregate expression".into(),
+        ));
+    }
+
+    let input_schema = acc.output_schema().clone();
+
+    // Type-check group-by expressions.
+    let mut group_by: Vec<(TypedExpr, String)> = Vec::with_capacity(group_items.len());
+    for (idx, item) in group_items.into_iter().enumerate() {
+        let typed = TypedExpr::from_ast(&item.expr, &input_schema, registry)?;
+        let output_name = if let Some(alias) = item.alias {
+            alias.text
+        } else {
+            // Generate name from expression.
+            match &item.expr.node {
+                Expr::Column(name) => name.text.clone(),
+                Expr::Qualified { table, column } => {
+                    format!("{}.{}", table.text, column.text)
+                }
+                _ => format!("group_{idx}"),
+            }
+        };
+        group_by.push((typed, output_name));
+    }
+
+    // Type-check and resolve aggregate expressions per §2.2.1.
+    let mut aggregates: Vec<TypedAggExpr> = Vec::with_capacity(agg_items.len());
+    for item in agg_items {
+        let typed_agg = resolve_agg_item(item, &input_schema, registry)?;
+        aggregates.push(typed_agg);
+    }
+
+    // Check for output name uniqueness per §5.4.
+    let mut output_names: HashSet<String> = HashSet::new();
+    for (_, name) in &group_by {
+        if !output_names.insert(name.clone()) {
+            return Err(BqliteError::Plan(format!(
+                "STATS: duplicate output name `{name}` in GROUP BY"
+            )));
+        }
+    }
+    for agg in &aggregates {
+        if !output_names.insert(agg.output_name.clone()) {
+            return Err(BqliteError::Plan(format!(
+                "STATS: duplicate output name `{}` — each aggregate and group-by key \
+                 must have a distinct name",
+                agg.output_name
+            )));
+        }
+    }
+
+    // Build output schema: group-by columns first, then aggregate results.
+    let mut output_columns: Vec<ColumnDef> = Vec::new();
+    for (expr, name) in &group_by {
+        output_columns.push(ColumnDef {
+            name: name.clone(),
+            bql_type: expr.result_type.clone(),
+            nullable: expr.nullable,
+            default_value: None,
+        });
+    }
+    for agg in &aggregates {
+        output_columns.push(ColumnDef {
+            name: agg.output_name.clone(),
+            bql_type: agg.output_type.clone(),
+            nullable: agg.nullable,
+            default_value: None,
+        });
+    }
+    let output_schema = OperatorSchema::new(output_columns)?;
+
+    Ok(LogicalPlan::Aggregate {
+        aggregates,
+        group_by,
+        input: Box::new(acc),
+        output_schema,
+    })
+}
+
+/// Resolve a single `AggItem` into a `TypedAggExpr`.
+///
+/// Maps the function name to an `AggFunction` variant, validates argument
+/// counts and types, and infers the output type per §2.2.1 table.
+fn resolve_agg_item(
+    item: bqlite_ast::AggItem,
+    input_schema: &OperatorSchema,
+    registry: &FunctionRegistry,
+) -> Result<TypedAggExpr> {
+    let function_name = item.function.text.to_lowercase();
+    let output_name = item.alias.text.clone();
+
+    // Match function name to AggFunction variant.
+    let (function, requires_arg) = match function_name.as_str() {
+        "count" if item.args.is_empty() => (AggFunction::Count, false),
+        "count" => (AggFunction::CountColumn, true),
+        "count_distinct" => (AggFunction::CountDistinct, true),
+        "sum" => (AggFunction::Sum, true),
+        "avg" => (AggFunction::Avg, true),
+        "min" => (AggFunction::Min, true),
+        "max" => (AggFunction::Max, true),
+        "p50" => (AggFunction::P50, true),
+        "p90" => (AggFunction::P90, true),
+        "p95" => (AggFunction::P95, true),
+        "p99" => (AggFunction::P99, true),
+        unknown => {
+            return Err(BqliteError::Plan(format!(
+                "STATS: unknown aggregate function `{unknown}` — \
+                 supported functions: count, sum, avg, min, max, count_distinct, p50, p90, p95, p99"
+            )));
+        }
+    };
+
+    // Validate argument count.
+    if requires_arg && item.args.is_empty() {
+        return Err(BqliteError::Plan(format!(
+            "STATS: aggregate function `{function_name}` requires exactly 1 argument"
+        )));
+    }
+    if !requires_arg && !item.args.is_empty() {
+        // COUNT(*) with args => this is COUNT(col), already handled above
+        // This shouldn't happen given the matching above, but guard it.
+    }
+    if item.args.len() > 1 {
+        return Err(BqliteError::Plan(format!(
+            "STATS: aggregate function `{function_name}` takes at most 1 argument, got {}",
+            item.args.len()
+        )));
+    }
+
+    // Type-check argument expressions.
+    let mut args: Vec<TypedExpr> = Vec::new();
+    for arg_expr in &item.args {
+        let typed = TypedExpr::from_ast(arg_expr, input_schema, registry)?;
+        args.push(typed);
+    }
+
+    // Determine the output type from the function and argument type.
+    let arg_type = args.first().map(|a| &a.result_type);
+    let output_type = function
+        .output_type(arg_type)
+        .ok_or_else(|| {
+            let arg_type_str = arg_type
+                .map(|t| format!("`{t}`"))
+                .unwrap_or_else(|| "none".into());
+            BqliteError::Plan(format!(
+                "STATS: aggregate function `{function_name}` does not accept argument type {arg_type_str}"
+            ))
+        })?;
+    let nullable = function.output_nullable();
+
+    Ok(TypedAggExpr {
+        function,
+        args,
+        distinct: false,
+        output_name,
+        output_type,
+        nullable,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 3 ORDER BY lowering — wave3-lowering.md §2.3
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `| ORDER BY <items>` into a `Sort` logical node.
+///
+/// Type-checks each sort key expression against the input schema and
+/// validates that the expression type is orderable (all BQL types except
+/// `Map` are orderable). Output schema is identical to input.
+fn lower_order_by(
+    items: Vec<bqlite_ast::expr::OrderItem>,
+    acc: LogicalPlan,
+    registry: &FunctionRegistry,
+) -> Result<LogicalPlan> {
+    if items.is_empty() {
+        return Err(BqliteError::Plan(
+            "ORDER BY must have at least one sort key".into(),
+        ));
+    }
+
+    let input_schema = acc.output_schema().clone();
+    let mut keys: Vec<(TypedExpr, SortDirection)> = Vec::with_capacity(items.len());
+
+    for item in items {
+        let typed = TypedExpr::from_ast(&item.expr, &input_schema, registry)?;
+
+        // Validate orderability per §5.5.
+        if matches!(typed.result_type, BqlType::Map(_)) {
+            return Err(BqliteError::Plan(
+                "ORDER BY: sort key has type `Map` which is not orderable — \
+                 only Bool, Int, Float, String, Timestamp, and List types can be sorted"
+                    .into(),
+            ));
+        }
+
+        let direction = match item.direction {
+            SortDir::Asc => SortDirection::Asc,
+            SortDir::Desc => SortDirection::Desc,
+        };
+        keys.push((typed, direction));
+    }
+
+    let output_schema = input_schema;
+
+    Ok(LogicalPlan::Sort {
+        keys,
+        input: Box::new(acc),
+        output_schema,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1604,7 +2236,8 @@ mod tests {
     }
 
     #[test]
-    fn select_distinct_rejected_until_wave_3() {
+    fn select_distinct_lowers_to_distinct_project() {
+        // SELECT DISTINCT user_id lowers to Distinct(Project(...)) per §2.4.
         let cat = InMemoryCatalog::default().with(purchases_schema());
         let pipeline = pipeline_with_stages(
             "purchases",
@@ -1614,10 +2247,17 @@ mod tests {
                 span: Span::EMPTY,
             }],
         );
-        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
-        match err {
-            BqliteError::Plan(msg) => assert!(msg.contains("DISTINCT")),
-            other => panic!("expected Plan error, got {other:?}"),
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::Distinct {
+                ref input,
+                ref output_schema,
+            } => {
+                assert!(matches!(**input, LogicalPlan::Project { .. }));
+                assert_eq!(output_schema.columns().len(), 1);
+                assert_eq!(output_schema.columns()[0].name, "user_id");
+            }
+            other => panic!("expected Distinct(Project(...)), got {other:?}"),
         }
     }
 
@@ -2726,5 +3366,358 @@ mod tests {
         assert_eq!(d.len(), 4);
         let empty = empty_output_schema();
         assert_eq!(empty.len(), 0);
+    }
+
+    // ── Wave 3: MATCH lowering ────────────────────────────────────────────────
+
+    fn match_step(name: Option<&str>, event: &str) -> bqlite_ast::pattern::Step {
+        use bqlite_ast::pattern::{EventRef, Step, StepEvent};
+        Step {
+            name: name.map(Name::synthetic),
+            event: StepEvent::Single(EventRef {
+                table: None,
+                event: Name::synthetic(event),
+                span: Span::EMPTY,
+            }),
+            predicate: None,
+            repetition: None,
+            immediately_next: false,
+            without_next: None,
+            span: Span::EMPTY,
+        }
+    }
+
+    #[test]
+    fn match_two_step_pattern_produces_sequence_match() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Match {
+                pattern: bqlite_ast::pattern::MatchPattern {
+                    steps: vec![
+                        match_step(Some("s"), "signup"),
+                        match_step(Some("p"), "purchase"),
+                    ],
+                    mode: MatchMode::First,
+                    window: None,
+                    brackets: None,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::SequenceMatch {
+                mode,
+                emit_all,
+                window,
+                output_schema,
+                ..
+            } => {
+                assert_eq!(*mode, MatchMode::First);
+                assert!(!emit_all);
+                assert!(window.is_none());
+                // Should have: entity_id, match_duration, match_events,
+                // + step properties for s and p (amount, country, s.ts, p.ts)
+                assert!(output_schema.column("entity_id").is_some());
+                assert!(output_schema.column("match_duration").is_some());
+                assert!(output_schema.column("match_events").is_some());
+                assert!(output_schema.column("s.amount").is_some());
+                assert!(output_schema.column("p.country").is_some());
+                assert!(output_schema.column("s.ts").is_some());
+                assert!(output_schema.column("p.ts").is_some());
+            }
+            other => panic!("expected SequenceMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_emit_all_produces_step_reached_column() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Match {
+                pattern: bqlite_ast::pattern::MatchPattern {
+                    steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
+                    mode: MatchMode::EmitAll,
+                    window: None,
+                    brackets: None,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::SequenceMatch {
+                emit_all,
+                output_schema,
+                ..
+            } => {
+                assert!(emit_all);
+                assert!(output_schema.column("step_reached").is_some());
+                let (_, col) = output_schema.column("step_reached").unwrap();
+                assert_eq!(col.bql_type, BqlType::Int);
+                assert!(!col.nullable);
+            }
+            other => panic!("expected SequenceMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_empty_pattern_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Match {
+                pattern: bqlite_ast::pattern::MatchPattern {
+                    steps: vec![],
+                    mode: MatchMode::First,
+                    window: None,
+                    brackets: None,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("at least one step")));
+    }
+
+    #[test]
+    fn match_duplicate_step_names_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Match {
+                pattern: bqlite_ast::pattern::MatchPattern {
+                    steps: vec![
+                        match_step(Some("s"), "signup"),
+                        match_step(Some("s"), "purchase"),
+                    ],
+                    mode: MatchMode::First,
+                    window: None,
+                    brackets: None,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("duplicate step name")));
+    }
+
+    #[test]
+    fn match_with_window_produces_match_window_spec() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Match {
+                pattern: bqlite_ast::pattern::MatchPattern {
+                    steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
+                    mode: MatchMode::First,
+                    window: Some(bqlite_ast::pattern::MatchWindow::Within(
+                        604_800_000_000_000,
+                    )),
+                    brackets: None,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::SequenceMatch { window, .. } => {
+                assert_eq!(
+                    *window,
+                    Some(MatchWindowSpec::Duration(604_800_000_000_000))
+                );
+            }
+            other => panic!("expected SequenceMatch, got {other:?}"),
+        }
+    }
+
+    // ── Wave 3: STATS lowering ──────────────────────────────────────────────────
+
+    fn agg_item(alias: &str, func: &str, args: Vec<Spanned<Expr>>) -> bqlite_ast::AggItem {
+        bqlite_ast::AggItem {
+            function: Name::synthetic(func),
+            args,
+            distinct: false,
+            alias: Name::synthetic(alias),
+            span: Span::EMPTY,
+        }
+    }
+
+    fn group_item(expr: Spanned<Expr>, alias: Option<&str>) -> bqlite_ast::GroupItem {
+        bqlite_ast::GroupItem {
+            expr,
+            alias: alias.map(Name::synthetic),
+            span: Span::EMPTY,
+        }
+    }
+
+    #[test]
+    fn stats_count_star_with_group_by() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Stats {
+                aggregates: vec![agg_item("total", "count", vec![])],
+                group_by: vec![group_item(column_expr("country"), None)],
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::Aggregate {
+                aggregates,
+                group_by,
+                output_schema,
+                ..
+            } => {
+                assert_eq!(aggregates.len(), 1);
+                assert_eq!(aggregates[0].function, AggFunction::Count);
+                assert!(aggregates[0].args.is_empty());
+                assert_eq!(aggregates[0].output_name, "total");
+                assert_eq!(aggregates[0].output_type, BqlType::Int);
+                assert!(!aggregates[0].nullable);
+                assert_eq!(group_by.len(), 1);
+                assert_eq!(group_by[0].1, "country");
+                let col_names: Vec<&str> = output_schema
+                    .columns()
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                assert_eq!(col_names, vec!["country", "total"]);
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_sum_with_type_validation() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Stats {
+                aggregates: vec![agg_item("total_amount", "sum", vec![column_expr("amount")])],
+                group_by: vec![],
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::Aggregate {
+                aggregates,
+                output_schema,
+                ..
+            } => {
+                assert_eq!(aggregates[0].function, AggFunction::Sum);
+                // SUM(Float) → Float
+                assert_eq!(aggregates[0].output_type, BqlType::Float);
+                assert!(aggregates[0].nullable);
+                assert_eq!(output_schema.columns()[0].name, "total_amount");
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_unknown_function_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Stats {
+                aggregates: vec![agg_item("x", "median", vec![column_expr("amount")])],
+                group_by: vec![],
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(msg) if msg.contains("unknown aggregate function"))
+        );
+    }
+
+    #[test]
+    fn stats_sum_string_type_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Stats {
+                aggregates: vec![agg_item("bad", "sum", vec![column_expr("country")])],
+                group_by: vec![],
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("does not accept")));
+    }
+
+    #[test]
+    fn stats_duplicate_output_name_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Stats {
+                aggregates: vec![
+                    agg_item("x", "count", vec![]),
+                    agg_item("x", "sum", vec![column_expr("amount")]),
+                ],
+                group_by: vec![],
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("duplicate output name")));
+    }
+
+    // ── Wave 3: ORDER BY lowering ───────────────────────────────────────────────
+
+    #[test]
+    fn order_by_sorts_by_column() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::OrderBy {
+                items: vec![bqlite_ast::expr::OrderItem {
+                    expr: column_expr("amount"),
+                    direction: bqlite_ast::expr::SortDir::Desc,
+                    span: Span::EMPTY,
+                }],
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match &plan {
+            LogicalPlan::Sort {
+                keys,
+                output_schema,
+                ..
+            } => {
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0].1, SortDirection::Desc);
+                // Sort output schema equals input schema.
+                let scan_schema = OperatorSchema::from_table(&purchases_schema());
+                assert_eq!(output_schema, &scan_schema);
+            }
+            other => panic!("expected Sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_empty_items_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::OrderBy {
+                items: vec![],
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("at least one sort key")));
     }
 }

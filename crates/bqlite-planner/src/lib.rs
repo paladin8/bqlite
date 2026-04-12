@@ -293,19 +293,22 @@ mod tests {
 
     #[test]
     fn propagates_unsupported_pipeline_stage_error() {
-        // ORDER BY is deferred to Wave 3 — logical lowering rejects it
+        // SESSIONIZE is deferred to Wave 4 — logical lowering rejects it
         // and `plan` must propagate that error verbatim.
         let catalog = InMemoryCatalog::default().with(events_schema());
         let mut pipeline = bare_pipeline("events");
-        pipeline.stages.push(PipelineStage::OrderBy {
-            items: vec![],
-            span: Span::EMPTY,
-        });
+        pipeline
+            .stages
+            .push(PipelineStage::Sessionize(bqlite_ast::Sessionize {
+                gap: 1_000_000_000,
+                end: None,
+                span: Span::EMPTY,
+            }));
         match plan(Statement::Query(pipeline), &catalog) {
             Err(BqliteError::Plan(msg)) => {
-                assert!(msg.contains("ORDER BY"), "got: {msg}");
+                assert!(msg.contains("SESSIONIZE"), "got: {msg}");
             }
-            other => panic!("expected Plan error for ORDER BY, got {other:?}"),
+            other => panic!("expected Plan error for SESSIONIZE, got {other:?}"),
         }
     }
 
