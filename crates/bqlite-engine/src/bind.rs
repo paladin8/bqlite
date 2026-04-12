@@ -142,11 +142,10 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
 }
 
 fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOperator>> {
-    // `Database::segment_reader` returns a `Box<dyn SegmentReader>` —
-    // the Wave 1 stub is the `EmptySegmentReader` TASK-116 wired in,
-    // and Wave 2 will swap in a real segment-format reader. We hand
-    // it to the scan as an `Arc` so later waves can share ownership
-    // across parallel shard-tasks without changing the trait.
+    // `Database::segment_reader` returns a manifest-backed
+    // `ManifestSegmentReader` (TASK-244) that enumerates live segments
+    // and opens them from disk. We hand it to the scan as an `Arc` so
+    // later waves can share ownership across parallel shard-tasks.
     let reader_box: Box<dyn SegmentReader> = db.segment_reader(&scan.table)?;
     let reader: Arc<dyn SegmentReader> = Arc::from(reader_box);
 
@@ -175,6 +174,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use arrow::array::Array;
     use bqlite_core::OperatorSchema;
     use bqlite_planner::{plan, PhysicalPlan, ScanPhysical};
     use bqlite_storage::{bootstrap_events_schema, Database};
@@ -329,5 +329,134 @@ mod tests {
         op.open().unwrap();
         assert!(op.next_batch().unwrap().is_none());
         op.close().unwrap();
+    }
+
+    // ── TASK-244: end-to-end real-rows through manifest-backed reader ────
+
+    /// Create a database with a 4-column events table suitable for
+    /// INSERT VALUES round-trip tests.
+    fn create_db_with_events_table(path: &Path) -> (Database, crate::Engine) {
+        let mut db = Database::create(path).expect("create db");
+        let engine = crate::Engine::new();
+        engine
+            .query(
+                "CREATE TABLE events (\
+                     user_id STRING NOT NULL ENTITY KEY, \
+                     ts TIMESTAMP NOT NULL EVENT TIME, \
+                     event_type STRING NOT NULL EVENT TYPE, \
+                     amount INT\
+                 )",
+                &mut db,
+            )
+            .expect("create events table");
+        (db, engine)
+    }
+
+    #[test]
+    fn insert_values_then_query_returns_real_rows() {
+        // TASK-244 end-to-end: CREATE TABLE → INSERT VALUES → query
+        // must return actual row data through the manifest-backed
+        // reader, not zero rows from the old EmptySegmentReader stub.
+        let scratch = Scratch::new("real-rows");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 42), \
+                 ('bob',   1700000000100000000, 'view',  NULL)",
+                &mut db,
+            )
+            .expect("INSERT VALUES must succeed");
+
+        // Query the table — the scan operator drives through the
+        // ManifestSegmentReader and returns real rows.
+        let result = engine.query("events", &mut db).expect("query must succeed");
+        assert_eq!(
+            result.row_count(),
+            2,
+            "query must return 2 rows, not zero — the scan reads real segments"
+        );
+
+        // Collect entity names across all batches (rows may be split
+        // across segments/shards).
+        let mut entities: Vec<String> = Vec::new();
+        let mut found_alice_amount = false;
+        let mut found_bob_null = false;
+        for batch in &result.rows {
+            let entity_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .expect("user_id column should be StringView");
+            let amount_col = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("amount column should be Int64");
+            for i in 0..batch.num_rows() {
+                let name = entity_col.value(i).to_string();
+                if name == "alice" {
+                    assert_eq!(amount_col.value(i), 42);
+                    found_alice_amount = true;
+                }
+                if name == "bob" {
+                    assert!(amount_col.is_null(i), "bob's amount must be NULL");
+                    found_bob_null = true;
+                }
+                entities.push(name);
+            }
+        }
+        entities.sort();
+        assert_eq!(entities, vec!["alice", "bob"]);
+        assert!(found_alice_amount, "alice's amount=42 must round-trip");
+        assert!(found_bob_null, "bob's NULL amount must round-trip");
+    }
+
+    #[test]
+    fn insert_values_then_where_returns_filtered_rows() {
+        let scratch = Scratch::new("real-rows-filter");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 10), \
+                 ('alice', 1700000000100000000, 'view',  20), \
+                 ('bob',   1700000000200000000, 'click', 30)",
+                &mut db,
+            )
+            .expect("INSERT VALUES must succeed");
+
+        // BQL pipe syntax: table | where ...
+        let result = engine
+            .query("events | where event_type = 'click'", &mut db)
+            .expect("filtered query");
+        assert_eq!(
+            result.row_count(),
+            2,
+            "WHERE event_type = 'click' should return 2 rows (alice + bob)"
+        );
+    }
+
+    #[test]
+    fn insert_values_then_limit_returns_bounded_rows() {
+        let scratch = Scratch::new("real-rows-limit");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 10), \
+                 ('bob',   1700000000100000000, 'view',  20), \
+                 ('carol', 1700000000200000000, 'click', 30)",
+                &mut db,
+            )
+            .expect("INSERT VALUES must succeed");
+
+        let result = engine
+            .query("events | limit 2", &mut db)
+            .expect("query with LIMIT");
+        assert_eq!(result.row_count(), 2, "LIMIT 2 should cap at 2 rows");
     }
 }

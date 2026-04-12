@@ -576,12 +576,10 @@ mod tests {
 
     /// Round-trip: `CREATE TABLE → INSERT VALUES → assert rows in manifest`.
     ///
-    /// The scan operator currently uses `EmptySegmentReader` (a Wave 1
-    /// stub — real segment-to-Arrow reads are a separate task). The
-    /// authoritative proof that rows landed is the manifest row count,
-    /// which the writer updates atomically on each successful
-    /// `write_partitioner` call. Direct Arrow column verification will be
-    /// added once the real scan path lands.
+    /// This test verifies the manifest row count after ingest. For the
+    /// full scan-path proof that queries return real rows through the
+    /// manifest-backed `ManifestSegmentReader` (TASK-244), see
+    /// `bind::tests::insert_values_then_query_returns_real_rows`.
     #[test]
     fn engine_query_insert_values_round_trip() {
         let scratch = Scratch::new("insert-values-e2e");
