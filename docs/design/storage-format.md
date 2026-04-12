@@ -405,7 +405,9 @@ windows/w_020238/shard_03  ──┘
 
 The hints are advisory — the kernel may ignore them, and bqlite never relies on them for correctness. They are an explicit signal that the engine knows the access pattern better than the kernel's default heuristic does. The reader applies the hint at segment open and re-applies `WillNeed` at row-group boundaries during compaction.
 
-This is a small but cheap win: `posix_fadvise` is a single syscall, the hints save the kernel from having to detect the pattern via cache misses, and the embeddable-engine constraint (Belief 5) means we cannot tune `vm.dirty_ratio` or other system-wide knobs — explicit hints are the only lever we have.
+Apple targets do not expose `posix_fadvise(2)`. On those platforms, the sequential-scan open path uses Darwin's `fcntl(F_RDADVISE)` equivalent instead of `POSIX_FADV_SEQUENTIAL`.
+
+This is a small but cheap win: the advisory calls are only a syscall or two, the hints save the kernel from having to detect the pattern via cache misses, and the embeddable-engine constraint (Belief 5) means we cannot tune `vm.dirty_ratio` or other system-wide knobs — explicit hints are the only lever we have.
 
 **Bounded buffers.** 4 MB read buffer per merge input stream. Modern SSDs deliver peak throughput at ≥128 KB I/O sizes, but larger buffers (2-4 MB) reduce syscall overhead and amortize seek latency on spinning disks. With k=6 (30-day windows, 6-month query) and 32 shards, total buffer memory is 192 streams * 4 MB = 768 MB — within the 3 GB query budget. Note that not all shards read simultaneously — the thread pool (sized to num_cores) limits concurrency, so actual buffer usage at any instant is `num_cores * k * 4 MB`.
 

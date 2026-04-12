@@ -1,9 +1,13 @@
 //! Access-pattern hints for segment I/O (TASK-243).
 //!
-//! Wraps `posix_fadvise(2)` on platforms that expose it so the
-//! segment reader can tell the kernel "this file is about to be
-//! read sequentially from start to end" at open time. On platforms
-//! that do not expose `posix_fadvise` (macOS, iOS, Windows) the
+//! Wraps the platform-specific sequential-read advisory syscall so
+//! the segment reader can tell the kernel "this file is about to be
+//! read sequentially from start to end" at open time.
+//!
+//! Linux/FreeBSD/Android use `posix_fadvise(2)` with
+//! `POSIX_FADV_SEQUENTIAL`. Apple targets use Darwin's
+//! `fcntl(F_RDADVISE)` with the file length as the advisory window.
+//! On platforms without either interface (for example Windows) the
 //! hint is a no-op and the kernel falls back on its own readahead
 //! heuristics.
 //!
@@ -43,10 +47,11 @@ pub(crate) static SEQUENTIAL_HINT_COUNT: AtomicUsize = AtomicUsize::new(0);
 ///
 /// On Linux, FreeBSD, and Android this issues
 /// `posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)`; per POSIX
-/// `offset = 0, len = 0` means "advise the entire file". On every
-/// other platform this is a no-op — macOS and iOS expose the
-/// equivalent as `fcntl(F_RDADVISE)` (a separate follow-up) and
-/// Windows has no comparable syscall.
+/// `offset = 0, len = 0` means "advise the entire file". On Apple
+/// targets this issues `fcntl(F_RDADVISE, &radvisory)` for the full
+/// file length, clamped to Darwin's `int` byte-count field. On every
+/// other platform this is a no-op because there is no comparable
+/// per-file-descriptor advisory interface.
 ///
 /// Errors from the syscall are deliberately ignored: a bad
 /// `posix_fadvise` return cannot corrupt the file, the caller has
@@ -74,10 +79,43 @@ fn issue_sequential_hint(file: &File) {
     let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
 }
 
+#[cfg(target_vendor = "apple")]
+fn issue_sequential_hint(file: &File) {
+    use std::os::unix::io::AsRawFd;
+
+    // Darwin exposes the advisory equivalent via `fcntl(F_RDADVISE)`
+    // and wants an explicit byte count instead of POSIX's
+    // "0 means the whole file" convention. If metadata lookup fails,
+    // skip the hint — it is purely advisory, and the caller's read
+    // path remains correct without it.
+    let file_len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return,
+    };
+
+    let advice = libc::radvisory {
+        ra_offset: 0,
+        ra_count: apple_read_ahead_len(file_len),
+    };
+
+    // SAFETY: `file` owns a live descriptor for the duration of this
+    // call, `advice` lives until `fcntl` returns, and `F_RDADVISE`
+    // treats the third argument as a borrowed `struct radvisory *`.
+    // The request is informational only; failures are ignored for the
+    // same reason as the POSIX branch above.
+    let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &advice) };
+}
+
+#[cfg(target_vendor = "apple")]
+fn apple_read_ahead_len(file_len: u64) -> libc::c_int {
+    file_len.min(libc::c_int::MAX as u64) as libc::c_int
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "android")))]
+#[cfg(not(target_vendor = "apple"))]
 fn issue_sequential_hint(_file: &File) {
-    // No-op on platforms without `posix_fadvise`. macOS/iOS would
-    // want `fcntl(F_RDADVISE)`; that path is deferred per TASK-243.
+    // No-op on platforms without a per-fd sequential-read advisory
+    // syscall.
 }
 
 #[cfg(test)]
@@ -118,5 +156,17 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_read_ahead_len_clamps_to_c_int_max() {
+        assert_eq!(apple_read_ahead_len(0), 0);
+        assert_eq!(apple_read_ahead_len(4096), 4096);
+        assert_eq!(
+            apple_read_ahead_len((libc::c_int::MAX as u64) + 1),
+            libc::c_int::MAX
+        );
+        assert_eq!(apple_read_ahead_len(u64::MAX), libc::c_int::MAX);
     }
 }

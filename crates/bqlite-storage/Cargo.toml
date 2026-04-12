@@ -18,9 +18,10 @@ lz4_flex = { workspace = true }
 postcard = { workspace = true }
 csv = { workspace = true }
 
-# `libc` is only pulled in on platforms where `posix_fadvise(2)` is
-# a real syscall (TASK-243). On macOS/iOS/Windows the segment reader
-# compiles without it and the advisory call is a no-op — see
+# `libc` is only pulled in on platforms where the segment reader emits
+# an OS-specific sequential-read hint: `posix_fadvise(2)` on
+# Linux/FreeBSD/Android and Darwin's `fcntl(F_RDADVISE)` on Apple
+# targets. Other platforms keep the advisory hook as a no-op — see
 # `src/segment/advise.rs`.
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "android"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "android", target_vendor = "apple"))'.dependencies]
 libc = "0.2"

@@ -149,8 +149,9 @@ impl SegmentFileReader {
     /// scans segments front-to-back, so `POSIX_FADV_SEQUENTIAL`
     /// is the single hint that actually matches every call path
     /// (see `docs/design/storage-format.md` §8.2 and TASK-243).
-    /// The hint is advisory and silently no-ops on platforms that
-    /// do not expose `posix_fadvise`.
+    /// The hint is advisory and uses the nearest platform-specific
+    /// equivalent where available (`posix_fadvise` on Linux-like
+    /// targets, Darwin `F_RDADVISE` on Apple targets).
     pub fn open<P: AsRef<Path>>(path: P, current_schema: TableSchema) -> Result<Self> {
         // Path comes from the manifest (trusted internal state), not user input.
         let mut file = fs::File::open(path)?; // nosemgrep
