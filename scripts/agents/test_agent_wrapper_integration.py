@@ -103,9 +103,12 @@ class AgentWrapperIntegrationTests(unittest.TestCase):
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
         env["BQLITE_TASK_TOOL_ROOT"] = str(repo)
         env["AGENT_ID"] = "agent-test-1"
+        # Override the absolute /root/.local/bin/claude default so the fake
+        # binary on PATH above is the one the wrapper actually spawns.
+        env["BQLITE_CLAUDE_BIN"] = "claude"
 
         result = subprocess.run(
-            [sys.executable, str(WRAPPER_PATH), "1", "EASY", "1"],
+            [sys.executable, str(WRAPPER_PATH), "1", "1"],
             cwd=repo,
             env=env,
             capture_output=True,

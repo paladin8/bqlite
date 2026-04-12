@@ -24,15 +24,14 @@ Run from the repo root:
 # 1. Build the devcontainer image (cached after first run) and start N idle containers.
 scripts/agents/launch-fleet.sh 4
 
-# 2. Open a cmux workspace with one tab per container, assigning pools.
-#    --easy N = N agents running Sonnet at high effort on [EASY]-tagged tasks
-#    --hard N = N agents running Opus at high effort on [HARD]-tagged tasks
-#    -w N     = wave number; agents only claim tasks in TASK-N00..TASK-N99
-#    -n N     = optional per-agent task quota; agent exits cleanly after N
-#               *successful* tasks (failed/released tasks do not count, but see
-#               the failure cap under "When tasks keep failing" below)
-scripts/agents/attach-fleet.sh -w 4 --easy 3 --hard 1
-scripts/agents/attach-fleet.sh -w 4 --easy 2 -n 2   # each agent stops after 2 successes
+# 2. Open a cmux workspace with one tab per container.
+#    -c, --count N  = attach the first N running containers
+#    -w N           = wave number; agents only claim tasks in TASK-N00..TASK-N99
+#    -n N           = optional per-agent task quota; agent exits cleanly after
+#                     N *successful* tasks (failed/released tasks do not count,
+#                     but see the failure cap under "When tasks keep failing")
+scripts/agents/attach-fleet.sh -w 4 -c 4
+scripts/agents/attach-fleet.sh -w 4 -c 2 -n 2       # each agent stops after 2 successes
 ```
 
 Each cmux tab execs into its container and runs `agent_wrapper.py`, which then claims tasks and invokes `claude` one task at a time. You can scroll through the cmux tabs to watch progress or talk to any agent directly.
@@ -98,30 +97,31 @@ Auth is read-only on the mount; the container copies auth files into `/root/.cla
 
 Each agent container runs `scripts/agents/agent_wrapper.py`, which owns the fleet loop. The wrapper:
 
-1. Claims one task from the agent's wave/pool via `scripts/agents/task_tool.py`
-2. Invokes `claude -p --verbose` once, with a prompt naming the single task to implement
-3. Inspects git state after claude exits:
-   - `tasks/completed/<id>.done` exists → task succeeded, increment quota, loop
-   - Lock still held → retry once with `claude -p --verbose -c "resume and finish …"`
-   - Still incomplete after retry → release the lock so another agent can pick it up, back off
-4. Captures `claude` stdout live, detects `[NEEDS INPUT]`, reads one line of human reply from the cmux tab's TTY, and resumes the same session with `claude -p --verbose -c "<reply>"`
-5. Tracks the batch quota (`-n` flag from `attach-fleet.sh`) and exits cleanly when hit
-6. Exits when the wave is drained for this pool (no claimable, blocked, active, or other-pool work left)
+1. Claims one task from the agent's wave via `scripts/agents/task_tool.py` — any tagged, dep-satisfied task is eligible regardless of difficulty
+2. Picks the claude model based on the claimed task's `[EASY]` / `[HARD]` tag (Sonnet for EASY, Opus for HARD)
+3. Invokes `claude -p --verbose --output-format stream-json` once, with a prompt naming the single task to implement
+4. Inspects git state after claude exits:
+   - `tasks/completed/<id>.done` on origin/main → task succeeded, increment quota, loop
+   - Lock still held → retry once with `claude -p -c "resume and finish …"`
+   - Still incomplete after retry → release the lock so another agent can pick it up, count as a consecutive failure
+5. Parses the streamed JSON events live into a human-readable trace (tool calls, tool results, assistant text), detects `[NEEDS INPUT]` in assistant text, reads one line of human reply from the cmux tab's TTY, and resumes the same session with `claude -p -c "<reply>"`
+6. Tracks the batch quota (`-n` flag from `attach-fleet.sh`) and exits cleanly when hit
+7. Exits when the wave is drained (no claimable, blocked, or active work left)
 
 There is no Stop hook. `claude -p` exits naturally when the model's turn is done; the wrapper decides whether to launch another session. The marker protocol that earlier versions used (`[WAVE COMPLETE]`, `[END LOOP]`, `[BATCH COMPLETE]`) has been removed — only `[NEEDS INPUT]` survives, detected by substring scan of captured stdout.
 
 This split keeps the reasoning claude has to do scoped to one task at a time and keeps the batching/restart/retry/backoff logic in plain Python where it can be unit-tested.
 
-### Difficulty pools
+### Task difficulty tags
 
-Every task in `TASKS.md` is tagged either `[EASY]` or `[HARD]`. `attach-fleet.sh` routes containers to pools:
+Every task in `TASKS.md` is tagged either `[EASY]` or `[HARD]`. The wrapper picks the claude model **per task**, not per container, so any agent can claim any tagged task in its wave:
 
-| Pool | Model | Effort | Claims tasks tagged |
-|---|---|---|---|
-| `EASY` | `claude-sonnet-4-6` | `high` | `[EASY]` |
-| `HARD` | `claude-opus-4-6[1m]` | `high` | `[HARD]` |
+| Tag | Model | Effort |
+|---|---|---|
+| `[EASY]` | `claude-sonnet-4-6` | `high` |
+| `[HARD]` | `claude-opus-4-6[1m]` | `high` |
 
-`task_tool.py` refuses to claim a task that doesn't match the agent's assigned pool, so a misassigned agent returns `no_claimable` rather than silently stealing work from the other pool.
+There is no container-level pool assignment — all running wrappers draw from the same claimable queue. This keeps the fleet well-utilized even when the wave is unbalanced (e.g. mostly HARD tasks with a single EASY trailing). It also means there is no implicit cap on concurrent Opus runs: if the next N claimable tasks are all `[HARD]`, every agent will pick Opus at once. For a Max subscription this is fine (CC backs off on 429s); for per-token billing, factor that in before sizing the fleet.
 
 ---
 
@@ -202,7 +202,7 @@ tasks/
 The wrapper calls `task_tool.py claim_next`, which:
 
 1. Syncs `main`
-2. Parses `TASKS.md`, filters to the agent's wave and difficulty pool
+2. Parses `TASKS.md` and filters to the agent's wave (any `[EASY]` or `[HARD]` tagged task is eligible)
 3. Verifies dependency completion from `tasks/completed/`
 4. Detects and breaks stale locks (see below)
 5. Writes `tasks/active/TASK-NNN.lock`, commits, pushes to `origin/main` — the push-to-main is atomic, so concurrent claims from different agents can only produce one winner
@@ -225,13 +225,13 @@ A lock is stale if **all** of the following are true:
 
 When `claim_next` returns `no_claimable` but there are still blocked or active tasks in the wave, the wrapper backs off on a **2 min → 5 min → 10 min → 20 min → 60 min** ladder, then stays at 60 min indefinitely until a task becomes claimable. The backoff resets after any successful claim. Dependency unblocks, newly filed non-anchor tasks, and stale-lock breaks all change what's claimable between scans.
 
-When `claim_next` returns `no_claimable` with *nothing* remaining (no claimable, blocked, active, or other-pool work), the wrapper declares the wave drained for this pool and exits cleanly.
+When `claim_next` returns `no_claimable` with *nothing* remaining (no claimable, blocked, or active work), the wrapper declares the wave drained and exits cleanly.
 
 ### When a wave has untagged tasks (`missing_difficulty`)
 
-A task is claimable for a pool only if its title carries the matching `[EASY]` or `[HARD]` tag. If `task_tool.claim_next` finds no claimable tasks for the agent's pool but discovers wave tasks that have neither tag and are otherwise ready to be claimed (dependencies satisfied, no lock), it returns `status: missing_difficulty` with the list of offenders attached.
+A task is claimable only if its title carries an `[EASY]` or `[HARD]` tag — the wrapper uses the tag to pick the claude model. If `task_tool.claim_next` finds no tagged claimable tasks but discovers wave tasks that are missing the tag and otherwise ready (dependencies satisfied, no lock), it returns `status: missing_difficulty` with the list of offenders attached.
 
-The wrapper treats this as operator input required: it prints a `[NEEDS INPUT]` banner naming the untagged tasks and retries every 60 seconds. The agent does **not** back off further, does **not** steal work from the other pool, and does **not** declare the wave drained — the wave is blocked until a human edits `TASKS.md` to tag the offenders and pushes the fix.
+The wrapper treats this as operator input required: it prints a `[NEEDS INPUT]` banner naming the untagged tasks and retries every 60 seconds. The wave does **not** back off further and does **not** declare itself drained — it is blocked until a human edits `TASKS.md` to tag the offenders and pushes the fix.
 
 If you launched the fleet and one or more agents appear to be spinning in place — claiming nothing but not exiting — check their cmux tab output for `[NEEDS INPUT]`. The usual cause is an untagged task. Adding `[EASY]` or `[HARD]` (or `[RETIRED]`) to the task header and pushing `main` unblocks the next poll cycle.
 
@@ -250,7 +250,7 @@ The cap exists so a structurally broken task (compile error, bad migration, envi
 | `agent_wrapper.py` | Per-container Python entry point — owns the fleet loop, runs claude once per task |
 | `task_tool.py` | Task-file parser, claim/release/stale-lock logic, importable from the wrapper |
 | `launch-fleet.sh` | Build image, start N idle containers |
-| `attach-fleet.sh` | Open cmux with one tab per agent, assigning pools and invoking the wrapper |
+| `attach-fleet.sh` | Open cmux with one tab per agent, invoking the wrapper in each tab |
 | `status.sh` | Print active/completed task state + running container status |
 | `stop-fleet.sh` | Stop and remove all `bqlite-agent-*` containers |
 | `cmux-notify.sh` | Notification hook installed into containers so claude alerts surface as cmux toasts |

@@ -12,34 +12,27 @@ import agent_wrapper
 
 
 class AgentWrapperArgsTests(unittest.TestCase):
-    def test_parse_args_accepts_wave_and_pool(self) -> None:
-        config = agent_wrapper.parse_args(["3", "EASY"])
+    def test_parse_args_accepts_wave_only(self) -> None:
+        config = agent_wrapper.parse_args(["3"])
         self.assertEqual(config.wave, 3)
-        self.assertEqual(config.difficulty_pool, "EASY")
-        self.assertEqual(config.model, "claude-sonnet-4-6")
-        self.assertEqual(config.effort, "high")
         self.assertIsNone(config.max_tasks)
 
-    def test_parse_args_accepts_max_tasks(self) -> None:
-        config = agent_wrapper.parse_args(["3", "HARD", "2"])
+    def test_parse_args_accepts_wave_and_max_tasks(self) -> None:
+        config = agent_wrapper.parse_args(["3", "2"])
+        self.assertEqual(config.wave, 3)
         self.assertEqual(config.max_tasks, 2)
-        self.assertEqual(config.model, "claude-opus-4-6[1m]")
-
-    def test_parse_args_lowercases_pool_input(self) -> None:
-        config = agent_wrapper.parse_args(["1", "easy"])
-        self.assertEqual(config.difficulty_pool, "EASY")
 
     def test_parse_args_rejects_negative_wave(self) -> None:
         with self.assertRaises(agent_wrapper.WrapperConfigError):
-            agent_wrapper.parse_args(["-1", "EASY"])
-
-    def test_parse_args_rejects_bad_pool(self) -> None:
-        with self.assertRaises(agent_wrapper.WrapperConfigError):
-            agent_wrapper.parse_args(["1", "SPICY"])
+            agent_wrapper.parse_args(["-1"])
 
     def test_parse_args_rejects_zero_max_tasks(self) -> None:
         with self.assertRaises(agent_wrapper.WrapperConfigError):
-            agent_wrapper.parse_args(["1", "EASY", "0"])
+            agent_wrapper.parse_args(["1", "0"])
+
+    def test_parse_args_rejects_too_many_positional_args(self) -> None:
+        with self.assertRaises(agent_wrapper.WrapperConfigError):
+            agent_wrapper.parse_args(["1", "2", "3"])
 
     def test_wave_range_label_wave_zero(self) -> None:
         self.assertEqual(
@@ -53,6 +46,16 @@ class AgentWrapperArgsTests(unittest.TestCase):
             "TASK-300 through TASK-399",
         )
 
+    def test_model_for_difficulty_maps_easy_and_hard(self) -> None:
+        self.assertEqual(
+            agent_wrapper._MODEL_FOR_DIFFICULTY["EASY"]["model"],
+            "claude-sonnet-4-6",
+        )
+        self.assertEqual(
+            agent_wrapper._MODEL_FOR_DIFFICULTY["HARD"]["model"],
+            "claude-opus-4-6[1m]",
+        )
+
 
 import os
 import subprocess
@@ -60,6 +63,19 @@ import tempfile
 
 
 class AgentWrapperClaudeInvocationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The wrapper defaults to /root/.local/bin/claude (where the
+        # container installs it). Override to "claude" so tests find the
+        # fake binary on the PATH they provide via env.
+        self._orig_claude_bin = os.environ.get("BQLITE_CLAUDE_BIN")
+        os.environ["BQLITE_CLAUDE_BIN"] = "claude"
+
+    def tearDown(self) -> None:
+        if self._orig_claude_bin is None:
+            os.environ.pop("BQLITE_CLAUDE_BIN", None)
+        else:
+            os.environ["BQLITE_CLAUDE_BIN"] = self._orig_claude_bin
+
     def _make_fake_claude(self, script_body: str) -> tuple[pathlib.Path, dict]:
         tmpdir = pathlib.Path(tempfile.mkdtemp(prefix="fake-claude-"))
         self.addCleanup(
@@ -375,7 +391,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
         }
 
     def test_run_fleet_loop_exits_after_max_tasks(self) -> None:
-        config = agent_wrapper.parse_args(["1", "EASY", "2"])
+        config = agent_wrapper.parse_args(["1", "2"])
 
         test_self = self
 
@@ -404,7 +420,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
         self.assertEqual(fake_claim_next.counter, 3)  # 2 calls made
 
     def test_run_fleet_loop_exits_on_wave_drained(self) -> None:
-        config = agent_wrapper.parse_args(["1", "EASY"])
+        config = agent_wrapper.parse_args(["1"])
         states = iter([
             {"status": "no_claimable", "claimable": [], "blocked": [],
              "active": [], "completed_count": 5,
@@ -423,7 +439,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
     def test_incomplete_releases_lock_and_continues_to_next_task(self) -> None:
         """An incomplete task must not count toward -n N; the wrapper releases
         the lock and keeps going. Only successful tasks count toward the quota."""
-        config = agent_wrapper.parse_args(["1", "EASY", "1"])
+        config = agent_wrapper.parse_args(["1", "1"])
         test_self = self
         claim_calls = iter([
             {"status": "claimed", "task": test_self._make_task("TASK-101")},
@@ -457,7 +473,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
     def test_run_fleet_loop_bails_after_consecutive_failure_cap(self) -> None:
         """Three incompletes in a row with no successes between them must exit
         with too_many_failures rather than looping forever when no -n is set."""
-        config = agent_wrapper.parse_args(["1", "EASY"])  # no quota
+        config = agent_wrapper.parse_args(["1"])  # no quota
         test_self = self
         claim_calls = iter([
             {"status": "claimed", "task": test_self._make_task(f"TASK-10{i}")}
@@ -488,7 +504,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
         """A successful task between failures must reset the consecutive failure
         counter; two failures then a success then two more failures should not
         trip the cap."""
-        config = agent_wrapper.parse_args(["1", "EASY", "1"])  # quota of 1 success
+        config = agent_wrapper.parse_args(["1", "1"])  # quota of 1 success
         test_self = self
         claim_calls = iter([
             {"status": "claimed", "task": test_self._make_task(f"TASK-10{i}")}
@@ -510,7 +526,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
         # If the counter had not reset, we'd have seen too_many_failures
 
     def test_run_fleet_loop_backs_off_then_retries_on_no_claimable(self) -> None:
-        config = agent_wrapper.parse_args(["1", "EASY", "1"])
+        config = agent_wrapper.parse_args(["1", "1"])
         test_self = self
 
         scenarios = iter([
@@ -543,7 +559,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
         """A git command exploding under claim_next must not crash the
         wrapper. It should log, count against the consecutive-failure cap,
         back off 60s, and retry on the next pass."""
-        config = agent_wrapper.parse_args(["1", "EASY", "1"])
+        config = agent_wrapper.parse_args(["1", "1"])
         test_self = self
         call_count = [0]
 
@@ -578,7 +594,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
         """A TaskToolError from task_tool (e.g. dirty worktree rejected by
         require_clean_worktree) must not crash the wrapper — it should log,
         count against the consecutive-failure cap, back off 60s, and retry."""
-        config = agent_wrapper.parse_args(["1", "EASY", "1"])
+        config = agent_wrapper.parse_args(["1", "1"])
         test_self = self
         call_count = [0]
 
@@ -610,7 +626,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
     def test_run_fleet_loop_bails_after_repeated_called_process_errors(self) -> None:
         """The consecutive-failure cap catches repeated git errors so a
         genuinely broken repo exits cleanly instead of looping forever."""
-        config = agent_wrapper.parse_args(["1", "EASY"])  # no quota
+        config = agent_wrapper.parse_args(["1"])  # no quota
 
         def always_explode(**kwargs) -> dict:
             raise subprocess.CalledProcessError(
@@ -671,10 +687,9 @@ class AgentWrapperPromptTests(unittest.TestCase):
         output = "... working on task ...\ndone.\n"
         self.assertFalse(agent_wrapper.has_needs_input(output))
 
-    def test_system_prompt_contains_agent_and_pool(self) -> None:
-        text = agent_wrapper.system_prompt("agent-3", "HARD", "[HARD]")
+    def test_system_prompt_contains_agent_and_protocol_reference(self) -> None:
+        text = agent_wrapper.system_prompt("agent-3")
         self.assertIn("agent-3", text)
-        self.assertIn("HARD", text)
         self.assertIn("AGENTS.md", text)
 
 

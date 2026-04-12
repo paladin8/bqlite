@@ -66,6 +66,33 @@ class TaskToolTests(unittest.TestCase):
         self.assertEqual([task.task_id for task in classified["claimable"]], ["TASK-102"])
         self.assertEqual(classified["other_pool_claimable"], [])
 
+    def test_classify_tasks_pool_less_mode_returns_all_tagged_claimables(self) -> None:
+        """With difficulty=None (the fleet-wide mode the wrapper uses after
+        the EASY/HARD pool split was collapsed), classify returns every
+        tagged, eligible task as claimable regardless of difficulty tag.
+        Untagged tasks still go in claimable_missing_difficulty, and
+        other_pool_claimable is empty because there is no "current" pool."""
+        tasks = task_tool.parse_tasks_text(SAMPLE_TASKS)
+        classified = task_tool.classify_tasks(
+            tasks=tasks,
+            wave=1,
+            difficulty=None,
+            active={},
+            completed={"TASK-101": {}},
+        )
+
+        # TASK-102 [HARD] is now claimable (its dep TASK-101 is complete).
+        # TASK-101 is completed, TASK-104 is retired → both filtered out.
+        self.assertEqual(
+            [task.task_id for task in classified["claimable"]],
+            ["TASK-102"],
+        )
+        self.assertEqual(
+            [task.task_id for task in classified["claimable_missing_difficulty"]],
+            ["TASK-103"],
+        )
+        self.assertEqual(classified["other_pool_claimable"], [])
+
     def test_parse_rejects_both_easy_and_hard_tags(self) -> None:
         markdown = "### TASK-101: [EASY][HARD][IMPL] Confused task\n**Depends on**: none\n"
         with self.assertRaises(task_tool.TaskToolError) as ctx:

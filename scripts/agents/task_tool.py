@@ -22,7 +22,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -225,10 +225,19 @@ def classify_tasks(
     *,
     tasks: dict[str, Task],
     wave: int,
-    difficulty: str,
+    difficulty: Optional[str],
     active: dict[str, dict[str, Any]],
     completed: dict[str, dict[str, Any]],
 ) -> dict[str, list[Task]]:
+    """Bucket the tasks in one wave by claim-eligibility.
+
+    When `difficulty` is a concrete pool name ("EASY"/"HARD"), eligible tasks
+    are those carrying exactly that tag and `other_pool_claimable` lists work
+    the current pool cannot touch. When `difficulty` is None (the fleet-wide
+    mode used by the Python wrapper), any tagged task is eligible and
+    `other_pool_claimable` is always empty — the wrapper picks the claude
+    model per task from the tag on the task itself.
+    """
     completed_ids = set(completed)
     scoped = [task for task in tasks.values() if task.wave == wave]
 
@@ -242,11 +251,28 @@ def classify_tasks(
         and is_dependency_satisfied(task, completed_ids)
     ]
 
-    eligible = [
-        task
-        for task in scoped
-        if task.difficulty == difficulty and not task.retired
-    ]
+    if difficulty is None:
+        eligible = [
+            task
+            for task in scoped
+            if task.difficulty is not None and not task.retired
+        ]
+        other_pool_claimable: list[Task] = []
+    else:
+        eligible = [
+            task
+            for task in scoped
+            if task.difficulty == difficulty and not task.retired
+        ]
+        other_pool_claimable = [
+            task
+            for task in scoped
+            if task.difficulty not in (None, difficulty)
+            and not task.retired
+            and task.task_id not in active
+            and task.task_id not in completed_ids
+            and is_dependency_satisfied(task, completed_ids)
+        ]
 
     claimable = [
         task
@@ -266,15 +292,6 @@ def classify_tasks(
 
     active_tasks = [task for task in eligible if task.task_id in active]
     completed_tasks = [task for task in eligible if task.task_id in completed_ids]
-    other_pool_claimable = [
-        task
-        for task in scoped
-        if task.difficulty not in (None, difficulty)
-        and not task.retired
-        and task.task_id not in active
-        and task.task_id not in completed_ids
-        and is_dependency_satisfied(task, completed_ids)
-    ]
 
     return {
         "claimable_missing_difficulty": sorted(
@@ -468,7 +485,7 @@ def release_lock(task_id: str, agent_id: str, note: str) -> bool:
 def claim_next(
     *,
     wave: int,
-    difficulty: str,
+    difficulty: Optional[str],
     agent_id: str,
     no_sync: bool,
     max_attempts: int,
@@ -546,7 +563,7 @@ def claim_next(
 def list_tasks(
     *,
     wave: int,
-    difficulty: str,
+    difficulty: Optional[str],
     no_sync: bool,
 ) -> dict[str, Any]:
     if not no_sync:
@@ -584,7 +601,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_common(subparser: argparse.ArgumentParser, *, needs_agent: bool) -> None:
         subparser.add_argument("--wave", type=int, required=True)
-        subparser.add_argument("--difficulty", required=True)
+        subparser.add_argument(
+            "--difficulty",
+            default=None,
+            help="optional pool filter (EASY/HARD); omit to consider both pools",
+        )
         subparser.add_argument(
             "--no-sync",
             action="store_true",
@@ -619,7 +640,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     try:
-        difficulty = parse_difficulty(args.difficulty)
+        difficulty = parse_difficulty(args.difficulty) if args.difficulty else None
         if args.command == "list":
             json_out(list_tasks(wave=args.wave, difficulty=difficulty, no_sync=args.no_sync))
             return 0

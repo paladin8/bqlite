@@ -28,48 +28,54 @@ import task_tool  # noqa: E402  (intentional after sys.path tweak)
 
 NEEDS_INPUT_MARKER = "[NEEDS INPUT]"
 
+# Absolute path to the claude binary inside the fleet container. Using the
+# absolute path avoids relying on PATH being wired up the same way under
+# `docker exec python3 ...` and under `docker exec bash -lc '... python3 ...'`
+# (the targeted-attach flow), which burned us once. Tests (and anything
+# that needs a different binary) can override via the BQLITE_CLAUDE_BIN env
+# var; the path is resolved at run_claude call time so tests can set it
+# per-invocation without re-importing the module.
+_DEFAULT_CLAUDE_BIN = "/root/.local/bin/claude"
+
+
+def _claude_bin() -> str:
+    return os.environ.get("BQLITE_CLAUDE_BIN", _DEFAULT_CLAUDE_BIN)
+
 
 class WrapperConfigError(RuntimeError):
     """User-visible configuration error; mapped to non-zero exit code."""
 
 
-_DIFFICULTY_POOLS = {
-    "EASY": {"model": "claude-sonnet-4-6", "effort": "high", "tag": "[EASY]"},
-    "HARD": {"model": "claude-opus-4-6[1m]", "effort": "high", "tag": "[HARD]"},
+# Per-task model routing: each TASKS.md entry is tagged [EASY] or [HARD],
+# and the wrapper picks the matching claude model when it runs the task.
+# Agents no longer belong to a pool — any wrapper can claim any tagged,
+# dep-satisfied task in its wave and spin up the right model for it.
+_MODEL_FOR_DIFFICULTY = {
+    "EASY": {"model": "claude-sonnet-4-6", "effort": "high"},
+    "HARD": {"model": "claude-opus-4-6[1m]", "effort": "high"},
 }
 
 
 @dataclasses.dataclass(frozen=True)
 class WrapperConfig:
     wave: int
-    difficulty_pool: str
-    difficulty_tag: str
-    model: str
-    effort: str
     max_tasks: Optional[int]
 
 
 def parse_args(argv: list[str]) -> WrapperConfig:
-    if len(argv) < 2 or len(argv) > 3:
+    if len(argv) < 1 or len(argv) > 2:
         raise WrapperConfigError(
-            "usage: agent_wrapper.py <wave> <difficulty_pool> [max_tasks]"
+            "usage: agent_wrapper.py <wave> [max_tasks]"
         )
 
     wave_raw = argv[0]
-    pool_raw = argv[1].upper()
-    max_tasks_raw = argv[2] if len(argv) == 3 else None
+    max_tasks_raw = argv[1] if len(argv) == 2 else None
 
     if not wave_raw.isdigit():
         raise WrapperConfigError(
             f"wave must be a non-negative integer, got {wave_raw!r}"
         )
     wave = int(wave_raw)
-
-    if pool_raw not in _DIFFICULTY_POOLS:
-        raise WrapperConfigError(
-            f"difficulty_pool must be EASY or HARD, got {argv[1]!r}"
-        )
-    pool_cfg = _DIFFICULTY_POOLS[pool_raw]
 
     max_tasks: Optional[int] = None
     if max_tasks_raw is not None:
@@ -79,14 +85,7 @@ def parse_args(argv: list[str]) -> WrapperConfig:
             )
         max_tasks = int(max_tasks_raw)
 
-    return WrapperConfig(
-        wave=wave,
-        difficulty_pool=pool_raw,
-        difficulty_tag=pool_cfg["tag"],
-        model=pool_cfg["model"],
-        effort=pool_cfg["effort"],
-        max_tasks=max_tasks,
-    )
+    return WrapperConfig(wave=wave, max_tasks=max_tasks)
 
 
 def wave_range_label(wave: int) -> str:
@@ -95,15 +94,12 @@ def wave_range_label(wave: int) -> str:
     return f"TASK-{wave}00 through TASK-{wave}99"
 
 
-def system_prompt(agent_name: str, difficulty_pool: str, difficulty_tag: str) -> str:
+def system_prompt(agent_name: str) -> str:
     return (
         f"You are {agent_name}, an autonomous agent building bqlite. "
         f"Read AGENTS.md for your complete operating protocol. "
-        f"Your assigned difficulty pool is {difficulty_pool}; "
-        f"only claim tasks tagged {difficulty_tag} unless a human explicitly "
-        f"changes your assignment. The wrapper handles task claiming, batching, "
-        f"and restart logic — your job is to execute one task at a time from "
-        f"start to merge."
+        f"The wrapper handles task claiming, batching, and restart logic — "
+        f"your job is to execute one task at a time from start to merge."
     )
 
 
@@ -309,7 +305,7 @@ def run_claude(
     provided `system_prompt_text` via `--append-system-prompt`.
     """
     args = [
-        "claude",
+        _claude_bin(),
         "-p",
         "--verbose",
         "--output-format",
@@ -487,9 +483,7 @@ def execute_task(
         task_state_fn = task_tool.task_state_on_origin
 
     task_id = task["task_id"]
-    sys_prompt_text = system_prompt(
-        agent_name, task["difficulty"], f"[{task['difficulty']}]"
-    )
+    sys_prompt_text = system_prompt(agent_name)
     prompt = task_prompt(task, agent_name)
 
     _run_once_with_needs_input_loop(
@@ -537,8 +531,7 @@ CONSECUTIVE_FAILURE_CAP = 3
 def _wave_range_to_status_banner(config: WrapperConfig, agent_name: str) -> str:
     return (
         f"=== {agent_name} launching on Wave {config.wave} "
-        f"({wave_range_label(config.wave)}) "
-        f"pool={config.difficulty_pool} model={config.model} ==="
+        f"({wave_range_label(config.wave)}) ==="
     )
 
 
@@ -584,9 +577,12 @@ def run_fleet_loop(
             return "too_many_failures"
 
         try:
+            # difficulty=None: the wrapper no longer belongs to a pool —
+            # it claims whatever tagged, dep-satisfied task is next in the
+            # wave and selects the claude model based on the task's own tag.
             result = claim_next(
                 wave=config.wave,
-                difficulty=config.difficulty_pool,
+                difficulty=None,
                 agent_id=agent_name,
                 no_sync=False,
                 max_attempts=5,
@@ -595,16 +591,33 @@ def run_fleet_loop(
 
             if status == "claimed":
                 task = result["task"]
+                difficulty = task.get("difficulty")
+                model_cfg = _MODEL_FOR_DIFFICULTY.get(difficulty) if difficulty else None
+                if model_cfg is None:
+                    # Defensive: claim_next is supposed to exclude untagged
+                    # tasks via the missing_difficulty path, so landing here
+                    # means something odd happened. Release the lock and
+                    # treat it as a consecutive failure so we back off.
+                    print(
+                        f"=== {agent_name}: claimed {task['task_id']} has no "
+                        f"recognized difficulty (got {difficulty!r}); releasing ===",
+                        flush=True,
+                    )
+                    release_lock(
+                        task["task_id"], agent_name, "unrecognized difficulty"
+                    )
+                    consecutive_failures += 1
+                    continue
                 print(
-                    f"=== {agent_name}: claimed {task['task_id']} — "
+                    f"=== {agent_name}: claimed {task['task_id']} [{difficulty}] — "
                     f"{task['title']} ===",
                     flush=True,
                 )
                 outcome = execute_task(
                     task,
                     agent_name=agent_name,
-                    model=config.model,
-                    effort=config.effort,
+                    model=model_cfg["model"],
+                    effort=model_cfg["effort"],
                     claude_runner=run_claude,
                     read_human_reply=read_human_reply,
                 )
@@ -625,8 +638,8 @@ def run_fleet_loop(
             if status == "no_claimable":
                 if _classified_is_drained(result):
                     print(
-                        f"=== {agent_name}: wave {config.wave} drained for pool "
-                        f"{config.difficulty_pool}. Exiting. ===",
+                        f"=== {agent_name}: wave {config.wave} drained. "
+                        f"Exiting. ===",
                         flush=True,
                     )
                     return "wave_complete"

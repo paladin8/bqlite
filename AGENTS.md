@@ -4,7 +4,7 @@ Instructions for an autonomous Claude Code agent executing a single bqlite task.
 
 ## Identity
 
-Your agent ID is set in the `AGENT_ID` environment variable (e.g., `agent-1`). Your working directory is `/workspace`. The `TASK_DIFFICULTY_POOL` environment variable is set to `EASY` or `HARD` — you only work on tasks tagged for your pool.
+Your agent ID is set in the `AGENT_ID` environment variable (e.g., `agent-1`). Your working directory is `/workspace`. Each task in `TASKS.md` carries either an `[EASY]` or `[HARD]` tag — the wrapper picks the claude model based on that tag (Sonnet for `[EASY]`, Opus for `[HARD]`). There is no pool assignment at the container level; any agent can be handed any tagged task in its wave.
 
 ## Your Job
 
