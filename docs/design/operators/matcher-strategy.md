@@ -388,13 +388,16 @@ Detection criteria:
 
 ## 6. Match Mode Interaction
 
-Match mode (`MatchMode::First`, `MatchMode::All`, `MatchMode::EmitAll`) does not affect pattern classification — the `PatternClass` is determined purely by pattern structure. Match mode affects the execution kernel's behavior within the selected strategy:
+Match mode (`MatchMode::First`, `MatchMode::All`) and the separate
+`emit_all` flag do not affect pattern classification — the `PatternClass` is
+determined purely by pattern structure. These flags affect the execution
+kernel's behavior within the selected strategy:
 
-| Match Mode | Step Counter Behavior | NFA Behavior |
+| Mode / Flag | Step Counter Behavior | NFA Behavior |
 |---|---|---|
 | `First` | Stop track on first accept. Entity-level early-exit if single track. | Stop track on first accept. |
-| `All` | Reset track on accept: clear step counter, set `scan_from = last_matched_ts`. Loop. | Reset track on accept: clear candidate deques, set `scan_from`. Loop. |
-| `EmitAll` | On window expiry / entity end, emit `step_reached = current_step`. In fused path, increment `step_counts[current_step]`. | On window expiry / entity end, emit partial results for all in-progress candidates. |
+| `All` | On accept, consume the participating entry, set `scan_from = anchor_ts`, and keep later unmatched anchors alive. | On accept, prune candidates that share the consumed events and keep later unmatched entries alive. |
+| `emit_all = true` | On window expiry / entity end, emit the farthest partial for the track/entry. In the fused path, increment `step_counts[current_step]`. | On window expiry / entity end, emit the farthest partial for each surviving track/entry. |
 
 EMIT ALL is orthogonal to pattern classification. A `LinearSimple` pattern with EMIT ALL still uses the step counter — the additional work (tracking `max_step_reached`, emitting partial results at entity end) is handled within the step counter kernel without requiring the NFA.
 

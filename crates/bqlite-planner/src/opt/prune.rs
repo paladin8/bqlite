@@ -85,7 +85,8 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
         PhysicalPlan::Scan(scan) => {
             let ScanPhysical {
                 table,
-                time_range,
+                query_range,
+                reader_range,
                 scan_predicates,
                 projected_columns: _,
                 output_schema,
@@ -122,7 +123,8 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
 
             PhysicalPlan::Scan(ScanPhysical {
                 table,
-                time_range,
+                query_range,
+                reader_range,
                 scan_predicates,
                 projected_columns: cols,
                 output_schema,
@@ -257,14 +259,13 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
                 output_schema
             };
 
-            // Recompute strategy after pruning: if match_duration and
-            // match_events are no longer in the output schema, the NFA
-            // strategy is no longer required — step counter suffices.
-            let pruned_needs_match_detail = pruned_output.column("match_duration").is_some()
-                || pruned_output.column("match_events").is_some();
+            // Recompute strategy after pruning. `match_events` still lowers
+            // to a typed NULL column today, so only a real match-duration
+            // demand should influence the runtime configuration here.
+            let pruned_needs_match_duration = pruned_output.column("match_duration").is_some();
             let pruned_execution_config = crate::compile::MatchExecutionConfig {
-                track_match_duration: pruned_needs_match_detail,
-                track_match_events: pruned_needs_match_detail,
+                track_match_duration: pruned_needs_match_duration,
+                track_match_events: false,
             };
             let pruned_strategy = crate::compile::select_strategy(
                 compiled_nfa.pattern_class,
@@ -452,7 +453,8 @@ mod tests {
     fn make_scan_with_schema(schema: OperatorSchema) -> ScanPhysical {
         ScanPhysical {
             table: "events".into(),
-            time_range: None,
+            query_range: None,
+            reader_range: None,
             scan_predicates: vec![],
             projected_columns: vec![],
             output_schema: schema,
@@ -642,7 +644,8 @@ mod tests {
         // The scan must also decode col3 for the predicate evaluation.
         let scan_with_pred = ScanPhysical {
             table: "events".into(),
-            time_range: None,
+            query_range: None,
+            reader_range: None,
             scan_predicates: vec![pushable_pred("col3", 5)],
             projected_columns: vec![],
             output_schema: ten_col_schema(),

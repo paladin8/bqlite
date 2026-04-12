@@ -100,10 +100,9 @@ match_mode := FIRST | ALL
 | `FIRST` keyword | `MatchMode::First` |
 | `ALL` keyword | `MatchMode::All` |
 
-**Note on `MatchMode::EmitAll`:** This variant is **not** produced directly
-from `match_mode`. The `EMIT ALL` modifier in `match_modifiers` interacts with
-the parsed mode to produce the final value stored in `MatchPattern::mode`. See
-§7.1 for the full encoding decision.
+**Note on `MatchMode::EmitAll`:** The parser does not produce this legacy
+compatibility variant. `match_mode` determines `MatchPattern::mode`, and the
+`EMIT ALL` modifier independently sets `MatchPattern::emit_all`. See §7.1.
 
 **Error site:**
 
@@ -459,16 +458,17 @@ non-None on the parsed `MatchPattern`.
 order without sorting. The planner validates that brackets are strictly
 increasing.
 
-#### 3.11.3 `EMIT ALL` → `MatchMode` encoding (see §7.1)
+#### 3.11.3 `EMIT ALL` flag encoding (see §7.1)
 
 `EMIT ALL` is two tokens: `Kw(Emit)` followed by `Kw(All)`. After parsing
 `match_mode` and `step_list` and the optional WITHIN/BRACKETS, the parser
 calls `try_kw(Emit)`. If present, it expects `Kw(All)` and records that
 EMIT ALL was requested.
 
-**How EMIT ALL modifies `MatchPattern::mode`:** See Section 7.1 for the full
-encoding decision. Summary: `FIRST + EMIT ALL` → `MatchMode::EmitAll`;
-`ALL + EMIT ALL` → **parse error in v1** (AST cannot represent it).
+**How EMIT ALL is represented:** `EMIT ALL` sets `MatchPattern::emit_all = true`
+while leaving `MatchPattern::mode` as either `MatchMode::First` or
+`MatchMode::All`. All four surface combinations are valid: `FIRST`, `ALL`,
+`FIRST EMIT ALL`, and `ALL EMIT ALL`.
 
 **Error site:**
 
@@ -628,45 +628,28 @@ This section documents every place where the shipped AST (`pattern.rs`,
 correspondence. Each gap must be resolved (either by amending the AST or by
 constraining the grammar surface) before TASK-312 can produce a complete parser.
 
-### 7.1 `MatchMode::EmitAll` Encoding — Primary Gap
+### 7.1 `MatchPattern::emit_all` Encoding — Resolved
 
-**Issue:** The grammar has `match_mode × EMIT ALL` as orthogonal: `FIRST`, `ALL`,
-`FIRST EMIT ALL`, and `ALL EMIT ALL` are all syntactically valid. The shipped
-AST `MatchMode` has three variants: `First`, `All`, `EmitAll`. There is no
-representation for `ALL + EMIT ALL`.
+The grammar treats `match_mode` and `EMIT ALL` as orthogonal, and the AST now
+does the same:
 
 ```rust
-pub enum MatchMode {
-    First,    // MATCH FIRST
-    All,      // MATCH ALL
-    EmitAll,  // MATCH FIRST EMIT ALL (funnel desugaring)
-              // MATCH ALL EMIT ALL — CANNOT BE REPRESENTED
+pub struct MatchPattern {
+    pub mode: MatchMode, // First | All
+    pub emit_all: bool,
+    // ...
 }
 ```
 
-**Root cause:** `MatchMode::EmitAll` was shipped as the representation for
-"FUNNEL desugaring" which always uses `FIRST + EMIT ALL`. The `ALL + EMIT ALL`
-combination was not considered when the AST was designed.
+| Surface form | `MatchPattern::mode` | `MatchPattern::emit_all` |
+|---|---|---|
+| `MATCH FIRST` | `MatchMode::First` | `false` |
+| `MATCH ALL` | `MatchMode::All` | `false` |
+| `MATCH FIRST ... EMIT ALL` | `MatchMode::First` | `true` |
+| `MATCH ALL ... EMIT ALL` | `MatchMode::All` | `true` |
 
-**Resolution for TASK-312/313:** Until the AST is amended, adopt this encoding:
-
-| Surface form | `MatchPattern::mode` |
-|---|---|
-| `MATCH FIRST` | `MatchMode::First` |
-| `MATCH ALL` | `MatchMode::All` |
-| `MATCH FIRST ... EMIT ALL` | `MatchMode::EmitAll` |
-| `MATCH ALL ... EMIT ALL` | **parse error** — `"MATCH ALL EMIT ALL is not supported in this version; use MATCH FIRST EMIT ALL or MATCH ALL without EMIT ALL"` |
-
-This restriction is conservative and covers all known Wave 3 use cases:
-- The Wave 3 acceptance test uses `MATCH FIRST ... WITHIN 7d` (no EMIT ALL).
-- FUNNEL desugaring generates `MATCH FIRST ... EMIT ALL` → `MatchMode::EmitAll`.
-- `MATCH ALL EMIT ALL` is not required by any Wave 3 task.
-
-**Recommended AST amendment (future task):** Add `emit_all: bool` to
-`MatchPattern` and reduce `MatchMode` to `First | All`. `MatchMode::EmitAll`
-becomes `MatchMode::First` with `emit_all: true`. The funnel desugaring path
-updates to set `emit_all: true` explicitly. File as a Wave 4 cleanup task
-when `ALL + EMIT ALL` is needed by a real query.
+`MatchMode::EmitAll` remains only as a legacy compatibility variant for older
+planner/tests; the parser does not produce it.
 
 ### 7.2 `Step::immediately_next` Placement
 
@@ -827,7 +810,7 @@ IMMEDIATELY modifier propagated to preceding step, WITHOUT exclusion on a step.
 repetition `(a WHERE x = 1)+`, error on `a WHERE x = 1+` (missing parens).
 
 **`match_modifiers`:** WITHIN only, BRACKETS only, EMIT ALL only, all three
-together, error on reversed order, error on `ALL + EMIT ALL`.
+together, error on reversed order, acceptance of `ALL + EMIT ALL`.
 
 **`funnel_op`:** happy-path, WITHIN modifer present, WITHIN absent.
 

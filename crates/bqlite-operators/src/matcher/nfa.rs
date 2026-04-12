@@ -36,6 +36,7 @@ use std::collections::VecDeque;
 use arrow::array::{Array, BooleanArray, StringViewArray};
 use arrow::record_batch::RecordBatch;
 
+use bqlite_core::TimeRange;
 use bqlite_planner::compile::{CompiledNfa, NfaState, Transition};
 
 use super::bindings::BindingValue;
@@ -259,6 +260,12 @@ pub struct EntityNfaState {
     /// Reusable propagation scratch buffer (avoids per-event heap
     /// allocation).
     propagation_buf: Vec<(u16, CandidateEntry)>,
+    /// Scratch buffer tracking anchor timestamps already emitted as
+    /// partials during a single window-expiry pass. Cleared at the
+    /// start of each event's Phase 1 so that, when the same anchor
+    /// lives in multiple state deques (e.g. state1 and state2 after
+    /// propagation), only the highest-step partial is emitted.
+    partial_expiry_seen: Vec<i64>,
 }
 
 impl EntityNfaState {
@@ -276,6 +283,7 @@ impl EntityNfaState {
             max_step_reached: 0,
             scan_from: None,
             propagation_buf: Vec::new(),
+            partial_expiry_seen: Vec::new(),
         }
     }
 
@@ -301,29 +309,48 @@ impl EntityNfaState {
 
     /// Emit remaining candidates as partials (for EMIT ALL) and clear
     /// all deques. Used by MATCH ALL reset and finish_entity.
+    ///
+    /// Iterates states in reverse (highest step first) so that when an
+    /// anchor exists in multiple deques (e.g. both state1 and state2 after
+    /// propagation), only the partial with the highest `step_reached` is
+    /// emitted.
     fn drain_as_partials(&mut self, state_to_step: &[u8]) {
-        for (idx, deque) in self.state_deques.iter_mut().enumerate() {
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let num_states = self.state_deques.len();
+        for idx in (0..num_states).rev() {
             let step = state_to_step[idx];
-            for entry in deque.candidates.drain(..) {
-                self.partials.push(PartialMatch {
-                    anchor_ts: entry.anchor_ts,
-                    step_reached: step,
-                    bindings: Vec::new(),
-                });
+            while let Some(entry) = self.state_deques[idx].candidates.pop_front() {
+                if seen.insert(entry.anchor_ts) {
+                    self.partials.push(PartialMatch {
+                        anchor_ts: entry.anchor_ts,
+                        step_reached: step,
+                        bindings: Vec::new(),
+                    });
+                }
             }
         }
     }
 
     /// Reset state for MATCH ALL after a completed match.
-    fn reset_for_match_all(&mut self, consumed_ts: i64, emit_all: bool, state_to_step: &[u8]) {
-        if emit_all {
-            self.drain_as_partials(state_to_step);
-        } else {
-            for deque in &mut self.state_deques {
-                deque.candidates.clear();
-            }
+    ///
+    /// MATCH ALL is non-overlapping: the next anchor must begin strictly
+    /// after the final event of the completed match. All candidates whose
+    /// anchor falls within [consumed_anchor_ts, consumed_final_ts] are
+    /// discarded; `scan_from` is set to `consumed_final_ts` so Phase 2
+    /// skips step-0 events at or before the final event.
+    fn reset_for_match_all(
+        &mut self,
+        _consumed_anchor_ts: i64,
+        consumed_final_ts: i64,
+        _emit_all: bool,
+        _state_to_step: &[u8],
+    ) {
+        for deque in &mut self.state_deques {
+            deque
+                .candidates
+                .retain(|entry| entry.anchor_ts > consumed_final_ts);
         }
-        self.scan_from = Some(consumed_ts);
+        self.scan_from = Some(consumed_final_ts);
     }
 
     // ── Public helpers for binding-aware processing (TASK-306) ───────
@@ -485,6 +512,9 @@ pub struct NfaSimulator {
     /// Whether this is a MATCH ALL query (repeated first-match with
     /// reset).
     match_all: bool,
+    /// Source time range that gates new step-0 entries. Existing
+    /// candidates may still advance beyond the source-range end.
+    entry_range: Option<TimeRange>,
     /// Pre-computed predicate index mapping.
     pred_map: PredicateIndexMap,
 }
@@ -500,8 +530,15 @@ impl NfaSimulator {
             nfa,
             active_state_limit: DEFAULT_ACTIVE_STATE_LIMIT,
             match_all,
+            entry_range: None,
             pred_map,
         }
+    }
+
+    /// Restrict step-0 entry to the given source time range.
+    pub fn with_entry_range(mut self, entry_range: Option<TimeRange>) -> Self {
+        self.entry_range = entry_range;
+        self
     }
 
     /// Override the active state limit (default 10,000).
@@ -523,6 +560,14 @@ impl NfaSimulator {
     /// Whether this is a MATCH ALL query.
     pub fn is_match_all(&self) -> bool {
         self.match_all
+    }
+
+    #[inline]
+    pub(crate) fn can_start_entry(&self, event_ts: i64) -> bool {
+        match self.entry_range {
+            Some(range) => event_ts >= range.start.as_nanos() && event_ts < range.end.as_nanos(),
+            None => true,
+        }
     }
 
     // ── Public helpers for binding-aware processing (TASK-306) ───────
@@ -642,6 +687,7 @@ impl NfaSimulator {
 
                 if self.match_all {
                     state.reset_for_match_all(
+                        entry.anchor_ts,
                         entry.last_step_ts,
                         self.nfa.emit_all,
                         &self.nfa.state_to_step,
@@ -744,6 +790,11 @@ impl NfaSimulator {
         // We collect propagations into a reusable scratch buffer to
         // avoid mutating state_deques while iterating.
         state.propagation_buf.clear();
+        // Clear per-event dedup tracker for window-expiry partials.
+        // An anchor that lives in multiple deques (after propagation) must
+        // only emit one partial — the one from the highest-indexed state,
+        // which is encountered first because we iterate states in reverse.
+        state.partial_expiry_seen.clear();
 
         let num_states = self.nfa.states.len();
         for state_idx in (0..num_states).rev() {
@@ -755,25 +806,31 @@ impl NfaSimulator {
 
             // Phase 1a: Expire candidates whose window has passed.
             if let Some(window) = self.nfa.global_window {
-                let deque = &mut state.state_deques[state_idx];
                 if self.nfa.emit_all {
                     // Record step_reached for expired candidates before
-                    // dropping them.
+                    // dropping them. States are visited in reverse order,
+                    // so the first time we see an anchor_ts it is from the
+                    // highest-step deque — subsequent occurrences of the
+                    // same anchor (in lower-step deques) are duplicates and
+                    // are silently dropped.
                     let step = self.nfa.state_to_step[state_idx];
-                    while let Some(front) = deque.candidates.front() {
-                        if event_ts - front.anchor_ts > window {
-                            let entry = deque.candidates.pop_front().unwrap();
+                    loop {
+                        let anchor = match state.state_deques[state_idx].candidates.front() {
+                            Some(f) if event_ts - f.anchor_ts > window => f.anchor_ts,
+                            _ => break,
+                        };
+                        state.state_deques[state_idx].candidates.pop_front();
+                        if !state.partial_expiry_seen.contains(&anchor) {
+                            state.partial_expiry_seen.push(anchor);
                             state.partials.push(PartialMatch {
-                                anchor_ts: entry.anchor_ts,
+                                anchor_ts: anchor,
                                 step_reached: step,
                                 bindings: Vec::new(),
                             });
-                        } else {
-                            break;
                         }
                     }
                 } else {
-                    deque.expire_window(event_ts, window);
+                    state.state_deques[state_idx].expire_window(event_ts, window);
                 }
             }
 
@@ -857,6 +914,9 @@ impl NfaSimulator {
                     continue;
                 }
             }
+            if !self.can_start_entry(event_ts) {
+                continue;
+            }
 
             let new_entry = CandidateEntry {
                 anchor_ts: event_ts,
@@ -895,6 +955,7 @@ impl NfaSimulator {
                     // MATCH ALL: emit remaining candidates as partials
                     // (if EMIT ALL) and reset.
                     state.reset_for_match_all(
+                        entry.anchor_ts,
                         entry.last_step_ts,
                         self.nfa.emit_all,
                         &self.nfa.state_to_step,
@@ -1193,6 +1254,78 @@ mod tests {
         }
     }
 
+    /// Build a 3-step general NFA: A THEN B+ THEN C.
+    fn nfa_a_then_b_plus_then_c() -> CompiledNfa {
+        CompiledNfa {
+            states: vec![
+                NfaState {
+                    transitions: vec![simple_transition("A", 1)],
+                    poison_transitions: vec![],
+                },
+                NfaState {
+                    transitions: vec![simple_transition("B", 2)],
+                    poison_transitions: vec![],
+                },
+                NfaState {
+                    transitions: vec![
+                        simple_transition("B", 2), // self-loop
+                        simple_transition("C", 3),
+                    ],
+                    poison_transitions: vec![],
+                },
+                NfaState {
+                    transitions: vec![],
+                    poison_transitions: vec![],
+                },
+            ],
+            accept_state: 3,
+            relevant_event_types: BTreeSet::from([
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+            ]),
+            pattern_class: PatternClass::GeneralNfa,
+            variable_bindings: vec![],
+            global_window: None,
+            emit_all: false,
+            state_to_step: vec![0, 1, 2, 3],
+        }
+    }
+
+    /// Build a 3-step general NFA: A THEN B* THEN C.
+    fn nfa_a_then_b_star_then_c() -> CompiledNfa {
+        CompiledNfa {
+            states: vec![
+                NfaState {
+                    transitions: vec![simple_transition("A", 1)],
+                    poison_transitions: vec![],
+                },
+                NfaState {
+                    transitions: vec![
+                        simple_transition("B", 1), // self-loop
+                        simple_transition("C", 2),
+                    ],
+                    poison_transitions: vec![],
+                },
+                NfaState {
+                    transitions: vec![],
+                    poison_transitions: vec![],
+                },
+            ],
+            accept_state: 2,
+            relevant_event_types: BTreeSet::from([
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+            ]),
+            pattern_class: PatternClass::GeneralNfa,
+            variable_bindings: vec![],
+            global_window: None,
+            emit_all: false,
+            state_to_step: vec![0, 1, 2],
+        }
+    }
+
     // ── Basic matching ──────────────────────────────────────────────
 
     #[test]
@@ -1299,20 +1432,20 @@ mod tests {
 
     #[test]
     fn test_match_all_non_overlapping() {
-        // MATCH ALL produces non-overlapping matches.
-        // Events: A(1), A(2), B(3) — only one match should be produced
-        // (the one with the earliest anchor).
+        // MATCH ALL is non-overlapping: after match {anchor=1, final=3},
+        // scan_from is set to 3. A(2) (anchor ≤ 3) is discarded; the next
+        // anchor must begin strictly after ts=3. B(4) arrives but there is
+        // no surviving anchor, so only one completion is produced.
         let nfa = nfa_a_then_b();
         let sim = NfaSimulator::new(nfa, true);
         let mut state = sim.create_state();
 
-        let batch = make_batch(&[("A", 1), ("A", 2), ("B", 3)]);
+        let batch = make_batch(&[("A", 1), ("A", 2), ("B", 3), ("B", 4)]);
         sim.process_batch(&mut state, &batch, "event_type", "ts");
 
-        // First match: anchor=1, final=3. Then reset with scan_from=3.
-        // The A(2) candidate is cleared during reset.
         assert_eq!(state.completions.len(), 1);
         assert_eq!(state.completions[0].anchor_ts, 1);
+        assert_eq!(state.completions[0].final_ts, 3);
     }
 
     // ── Time window ─────────────────────────────────────────────────
@@ -1522,44 +1655,7 @@ mod tests {
     #[test]
     fn test_repetition_one_or_more() {
         // A THEN B+ THEN C
-        // State 0: --[A]--> State 1
-        // State 1: --[B]--> State 2
-        // State 2: --[B]--> State 2 (self-loop)
-        // State 2: --[C]--> State 3 (accept)
-        let nfa = CompiledNfa {
-            states: vec![
-                NfaState {
-                    transitions: vec![simple_transition("A", 1)],
-                    poison_transitions: vec![],
-                },
-                NfaState {
-                    transitions: vec![simple_transition("B", 2)],
-                    poison_transitions: vec![],
-                },
-                NfaState {
-                    transitions: vec![
-                        simple_transition("B", 2), // self-loop
-                        simple_transition("C", 3),
-                    ],
-                    poison_transitions: vec![],
-                },
-                NfaState {
-                    transitions: vec![],
-                    poison_transitions: vec![],
-                },
-            ],
-            accept_state: 3,
-            relevant_event_types: BTreeSet::from([
-                "A".to_string(),
-                "B".to_string(),
-                "C".to_string(),
-            ]),
-            pattern_class: PatternClass::GeneralNfa,
-            variable_bindings: vec![],
-            global_window: None,
-            emit_all: false,
-            state_to_step: vec![0, 1, 2, 3],
-        };
+        let nfa = nfa_a_then_b_plus_then_c();
 
         let sim = NfaSimulator::new(nfa.clone(), false);
 
@@ -1582,6 +1678,25 @@ mod tests {
         let batch = make_batch(&[("A", 1), ("C", 2)]);
         sim.process_batch(&mut state, &batch, "event_type", "ts");
         assert!(state.completions.is_empty());
+    }
+
+    #[test]
+    fn test_repetition_zero_or_more() {
+        let nfa = nfa_a_then_b_star_then_c();
+        let sim = NfaSimulator::new(nfa.clone(), false);
+
+        // Zero B's.
+        let mut state = sim.create_state();
+        let batch = make_batch(&[("A", 1), ("C", 2)]);
+        sim.process_batch(&mut state, &batch, "event_type", "ts");
+        assert_eq!(state.completions.len(), 1);
+
+        // Multiple B's.
+        let sim = NfaSimulator::new(nfa, false);
+        let mut state = sim.create_state();
+        let batch = make_batch(&[("A", 1), ("B", 2), ("B", 3), ("C", 4)]);
+        sim.process_batch(&mut state, &batch, "event_type", "ts");
+        assert_eq!(state.completions.len(), 1);
     }
 
     // ── Alternation ─────────────────────────────────────────────────
@@ -1697,30 +1812,85 @@ mod tests {
     }
 
     #[test]
-    fn test_match_all_emit_all_interaction() {
-        // MATCH ALL + EMIT ALL: intermediate candidates at the time
-        // of a match reset should be emitted as partials (§5.3).
+    fn test_match_all_emit_all_non_overlapping() {
+        // MATCH ALL is non-overlapping: A(2) starts within the span [1, 3]
+        // of the first match and is discarded by the reset. No partial is
+        // emitted for A(2) — it is consumed by the completed match.
         let mut nfa = nfa_a_then_b();
         nfa.emit_all = true;
         let sim = NfaSimulator::new(nfa, true); // MATCH ALL + EMIT ALL
         let mut state = sim.create_state();
 
-        // A(1), A(2): two candidates at state 1.
-        // B(3): both reach accept, earliest (anchor=1) is consumed.
-        //   Remaining candidate (anchor=2) at state 1 should be
-        //   emitted as a partial with step_reached=1.
-        // A(4), B(5): second match.
-        let batch = make_batch(&[("A", 1), ("A", 2), ("B", 3), ("A", 4), ("B", 5)]);
+        let batch = make_batch(&[("A", 1), ("A", 2), ("B", 3)]);
+        sim.process_batch(&mut state, &batch, "event_type", "ts");
+        let state = sim.finish_entity(state);
+
+        assert_eq!(state.completions.len(), 1);
+        assert_eq!(state.completions[0].anchor_ts, 1);
+        assert_eq!(state.completions[0].final_ts, 3);
+        assert_eq!(state.partials.len(), 0);
+    }
+
+    #[test]
+    fn test_match_all_complete_partial_complete() {
+        // Three-result scenario: two completions with a window-expired partial
+        // between them.
+        //
+        // Pattern: A THEN B THEN C, window=5, MATCH ALL + EMIT ALL.
+        //
+        // A@1 → B@2 → C@3   : complete {anchor=1, final=3}.  scan_from=3.
+        // A@4 → B@5          : anchor=4 enters state 1 and (after B@5) state 2.
+        // A@20               : 20−4=16 > 5 → partial {anchor=4, step=2} emitted
+        //                      (highest step reached); A@20 starts anchor=20.
+        // B@21 → C@22        : complete {anchor=20, final=22}.
+        let mut nfa = nfa_a_then_b_then_c();
+        nfa.emit_all = true;
+        nfa.global_window = Some(5);
+        let sim = NfaSimulator::new(nfa, true); // MATCH ALL + EMIT ALL
+        let mut state = sim.create_state();
+
+        let batch = make_batch(&[
+            ("A", 1),
+            ("B", 2),
+            ("C", 3), // first complete
+            ("A", 4),
+            ("B", 5), // anchor that will expire
+            ("A", 20),
+            ("B", 21),
+            ("C", 22), // second complete
+        ]);
         sim.process_batch(&mut state, &batch, "event_type", "ts");
 
         assert_eq!(state.completions.len(), 2);
         assert_eq!(state.completions[0].anchor_ts, 1);
-        assert_eq!(state.completions[1].anchor_ts, 4);
-        // The A(2) candidate at state 1 should have been emitted as
-        // a partial during the first match's reset.
-        assert!(!state.partials.is_empty());
-        let partial_steps: Vec<u8> = state.partials.iter().map(|p| p.step_reached).collect();
-        assert!(partial_steps.contains(&1));
+        assert_eq!(state.completions[0].final_ts, 3);
+        assert_eq!(state.completions[1].anchor_ts, 20);
+        assert_eq!(state.completions[1].final_ts, 22);
+
+        assert_eq!(state.partials.len(), 1);
+        assert_eq!(state.partials[0].anchor_ts, 4);
+        assert_eq!(state.partials[0].step_reached, 2);
+    }
+
+    #[test]
+    fn test_match_all_repetition_does_not_reuse_consumed_intermediate_event() {
+        let mut nfa = nfa_a_then_b_plus_then_c();
+        nfa.emit_all = true;
+        let sim = NfaSimulator::new(nfa, true); // MATCH ALL + EMIT ALL
+        let mut state = sim.create_state();
+
+        // The second anchor reaches the repeated B state via B@3, but once
+        // A@1 -> B@3 -> C@4 completes, that B@3 must be considered consumed.
+        // A later C@5 must not produce a second match or a surviving partial
+        // for anchor A@2 by reusing the consumed intermediate event.
+        let batch = make_batch(&[("A", 1), ("A", 2), ("B", 3), ("C", 4), ("C", 5)]);
+        sim.process_batch(&mut state, &batch, "event_type", "ts");
+        let state = sim.finish_entity(state);
+
+        assert_eq!(state.completions.len(), 1);
+        assert_eq!(state.completions[0].anchor_ts, 1);
+        assert_eq!(state.completions[0].final_ts, 4);
+        assert!(state.partials.is_empty());
     }
 
     // ── Cross sub-batch persistence ─────────────────────────────────
@@ -1853,21 +2023,25 @@ mod tests {
 
     #[test]
     fn test_match_all_scan_from_prevents_reuse() {
-        // After MATCH ALL reset, events at or before scan_from should
-        // not start new candidates.
+        // After MATCH ALL reset, scan_from is set to the final_ts of the
+        // completed match. Events at or before scan_from cannot start new
+        // candidates.
         let nfa = nfa_a_then_b();
         let sim = NfaSimulator::new(nfa, true);
         let mut state = sim.create_state();
 
-        // A(1), B(2) -> match, reset scan_from=2.
-        // A(2) at ts=2 <= scan_from=2 -> should not start new candidate.
-        // A(3), B(4) -> second match.
+        // A(1), B(2) → match {anchor=1, final=2}. scan_from=2.
+        // A(2) at or before scan_from=2 → skipped.
+        // A(3) > scan_from=2 → starts new anchor.
+        // B(4) completes anchor=3.
         let batch = make_batch(&[("A", 1), ("B", 2), ("A", 2), ("A", 3), ("B", 4)]);
         sim.process_batch(&mut state, &batch, "event_type", "ts");
 
         assert_eq!(state.completions.len(), 2);
         assert_eq!(state.completions[0].anchor_ts, 1);
+        assert_eq!(state.completions[0].final_ts, 2);
         assert_eq!(state.completions[1].anchor_ts, 3);
+        assert_eq!(state.completions[1].final_ts, 4);
     }
 
     // ── Anti-cascading ──────────────────────────────────────────────

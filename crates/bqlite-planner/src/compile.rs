@@ -262,7 +262,7 @@ pub fn compile_pattern(
         Some(MatchWindow::WithinSession) | None => None,
     };
 
-    let emit_all = pattern.mode == MatchMode::EmitAll;
+    let emit_all = pattern.emit_all || pattern.mode == MatchMode::EmitAll;
 
     Ok(CompiledNfa {
         states,
@@ -1182,6 +1182,7 @@ mod tests {
         MatchPattern {
             steps,
             mode: MatchMode::First,
+            emit_all: false,
             window: None,
             brackets: None,
             span: Span::EMPTY,
@@ -1541,6 +1542,7 @@ mod tests {
         let p = MatchPattern {
             steps: vec![simple_step("signup"), simple_step("purchase")],
             mode: MatchMode::First,
+            emit_all: false,
             window: Some(MatchWindow::Within(86_400_000_000_000)),
             brackets: None,
             span: Span::EMPTY,
@@ -1554,6 +1556,7 @@ mod tests {
         let p = MatchPattern {
             steps: vec![simple_step("signup")],
             mode: MatchMode::First,
+            emit_all: false,
             window: Some(MatchWindow::WithinSession),
             brackets: None,
             span: Span::EMPTY,
@@ -1575,7 +1578,8 @@ mod tests {
     fn emit_all_flag() {
         let p = MatchPattern {
             steps: vec![simple_step("signup"), simple_step("purchase")],
-            mode: MatchMode::EmitAll,
+            mode: MatchMode::First,
+            emit_all: true,
             window: None,
             brackets: None,
             span: Span::EMPTY,
@@ -1977,6 +1981,7 @@ mod tests {
         let p = MatchPattern {
             steps: vec![simple_step("signup")],
             mode: MatchMode::All,
+            emit_all: false,
             window: None,
             brackets: None,
             span: Span::EMPTY,

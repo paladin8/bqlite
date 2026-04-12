@@ -42,12 +42,13 @@
 //! - match-operator.md §4.2 — `StepCounterState` layout
 //! - matcher-strategy.md §4 — variable-binding interaction with step counter
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use arrow::array::{Array, BooleanArray, StringViewArray};
 use arrow::record_batch::RecordBatch;
 use smallvec::SmallVec;
 
+use bqlite_core::TimeRange;
 use bqlite_planner::compile::{CompiledNfa, NfaState};
 
 use super::bindings::{check_bindings, try_bind_variables, BindingValue, BindingValueCache};
@@ -344,6 +345,10 @@ pub struct StepCounterSimulator {
     num_steps: u8,
     /// MATCH ALL mode: reset and continue after each match.
     match_all: bool,
+    /// Source time range that gates step-0 entry. Later steps may
+    /// still advance beyond the source-range end when the reader was
+    /// widened for MATCH windows or brackets.
+    entry_range: Option<TimeRange>,
     /// Maximum active tracks per entity before oldest are dropped
     /// (sequence-matching.md §16.1). Default: 10 000.
     active_state_limit: usize,
@@ -360,8 +365,15 @@ impl StepCounterSimulator {
             nfa,
             num_steps,
             match_all,
+            entry_range: None,
             active_state_limit: 10_000,
         }
+    }
+
+    /// Restrict step-0 entry to the given source time range.
+    pub fn with_entry_range(mut self, entry_range: Option<TimeRange>) -> Self {
+        self.entry_range = entry_range;
+        self
     }
 
     /// Override the active-state limit (default 10 000).
@@ -383,6 +395,14 @@ impl StepCounterSimulator {
     /// Whether this is a MATCH ALL query.
     pub fn is_match_all(&self) -> bool {
         self.match_all
+    }
+
+    #[inline]
+    fn can_start_entry(&self, event_ts: i64) -> bool {
+        match self.entry_range {
+            Some(range) => event_ts >= range.start.as_nanos() && event_ts < range.end.as_nanos(),
+            None => true,
+        }
     }
 
     /// Process a sub-batch of events for a single entity.
@@ -420,8 +440,11 @@ impl StepCounterSimulator {
         // Pre-extract all binding column values (empty if no bindings).
         let binding_cache = BindingValueCache::build(&self.nfa.variable_bindings, batch);
 
-        // MATCH FIRST: if all tracks are already done, no more work to do.
-        if !self.match_all && !state.completions.is_empty() {
+        // MATCH FIRST can only short-circuit the whole entity when there are
+        // no binding tracks. With bindings, another track may still complete
+        // or emit a partial row later in the entity stream.
+        if !self.match_all && self.nfa.variable_bindings.is_empty() && !state.completions.is_empty()
+        {
             return;
         }
 
@@ -442,8 +465,12 @@ impl StepCounterSimulator {
                 &binding_cache,
             );
 
-            // MATCH FIRST: stop processing after the first completion.
-            if !self.match_all && !state.completions.is_empty() {
+            // MATCH FIRST without bindings stops after the first completion.
+            // Binding-aware patterns still need later rows for other tracks.
+            if !self.match_all
+                && self.nfa.variable_bindings.is_empty()
+                && !state.completions.is_empty()
+            {
                 break;
             }
         }
@@ -457,15 +484,49 @@ impl StepCounterSimulator {
         if !self.nfa.emit_all {
             return;
         }
+        let mut emitted_entries: HashSet<(Vec<BindingValue>, i64)> = state
+            .completions
+            .iter()
+            .map(|c| (c.bindings.clone(), c.anchor_ts))
+            .chain(
+                state
+                    .partials
+                    .iter()
+                    .map(|p| (p.bindings.clone(), p.anchor_ts)),
+            )
+            .collect();
+        let mut new_partials = Vec::new();
+
         for track in &state.tracks {
             if track.current_step > 0 && !track.done {
-                state.partials.push(PartialMatch {
-                    anchor_ts: track.anchor_ts,
-                    step_reached: track.max_step_reached,
-                    bindings: Vec::new(),
-                });
+                let bindings = track.bindings.to_vec();
+                if emitted_entries.insert((bindings.clone(), track.anchor_ts)) {
+                    new_partials.push(PartialMatch {
+                        anchor_ts: track.anchor_ts,
+                        step_reached: track.max_step_reached,
+                        bindings,
+                    });
+                }
             }
         }
+
+        // MATCH ALL keeps a single active track plus step-0 backup anchors.
+        // Any remaining backup anchor has entered the sequence and must be
+        // surfaced as a step-1 partial at entity end under EMIT ALL.
+        if self.match_all {
+            for entry in &state.step0_candidates {
+                let bindings = entry.binding_key.iter().cloned().collect::<Vec<_>>();
+                if emitted_entries.insert((bindings.clone(), entry.anchor_ts)) {
+                    new_partials.push(PartialMatch {
+                        anchor_ts: entry.anchor_ts,
+                        step_reached: 1,
+                        bindings,
+                    });
+                }
+            }
+        }
+
+        state.partials.extend(new_partials);
     }
 
     // ── Per-event hot loop ────────────────────────────────────────────────
@@ -530,10 +591,11 @@ impl StepCounterSimulator {
                         if self.nfa.emit_all {
                             let anchor_ts = state.tracks[track_idx].anchor_ts;
                             let step_reached = state.tracks[track_idx].max_step_reached;
+                            let bindings = state.tracks[track_idx].bindings.to_vec();
                             state.partials.push(PartialMatch {
                                 anchor_ts,
                                 step_reached,
-                                bindings: Vec::new(),
+                                bindings,
                             });
                         }
                         to_remove.push(track_idx);
@@ -549,10 +611,11 @@ impl StepCounterSimulator {
                 if self.nfa.emit_all {
                     let anchor_ts = state.tracks[track_idx].anchor_ts;
                     let step_reached = state.tracks[track_idx].max_step_reached;
+                    let bindings = state.tracks[track_idx].bindings.to_vec();
                     state.partials.push(PartialMatch {
                         anchor_ts,
                         step_reached,
-                        bindings: Vec::new(),
+                        bindings,
                     });
                 }
                 to_remove.push(track_idx);
@@ -619,29 +682,34 @@ impl StepCounterSimulator {
 
     /// Handle a completed match for `track_idx`.
     fn on_match_complete(&self, state: &mut StepCounterState, track_idx: usize, event_ts: i64) {
+        let completed_anchor = state.tracks[track_idx].anchor_ts;
+        let track_bindings = state.tracks[track_idx].bindings.to_vec();
         state.completions.push(MatchCompletion {
-            anchor_ts: state.tracks[track_idx].anchor_ts,
+            anchor_ts: completed_anchor,
             final_ts: event_ts,
-            bindings: Vec::new(),
+            bindings: track_bindings.clone(),
         });
         state.tracks[track_idx].match_count += 1;
 
         if self.match_all {
-            // MATCH ALL: reset the track and continue from scan_from.
-            let scan_from = event_ts;
+            // MATCH ALL is non-overlapping: the next anchor must start strictly
+            // after the final event of the completed match. Set scan_from to
+            // the final_ts so all step-0 candidates within the match span are
+            // purged and no new anchor can reuse any event from that span.
+            let scan_from = event_ts; // event_ts == final_ts of the completed match
             state.tracks[track_idx].scan_from = scan_from;
             state.tracks[track_idx].current_step = 0;
             state.tracks[track_idx].anchor_ts = 0;
             state.tracks[track_idx].last_step_ts = 0;
+            state.tracks[track_idx].max_step_reached = 0;
 
-            // Purge step0_candidates entries consumed by this match.
-            purge_step0_candidates(&mut state.step0_candidates, scan_from);
+            // Purge the consumed anchor for this binding track only.
+            purge_step0_candidates(&mut state.step0_candidates, scan_from, &track_bindings);
 
             // Immediately restart from the next eligible step-0 anchor
             // (if any remain in the deque).
-            let bindings: SmallVec<[BindingValue; 2]> = state.tracks[track_idx].bindings.clone();
             if let Some(new_anchor) =
-                find_next_step0_candidate(&state.step0_candidates, scan_from, &bindings)
+                find_next_step0_candidate(&state.step0_candidates, scan_from, &track_bindings)
             {
                 // Track stays active (current_step goes 0→1): no count change.
                 state.tracks[track_idx].start(new_anchor);
@@ -683,6 +751,9 @@ impl StepCounterSimulator {
             .enumerate()
             .all(|(p_idx, _)| pred_cache.check_forward(0, p_idx, row))
         {
+            return;
+        }
+        if !self.can_start_entry(event_ts) {
             return;
         }
 
@@ -966,14 +1037,14 @@ fn find_next_step0_candidate(
 /// Called after MATCH ALL match completion. Entries are in ascending
 /// timestamp order, so we pop from the front until we hit one that's
 /// after `scan_from`.
-fn purge_step0_candidates(step0_candidates: &mut VecDeque<Step0Entry>, scan_from: i64) {
-    while let Some(front) = step0_candidates.front() {
-        if front.anchor_ts <= scan_from {
-            step0_candidates.pop_front();
-        } else {
-            break;
-        }
-    }
+fn purge_step0_candidates(
+    step0_candidates: &mut VecDeque<Step0Entry>,
+    scan_from: i64,
+    track_bindings: &[BindingValue],
+) {
+    step0_candidates.retain(|entry| {
+        entry.anchor_ts > scan_from || entry.binding_key.as_slice() != track_bindings
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -991,6 +1062,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
 
+    use bqlite_core::{TimeRange, Timestamp};
     use bqlite_planner::compile::{
         CompiledNfa, NfaState, PatternClass, PoisonTransition, Transition,
     };
@@ -1199,15 +1271,15 @@ mod tests {
         let sim = StepCounterSimulator::new(nfa, true);
         let mut state = sim.create_state();
 
-        // A(1) is the first anchor. A(2) is a backup in step0_candidates.
-        // B(4) advances the track. C(5) completes: anchor=1, final=5.
-        // After the match, scan_from=5 purges both A(1) and A(2) from
-        // step0_candidates, so no further restart is possible.
-        let batch = make_batch(&[("A", 1), ("A", 2), ("B", 4), ("C", 5)]);
+        // A(1)->B(4)->C(5) completes as {anchor=1, final=5}. scan_from=5.
+        // A(2) had anchor_ts=2 ≤ final_ts=5 and is purged. B(6), C(7)
+        // find no surviving anchor — only one completion.
+        let batch = make_batch(&[("A", 1), ("A", 2), ("B", 4), ("C", 5), ("B", 6), ("C", 7)]);
         sim.process_batch(&mut state, &batch, "event_type", "ts");
 
-        // Only one match: A(2), B(4), C(5).
         assert_eq!(state.completions.len(), 1);
+        assert_eq!(state.completions[0].anchor_ts, 1);
+        assert_eq!(state.completions[0].final_ts, 5);
     }
 
     #[test]
@@ -1316,6 +1388,41 @@ mod tests {
         assert_eq!(state.completions.len(), 0);
         assert_eq!(state.partials.len(), 1);
         assert_eq!(state.partials[0].step_reached, 2);
+    }
+
+    #[test]
+    fn match_all_emit_all_non_overlapping_discards_within_span() {
+        let mut nfa = build_3step_nfa();
+        nfa.emit_all = true;
+        let sim = StepCounterSimulator::new(nfa, true);
+        let mut state = sim.create_state();
+
+        // A(1)->B(3)->C(4) completes as {anchor=1, final=4}. scan_from=4.
+        // A(2) (anchor_ts=2 ≤ final_ts=4) is purged by the reset — it falls
+        // within the completed match's span and is not emitted as a partial.
+        let batch = make_batch(&[("A", 1), ("A", 2), ("B", 3), ("C", 4)]);
+        sim.process_batch(&mut state, &batch, "event_type", "ts");
+        sim.finish_entity(&mut state);
+
+        assert_eq!(state.completions.len(), 1);
+        assert_eq!(state.completions[0].anchor_ts, 1);
+        assert_eq!(state.completions[0].final_ts, 4);
+        assert_eq!(state.partials.len(), 0);
+    }
+
+    #[test]
+    fn entry_range_blocks_step0_after_source_end() {
+        let nfa = build_3step_nfa();
+        let sim = StepCounterSimulator::new(nfa, false)
+            .with_entry_range(Some(TimeRange::new(Timestamp(100), Timestamp(300))));
+        let mut state = sim.create_state();
+
+        let batch = make_batch(&[("A", 350), ("B", 360), ("C", 370)]);
+        sim.process_batch(&mut state, &batch, "event_type", "ts");
+
+        assert!(state.completions.is_empty());
+        assert!(state.step0_candidates.is_empty());
+        assert!(state.tracks.is_empty());
     }
 
     #[test]

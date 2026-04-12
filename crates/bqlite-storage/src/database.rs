@@ -300,16 +300,36 @@ impl Database {
     /// for columns added after a segment was written) is handled by
     /// `SegmentFileReader` itself.
     pub fn segment_reader(&self, table_name: &str) -> Result<Box<dyn SegmentReader>> {
+        self.segment_reader_for_time_range(table_name, TimeRange::unbounded())
+    }
+
+    /// Open a manifest-backed segment reader whose visible segment set
+    /// is restricted to `time_range`.
+    ///
+    /// The table schema still reflects the table's full current schema;
+    /// only the visible segment inventory is filtered.
+    pub fn segment_reader_for_time_range(
+        &self,
+        table_name: &str,
+        time_range: TimeRange,
+    ) -> Result<Box<dyn SegmentReader>> {
         let entry = self
             .manifest
             .tables
             .get(table_name)
             .ok_or_else(|| bqlite_core::catalog::unknown_table_error(table_name))?;
+
+        let windows = if time_range == TimeRange::unbounded() {
+            entry.windows.clone()
+        } else {
+            filter_windows_by_time_range(&entry.windows, time_range)
+        };
+
         Ok(Box::new(ManifestSegmentReader {
             root: self.root.clone(),
             table_name: table_name.to_string(),
             schema: Arc::new(entry.schema.clone()),
-            windows: entry.windows.clone(),
+            windows,
         }))
     }
 
@@ -738,6 +758,40 @@ fn io_ctx(action: &str, path: &Path, err: io::Error) -> BqliteError {
         err.kind(),
         format!("{action} {}: {err}", path.display()),
     ))
+}
+
+fn filter_windows_by_time_range(
+    windows: &[WindowManifest],
+    time_range: TimeRange,
+) -> Vec<WindowManifest> {
+    let start = time_range.start.as_nanos();
+    let end = time_range.end.as_nanos();
+
+    windows
+        .iter()
+        .filter_map(|window| {
+            let shards: Vec<Vec<SegmentMeta>> = window
+                .shards
+                .iter()
+                .map(|segments| {
+                    segments
+                        .iter()
+                        .filter(|seg| seg.ts_range.1 >= start && seg.ts_range.0 < end)
+                        .cloned()
+                        .collect()
+                })
+                .collect();
+
+            if shards.iter().all(Vec::is_empty) {
+                None
+            } else {
+                Some(WindowManifest {
+                    window_id: window.window_id,
+                    shards,
+                })
+            }
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

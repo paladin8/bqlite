@@ -213,10 +213,14 @@ Find the first complete match for each `(entity, binding track)` pair, then stop
 
 ### 5.2 MATCH ALL (Non-Overlapping)
 
-Find all matches where no event participates in more than one match within the same binding track. After a match completes, reset NFA state for that track and restart scanning from after the last consumed event.
+Find all matches where no event participates in more than one match within the
+same binding track. After a match completes, remove only the candidates that
+used the consumed events and keep later unmatched entries alive.
 
 - Reduces to **repeated first-match with a moving start point** per binding track.
-- After each match completion: clear candidate deques for that track, set `scan_from` = timestamp of last matched event. New candidates for this track are only created from events with `ts > scan_from`, effectively restarting the scan.
+- After each match completion: advance the track's restart point to the
+  consumed anchor and prune only candidates that share consumed events. New
+  step-1 entries for this track are created only from events with `ts > scan_from`.
 - Adds almost zero complexity over first-match — a loop around first-match logic with a reset.
 - Covers the common "count conversions per user" use case.
 
@@ -228,13 +232,21 @@ When the EMIT ALL flag is set on a MATCH operator, the output includes **all bin
 
 1. **Match completion.** `step_reached = num_steps`. Normal completed match.
 2. **Window expiry.** When a candidate's global window expires during Phase 1 of the transition algorithm (Section 3.3), record `step_reached = state_to_step[current_state]` and emit (or fuse into the aggregation accumulator) before dropping the candidate. This avoids retaining any state for expired candidates.
-3. **Entity end.** When `finish_entity()` is called, emit rows for any remaining in-progress candidates that haven't expired or completed.
+3. **Entity end.** When `finish_entity()` is called, emit rows for any
+   remaining in-progress candidates that haven't expired or completed.
+   `MATCH FIRST EMIT ALL` collapses those live candidates to the single
+   farthest partial for the binding track; `MATCH ALL EMIT ALL` collapses to
+   the farthest partial per surviving step-1 entry.
 
 **Fused aggregation at expiry.** For the common funnel use case (EMIT ALL + STATS step counts), the fused aggregation path increments `step_counts[step_reached]` directly at the moment of expiry. No buffering, no retained state for expired candidates. This is the primary advantage of emitting at expiry — the sequence match operator can fuse aggregations incrementally without accumulating partial results.
 
 **MATCH FIRST EMIT ALL:** Each `(entity, binding track)` pair produces exactly one row. Either completed (`step_reached = num_steps`) or incomplete (farthest step before entity end or window expiry).
 
-**MATCH ALL EMIT ALL:** Each NFA entry (step 1 match) within a binding track produces a row. After a match completes (or a window expires), the track resets and the next step 1 match starts a new entry. This is the funnel use case: "how many times did the user start checkout, and how far did they get each time?"
+**MATCH ALL EMIT ALL:** Each NFA entry (step 1 match) within a binding track
+produces a row. After a match completes (or a window expires), that entry
+closes and later unmatched step-1 events continue as new entries. This is the
+funnel use case: "how many times did the user start checkout, and how far did
+they get each time?"
 
 ### 5.4 BQL Syntax
 
@@ -337,7 +349,10 @@ When an event matches the transition predicate for state S → state S+1 within 
 3. **Propagate** ALL remaining eligible candidates to state S+1 (copied), with `last_step_ts = event.ts`. Anchor is preserved.
 4. **Dedup** at state S+1 (same `anchor_ts` = keep one, preferring the entry with the latest `last_step_ts`).
 5. Candidates at state S are **not removed** (deferred consumption).
-6. When a candidate reaches the accept state: match completed. Consume earliest eligible anchor. For MATCH ALL: reset the binding track and set `scan_from`.
+6. When a candidate reaches the accept state: match completed. Consume the
+   earliest eligible anchor. For MATCH ALL: remove candidates that share the
+   consumed events, preserve later unmatched entries, and set `scan_from` to
+   the consumed anchor so earlier step-1 events are not reconsidered.
 
 ### 6.4 Why All Candidates Must Be Kept
 
@@ -360,7 +375,7 @@ An earlier anchor may be the only one whose subsequent steps have arrived in tim
 Candidates are bounded by:
 - **Time window expiration** — old candidates expire from the front of the deque.
 - **Dedup** — each `anchor_ts` appears at most once per `(state, track)`.
-- **MATCH ALL mode** — full reset on match completion.
+- **MATCH ALL mode** — per-completion pruning of consumed-event candidates.
 - **Active state limit** (Section 16.1) — hard cap on total candidates per entity.
 
 For a typical entity with a few hundred events over 30 days and a 7-day window, each state's deque has ~10-50 entries. The inline `ArrayVec<CandidateEntry, 4>` (64 bytes) handles most cases; rare spills to heap for power-law entities.
@@ -581,9 +596,11 @@ This fast path is for non-consecutive linear patterns only. `IMMEDIATELY` patter
 
 For MATCH FIRST, when the window expires at an intermediate step, fall back to `step0_candidates` and rebind to the next eligible anchor. If no eligible anchors remain, reset to step 0.
 
-For MATCH ALL, reset the track on match completion and continue.
+For MATCH ALL, prune only the consumed entry on match completion and continue.
 
-With EMIT ALL, when a window expires or the entity stream ends, emit a row with `step_reached = current_step` for that track. In the fused path, increment `step_counts[current_step]` directly.
+With EMIT ALL, when a window expires or the entity stream ends, emit the
+farthest surviving partial for that track/entry. In the fused path, increment
+`step_counts[current_step]` directly.
 
 This is the hot path for funnel queries. A 5-step funnel with no negation or bindings: check event type (string comparison), check window (integer subtraction + comparison), increment step counter. ~1-3 ns/event.
 

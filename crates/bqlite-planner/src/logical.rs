@@ -50,7 +50,7 @@ use bqlite_ast::{
 };
 use bqlite_core::{
     AggFunction, BqlType, BqliteError, Catalog, ColumnDef, OperatorSchema, PropertyValue, Result,
-    TableSchema,
+    TableSchema, Timestamp,
 };
 
 use crate::demand::{FusableAggregate, StepPropertyRef};
@@ -77,10 +77,19 @@ pub enum LogicalPlan {
         table: TableSchema,
         /// Optional `LAST <duration>` / `BETWEEN <ts> AND <ts>` range
         /// from `Pipeline.source.time_range`. Populated by the parser
-        /// when the source includes a time-range clause. May be widened
-        /// by `extend_scan_time_range()` per planner-pipeline.md §4.4
-        /// when a downstream MATCH has a WITHIN window.
+        /// when the source includes a time-range clause. Never mutated
+        /// after construction — the pristine user-specified range is
+        /// preserved here and the reader extension is tracked separately
+        /// in `reader_backward_ns` / `reader_forward_ns`.
         time_range: Option<TimeRange>,
+        /// Nanoseconds to extend the segment-reader start earlier (backward).
+        /// Default 0. Added to the resolved `time_range` start when lowering
+        /// to a physical plan. No-op when `time_range` is `None`.
+        reader_backward_ns: i64,
+        /// Nanoseconds to extend the segment-reader end later (forward).
+        /// Default 0. Added to the resolved `time_range` end when lowering
+        /// to a physical plan. No-op when `time_range` is `None`.
+        reader_forward_ns: i64,
         /// `JOIN <table>` tables. Empty in Wave 2; populated by Wave 4.
         joined_tables: Vec<TableSchema>,
         /// Scan-level predicates populated by TASK-227's predicate
@@ -507,6 +516,8 @@ impl LogicalPlan {
         LogicalPlan::Scan {
             table,
             time_range,
+            reader_backward_ns: 0,
+            reader_forward_ns: 0,
             joined_tables,
             scan_predicates: Vec::new(),
             projected_columns: Vec::new(),
@@ -576,41 +587,85 @@ impl LogicalPlan {
         }
     }
 
-    /// Extend the Scan node's time range by `extension_ns` nanoseconds on
-    /// the upper bound, per planner-pipeline.md §4.4.
+    /// Extend the segment-reader window backwards (earlier start) by `ns`
+    /// nanoseconds, per planner-pipeline.md §4.4.
     ///
     /// Walks through `Filter`/`Project`/`Limit` wrappers to reach the
     /// deepest `Scan`. If the Scan has no time range (`None`), the method
-    /// is a no-op — there is nothing to extend.
-    ///
-    /// `LAST(d)` is extended to `Last(d + extension_ns)` (the scan must
-    /// fetch events beyond the user's stated duration so pattern
-    /// completions near the boundary remain visible).
-    ///
-    /// `BETWEEN { start, end }` is unchanged at the logical level — the
-    /// planner stores the raw user strings and the engine applies the
-    /// extension at bind time when it resolves them to timestamps.
-    pub(crate) fn extend_scan_time_range(&mut self, extension_ns: i64) {
+    /// is a no-op — there is nothing to extend (unbounded scans already
+    /// cover all time). The pristine `time_range` field is never mutated;
+    /// only `reader_backward_ns` is updated.
+    #[allow(dead_code)]
+    pub(crate) fn extend_scan_reader_backward(&mut self, ns: i64) -> Result<()> {
         match self {
             LogicalPlan::Scan {
-                time_range: Some(TimeRange::Last(ns)),
+                time_range: Some(_),
+                reader_backward_ns,
                 ..
             } => {
-                *ns = ns.saturating_add(extension_ns);
+                *reader_backward_ns = reader_backward_ns.saturating_add(ns);
+                Ok(())
             }
-            // BETWEEN: left as-is at the logical level; the engine
-            // applies the extension during timestamp resolution.
-            LogicalPlan::Scan { .. } => {}
+            LogicalPlan::Scan { .. } => Ok(()),
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
-            | LogicalPlan::Limit { input, .. } => {
-                input.extend_scan_time_range(extension_ns);
-            }
-            // SequenceMatch / Aggregate / Sort / Distinct — no deeper
-            // scan to reach (the extension applies to the scan feeding
-            // the first MATCH in the pipeline).
-            _ => {}
+            | LogicalPlan::Limit { input, .. } => input.extend_scan_reader_backward(ns),
+            _ => Ok(()),
         }
+    }
+
+    /// Extend the segment-reader window forwards (later end) by `ns`
+    /// nanoseconds, per planner-pipeline.md §4.4.
+    ///
+    /// Walks through `Filter`/`Project`/`Limit` wrappers to reach the
+    /// deepest `Scan`. If the Scan has no time range (`None`), the method
+    /// is a no-op. The pristine `time_range` field is never mutated;
+    /// only `reader_forward_ns` is updated.
+    pub(crate) fn extend_scan_reader_forward(&mut self, ns: i64) -> Result<()> {
+        match self {
+            LogicalPlan::Scan {
+                time_range: Some(_),
+                reader_forward_ns,
+                ..
+            } => {
+                *reader_forward_ns = reader_forward_ns.saturating_add(ns);
+                Ok(())
+            }
+            LogicalPlan::Scan { .. } => Ok(()),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Limit { input, .. } => input.extend_scan_reader_forward(ns),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn extend_between_end(end: &str, extension_ns: i64) -> Result<String> {
+    if extension_ns <= 0 {
+        return Ok(end.to_string());
+    }
+
+    let parsed_end = parse_time_range_timestamp(end, "BETWEEN end")?;
+    let widened_end = parsed_end
+        .checked_add_nanos(extension_ns)
+        .unwrap_or(Timestamp::MAX_VALID);
+
+    match PropertyValue::Timestamp(widened_end.as_nanos()).coerce_to(&BqlType::String) {
+        Some(PropertyValue::String(s)) => Ok(s),
+        _ => Err(BqliteError::Plan(format!(
+            "failed to format widened BETWEEN end timestamp `{end}`"
+        ))),
+    }
+}
+
+#[allow(dead_code)]
+fn parse_time_range_timestamp(raw: &str, context: &str) -> Result<Timestamp> {
+    match PropertyValue::String(raw.to_string()).coerce_to(&BqlType::Timestamp) {
+        Some(PropertyValue::Timestamp(ns)) => Ok(Timestamp::from_nanos(ns)),
+        _ => Err(BqliteError::Plan(format!(
+            "{context} `{raw}` is not a valid RFC 3339 timestamp"
+        ))),
     }
 }
 
@@ -997,11 +1052,11 @@ fn lower_match(
     }
 
     // Determine match mode and emit_all per §2.1.2.
-    let (mode, emit_all) = match pattern.mode {
-        MatchMode::First => (MatchMode::First, false),
-        MatchMode::All => (MatchMode::All, false),
-        MatchMode::EmitAll => (MatchMode::First, true),
+    let mode = match pattern.mode {
+        MatchMode::EmitAll => MatchMode::First,
+        other => other,
     };
+    let emit_all = pattern.emit_all || pattern.mode == MatchMode::EmitAll;
 
     // Convert AST MatchWindow to planner MatchWindowSpec per §2.1.1.
     let window = pattern.window.map(|w| match w {
@@ -1107,9 +1162,8 @@ fn lower_match(
     //   2. BRACKETS only     → extend by max(bracket durations)
     //   3. Both              → extend by max(window_ns, max_bracket)
     //
-    // For BETWEEN ranges, `extend_scan_time_range` is a no-op at the
-    // logical level — the engine resolves the raw timestamp strings and
-    // applies the extension at bind time.
+    // BETWEEN ranges are widened by extending their inclusive end
+    // timestamp. LAST ranges still widen through the stored duration.
     let mut acc = acc;
     let window_ns = match &window {
         Some(MatchWindowSpec::Duration(ns)) => *ns,
@@ -1121,7 +1175,7 @@ fn lower_match(
         .unwrap_or(0);
     let extension = window_ns.max(max_bracket);
     if extension > 0 {
-        acc.extend_scan_time_range(extension);
+        acc.extend_scan_reader_forward(extension)?;
     }
 
     Ok(LogicalPlan::SequenceMatch {
@@ -2105,6 +2159,8 @@ mod tests {
             LogicalPlan::Scan {
                 table,
                 time_range,
+                reader_backward_ns,
+                reader_forward_ns,
                 joined_tables,
                 scan_predicates,
                 projected_columns,
@@ -2112,6 +2168,8 @@ mod tests {
             } => {
                 assert_eq!(table.name(), "purchases");
                 assert!(time_range.is_none());
+                assert_eq!(*reader_backward_ns, 0);
+                assert_eq!(*reader_forward_ns, 0);
                 assert!(joined_tables.is_empty());
                 assert!(scan_predicates.is_empty());
                 assert!(projected_columns.is_empty());
@@ -3511,6 +3569,7 @@ mod tests {
                         match_step(Some("p"), "purchase"),
                     ],
                     mode: MatchMode::First,
+                    emit_all: false,
                     window: None,
                     brackets: None,
                     span: Span::EMPTY,
@@ -3552,7 +3611,8 @@ mod tests {
             vec![PipelineStage::Match {
                 pattern: bqlite_ast::pattern::MatchPattern {
                     steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
-                    mode: MatchMode::EmitAll,
+                    mode: MatchMode::First,
+                    emit_all: true,
                     window: None,
                     brackets: None,
                     span: Span::EMPTY,
@@ -3586,6 +3646,7 @@ mod tests {
                 pattern: bqlite_ast::pattern::MatchPattern {
                     steps: vec![],
                     mode: MatchMode::First,
+                    emit_all: false,
                     window: None,
                     brackets: None,
                     span: Span::EMPTY,
@@ -3609,6 +3670,7 @@ mod tests {
                         match_step(Some("s"), "purchase"),
                     ],
                     mode: MatchMode::First,
+                    emit_all: false,
                     window: None,
                     brackets: None,
                     span: Span::EMPTY,
@@ -3629,6 +3691,7 @@ mod tests {
                 pattern: bqlite_ast::pattern::MatchPattern {
                     steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
                     mode: MatchMode::First,
+                    emit_all: false,
                     window: Some(bqlite_ast::pattern::MatchWindow::Within(
                         604_800_000_000_000,
                     )),
@@ -4057,6 +4120,7 @@ mod tests {
             vec![PipelineStage::Match {
                 pattern: MatchPattern {
                     mode: MatchMode::First,
+                    emit_all: false,
                     steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
                     window: Some(MatchWindow::Within(ns_7d)),
                     brackets: None,
@@ -4066,12 +4130,79 @@ mod tests {
             }],
         );
         let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
-        // The SequenceMatch wraps a Scan whose time_range should be
-        // extended by the 7d window: 30d + 7d = 37d.
+        // The SequenceMatch wraps a Scan. The pristine time_range must remain
+        // Last(30d) unchanged; reader_forward_ns captures the 7d extension.
         match &plan {
             LogicalPlan::SequenceMatch { input, .. } => match input.as_ref() {
-                LogicalPlan::Scan { time_range, .. } => {
-                    assert_eq!(*time_range, Some(TimeRange::Last(ns_30d + ns_7d)));
+                LogicalPlan::Scan {
+                    time_range,
+                    reader_forward_ns,
+                    reader_backward_ns,
+                    ..
+                } => {
+                    assert_eq!(
+                        *time_range,
+                        Some(TimeRange::Last(ns_30d)),
+                        "time_range must not be mutated"
+                    );
+                    assert_eq!(
+                        *reader_forward_ns, ns_7d,
+                        "reader_forward_ns must hold the 7d extension"
+                    );
+                    assert_eq!(*reader_backward_ns, 0, "reader_backward_ns must remain 0");
+                }
+                other => panic!("expected Scan under SequenceMatch, got {other:?}"),
+            },
+            _ => panic!("expected SequenceMatch, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_between_range_extended_by_match_within_window() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_2d = 2 * 86_400_000_000_000_i64;
+        let pipeline = pipeline_with_time_range(
+            "purchases",
+            Some(TimeRange::Between {
+                start: "2024-01-02T00:00:00Z".into(),
+                end: "2024-01-03T00:00:00Z".into(),
+            }),
+            vec![PipelineStage::Match {
+                pattern: MatchPattern {
+                    mode: MatchMode::First,
+                    emit_all: false,
+                    steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
+                    window: Some(MatchWindow::Within(ns_2d)),
+                    brackets: None,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        // The pristine time_range must remain unchanged (Jan2..Jan3).
+        // reader_forward_ns captures the 2d extension.
+        match &plan {
+            LogicalPlan::SequenceMatch { input, .. } => match input.as_ref() {
+                LogicalPlan::Scan {
+                    time_range,
+                    reader_forward_ns,
+                    reader_backward_ns,
+                    ..
+                } => {
+                    assert_eq!(
+                        *time_range,
+                        Some(TimeRange::Between {
+                            start: "2024-01-02T00:00:00Z".into(),
+                            end: "2024-01-03T00:00:00Z".into(),
+                        }),
+                        "time_range must not be mutated"
+                    );
+                    assert_eq!(
+                        *reader_forward_ns, ns_2d,
+                        "reader_forward_ns must hold the 2d extension"
+                    );
+                    assert_eq!(*reader_backward_ns, 0, "reader_backward_ns must remain 0");
                 }
                 other => panic!("expected Scan under SequenceMatch, got {other:?}"),
             },
@@ -4089,6 +4220,7 @@ mod tests {
             vec![PipelineStage::Match {
                 pattern: MatchPattern {
                     mode: MatchMode::First,
+                    emit_all: false,
                     steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
                     window: None,
                     brackets: None,
@@ -4100,8 +4232,21 @@ mod tests {
         let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
         match &plan {
             LogicalPlan::SequenceMatch { input, .. } => match input.as_ref() {
-                LogicalPlan::Scan { time_range, .. } => {
+                LogicalPlan::Scan {
+                    time_range,
+                    reader_backward_ns,
+                    reader_forward_ns,
+                    ..
+                } => {
                     assert_eq!(*time_range, Some(TimeRange::Last(ns_30d)));
+                    assert_eq!(
+                        *reader_backward_ns, 0,
+                        "reader_backward_ns must be 0 when no window"
+                    );
+                    assert_eq!(
+                        *reader_forward_ns, 0,
+                        "reader_forward_ns must be 0 when no window"
+                    );
                 }
                 other => panic!("expected Scan under SequenceMatch, got {other:?}"),
             },
@@ -4119,6 +4264,7 @@ mod tests {
             vec![PipelineStage::Match {
                 pattern: MatchPattern {
                     mode: MatchMode::First,
+                    emit_all: false,
                     steps: vec![match_step(None, "signup"), match_step(None, "purchase")],
                     window: Some(MatchWindow::Within(ns_7d)),
                     brackets: None,
@@ -4140,7 +4286,7 @@ mod tests {
     }
 
     #[test]
-    fn extend_scan_time_range_reaches_through_filter() {
+    fn extend_scan_reader_forward_reaches_through_filter() {
         let schema = purchases_schema();
         let ns_30d = 30 * 86_400_000_000_000_i64;
         let ns_7d = 7 * 86_400_000_000_000_i64;
@@ -4152,12 +4298,21 @@ mod tests {
             span: Span::EMPTY,
         };
         let mut plan = LogicalPlan::filter(predicate, scan).unwrap();
-        plan.extend_scan_time_range(ns_7d);
-        // Walk down to the scan to check.
+        plan.extend_scan_reader_forward(ns_7d).unwrap();
+        // Walk down to the scan to check: time_range unchanged, reader_forward_ns set.
         match &plan {
             LogicalPlan::Filter { input, .. } => match input.as_ref() {
-                LogicalPlan::Scan { time_range, .. } => {
-                    assert_eq!(*time_range, Some(TimeRange::Last(ns_30d + ns_7d)));
+                LogicalPlan::Scan {
+                    time_range,
+                    reader_forward_ns,
+                    ..
+                } => {
+                    assert_eq!(
+                        *time_range,
+                        Some(TimeRange::Last(ns_30d)),
+                        "time_range must not be mutated"
+                    );
+                    assert_eq!(*reader_forward_ns, ns_7d, "reader_forward_ns must be set");
                 }
                 other => panic!("expected Scan under Filter, got {other:?}"),
             },

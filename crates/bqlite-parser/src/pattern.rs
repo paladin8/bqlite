@@ -121,18 +121,16 @@ pub(crate) fn parse_step_list(p: &mut Parser) -> Result<Vec<Step>, ParseError> {
 /// in canonical order.
 ///
 /// `base_mode` is the already-parsed `MatchMode::First` or `MatchMode::All`.
-/// Returns `(window, brackets, final_mode, modifier_end_span)`.
+/// Returns `(window, brackets, emit_all, modifier_end_span)`.
 ///
 /// `modifier_end_span` is the [`Span`] of the last token consumed by any
 /// modifier, or [`Span::EMPTY`] when no modifiers are present. Callers use it
 /// to extend the MATCH stage span through the last modifier token.
 ///
-/// Errors if modifiers appear out of canonical order or if the mode /
-/// modifier combination is unsupported (e.g. `MATCH ALL EMIT ALL`).
 pub(crate) fn parse_match_modifiers(
     p: &mut Parser,
-    base_mode: MatchMode,
-) -> Result<(Option<MatchWindow>, Option<BracketSpec>, MatchMode, Span), ParseError> {
+    _base_mode: MatchMode,
+) -> Result<(Option<MatchWindow>, Option<BracketSpec>, bool, Span), ParseError> {
     // 1. Optional WITHIN clause.
     let (window, window_end) = parse_within(p)?;
 
@@ -152,7 +150,7 @@ pub(crate) fn parse_match_modifiers(
     }
 
     // 3. Optional EMIT ALL.
-    let (final_mode, emit_end) = parse_emit_all(p, base_mode)?;
+    let (emit_all, emit_end) = parse_emit_all(p)?;
 
     // Compute the end span: the last consumed modifier wins.  Merging with
     // Span::EMPTY is a no-op (see Span::merged), so this correctly handles
@@ -161,7 +159,7 @@ pub(crate) fn parse_match_modifiers(
         .merged(brackets.as_ref().map(|b| b.span).unwrap_or(Span::EMPTY))
         .merged(emit_end);
 
-    Ok((window, brackets, final_mode, modifier_end))
+    Ok((window, brackets, emit_all, modifier_end))
 }
 
 /// Parse `(name ".")? name` into an [`EventRef`].
@@ -539,14 +537,12 @@ fn parse_brackets(p: &mut Parser) -> Result<Option<BracketSpec>, ParseError> {
 ///
 /// Errors:
 /// - `EMIT` not followed by `ALL` → `Expected::Keyword("ALL")`
-/// - `MATCH ALL ... EMIT ALL` → `Expected::EndOfModifiers` (unsupported)
 /// - `EMIT ALL` followed by `WITHIN` or `BRACKETS` → out-of-order error
-fn parse_emit_all(p: &mut Parser, base_mode: MatchMode) -> Result<(MatchMode, Span), ParseError> {
-    let emit_tok = match p.try_kw(Keyword::Emit) {
+fn parse_emit_all(p: &mut Parser) -> Result<(bool, Span), ParseError> {
+    let _emit_tok = match p.try_kw(Keyword::Emit) {
         Some(tok) => tok,
-        None => return Ok((base_mode, Span::EMPTY)),
+        None => return Ok((false, Span::EMPTY)),
     };
-    let emit_span = token_span(&emit_tok);
 
     // `EMIT` must be followed by `ALL`.
     let all_tok = p.expect_kw(Keyword::All)?;
@@ -569,22 +565,7 @@ fn parse_emit_all(p: &mut Parser, base_mode: MatchMode) -> Result<(MatchMode, Sp
         _ => {}
     }
 
-    // `MATCH ALL EMIT ALL` is not representable in the current AST.
-    // See pattern-grammar.md §7.1 for the encoding decision.
-    match base_mode {
-        MatchMode::First | MatchMode::EmitAll => Ok((MatchMode::EmitAll, all_span)),
-        MatchMode::All => Err(ParseError::Unexpected {
-            offset: emit_span.start,
-            line: emit_span.line,
-            column: emit_span.column,
-            expected: Expected::EndOfModifiers,
-            found: "EMIT".to_string(),
-            detail: Some(
-                "MATCH ALL EMIT ALL is not supported in this version; \
-                 use MATCH FIRST EMIT ALL or MATCH ALL without EMIT ALL",
-            ),
-        }),
-    }
+    Ok((true, all_span))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -976,21 +957,22 @@ mod tests {
     #[test]
     fn modifiers_none() {
         let mut p = make_parser("");
-        let (window, brackets, mode, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (window, brackets, emit_all, _) =
+            parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         assert!(window.is_none());
         assert!(brackets.is_none());
-        assert_eq!(mode, MatchMode::First);
+        assert!(!emit_all);
     }
 
     #[test]
     fn modifiers_within_duration() {
         let mut p = make_parser("WITHIN 7d");
-        let (window, _, mode, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (window, _, emit_all, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         assert_eq!(
             window,
             Some(MatchWindow::Within(7 * 24 * 3_600_000_000_000))
         );
-        assert_eq!(mode, MatchMode::First);
+        assert!(!emit_all);
     }
 
     #[test]
@@ -1001,41 +983,32 @@ mod tests {
     }
 
     #[test]
-    fn modifiers_emit_all_with_first_produces_emit_all_mode() {
+    fn modifiers_emit_all_sets_flag() {
         let mut p = make_parser("EMIT ALL");
-        let (_, _, mode, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
-        assert_eq!(mode, MatchMode::EmitAll);
+        let (_, _, emit_all, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        assert!(emit_all);
     }
 
     #[test]
     fn modifiers_all_mode_no_emit_all_stays_all() {
         let mut p = make_parser("");
-        let (_, _, mode, _) = parse_match_modifiers(&mut p, MatchMode::All).unwrap();
-        assert_eq!(mode, MatchMode::All);
+        let (_, _, emit_all, _) = parse_match_modifiers(&mut p, MatchMode::All).unwrap();
+        assert!(!emit_all);
     }
 
     #[test]
-    fn modifiers_all_with_emit_all_is_error() {
+    fn modifiers_all_with_emit_all_is_allowed() {
         let mut p = make_parser("EMIT ALL");
-        match parse_match_modifiers(&mut p, MatchMode::All) {
-            Err(ParseError::Unexpected {
-                expected, detail, ..
-            }) => {
-                assert_eq!(expected, Expected::EndOfModifiers);
-                assert!(detail
-                    .unwrap_or("")
-                    .contains("MATCH ALL EMIT ALL is not supported"));
-            }
-            other => panic!("expected EndOfModifiers error, got {other:?}"),
-        }
+        let (_, _, emit_all, _) = parse_match_modifiers(&mut p, MatchMode::All).unwrap();
+        assert!(emit_all);
     }
 
     #[test]
     fn modifiers_within_and_emit_all() {
         let mut p = make_parser("WITHIN 7d EMIT ALL");
-        let (window, _, mode, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
+        let (window, _, emit_all, _) = parse_match_modifiers(&mut p, MatchMode::First).unwrap();
         assert!(window.is_some());
-        assert_eq!(mode, MatchMode::EmitAll);
+        assert!(emit_all);
     }
 
     #[test]

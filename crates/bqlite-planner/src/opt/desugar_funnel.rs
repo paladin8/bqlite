@@ -103,13 +103,14 @@ pub fn desugar_funnel(funnel: Funnel) -> Result<(PipelineStage, PipelineStage)> 
     }
 
     // ── Build the MATCH stage ────────────────────────────────────────────────
-    // FUNNEL desugars to MATCH FIRST ... EMIT ALL, which uses MatchMode::EmitAll.
+    // FUNNEL desugars to MATCH FIRST ... EMIT ALL.
     // The window from the Funnel (in nanoseconds) becomes MatchWindow::Within.
 
     let match_stage = PipelineStage::Match {
         pattern: MatchPattern {
             steps: funnel.steps,
-            mode: MatchMode::EmitAll,
+            mode: MatchMode::First,
+            emit_all: true,
             window: funnel.window.map(MatchWindow::Within),
             brackets: None,
             span,
@@ -274,7 +275,8 @@ mod tests {
         let PipelineStage::Match { pattern, .. } = match_stage else {
             panic!("expected Match stage");
         };
-        assert_eq!(pattern.mode, MatchMode::EmitAll);
+        assert_eq!(pattern.mode, MatchMode::First);
+        assert!(pattern.emit_all);
         assert_eq!(pattern.steps.len(), 2);
         assert_eq!(
             pattern.window,
@@ -333,6 +335,7 @@ mod tests {
         let PipelineStage::Match { pattern, .. } = match_stage else {
             panic!("expected Match");
         };
+        assert!(pattern.emit_all);
         assert!(pattern.window.is_none());
     }
 

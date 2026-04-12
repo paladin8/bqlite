@@ -52,8 +52,8 @@
 //! use bqlite_core::Catalog;
 //! use bqlite_planner::{plan, PhysicalPlan};
 //!
-//! fn run(stmt: Statement, catalog: &dyn Catalog) -> bqlite_core::Result<PhysicalPlan> {
-//!     plan(stmt, catalog)
+//! fn run(stmt: Statement, catalog: &dyn Catalog, now_ns: i64) -> bqlite_core::Result<PhysicalPlan> {
+//!     plan(stmt, catalog, now_ns)
 //! }
 //! ```
 
@@ -111,7 +111,9 @@ pub use physical::{
 ///    [`bqlite_core::BqliteError::Plan`] or
 ///    [`bqlite_core::BqliteError::Schema`].
 /// 2. [`physical::lower_physical`] — infallible one-to-one lowering
-///    that swaps `TypedExpr` for `CompiledExpr`.
+///    that swaps `TypedExpr` for `CompiledExpr` and resolves AST time
+///    ranges into absolute [`bqlite_core::TimeRange`] bounds using
+///    `now_ns` as the current Unix epoch nanoseconds.
 /// 3. [`opt::fuse_match_aggregate::fuse_match_aggregate`] (TASK-320) —
 ///    detects `Aggregate(SequenceMatch(...))` pairs where the aggregate
 ///    can be fulfilled from the match output, fuses the aggregate into
@@ -135,9 +137,9 @@ pub use physical::{
 ///   invalid `INSERT` shape, etc.
 /// - `BqliteError::Schema` — DDL validation failures (duplicate
 ///   columns, missing role columns, invalid `ALTER` action).
-pub fn plan(statement: Statement, catalog: &dyn Catalog) -> Result<PhysicalPlan> {
+pub fn plan(statement: Statement, catalog: &dyn Catalog, now_ns: i64) -> Result<PhysicalPlan> {
     let logical = lower_statement(statement, catalog)?;
-    let physical = lower_physical(logical);
+    let physical = lower_physical(logical, now_ns);
     // Wave 3 fusion pass (TASK-320): fuse Aggregate(SequenceMatch) pairs.
     // Runs first so the plan shape downstream sees the fused schema.
     let physical = opt::fuse_match_aggregate::fuse_match_aggregate(physical);
@@ -242,7 +244,7 @@ mod tests {
         let catalog = InMemoryCatalog::default().with(events_schema());
         let stmt = Statement::Query(bare_pipeline("events"));
 
-        let physical = plan(stmt, &catalog).expect("events must plan");
+        let physical = plan(stmt, &catalog, 0).expect("events must plan");
 
         let PhysicalPlan::Scan(scan) = physical else {
             panic!("expected Scan, got {physical:?}");
@@ -266,7 +268,7 @@ mod tests {
         let catalog = InMemoryCatalog::default().with(events_schema());
         let stmt = Statement::Query(bare_pipeline("events"));
 
-        let physical = plan(stmt, &catalog).unwrap();
+        let physical = plan(stmt, &catalog, 0).unwrap();
         let expected = OperatorSchema::from_table(&events_schema());
         assert_eq!(physical.output_schema(), &expected);
     }
@@ -279,7 +281,7 @@ mod tests {
         let owned = InMemoryCatalog::default().with(events_schema());
         let catalog: &dyn Catalog = &owned;
         let stmt = Statement::Query(bare_pipeline("events"));
-        assert!(plan(stmt, catalog).is_ok());
+        assert!(plan(stmt, catalog, 0).is_ok());
     }
 
     // ── Unknown table ───────────────────────────────────────────────
@@ -289,7 +291,7 @@ mod tests {
         let catalog = InMemoryCatalog::default();
         let stmt = Statement::Query(bare_pipeline("ghost"));
 
-        match plan(stmt, &catalog) {
+        match plan(stmt, &catalog, 0) {
             Err(BqliteError::Plan(msg)) => {
                 assert!(msg.contains("ghost"), "got: {msg}");
                 assert!(msg.contains("unknown table"), "got: {msg}");
@@ -313,7 +315,7 @@ mod tests {
                 end: None,
                 span: Span::EMPTY,
             }));
-        match plan(Statement::Query(pipeline), &catalog) {
+        match plan(Statement::Query(pipeline), &catalog, 0) {
             Err(BqliteError::Plan(msg)) => {
                 assert!(msg.contains("SESSIONIZE"), "got: {msg}");
             }
@@ -326,7 +328,7 @@ mod tests {
         let catalog = InMemoryCatalog::default().with(events_schema());
         let mut pipeline = bare_pipeline("events");
         pipeline.source.joins.push(table_ref("other"));
-        match plan(Statement::Query(pipeline), &catalog) {
+        match plan(Statement::Query(pipeline), &catalog, 0) {
             Err(BqliteError::Plan(msg)) => {
                 assert!(msg.contains("JOIN"), "got: {msg}");
             }
@@ -342,7 +344,7 @@ mod tests {
             predicate: Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY),
             span: Span::EMPTY,
         });
-        match plan(stmt, &catalog) {
+        match plan(stmt, &catalog, 0) {
             Err(BqliteError::Plan(msg)) => {
                 assert!(msg.contains("DELETE"), "got: {msg}");
             }
@@ -358,7 +360,7 @@ mod tests {
             body: bare_pipeline("events"),
             span: Span::EMPTY,
         };
-        match plan(stmt, &catalog) {
+        match plan(stmt, &catalog, 0) {
             Err(BqliteError::Plan(msg)) => {
                 assert!(msg.contains("alias"), "got: {msg}");
             }

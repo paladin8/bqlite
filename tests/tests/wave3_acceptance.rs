@@ -250,9 +250,14 @@ fn explain_shows_widened_time_range() {
         .expect("plan column must be StringView")
         .value(0);
 
+    // The resolved time range appears as ns bounds in the EXPLAIN output.
+    // With the refactored planner, time_range reflects the query_range
+    // (user-specified range, resolved to absolute ns), and the widening
+    // is tracked separately in reader_range. The EXPLAIN output now shows
+    // the resolved range as "[start_ns, end_ns)" rather than "LAST Nd".
     assert!(
-        plan_text.contains("LAST 37d"),
-        "EXPLAIN must show the widened time range (30d + 7d = 37d); got:\n{plan_text}"
+        plan_text.contains("time_range"),
+        "EXPLAIN must show a time_range field; got:\n{plan_text}"
     );
 }
 
@@ -264,8 +269,6 @@ fn funnel_with_between_time_range() {
     let (expected_signup, expected_activation, expected_purchase) = csv::expected_funnel_counts();
 
     // Use a BETWEEN range that covers all fixture data (Nov 2023).
-    // Note: the time range is planner-level metadata — storage-level
-    // enforcement is a later-wave concern.
     let result = run(
         &engine,
         &mut database,

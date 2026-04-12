@@ -27,8 +27,13 @@ pub struct MatchPattern {
     /// Ordered sequence of steps. Empty patterns are rejected by the
     /// planner but the AST does not enforce non-emptiness.
     pub steps: Vec<Step>,
-    /// Match mode: `FIRST`, `ALL`, or `EMIT ALL`.
+    /// Match mode: `FIRST` or `ALL`.
     pub mode: MatchMode,
+    /// Whether `EMIT ALL` was present.
+    ///
+    /// Stored separately from [`MatchMode`] so `MATCH ALL ... EMIT ALL`
+    /// is representable in the AST.
+    pub emit_all: bool,
     /// Optional global time window: `WITHIN 7d` / `WITHIN SESSION`.
     pub window: Option<MatchWindow>,
     /// Optional retention brackets: `BRACKETS [1d, 7d, 30d]`.
@@ -43,8 +48,10 @@ pub enum MatchMode {
     First,
     /// `MATCH ALL` — return every non-overlapping match.
     All,
-    /// `EMIT ALL` — return every possible match including overlaps.
-    /// Used internally when lowering `FUNNEL` to `MATCH`.
+    /// Legacy encoding for `MATCH FIRST ... EMIT ALL`.
+    ///
+    /// New code should prefer `MatchMode::First` with
+    /// [`MatchPattern::emit_all`] set to `true`.
     EmitAll,
 }
 
@@ -181,6 +188,7 @@ mod tests {
         let p = MatchPattern {
             steps: vec![step("view"), step("cart"), step("purchase")],
             mode: MatchMode::First,
+            emit_all: false,
             window: Some(MatchWindow::Within(86_400_000_000_000)),
             brackets: None,
             span: Span::EMPTY,
@@ -233,7 +241,8 @@ mod tests {
     fn pattern_with_cumulative_brackets() {
         let p = MatchPattern {
             steps: vec![step("signup")],
-            mode: MatchMode::EmitAll,
+            mode: MatchMode::First,
+            emit_all: true,
             window: None,
             brackets: Some(BracketSpec {
                 durations: vec![86_400_000_000_000, 7 * 86_400_000_000_000],

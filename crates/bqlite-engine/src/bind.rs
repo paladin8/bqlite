@@ -47,13 +47,18 @@ use arrow::array::{ArrayRef, Int64Array, StringViewBuilder};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::{BqliteError, EntityId, OperatorSchema, Result, SegmentReader};
+use bqlite_core::{
+    BqlType, BqliteError, EntityId, OperatorSchema, PropertyValue, Result, SegmentReader, TimeRange,
+};
 use bqlite_operators::matcher::SequenceMatchState;
 use bqlite_operators::operator::EntityOperator;
 use bqlite_operators::{
     Accumulator, CancellationToken, DistinctOperator, FilterOperator, HashAccumulator,
     HashAggregateOperator, LimitOperator, PhysicalOperator, ProjectOperator, ScanOperator,
     SequenceMatchOperator, SortOperator,
+};
+use bqlite_planner::compiled::{
+    ArrowKernelId, CompareKernel, CompareOp, CompiledExpr, CompiledNode,
 };
 use bqlite_planner::{PhysicalPlan, ScanPhysical, SequenceMatchPhysical};
 use bqlite_storage::Database;
@@ -579,11 +584,14 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
 }
 
 fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOperator>> {
-    // `Database::segment_reader` returns a manifest-backed
-    // `ManifestSegmentReader` (TASK-244) that enumerates live segments
-    // and opens them from disk. We hand it to the scan as an `Arc` so
-    // later waves can share ownership across parallel shard-tasks.
-    let reader_box: Box<dyn SegmentReader> = db.segment_reader(&scan.table)?;
+    let reader_range = scan.reader_range.unwrap_or_else(TimeRange::unbounded);
+
+    // `Database::segment_reader_for_time_range` returns a manifest-backed
+    // `ManifestSegmentReader` that enumerates only live segments that overlap
+    // `reader_range`. We hand it to the scan as an `Arc` so later waves can
+    // share ownership across parallel shard-tasks.
+    let reader_box: Box<dyn SegmentReader> =
+        db.segment_reader_for_time_range(&scan.table, reader_range)?;
     let reader: Arc<dyn SegmentReader> = Arc::from(reader_box);
 
     // Thread the descriptor's projection and pushed predicates into
@@ -594,13 +602,88 @@ fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOpera
     // path. `projected_columns` is empty only for manually constructed
     // `ScanPhysical` descriptors (e.g., unit tests that bypass `plan()`),
     // in which case `ScanOperator::new` falls back to `ColumnProjection::all()`.
+    let mut scan_predicates = scan.scan_predicates.clone();
+    // Keep the widened reader window visible to the scan so later MATCH
+    // steps can complete after the source-range end. Step-0 entry is gated
+    // separately inside the matcher using the source scan's `query_range`.
+    scan_predicates.extend(build_time_range_predicates(scan, reader_range)?);
     let op = ScanOperator::new(
         reader,
         &scan.projected_columns,
-        scan.scan_predicates.clone(),
+        scan_predicates,
         CancellationToken::new(),
     )?;
     Ok(Box::new(op))
+}
+
+/// Build row-level timestamp predicates from a resolved `TimeRange`.
+///
+/// Returns an empty vec for [`TimeRange::unbounded`] so callers can extend
+/// `scan_predicates` unconditionally.
+fn build_time_range_predicates(
+    scan: &ScanPhysical,
+    time_range: TimeRange,
+) -> Result<Vec<CompiledExpr>> {
+    if time_range == TimeRange::unbounded() {
+        return Ok(Vec::new());
+    }
+
+    let (ts_index, _) = scan
+        .output_schema
+        .column(&scan.timestamp_col)
+        .ok_or_else(|| {
+            BqliteError::Schema(format!(
+                "scan bind: timestamp column `{}` missing from output schema",
+                scan.timestamp_col
+            ))
+        })?;
+
+    let timestamp_column = CompiledExpr {
+        node: CompiledNode::Column {
+            index: ts_index,
+            name: scan.timestamp_col.clone(),
+        },
+        result_type: BqlType::Timestamp,
+        nullable: false,
+    };
+
+    Ok(vec![
+        compiled_timestamp_compare(
+            timestamp_column.clone(),
+            CompareOp::GreaterOrEqual,
+            time_range.start.as_nanos(),
+            ArrowKernelId::GeTimestamp,
+        ),
+        compiled_timestamp_compare(
+            timestamp_column,
+            CompareOp::Less,
+            time_range.end.as_nanos(),
+            ArrowKernelId::LtTimestamp,
+        ),
+    ])
+}
+
+/// Build a single compiled timestamp comparison predicate.
+fn compiled_timestamp_compare(
+    column: CompiledExpr,
+    op: CompareOp,
+    literal_ns: i64,
+    kernel: ArrowKernelId,
+) -> CompiledExpr {
+    CompiledExpr {
+        node: CompiledNode::Compare {
+            op,
+            left: Box::new(column),
+            right: Box::new(CompiledExpr {
+                node: CompiledNode::Literal(PropertyValue::Timestamp(literal_ns)),
+                result_type: BqlType::Timestamp,
+                nullable: false,
+            }),
+            kernel: CompareKernel::ArrowKernel(kernel),
+        },
+        result_type: BqlType::Bool,
+        nullable: false,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -660,7 +743,8 @@ mod tests {
     fn bootstrap_scan_descriptor() -> PhysicalPlan {
         PhysicalPlan::Scan(ScanPhysical {
             table: "events".to_string(),
-            time_range: None,
+            query_range: None,
+            reader_range: None,
             scan_predicates: Vec::new(),
             projected_columns: Vec::new(),
             output_schema: OperatorSchema::from_table(&bootstrap_events_schema()),
@@ -735,7 +819,8 @@ mod tests {
         let mut db = create_db_with_bootstrap(scratch.path());
         let descriptor = PhysicalPlan::Scan(ScanPhysical {
             table: "ghost".to_string(),
-            time_range: None,
+            query_range: None,
+            reader_range: None,
             scan_predicates: Vec::new(),
             projected_columns: Vec::new(),
             output_schema: OperatorSchema::from_table(&bootstrap_events_schema()),
@@ -765,7 +850,7 @@ mod tests {
         let stmt = bqlite_parser::parse("events").expect("parse events");
         let physical = {
             let catalog = db.catalog();
-            plan(stmt, &catalog).expect("plan events")
+            plan(stmt, &catalog, 0).expect("plan events")
         };
 
         let mut op = bind_physical(&physical, &mut db).expect("bind succeeds");

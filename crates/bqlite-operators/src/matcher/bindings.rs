@@ -578,6 +578,9 @@ impl NfaSimulator {
             if !check_bindings(&transition.check_variables, &new_bound, binding_cache, row) {
                 continue;
             }
+            if !self.can_start_entry(event_ts) {
+                continue;
+            }
 
             // Build positional key from all variable slots. Variables
             // that bind at later steps are represented as a sentinel

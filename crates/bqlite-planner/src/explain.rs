@@ -19,7 +19,6 @@
 //! these arms prevent panics when an `EXPLAIN` wraps a Wave 3 query.
 
 use bqlite_ast::expr::{BinaryOp, CompareOp, UnaryOp};
-use bqlite_ast::TimeRange;
 use bqlite_core::{AggFunction, PropertyValue};
 
 use crate::compiled::{CompiledExpr, CompiledNode};
@@ -129,7 +128,7 @@ pub fn build_explain_node(plan: &PhysicalPlan) -> ExplainNode {
             };
             ExplainNode::Scan {
                 table: scan.table.clone(),
-                time_range: format_time_range(&scan.time_range),
+                time_range: format_time_range(&scan.query_range),
                 predicates: scan.scan_predicates.iter().map(format_expr).collect(),
                 columns,
             }
@@ -381,23 +380,20 @@ pub fn format_expr(expr: &CompiledExpr) -> String {
     }
 }
 
-/// Format a `TimeRange` for EXPLAIN output. Uses human-readable
-/// duration for `LAST` (e.g., `LAST 30d`) and ISO-8601 strings for
-/// `BETWEEN`.
-fn format_time_range(tr: &Option<TimeRange>) -> String {
+/// Format a resolved `TimeRange` for EXPLAIN output.
+/// Displays the inclusive start and exclusive end as nanosecond epoch values,
+/// e.g. `[1700000000000000000, 1702678400000000000)`.
+/// `None` (unbounded) is rendered as `none`.
+fn format_time_range(tr: &Option<bqlite_core::TimeRange>) -> String {
     match tr {
         None => "none".to_string(),
-        Some(TimeRange::Last(ns)) => {
-            format!("LAST {}", format_duration_ns(*ns))
-        }
-        Some(TimeRange::Between { start, end }) => {
-            format!("BETWEEN '{start}' AND '{end}'")
-        }
+        Some(r) => format!("[{}, {})", r.start.as_nanos(), r.end.as_nanos()),
     }
 }
 
 /// Format nanoseconds as a human-readable duration string. Picks the
 /// largest unit that divides evenly, falling back to nanoseconds.
+#[cfg(test)]
 fn format_duration_ns(ns: i64) -> String {
     const NS_PER_DAY: i64 = 86_400_000_000_000;
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
@@ -682,7 +678,7 @@ mod tests {
         // A bare `FROM events` — projected_columns is empty, so
         // ExplainNode must fall back to the full output schema columns.
         let catalog = TestCatalog::default().with(events_schema());
-        let physical = plan(Statement::Query(bare_pipeline("events")), &catalog).unwrap();
+        let physical = plan(Statement::Query(bare_pipeline("events")), &catalog, 0).unwrap();
         let node = build_explain_node(&physical);
         match node {
             ExplainNode::Scan {
@@ -709,7 +705,7 @@ mod tests {
         // `EXPLAIN events` — the outer Explain wrapper must be stripped
         // so the caller gets the inner pipeline's ExplainNode.
         let catalog = TestCatalog::default().with(events_schema());
-        let physical = plan(Statement::Explain(bare_pipeline("events")), &catalog).unwrap();
+        let physical = plan(Statement::Explain(bare_pipeline("events")), &catalog, 0).unwrap();
         // The physical plan is Explain(Scan(...)). build_explain_node
         // should unwrap to produce Scan, not some Explain node.
         let node = build_explain_node(&physical);
@@ -731,7 +727,7 @@ mod tests {
             }),
             span: Span::EMPTY,
         });
-        let physical = plan(Statement::Query(pipeline), &catalog).unwrap();
+        let physical = plan(Statement::Query(pipeline), &catalog, 0).unwrap();
         let node = build_explain_node(&physical);
         // After pushdown the filter may be elided; either way the
         // predicate string should appear somewhere in the tree.
@@ -750,7 +746,7 @@ mod tests {
             count: 10,
             span: Span::EMPTY,
         });
-        let physical = plan(Statement::Query(pipeline), &catalog).unwrap();
+        let physical = plan(Statement::Query(pipeline), &catalog, 0).unwrap();
         let node = build_explain_node(&physical);
         match node {
             ExplainNode::Limit { count, .. } => assert_eq!(count, 10),
@@ -930,27 +926,13 @@ mod tests {
     }
 
     #[test]
-    fn format_time_range_last_days() {
-        let tr = Some(TimeRange::Last(30 * 86_400_000_000_000));
-        assert_eq!(format_time_range(&tr), "LAST 30d");
-    }
-
-    #[test]
-    fn format_time_range_last_hours() {
-        let tr = Some(TimeRange::Last(12 * 3_600_000_000_000));
-        assert_eq!(format_time_range(&tr), "LAST 12h");
-    }
-
-    #[test]
-    fn format_time_range_between() {
-        let tr = Some(TimeRange::Between {
-            start: "2024-01-01".into(),
-            end: "2024-02-01".into(),
-        });
-        assert_eq!(
-            format_time_range(&tr),
-            "BETWEEN '2024-01-01' AND '2024-02-01'"
-        );
+    fn format_time_range_resolved_shows_bounds() {
+        use bqlite_core::{TimeRange, Timestamp};
+        let tr = Some(TimeRange::new(
+            Timestamp::from_nanos(1_000),
+            Timestamp::from_nanos(5_000),
+        ));
+        assert_eq!(format_time_range(&tr), "[1000, 5000)");
     }
 
     #[test]
@@ -971,18 +953,26 @@ mod tests {
             source: Source {
                 primary: table_ref("events"),
                 joins: vec![],
-                time_range: Some(TimeRange::Last(30 * 86_400_000_000_000)),
+                time_range: Some(bqlite_ast::pipeline::TimeRange::Last(
+                    30 * 86_400_000_000_000,
+                )),
                 span: Span::EMPTY,
             },
             stages: vec![],
             span: Span::EMPTY,
         };
-        let physical = plan(Statement::Explain(pipeline), &cat).expect("plan must succeed");
+        // Pass now_ns=0 so LAST 30d resolves to [-2592000000000000, 0).
+        let physical = plan(Statement::Explain(pipeline), &cat, 0).expect("plan must succeed");
         let node = build_explain_node(&physical);
         let text = format_explain(&node);
+        // The resolved time range should appear as ns bounds.
         assert!(
-            text.contains("LAST 30d"),
-            "EXPLAIN output must show time range; got:\n{text}"
+            text.contains("time_range"),
+            "EXPLAIN output must show time_range; got:\n{text}"
+        );
+        assert!(
+            text.contains("[-"),
+            "EXPLAIN output must show resolved ns range; got:\n{text}"
         );
     }
 
@@ -993,21 +983,26 @@ mod tests {
             source: Source {
                 primary: table_ref("events"),
                 joins: vec![],
-                time_range: Some(TimeRange::Between {
-                    start: "2024-01-01".into(),
-                    end: "2024-02-01".into(),
+                time_range: Some(bqlite_ast::pipeline::TimeRange::Between {
+                    start: "2024-01-01T00:00:00Z".into(),
+                    end: "2024-02-01T00:00:00Z".into(),
                 }),
                 span: Span::EMPTY,
             },
             stages: vec![],
             span: Span::EMPTY,
         };
-        let physical = plan(Statement::Explain(pipeline), &cat).expect("plan must succeed");
+        let physical = plan(Statement::Explain(pipeline), &cat, 0).expect("plan must succeed");
         let node = build_explain_node(&physical);
         let text = format_explain(&node);
+        // The resolved time range should appear as ns bounds.
         assert!(
-            text.contains("BETWEEN '2024-01-01' AND '2024-02-01'"),
-            "EXPLAIN output must show time range; got:\n{text}"
+            text.contains("time_range"),
+            "EXPLAIN output must show time_range; got:\n{text}"
+        );
+        assert!(
+            text.contains('['),
+            "EXPLAIN output must show resolved ns range; got:\n{text}"
         );
     }
 }

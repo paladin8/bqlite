@@ -270,6 +270,33 @@ fn match_all_returns_multiple_non_overlapping() {
 }
 
 #[test]
+fn match_all_repetition_does_not_reuse_consumed_intermediate_event() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup'), \
+         ('u1', 200, 'signup'), \
+         ('u1', 300, 'view'), \
+         ('u1', 400, 'purchase'), \
+         ('u1', 500, 'purchase')",
+    );
+
+    // The first completion consumes signup@100, view@300, purchase@400.
+    // signup@200 must not survive and later complete via purchase@500 by
+    // reusing the already-consumed intermediate view@300.
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH ALL SEQUENCE(signup THEN view+ THEN purchase)",
+    );
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(match_durations(&result), vec![Some(300)]);
+}
+
+#[test]
 fn match_first_stops_after_first() {
     let db = TempDb::new();
     let (mut database, engine) = setup_events(&db);
@@ -412,6 +439,34 @@ fn without_negation_no_poison_event_matches() {
     assert_eq!(match_durations(&result), vec![Some(200)]);
 }
 
+#[test]
+fn without_multiple_exclusions_kills_any_listed_event() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u_match', 100, 'signup'), \
+         ('u_match', 300, 'purchase'), \
+         ('u_refund', 100, 'signup'), \
+         ('u_refund', 200, 'refund'), \
+         ('u_refund', 300, 'purchase'), \
+         ('u_churn', 100, 'signup'), \
+         ('u_churn', 200, 'churn'), \
+         ('u_churn', 300, 'purchase')",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(signup WITHOUT (refund OR churn) THEN purchase)",
+    );
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(entity_ids_sorted(&result), vec!["u_match"]);
+    assert_eq!(match_durations(&result), vec![Some(200)]);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // EMIT ALL (partial matches)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -476,19 +531,42 @@ fn emit_all_two_of_three_steps() {
          ('u1', 200, 'purchase')",
     );
 
-    // Pattern: signup → purchase → checkout. Entity reaches step 2 of 3.
-    // The NFA drains all in-progress candidates at entity end: one at
-    // state 1 (step_reached=1) and one at state 2 (step_reached=2).
-    // This is correct for funnel analysis — each row shows a step the
-    // entity entered.
+    // Pattern: signup → purchase → checkout. FIRST + EMIT ALL surfaces the
+    // farthest partial only, not every live in-flight state.
     let result = run(
         &engine,
         &mut database,
         "events | MATCH FIRST SEQUENCE(signup THEN purchase THEN checkout) EMIT ALL",
     );
-    assert_eq!(total_rows(&result), 2);
+    assert_eq!(total_rows(&result), 1);
     let steps = step_reached_values(&result);
-    assert_eq!(steps, vec![1, 2]);
+    assert_eq!(steps, vec![2]);
+}
+
+#[test]
+fn emit_all_general_nfa_reports_only_farthest_partial() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup'), \
+         ('u1', 200, 'view'), \
+         ('u1', 300, 'view')",
+    );
+
+    // Repetition forces the full NFA path. Even if multiple live NFA states
+    // remain at entity end, FIRST + EMIT ALL must collapse them to the single
+    // farthest partial for the track.
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(signup THEN view+ THEN purchase) EMIT ALL",
+    );
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(step_reached_values(&result), vec![2]);
+    assert_eq!(match_durations(&result), vec![None]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -674,6 +752,58 @@ fn zero_or_more_repetition_zero_occurrences_passes() {
     assert_eq!(total_rows(&result), 1);
 }
 
+#[test]
+fn zero_or_more_repetition_multiple_occurrences_passes() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup'), \
+         ('u1', 200, 'view'), \
+         ('u1', 300, 'view'), \
+         ('u1', 400, 'purchase')",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(signup THEN view* THEN purchase)",
+    );
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(match_durations(&result), vec![Some(300)]);
+}
+
+#[test]
+fn general_nfa_without_negation_kills_match_on_branched_path() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u_match', 100, 'signup'), \
+         ('u_match', 200, 'add_to_cart'), \
+         ('u_match', 300, 'purchase'), \
+         ('u_kill', 100, 'signup'), \
+         ('u_kill', 200, 'view'), \
+         ('u_kill', 250, 'churn'), \
+         ('u_kill', 300, 'purchase')",
+    );
+
+    // Alternation forces the full NFA path. The churn event must still poison
+    // the active branch before purchase.
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(signup THEN (view OR add_to_cart) WITHOUT churn THEN purchase)",
+    );
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(entity_ids_sorted(&result), vec!["u_match"]);
+    assert_eq!(match_durations(&result), vec![Some(200)]);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IMMEDIATELY modifier (consecutive matching)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -790,6 +920,28 @@ fn string_column_values(result: &ExecutionResult, col_name: &str) -> Vec<String>
         }
     }
     vals
+}
+
+/// Collect `(binding_value, step_reached, match_duration)` rows keyed by a
+/// String binding column and sort them by binding value for stable assertions.
+fn binding_step_duration_rows(
+    result: &ExecutionResult,
+    binding_col: &str,
+) -> Vec<(String, i64, Option<i64>)> {
+    let bindings = string_column_values(result, binding_col);
+    let steps = step_reached_values(result);
+    let durations = match_durations(result);
+    assert_eq!(bindings.len(), steps.len());
+    assert_eq!(bindings.len(), durations.len());
+
+    let mut rows: Vec<_> = bindings
+        .into_iter()
+        .zip(steps)
+        .zip(durations)
+        .map(|((binding, step), duration)| (binding, step, duration))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
 }
 
 #[test]
@@ -1159,7 +1311,7 @@ fn empty_table_returns_empty() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn match_all_emit_all_is_parse_error() {
+fn match_all_emit_all_surfaces_completed_and_partial_entries() {
     let db = TempDb::new();
     let (mut database, engine) = setup_events(&db);
     run(
@@ -1168,18 +1320,66 @@ fn match_all_emit_all_is_parse_error() {
         "INSERT INTO events VALUES ('u1', 100, 'signup'), ('u1', 200, 'purchase')",
     );
 
-    // MATCH ALL EMIT ALL is intentionally unsupported — the parser rejects
-    // this combination per query-language.md §4.3 (EMIT ALL only with FIRST).
-    let err = engine
-        .query(
-            "events | MATCH ALL SEQUENCE(signup THEN purchase) EMIT ALL",
-            &mut database,
-        )
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("EMIT"),
-        "error should mention EMIT: {err}"
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH ALL SEQUENCE(signup THEN purchase) EMIT ALL",
     );
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(step_reached_values(&result), vec![2]);
+}
+
+#[test]
+fn match_all_non_overlapping_discards_within_span() {
+    // MATCH ALL is non-overlapping: after signup@100->purchase@300 completes,
+    // scan_from=300. signup@200 (anchor_ts=200 ≤ final_ts=300) is discarded.
+    // purchase@400 finds no surviving anchor, so only one match is produced.
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup'), \
+         ('u1', 200, 'signup'), \
+         ('u1', 300, 'purchase'), \
+         ('u1', 400, 'purchase')",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH ALL SEQUENCE(signup THEN purchase)",
+    );
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(match_durations(&result), vec![Some(200)]);
+}
+
+#[test]
+fn match_all_emit_all_within_span_not_emitted() {
+    // MATCH ALL non-overlapping: signup@100->purchase@300 completes.
+    // signup@200 falls within [100, 300] and is purged — not emitted as a
+    // partial. Only the completion row (step_reached=2) is produced.
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup'), \
+         ('u1', 200, 'signup'), \
+         ('u1', 300, 'purchase')",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH ALL SEQUENCE(signup THEN purchase) EMIT ALL",
+    );
+    assert_eq!(total_rows(&result), 1);
+
+    let steps = step_reached_values(&result);
+    assert_eq!(steps, vec![2]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1209,6 +1409,136 @@ fn time_window_expiry_with_emit_all() {
     assert_eq!(total_rows(&result), 1);
     let steps = step_reached_values(&result);
     assert_eq!(steps, vec![1]);
+}
+
+/// This test verifies that the source `BETWEEN` range gates sequence *entry*
+/// (only events within the window can start a match) while the WITHIN window
+/// still allows the sequence to *complete* after the source range end.
+///
+#[test]
+fn source_time_range_bounds_entry_but_window_can_finish_after_end() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u_before', '2024-01-01T23:00:00Z', 'signup'), \
+         ('u_before', '2024-01-02T12:00:00Z', 'purchase'), \
+         ('u_after', '2024-01-02T12:00:00Z', 'signup'), \
+         ('u_after', '2024-01-03T12:00:00Z', 'purchase'), \
+         ('u_late', '2024-01-03T12:00:00Z', 'signup'), \
+         ('u_late', '2024-01-04T12:00:00Z', 'purchase')",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events BETWEEN '2024-01-02T00:00:00Z' AND '2024-01-03T00:00:00Z' \
+         | MATCH FIRST SEQUENCE(signup THEN purchase) WITHIN 2d",
+    );
+
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(entity_ids_sorted(&result), vec!["u_after"]);
+}
+
+#[test]
+fn source_time_range_bounds_entry_for_general_nfa_patterns() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u_before', '2024-01-01T23:00:00Z', 'signup_mobile'), \
+         ('u_before', '2024-01-02T12:00:00Z', 'purchase'), \
+         ('u_after', '2024-01-02T12:00:00Z', 'signup_web'), \
+         ('u_after', '2024-01-03T12:00:00Z', 'purchase'), \
+         ('u_late', '2024-01-03T12:00:00Z', 'signup_mobile'), \
+         ('u_late', '2024-01-04T12:00:00Z', 'purchase')",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events BETWEEN '2024-01-02T00:00:00Z' AND '2024-01-03T00:00:00Z' \
+         | MATCH FIRST SEQUENCE((signup_web OR signup_mobile) THEN purchase) WITHIN 2d",
+    );
+
+    // The source range still gates sequence entry even when the planner widens
+    // the reader window and the matcher runs the full GeneralNfa path.
+    assert_eq!(total_rows(&result), 1);
+    assert_eq!(entity_ids_sorted(&result), vec!["u_after"]);
+}
+
+#[test]
+fn emit_all_with_bindings_keeps_partial_for_unfinished_track() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup', 'pro', NULL), \
+         ('u1', 200, 'purchase', 'pro', NULL), \
+         ('u1', 300, 'checkout', 'pro', NULL), \
+         ('u1', 400, 'signup', 'free', NULL)",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(\
+             signup WHERE plan = $plan \
+             THEN purchase WHERE plan = $plan \
+             THEN checkout WHERE plan = $plan\
+         ) EMIT ALL",
+    );
+
+    assert_eq!(total_rows(&result), 2);
+    assert_eq!(entity_ids_sorted(&result), vec!["u1", "u1"]);
+    assert_eq!(
+        binding_step_duration_rows(&result, "$plan"),
+        vec![
+            ("free".to_string(), 1, None),
+            ("pro".to_string(), 3, Some(200))
+        ]
+    );
+}
+
+#[test]
+fn emit_all_general_nfa_with_bindings_keeps_partial_for_unfinished_track() {
+    let db = TempDb::new();
+    let (mut database, engine) = setup_events_with_plan(&db);
+    run(
+        &engine,
+        &mut database,
+        "INSERT INTO events VALUES \
+         ('u1', 100, 'signup', 'pro', NULL), \
+         ('u1', 200, 'renew', 'pro', NULL), \
+         ('u1', 300, 'checkout', 'pro', NULL), \
+         ('u1', 400, 'signup', 'free', NULL), \
+         ('u1', 500, 'purchase', 'free', NULL)",
+    );
+
+    let result = run(
+        &engine,
+        &mut database,
+        "events | MATCH FIRST SEQUENCE(\
+             signup WHERE plan = $plan \
+             THEN (purchase OR renew) WHERE plan = $plan \
+             THEN checkout WHERE plan = $plan\
+         ) EMIT ALL",
+    );
+
+    assert_eq!(total_rows(&result), 2);
+    assert_eq!(
+        binding_step_duration_rows(&result, "$plan"),
+        vec![
+            ("free".to_string(), 2, None),
+            ("pro".to_string(), 3, Some(200))
+        ]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

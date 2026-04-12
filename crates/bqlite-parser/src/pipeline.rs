@@ -643,7 +643,6 @@ fn parse_order_item(p: &mut Parser) -> Result<OrderItem, ParseError> {
 /// - Missing `SEQUENCE` after mode → `Expected::Keyword("SEQUENCE")`
 /// - Empty `SEQUENCE()` → `Expected::Keyword("step")`
 /// - Modifier order violations → `Expected::EndOfModifiers`
-/// - `MATCH ALL EMIT ALL` → `Expected::EndOfModifiers` (unsupported, §7.1)
 fn parse_match_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
     // Consume `MATCH` keyword — span anchor (start of the whole stage).
     let match_tok = p.expect_kw(Keyword::Match)?;
@@ -686,7 +685,7 @@ fn parse_match_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
     // Parse optional modifiers in canonical order: WITHIN, BRACKETS, EMIT ALL.
     // `modifier_end` is the span of the last modifier token consumed, or
     // `Span::EMPTY` when no modifiers are present.
-    let (window, brackets, final_mode, modifier_end) = parse_match_modifiers(p, base_mode)?;
+    let (window, brackets, emit_all, modifier_end) = parse_match_modifiers(p, base_mode)?;
 
     // Full stage span: from `MATCH` through the last modifier (or through the
     // closing `)` of SEQUENCE when no modifiers are present).
@@ -696,7 +695,8 @@ fn parse_match_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
 
     let pattern = MatchPattern {
         steps,
-        mode: final_mode,
+        mode: base_mode,
+        emit_all,
         window,
         brackets,
         span,
@@ -1971,11 +1971,11 @@ mod tests {
     }
 
     #[test]
-    fn match_first_emit_all_produces_emit_all_mode() {
-        // `MATCH FIRST … EMIT ALL` → `MatchMode::EmitAll` (§7.1).
+    fn match_first_emit_all_sets_flag() {
         let stmt = parse_stmt("events | MATCH FIRST SEQUENCE(signup THEN purchase) EMIT ALL");
         let pat = match_pattern_of(stages_of(&stmt));
-        assert_eq!(pat.mode, MatchMode::EmitAll);
+        assert_eq!(pat.mode, MatchMode::First);
+        assert!(pat.emit_all);
         assert!(pat.window.is_none());
     }
 
@@ -1983,7 +1983,8 @@ mod tests {
     fn match_first_with_within_and_emit_all() {
         let stmt = parse_stmt("events | MATCH FIRST SEQUENCE(signup) WITHIN 30d EMIT ALL");
         let pat = match_pattern_of(stages_of(&stmt));
-        assert_eq!(pat.mode, MatchMode::EmitAll);
+        assert_eq!(pat.mode, MatchMode::First);
+        assert!(pat.emit_all);
         assert_eq!(
             pat.window,
             Some(MatchWindow::Within(30 * 24 * 3_600_000_000_000))
@@ -1995,22 +1996,15 @@ mod tests {
         let stmt = parse_stmt("events | MATCH ALL SEQUENCE(a THEN b)");
         let pat = match_pattern_of(stages_of(&stmt));
         assert_eq!(pat.mode, MatchMode::All);
+        assert!(!pat.emit_all);
     }
 
     #[test]
-    fn match_all_emit_all_is_error() {
-        // `MATCH ALL … EMIT ALL` is unsupported per pattern-grammar.md §7.1.
-        match crate::parse("events | MATCH ALL SEQUENCE(signup) EMIT ALL") {
-            Err(ParseError::Unexpected {
-                expected, detail, ..
-            }) => {
-                assert_eq!(expected, Expected::EndOfModifiers);
-                assert!(detail
-                    .unwrap_or("")
-                    .contains("MATCH ALL EMIT ALL is not supported"));
-            }
-            other => panic!("expected EndOfModifiers error, got {other:?}"),
-        }
+    fn match_all_emit_all_is_allowed() {
+        let stmt = parse_stmt("events | MATCH ALL SEQUENCE(signup) EMIT ALL");
+        let pat = match_pattern_of(stages_of(&stmt));
+        assert_eq!(pat.mode, MatchMode::All);
+        assert!(pat.emit_all);
     }
 
     #[test]

@@ -564,7 +564,8 @@ mod tests {
         let plan = ExplainPhysical {
             plan: Box::new(PhysicalPlan::Scan(ScanPhysical {
                 table: "events".into(),
-                time_range: None,
+                query_range: None,
+                reader_range: None,
                 scan_predicates: Vec::new(),
                 projected_columns: Vec::new(),
                 output_schema: OperatorSchema::new(vec![

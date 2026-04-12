@@ -357,7 +357,9 @@ For each sub-batch (one row-group, entity-aligned, up to 64K rows):
 
 3. **Match completion handling**: When a candidate reaches the accept state:
    - **MATCH FIRST**: Set an early-exit flag for this track (stop processing events for this track). If single binding track, set entity-level early-exit.
-   - **MATCH ALL**: Reset the track (`scan_from = last_matched_ts`, clear candidates, increment `match_count`).
+   - **MATCH ALL**: Prune candidates that shared the consumed events, set
+     `scan_from = anchor_ts`, increment `match_count`, and keep later
+     unmatched entries alive.
    - In both modes, run the layered extraction hooks (§7.2).
 
 4. **Active-state cap check**: After processing each event, if `active_candidate_count > active_state_limit`, drop oldest candidates from the front of deques until under the limit. Set `cap_exceeded = true`.
@@ -477,10 +479,14 @@ When a candidate reaches the accept state. This is the primary emission point fo
 1. Record `step_reached = num_steps` for this track.
 2. Run layered extraction hooks (§7.2): compute `match_duration` if demanded, extract step properties if demanded, build `match_events` map if demanded.
 3. **MATCH FIRST**: Mark the binding track as completed. No further events are processed for this track.
-4. **MATCH ALL**: Reset the binding track — clear candidate deques, set `scan_from = last_matched_ts`, increment `match_count`. The track restarts scanning for the next match.
+4. **MATCH ALL**: Prune only the candidates that used the consumed events,
+   set `scan_from = anchor_ts`, increment `match_count`, and keep later
+   unmatched entries alive for the next match.
 5. In the fused path, update the accumulator directly. In the non-fused path, buffer the result row for `finish_entity`.
 
-**Event consumption**: At match completion, consume the earliest eligible anchor (sequence-matching.md §4.3). This maximizes the chance of future matches by preserving newer events.
+**Event consumption**: At match completion, consume the earliest eligible
+anchor and the events that participated in that completed sequence
+(sequence-matching.md §4.3). Newer unmatched entries must remain eligible.
 
 ### 6.2 Window Expiry
 
@@ -500,7 +506,11 @@ When `finish_entity()` is called. Handles remaining in-progress candidates.
 
 **What happens**:
 1. **Without EMIT ALL**: Only completed matches (buffered during match completion) are returned. In-progress candidates are silently dropped.
-2. **With EMIT ALL**: All remaining in-progress candidates that haven't expired or completed are emitted with their current `step_reached`. For the fused path, accumulated counts plus these final partials are replayed into the accumulator.
+2. **With EMIT ALL**: Remaining in-progress candidates are normalized to the
+   contract row shape before emission: one farthest partial per binding track
+   for MATCH FIRST, or one farthest partial per surviving step-1 entry for
+   MATCH ALL. For the fused path, accumulated counts plus these final
+   partials are replayed into the accumulator.
 
 ---
 

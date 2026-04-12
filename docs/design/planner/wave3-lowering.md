@@ -49,7 +49,7 @@ populates `fused_downstream` after demand resolves.
 LogicalPlan::SequenceMatch {
     pattern: SequencePattern,        // converted from MatchPattern
     mode: MatchMode,                 // FIRST | ALL (from pattern.mode)
-    emit_all: bool,                  // true when pattern.mode == EmitAll
+    emit_all: bool,                  // copied from pattern.emit_all
     window: Option<MatchWindowSpec>,  // lowered from MatchWindow; see SS2.1.1
     brackets: Option<BracketSpec>,   // always None in Wave 3; populated by RETENTION desugaring in Wave 4
     step_properties: Vec<StepPropertyRef>, // initially empty; filled by demand analysis (Pass 4)
@@ -67,7 +67,7 @@ The planner converts the AST `MatchPattern` into a planner-owned
 | AST field | Planner field | Transformation |
 |---|---|---|
 | `pattern.steps: Vec<Step>` | `SequencePattern.steps` | Each step's event type validated against the catalog; predicates type-checked via `type_check(expr, step_event_schema)` |
-| `pattern.mode: MatchMode` | `mode`, `emit_all` | `MatchMode::First` -> `(First, false)`, `MatchMode::All` -> `(All, false)`, `MatchMode::EmitAll` -> `(First, true)` |
+| `pattern.mode: MatchMode`, `pattern.emit_all: bool` | `mode`, `emit_all` | `mode` lowers directly; `emit_all` is copied unchanged |
 | `pattern.window` | `window` | `MatchWindow::Within(ns)` -> `Some(MatchWindowSpec::Duration(ns))`, `MatchWindow::WithinSession` -> `Some(MatchWindowSpec::Session)`, `None` -> `None` |
 | `pattern.brackets` | `brackets` | `None` in Wave 3. RETENTION desugaring (Wave 4) will populate this; the field is carried as `Option<BracketSpec>` for forward compatibility. When populated, durations are validated for monotonically increasing order. |
 | `step.name: Option<Name>` | step name table | Recorded for step-property resolution in SS2.1.3 |
@@ -114,19 +114,19 @@ for the pattern compiler to resolve during TASK-311.
 
 #### 2.1.2 MatchMode Mapping
 
-The AST `MatchMode` enum has three variants; the logical plan separates
-these into two orthogonal fields:
+The logical plan carries match mode and `emit_all` as two orthogonal fields:
 
-| AST `MatchMode` | Logical `mode` | Logical `emit_all` | Semantics |
+| AST fields | Logical `mode` | Logical `emit_all` | Semantics |
 |---|---|---|---|
-| `First` | `MatchMode::First` | `false` | One match per entity (earliest) |
-| `All` | `MatchMode::All` | `false` | All non-overlapping matches per entity |
-| `EmitAll` | `MatchMode::First` | `true` | One row per entity regardless of completion; `step_reached` column present |
+| `mode = First`, `emit_all = false` | `MatchMode::First` | `false` | One match per entity (earliest) |
+| `mode = All`, `emit_all = false` | `MatchMode::All` | `false` | All non-overlapping matches per entity |
+| `mode = First`, `emit_all = true` | `MatchMode::First` | `true` | One row per entity regardless of completion; `step_reached` column present |
+| `mode = All`, `emit_all = true` | `MatchMode::All` | `true` | One row per step-1 entry; `step_reached` column present |
 
-`EmitAll` is the mode used by FUNNEL and RETENTION desugaring
-(planner-pipeline.md SS4.3). When `emit_all` is true, every entity that
-enters the MATCH emits exactly one output row, with `step_reached`
-indicating how far through the pattern the entity progressed (1-indexed).
+FUNNEL and RETENTION desugaring use `mode = First, emit_all = true`
+(planner-pipeline.md SS4.3). When `emit_all` is true, MATCH emits partial
+progress rows with `step_reached` indicating how far through the pattern the
+entity or entry progressed (1-indexed).
 
 #### 2.1.3 Output Schema Computation
 

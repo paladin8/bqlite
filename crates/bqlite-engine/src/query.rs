@@ -159,8 +159,22 @@ impl Engine {
         // 2. Plan. The database's `ManifestCatalog<'_>` implements
         //    `Catalog`, and the planner only needs a `&dyn Catalog` —
         //    the borrow lives only for this call.
+        //
+        //    Read the current time once here so `LAST <dur>` time ranges are
+        //    resolved to the same instant throughout the entire query.
+        let now_ns = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| {
+                    BqliteError::Execution(format!("system clock before Unix epoch: {e}"))
+                })?
+                .as_nanos()
+                .try_into()
+                .unwrap_or(i64::MAX)
+        };
         let catalog = db.catalog();
-        let physical = bqlite_planner::plan(statement, &catalog)?;
+        let physical = bqlite_planner::plan(statement, &catalog, now_ns)?;
 
         // Snapshot the root schema *before* binding. Binding consumes
         // the descriptor via `bind_physical` (by reference for Wave 1),

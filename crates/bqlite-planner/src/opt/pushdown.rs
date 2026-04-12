@@ -288,7 +288,8 @@ mod tests {
     fn make_scan() -> ScanPhysical {
         ScanPhysical {
             table: "events".into(),
-            time_range: None,
+            query_range: None,
+            reader_range: None,
             scan_predicates: vec![],
             projected_columns: vec![],
             output_schema: empty_schema(),

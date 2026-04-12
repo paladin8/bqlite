@@ -440,7 +440,8 @@ mod tests {
     fn minimal_scan() -> PhysicalPlan {
         PhysicalPlan::Scan(ScanPhysical {
             table: "events".into(),
-            time_range: None,
+            query_range: None,
+            reader_range: None,
             scan_predicates: vec![],
             projected_columns: vec![],
             output_schema: scan_schema(),

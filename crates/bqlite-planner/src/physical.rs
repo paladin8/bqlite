@@ -47,7 +47,6 @@
 //!   extensibility point; later waves extend it without renaming the
 //!   Wave 2 variants.
 
-use bqlite_ast::pipeline::TimeRange;
 use bqlite_core::{AggFunction, ColumnDef, OperatorSchema, TableSchema};
 
 use crate::compile::{CompiledNfa, MatchExecutionConfig, MatchStrategy};
@@ -185,11 +184,15 @@ impl PhysicalPlan {
 pub struct ScanPhysical {
     /// Catalog name of the table being scanned.
     pub table: String,
-    /// Optional `LAST <dur>` / `BETWEEN <ts> AND <ts>` range from the
-    /// logical source. May be widened by the planner's scan-extension
-    /// pass (planner-pipeline.md §4.4) when a downstream MATCH has a
-    /// WITHIN window.
-    pub time_range: Option<TimeRange>,
+    /// User-specified time range, resolved to absolute nanosecond bounds
+    /// with `now_ns`. `None` means the user did not specify a range
+    /// (unbounded). Used for row-level timestamp predicates.
+    pub query_range: Option<bqlite_core::TimeRange>,
+    /// Segment-reader window: `query_range` extended by
+    /// `reader_backward_ns` / `reader_forward_ns` from the logical plan.
+    /// Equals `query_range` when no extension applies.
+    /// `None` only when `query_range` is `None`.
+    pub reader_range: Option<bqlite_core::TimeRange>,
     /// Scan-level predicates populated by the predicate-pushdown pass
     /// (TASK-227). Empty at lowering time; TASK-227 rewrites
     /// `FilterPhysical`-above-`ScanPhysical` patterns to move pushable
@@ -534,6 +537,71 @@ pub struct DistinctPhysical {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Time-range resolution helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve an AST time-range (still carrying string timestamps or relative
+/// nanosecond durations) into an absolute [`bqlite_core::TimeRange`] using
+/// `now_ns` as the current time.
+///
+/// Returns `None` when `tr` is `None` (unbounded scan).
+fn resolve_ast_time_range(
+    tr: Option<&bqlite_ast::pipeline::TimeRange>,
+    now_ns: i64,
+) -> bqlite_core::Result<Option<bqlite_core::TimeRange>> {
+    use bqlite_ast::pipeline::TimeRange as AstTr;
+    use bqlite_core::{TimeRange, Timestamp};
+    let Some(tr) = tr else { return Ok(None) };
+    match tr {
+        AstTr::Last(ns) => {
+            let end = Timestamp::from_nanos(now_ns);
+            let start = end.checked_sub_nanos(*ns).unwrap_or(Timestamp::MIN);
+            Ok(Some(TimeRange::new(start, end)))
+        }
+        AstTr::Between { start, end } => {
+            let start_ts = parse_time_range_ts(start)?;
+            let end_ts = parse_time_range_ts(end)?;
+            let exclusive_end = end_ts.checked_add_nanos(1).unwrap_or(Timestamp::MAX);
+            Ok(Some(TimeRange::new(start_ts, exclusive_end)))
+        }
+    }
+}
+
+/// Parse an RFC 3339 timestamp string into a [`bqlite_core::Timestamp`].
+fn parse_time_range_ts(raw: &str) -> bqlite_core::Result<bqlite_core::Timestamp> {
+    use bqlite_core::{BqlType, BqliteError, PropertyValue, Timestamp};
+    match PropertyValue::String(raw.to_string()).coerce_to(&BqlType::Timestamp) {
+        Some(PropertyValue::Timestamp(ns)) => Ok(Timestamp::from_nanos(ns)),
+        _ => Err(BqliteError::Plan(format!(
+            "`{raw}` is not a valid RFC 3339 timestamp"
+        ))),
+    }
+}
+
+/// Apply reader extension to a base [`bqlite_core::TimeRange`], returning
+/// a widened range (or `None` when the base is `None`).
+fn apply_reader_extension(
+    base: Option<bqlite_core::TimeRange>,
+    backward_ns: i64,
+    forward_ns: i64,
+) -> Option<bqlite_core::TimeRange> {
+    use bqlite_core::{TimeRange, Timestamp};
+    let r = base?;
+    if backward_ns == 0 && forward_ns == 0 {
+        return Some(r);
+    }
+    let new_start = r
+        .start
+        .checked_sub_nanos(backward_ns)
+        .unwrap_or(Timestamp::MIN);
+    let new_end = r
+        .end
+        .checked_add_nanos(forward_ns)
+        .unwrap_or(Timestamp::MAX);
+    Some(TimeRange::new(new_start, new_end))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Logical → physical lowering
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -545,11 +613,17 @@ pub struct DistinctPhysical {
 /// invariant (see `docs/design/planner/logical-plan-nodes.md` §4),
 /// so this function only needs to swap expression types and reshape
 /// a few fields.
-pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
+///
+/// `now_ns` is the current Unix epoch in nanoseconds, used to resolve
+/// `LAST <dur>` time ranges into absolute `[start, end)` bounds.
+/// Pass `0` in tests that do not exercise time ranges.
+pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
     match plan {
         LogicalPlan::Scan {
             table,
             time_range,
+            reader_backward_ns,
+            reader_forward_ns,
             joined_tables,
             scan_predicates,
             projected_columns,
@@ -576,9 +650,18 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                 .iter()
                 .map(CompiledExpr::from_typed)
                 .collect();
+            let query_range =
+                resolve_ast_time_range(time_range.as_ref(), now_ns).unwrap_or_else(|e| {
+                    panic!(
+                        "time range validation failed (logical phase should have caught this): {e}"
+                    )
+                });
+            let reader_range =
+                apply_reader_extension(query_range, reader_backward_ns, reader_forward_ns);
             PhysicalPlan::Scan(ScanPhysical {
                 table: table.name().to_string(),
-                time_range,
+                query_range,
+                reader_range,
                 scan_predicates: compiled_predicates,
                 projected_columns,
                 output_schema,
@@ -593,7 +676,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
             output_schema,
         } => {
             let compiled = CompiledExpr::from_typed(&predicate);
-            let child = lower_physical(*input);
+            let child = lower_physical(*input, now_ns);
             PhysicalPlan::Filter(FilterPhysical {
                 predicate: compiled,
                 input: Box::new(child),
@@ -614,7 +697,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                     output_name,
                 })
                 .collect();
-            let child = lower_physical(*input);
+            let child = lower_physical(*input, now_ns);
             PhysicalPlan::Project(ProjectPhysical {
                 expressions: compiled_items,
                 input: Box::new(child),
@@ -627,7 +710,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
             input,
             output_schema,
         } => {
-            let child = lower_physical(*input);
+            let child = lower_physical(*input, now_ns);
             PhysicalPlan::Limit(LimitPhysical {
                 count,
                 input: Box::new(child),
@@ -691,7 +774,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
             plan,
             output_schema,
         } => {
-            let child = lower_physical(*plan);
+            let child = lower_physical(*plan, now_ns);
             PhysicalPlan::Explain(ExplainPhysical {
                 plan: Box::new(child),
                 output_schema,
@@ -740,8 +823,11 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
             };
 
             let execution_config = MatchExecutionConfig {
-                track_match_duration: demand.needs_match_detail,
-                track_match_events: demand.needs_match_detail,
+                track_match_duration: output_schema.column("match_duration").is_some(),
+                // `match_events` is still materialized as a typed NULL column.
+                // Until real trace tracking lands, it should not force the
+                // general NFA path for otherwise-linear patterns.
+                track_match_events: false,
             };
 
             // Select strategy based on pattern class and demand.
@@ -777,7 +863,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                     max_groups: DEFAULT_MAX_GROUPS,
                 });
 
-            let child = lower_physical(*input);
+            let child = lower_physical(*input, now_ns);
             let match_all = mode == bqlite_ast::pattern::MatchMode::All;
 
             PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
@@ -823,7 +909,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                 .map(|(expr, name)| (CompiledExpr::from_typed(expr), name.clone()))
                 .collect();
 
-            let child = lower_physical(*input);
+            let child = lower_physical(*input, now_ns);
             PhysicalPlan::Aggregate(AggregatePhysical {
                 aggregates: compiled_aggs,
                 group_by: compiled_group_by,
@@ -844,7 +930,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                 .map(|(expr, dir)| (CompiledExpr::from_typed(expr), *dir))
                 .collect();
 
-            let child = lower_physical(*input);
+            let child = lower_physical(*input, now_ns);
             PhysicalPlan::Sort(SortPhysical {
                 keys: compiled_keys,
                 max_rows: DEFAULT_SORT_MAX_ROWS,
@@ -857,7 +943,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
             input,
             output_schema,
         } => {
-            let child = lower_physical(*input);
+            let child = lower_physical(*input, now_ns);
             PhysicalPlan::Distinct(DistinctPhysical {
                 max_groups: DEFAULT_MAX_GROUPS,
                 input: Box::new(child),
@@ -976,7 +1062,7 @@ mod tests {
     /// Mirrors the compiler pipeline the `plan()` entry point uses.
     fn plan_physical(stmt: Statement, catalog: &dyn Catalog) -> PhysicalPlan {
         let logical = lower_statement(stmt, catalog).expect("logical lowering must succeed");
-        lower_physical(logical)
+        lower_physical(logical, 0)
     }
 
     // ── ScanPhysical ────────────────────────────────────────────────
@@ -990,7 +1076,8 @@ mod tests {
         match physical {
             PhysicalPlan::Scan(scan) => {
                 assert_eq!(scan.table, "events");
-                assert!(scan.time_range.is_none());
+                assert!(scan.query_range.is_none());
+                assert!(scan.reader_range.is_none());
                 assert!(
                     scan.scan_predicates.is_empty(),
                     "lowering produces an empty predicate list; TASK-227 \
@@ -1066,7 +1153,8 @@ mod tests {
         // Build a trivial filter directly to exercise `FilterPhysical::new`.
         let scan = PhysicalPlan::Scan(ScanPhysical {
             table: "events".into(),
-            time_range: None,
+            query_range: None,
+            reader_range: None,
             scan_predicates: Vec::new(),
             projected_columns: Vec::new(),
             output_schema: OperatorSchema::from_table(&events_schema()),
@@ -1389,7 +1477,7 @@ mod tests {
         let stmt = Statement::Query(bare_pipeline("events"));
         let logical = lower_statement(stmt, &catalog).expect("logical");
         let expected = logical.output_schema().clone();
-        let physical = lower_physical(logical);
+        let physical = lower_physical(logical, 0);
         assert_eq!(physical.output_schema(), &expected);
     }
 
@@ -1412,7 +1500,7 @@ mod tests {
             span: Span::EMPTY,
         });
         let stmt = Statement::Query(pipeline);
-        let physical = crate::plan(stmt, &catalog).expect("plan");
+        let physical = crate::plan(stmt, &catalog, 0).expect("plan");
 
         let PhysicalPlan::Aggregate(agg) = physical else {
             panic!("expected Aggregate, got {physical:?}");
@@ -1448,7 +1536,7 @@ mod tests {
             span: Span::EMPTY,
         });
         let stmt = Statement::Query(pipeline);
-        let physical = crate::plan(stmt, &catalog).expect("plan");
+        let physical = crate::plan(stmt, &catalog, 0).expect("plan");
 
         let PhysicalPlan::Aggregate(agg) = physical else {
             panic!("expected Aggregate, got {physical:?}");
@@ -1484,7 +1572,7 @@ mod tests {
             span: Span::EMPTY,
         });
         let stmt = Statement::Query(pipeline);
-        let physical = crate::plan(stmt, &catalog).expect("plan");
+        let physical = crate::plan(stmt, &catalog, 0).expect("plan");
 
         let PhysicalPlan::Sort(sort) = physical else {
             panic!("expected Sort, got {physical:?}");
@@ -1512,7 +1600,7 @@ mod tests {
             span: Span::EMPTY,
         });
         let stmt = Statement::Query(pipeline);
-        let physical = crate::plan(stmt, &catalog).expect("plan");
+        let physical = crate::plan(stmt, &catalog, 0).expect("plan");
 
         let PhysicalPlan::Distinct(distinct) = physical else {
             panic!("expected Distinct, got {physical:?}");

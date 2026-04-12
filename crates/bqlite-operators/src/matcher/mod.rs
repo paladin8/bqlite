@@ -26,12 +26,15 @@ pub mod nfa;
 pub mod output;
 pub mod step_counter;
 
+use std::collections::{HashMap, HashSet};
+
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::{BqlType, ColumnDef, EntityId, OperatorSchema};
+use bqlite_core::{BqlType, ColumnDef, EntityId, OperatorSchema, TimeRange};
 use bqlite_planner::compile::{CompiledNfa, MatchStrategy};
 use bqlite_planner::demand::CompiledFusableAggregate;
 use bqlite_planner::physical::SequenceMatchPhysical;
+use bqlite_planner::PhysicalPlan;
 
 use crate::aggregate::Accumulator;
 use crate::operator::EntityOperator;
@@ -108,6 +111,7 @@ impl SequenceMatchOperator {
         let emit_all = desc.compiled_nfa.emit_all;
         let num_steps = desc.compiled_nfa.accept_state as u8;
         let num_variables = desc.compiled_nfa.variable_bindings.len();
+        let entry_range = Self::source_entry_range(&desc.input);
 
         // Build required column names from the NFA's relevant event types
         // and variable bindings. At minimum we need entity_id, ts, event_type.
@@ -128,6 +132,7 @@ impl SequenceMatchOperator {
             desc.strategy,
             &desc.execution_config,
             match_all,
+            entry_range,
         );
 
         // When fused, `desc.output_schema` has been replaced with the
@@ -180,7 +185,8 @@ impl SequenceMatchOperator {
             }
         }
 
-        let strategy = Self::build_strategy(compiled_nfa, strategy_kind, &exec_config, match_all);
+        let strategy =
+            Self::build_strategy(compiled_nfa, strategy_kind, &exec_config, match_all, None);
 
         Self {
             strategy,
@@ -200,22 +206,46 @@ impl SequenceMatchOperator {
         strategy_kind: MatchStrategy,
         _exec_config: &bqlite_planner::compile::MatchExecutionConfig,
         match_all: bool,
+        entry_range: Option<TimeRange>,
     ) -> StrategyDriver {
         match strategy_kind {
-            MatchStrategy::StepCounter => {
-                StrategyDriver::StepCounter(StepCounterSimulator::new(compiled_nfa, match_all))
-            }
+            MatchStrategy::StepCounter => StrategyDriver::StepCounter(
+                StepCounterSimulator::new(compiled_nfa, match_all).with_entry_range(entry_range),
+            ),
             MatchStrategy::ConsecutiveMatcher => {
                 // ConsecutiveMatcher uses the step counter with the same
                 // interface — the consecutive constraint is encoded in the
                 // NFA transitions (IMMEDIATELY transitions require
                 // `last_step_ts + 1 == event_ts`). For now, route through
                 // the step counter.
-                StrategyDriver::StepCounter(StepCounterSimulator::new(compiled_nfa, match_all))
+                StrategyDriver::StepCounter(
+                    StepCounterSimulator::new(compiled_nfa, match_all)
+                        .with_entry_range(entry_range),
+                )
             }
-            MatchStrategy::FullNfa => {
-                StrategyDriver::Nfa(NfaSimulator::new(compiled_nfa, match_all))
-            }
+            MatchStrategy::FullNfa => StrategyDriver::Nfa(
+                NfaSimulator::new(compiled_nfa, match_all).with_entry_range(entry_range),
+            ),
+        }
+    }
+
+    /// Discover the source time range that gates sequence entry.
+    ///
+    /// The scan may read a widened `reader_range` so already-entered
+    /// sequences can finish after the source-range end, but only
+    /// step-0 events inside the original scan `query_range` may start
+    /// a new sequence.
+    fn source_entry_range(plan: &PhysicalPlan) -> Option<TimeRange> {
+        match plan {
+            PhysicalPlan::Scan(scan) => scan.query_range,
+            PhysicalPlan::Filter(node) => Self::source_entry_range(&node.input),
+            PhysicalPlan::Project(node) => Self::source_entry_range(&node.input),
+            PhysicalPlan::Limit(node) => Self::source_entry_range(&node.input),
+            PhysicalPlan::SequenceMatch(node) => Self::source_entry_range(&node.input),
+            PhysicalPlan::Aggregate(node) => Self::source_entry_range(&node.input),
+            PhysicalPlan::Sort(node) => Self::source_entry_range(&node.input),
+            PhysicalPlan::Distinct(node) => Self::source_entry_range(&node.input),
+            _ => None,
         }
     }
 
@@ -381,7 +411,7 @@ impl SequenceMatchOperator {
         &self,
         state: SequenceMatchState,
     ) -> (Vec<MatchCompletion>, Vec<PartialMatch>, u64) {
-        match (state, &self.strategy) {
+        let (mut completions, mut partials, dropped) = match (state, &self.strategy) {
             (SequenceMatchState::StepCounter(mut sc_state), StrategyDriver::StepCounter(sim)) => {
                 sim.finish_entity(&mut sc_state);
                 let completions = sc_state.completions().to_vec();
@@ -449,7 +479,80 @@ impl SequenceMatchOperator {
                 debug_assert!(false, "state/strategy variant mismatch");
                 (Vec::new(), Vec::new(), 0)
             }
+        };
+
+        self.normalize_emit_all_rows(&mut completions, &mut partials);
+        (completions, partials, dropped)
+    }
+
+    fn normalize_emit_all_rows(
+        &self,
+        completions: &mut [MatchCompletion],
+        partials: &mut Vec<PartialMatch>,
+    ) {
+        if !self.emit_all {
+            partials.clear();
+            return;
         }
+
+        if self.match_all {
+            let completion_keys: HashSet<_> = completions
+                .iter()
+                .map(|c| (c.bindings.clone(), c.anchor_ts))
+                .collect();
+            let mut best_by_entry: HashMap<(Vec<BindingValue>, i64), PartialMatch> = HashMap::new();
+
+            for partial in partials.drain(..) {
+                let key = (partial.bindings.clone(), partial.anchor_ts);
+                if completion_keys.contains(&key) {
+                    continue;
+                }
+                match best_by_entry.get_mut(&key) {
+                    Some(existing) if partial.step_reached > existing.step_reached => {
+                        *existing = partial;
+                    }
+                    None => {
+                        best_by_entry.insert(key, partial);
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut normalized: Vec<_> = best_by_entry.into_values().collect();
+            normalized.sort_by_key(|p| (p.anchor_ts, p.step_reached));
+            *partials = normalized;
+            return;
+        }
+
+        // MATCH FIRST + EMIT ALL returns exactly one row per binding track:
+        // a completion if one exists, otherwise the farthest partial.
+        let completed_bindings: HashSet<_> =
+            completions.iter().map(|c| c.bindings.clone()).collect();
+
+        let mut best_by_binding: HashMap<Vec<BindingValue>, PartialMatch> = HashMap::new();
+        for partial in partials.drain(..) {
+            let key = partial.bindings.clone();
+            if completed_bindings.contains(&key) {
+                continue;
+            }
+            match best_by_binding.get_mut(&key) {
+                Some(existing)
+                    if partial.step_reached > existing.step_reached
+                        || (partial.step_reached == existing.step_reached
+                            && partial.anchor_ts < existing.anchor_ts) =>
+                {
+                    *existing = partial;
+                }
+                None => {
+                    best_by_binding.insert(key, partial);
+                }
+                _ => {}
+            }
+        }
+
+        let mut normalized: Vec<_> = best_by_binding.into_values().collect();
+        normalized.sort_by_key(|p| (p.anchor_ts, p.step_reached));
+        *partials = normalized;
     }
 }
 
@@ -696,6 +799,33 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         // step_reached is 1-indexed: reaching step 2 of 3 → step_reached = 2.
+        assert_eq!(steps.value(0), 2);
+    }
+
+    #[test]
+    fn emit_all_nfa_path_keeps_only_farthest_partial() {
+        let mut nfa = linear_nfa(&["signup", "purchase", "activate"]);
+        nfa.pattern_class = bqlite_planner::compile::PatternClass::GeneralNfa;
+        nfa.emit_all = true;
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, emit_all_schema());
+
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+
+        let batch = make_batch(&[("signup", 100), ("purchase", 200)]);
+        op.process_sub_batch(&mut state, &batch);
+
+        let result = op.finish_entity(state);
+        assert!(result.is_some());
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let steps = batch
+            .column_by_name("step_reached")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(steps.value(0), 2);
     }
 

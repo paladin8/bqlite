@@ -148,6 +148,37 @@ fn nfa_a_then_b_without_c(window: Option<i64>) -> CompiledNfa {
     }
 }
 
+/// Build a 3-step general NFA: A THEN B+ THEN C, with optional window.
+fn nfa_a_then_b_plus_then_c(window: Option<i64>) -> CompiledNfa {
+    CompiledNfa {
+        states: vec![
+            NfaState {
+                transitions: vec![simple_transition("A", 1)],
+                poison_transitions: vec![],
+            },
+            NfaState {
+                transitions: vec![simple_transition("B", 2)],
+                poison_transitions: vec![],
+            },
+            NfaState {
+                transitions: vec![simple_transition("B", 2), simple_transition("C", 3)],
+                poison_transitions: vec![],
+            },
+            NfaState {
+                transitions: vec![],
+                poison_transitions: vec![],
+            },
+        ],
+        accept_state: 3,
+        relevant_event_types: BTreeSet::from(["A".to_string(), "B".to_string(), "C".to_string()]),
+        pattern_class: PatternClass::GeneralNfa,
+        variable_bindings: vec![],
+        global_window: window,
+        emit_all: false,
+        state_to_step: vec![0, 1, 2, 3],
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Brute-force reference evaluator for "A THEN B" with optional window
 // ─────────────────────────────────────────────────────────────────────────────
@@ -441,7 +472,7 @@ proptest! {
 // ─────────────────────────────────────────────────────────────────────────────
 
 proptest! {
-    /// MATCH ALL: every completed match has anchor_ts strictly less than
+    /// MATCH ALL: every completed match has final_ts strictly less than
     /// the next match's anchor_ts (matches are non-overlapping and
     /// ordered).
     #[test]
@@ -484,6 +515,28 @@ proptest! {
             prop_assert!(pair[0].anchor_ts < pair[1].anchor_ts,
                 "Non-monotonic anchors: {:?} and {:?}.\nEvents: {:?}",
                 pair[0], pair[1], events);
+        }
+    }
+
+    /// General-NFA MATCH ALL must remain non-overlapping even with repetition.
+    /// This guards the full simulator path used for patterns like `A THEN B+ THEN C`.
+    #[test]
+    fn prop_general_nfa_match_all_non_overlapping_repetition(
+        events in arb_event_stream(&["A", "B", "C", "X"], 20),
+        window in arb_window(),
+    ) {
+        let nfa = nfa_a_then_b_plus_then_c(window);
+        let sim = NfaSimulator::new(nfa, true);
+        let mut state = sim.create_state();
+
+        let batch = make_batch(&events);
+        sim.process_batch(&mut state, &batch, "event_type", "ts");
+
+        let completions = state.completions();
+        for pair in completions.windows(2) {
+            prop_assert!(pair[0].final_ts < pair[1].anchor_ts,
+                "Overlapping general-NFA matches: {:?} and {:?}.\nEvents: {:?}\nWindow: {:?}",
+                pair[0], pair[1], events, window);
         }
     }
 }
