@@ -645,18 +645,26 @@ passes that run in sequence per planner-pipeline.md SS6.2:
 1. **Pass 4 (demand propagation)** resolves which columns each node
    needs and records step-property demand on `SequenceMatch` nodes.
 2. **Pass 6 (fusion detection -- TASK-320)** examines
-   `SequenceMatch -> (Filter ->) Aggregate` chains and, if eligible,
-   populates `fused_downstream` on the `SequenceMatch` node and removes
-   the intermediate `Filter` and `Aggregate` nodes.
+   `SequenceMatch -> Aggregate` chains and, if eligible, populates
+   `fused_aggregate` on the `SequenceMatchPhysical` descriptor and
+   removes the `Aggregate` node.
 
 The separation ensures that demand is fully resolved before fusion
 decisions are made. Fusion eligibility depends on knowing which columns
 the aggregate references, which is only available after Pass 4 has
 collected demand.
 
+**Implementation note (TASK-320 Wave 3 scope).** Pass 6 operates on
+the physical plan after logical→physical lowering, directly setting
+`SequenceMatchPhysical.fused_aggregate`. The logical plan's
+`SequenceMatch.fused_downstream` field is not set by this pass —
+it remains `None` and the physical lowering's `fused_downstream.map(...)`
+arm is a forward-compat path for a possible future logical-level fusion
+optimizer.
+
 ### 4.2 Fusion Eligibility Summary
 
-Per planner-pipeline.md SS7.2, fusion requires:
+Per planner-pipeline.md SS7.2, full fusion requires:
 
 1. **Adjacency.** `SequenceMatch` and `Aggregate` are adjacent (or
    separated by a single `Filter`).
@@ -669,27 +677,24 @@ Per planner-pipeline.md SS7.2, fusion requires:
 4. **No ordering dependency.** No `Sort` between the `SequenceMatch`
    and the `Aggregate`.
 
-When all conditions are met, TASK-320 constructs:
+**TASK-320 Wave 3 implements direct-adjacency fusion only.**
+When `Aggregate` is immediately above `SequenceMatch` (no intermediate
+node) and conditions 2–4 hold, the pass constructs a
+`CompiledFusableAggregate` from the `AggregatePhysical` descriptor and
+sets it on `SequenceMatchPhysical.fused_aggregate`. The `Aggregate` node
+is removed.
 
-```rust
-FusedDownstream::Aggregate(FusableAggregate {
-    functions: Vec<AggFunction>,
-    arguments: Vec<TypedExpr>,
-    group_by: Vec<TypedExpr>,
-    output_names: Vec<String>,
-})
-```
+The `Filter`-separated pattern (`Aggregate(Filter(SequenceMatch(...)))`),
+which planner-pipeline.md §7.2 calls `FilterThenAggregate`, is not fused
+in Wave 3. A `Filter` between the `Aggregate` and `SequenceMatch` blocks
+fusion — the plan tree is left unchanged and both nodes remain. This is
+a deliberate conservative choice: the `CompiledFusableAggregate` type
+would need a `fused_filter: Option<CompiledExpr>` field and the
+`SequenceMatchOperator` (TASK-321) would need to evaluate it at entity
+boundary. This complexity is deferred to a follow-up task. The
+`DemandSet.fused_filter` field is reserved for this purpose.
 
-or, if a `Filter` is present:
-
-```rust
-FusedDownstream::FilterThenAggregate {
-    filter: TypedExpr,
-    aggregate: FusableAggregate,
-}
-```
-
-The `Filter` and `Aggregate` nodes are removed from the plan tree.
+The `Aggregate` node is removed from the plan tree when fusion occurs.
 
 ### 4.3 Post-Fusion Demand Update
 

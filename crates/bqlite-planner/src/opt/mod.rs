@@ -19,11 +19,19 @@
 //! | Helper | Module | Task |
 //! |--------|--------|------|
 //! | FUNNEL desugaring | [`desugar_funnel`] | TASK-319 |
+//!
+//! ## Wave 3 passes
+//!
+//! | Pass | Module | Task |
+//! |------|--------|------|
+//! | Match-aggregate fusion | [`fuse_match_aggregate`] | TASK-320 |
 
 pub mod desugar_funnel;
+pub mod fuse_match_aggregate;
 pub mod prune;
 pub mod pushdown;
 
 pub use desugar_funnel::desugar_funnel;
+pub use fuse_match_aggregate::fuse_match_aggregate;
 pub use prune::prune_columns;
 pub use pushdown::pushdown_predicates;

@@ -743,6 +743,12 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                 crate::compile::select_strategy(compiled_nfa.pattern_class, &execution_config);
 
             // Compile fused downstream aggregate if present (TASK-320).
+            // `FusableAggregate` (logical form) does not carry `max_groups`
+            // because fusion via the logical path is not yet exercised
+            // (logical lowering never sets `fused_downstream`). The physical
+            // pass (TASK-320) sets `fused_aggregate` directly with the
+            // correct `max_groups` value; this arm is a forward-compat path
+            // that falls back to `DEFAULT_MAX_GROUPS`.
             let fused_aggregate =
                 fused_downstream.map(|fd| crate::demand::CompiledFusableAggregate {
                     aggregates: fd
@@ -762,6 +768,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                         .map(|(e, n)| (CompiledExpr::from_typed(e), n.clone()))
                         .collect(),
                     output_schema: fd.aggregate.output_schema.clone(),
+                    max_groups: DEFAULT_MAX_GROUPS,
                 });
 
             let child = lower_physical(*input);

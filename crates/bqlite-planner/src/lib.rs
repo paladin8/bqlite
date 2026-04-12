@@ -112,11 +112,17 @@ pub use physical::{
 ///    [`bqlite_core::BqliteError::Schema`].
 /// 2. [`physical::lower_physical`] — infallible one-to-one lowering
 ///    that swaps `TypedExpr` for `CompiledExpr`.
-/// 3. [`opt::pushdown::pushdown_predicates`] (TASK-227) — moves
+/// 3. [`opt::fuse_match_aggregate::fuse_match_aggregate`] (TASK-320) —
+///    detects `Aggregate(SequenceMatch(...))` pairs where the aggregate
+///    can be fulfilled from the match output, fuses the aggregate into
+///    `SequenceMatchPhysical.fused_aggregate`, and elides the
+///    `Aggregate` node. Must run before pushdown and prune so the plan
+///    shape is correct for those passes.
+/// 4. [`opt::pushdown::pushdown_predicates`] (TASK-227) — moves
 ///    `Filter(Scan)` conjuncts into `ScanPhysical::scan_predicates`
 ///    and elides the `Filter` node when all conjuncts are pushable.
 ///    DDL / DML leaf nodes are returned unchanged.
-/// 4. [`opt::prune::prune_columns`] (TASK-228) — propagates a
+/// 5. [`opt::prune::prune_columns`] (TASK-228) — propagates a
 ///    backward demand set from the root to the scan and writes
 ///    `ScanPhysical::projected_columns` with the minimal sorted column
 ///    list. DDL / DML leaf nodes are returned unchanged.
@@ -132,6 +138,9 @@ pub use physical::{
 pub fn plan(statement: Statement, catalog: &dyn Catalog) -> Result<PhysicalPlan> {
     let logical = lower_statement(statement, catalog)?;
     let physical = lower_physical(logical);
+    // Wave 3 fusion pass (TASK-320): fuse Aggregate(SequenceMatch) pairs.
+    // Runs first so the plan shape downstream sees the fused schema.
+    let physical = opt::fuse_match_aggregate::fuse_match_aggregate(physical);
     // Apply Wave 2 optimizer passes in order (TASK-227, TASK-228).
     // Both passes treat DDL / DML leaves as identity, so it is safe to
     // apply them unconditionally regardless of statement kind.

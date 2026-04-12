@@ -122,7 +122,8 @@ pub struct CompiledAggExpr {
 
 /// Compiled form of [`FusableAggregate`] carried on the physical descriptor.
 ///
-/// Produced by TASK-318's physical lowering from `FusableAggregate`.
+/// Produced by TASK-318's physical lowering from `FusableAggregate`, or
+/// directly by TASK-320's match-aggregate fusion pass.
 /// Consumed by the `SequenceMatchOperator` (TASK-321) to update
 /// accumulators inline via `finish_entity_into`.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +134,12 @@ pub struct CompiledFusableAggregate {
     pub group_by: Vec<(CompiledExpr, String)>,
     /// Output schema of the fused aggregate.
     pub output_schema: OperatorSchema,
+    /// Hard cap on group cardinality. Propagated from the originating
+    /// `AggregatePhysical.max_groups`. Default: `DEFAULT_MAX_GROUPS`.
+    ///
+    /// The `SequenceMatchOperator` constructs a `HashAccumulator` with this
+    /// cap, matching the behaviour of the non-fused `HashAggregateOperator`.
+    pub max_groups: usize,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

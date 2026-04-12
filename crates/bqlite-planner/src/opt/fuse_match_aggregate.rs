@@ -1,0 +1,859 @@
+//! Match-aggregate fusion optimizer pass (TASK-320, Pass 6).
+//!
+//! Detects `Aggregate(SequenceMatch(...))` in the physical plan where the
+//! aggregate's expressions can be fulfilled entirely from the SequenceMatch's
+//! output schema (`entity_id`, `step_reached`, bound variables). When
+//! eligible, the aggregate is fused into `SequenceMatchPhysical.fused_aggregate`
+//! and the standalone `Aggregate` node is elided.
+//!
+//! # Pattern
+//!
+//! Conservative — only the direct adjacency pattern is fused:
+//!
+//! ```text
+//! Aggregate(input = SequenceMatch(...))
+//! ```
+//!
+//! Any intermediate node (Filter, Sort, Project) between the Aggregate
+//! and the SequenceMatch blocks fusion. These cases are left unchanged.
+//!
+//! The `Filter`-separated pattern (`Aggregate(Filter(SequenceMatch(...)))`),
+//! termed `FilterThenAggregate` in planner-pipeline.md §7.2, is **not**
+//! fused in Wave 3. Implementing it would require a `fused_filter` field on
+//! `CompiledFusableAggregate` and filter-evaluation logic in
+//! `SequenceMatchOperator` (TASK-321). This is deferred to a follow-up task;
+//! `DemandSet.fused_filter` is reserved for that extension.
+//! See `docs/design/planner/wave3-lowering.md` §4.2 for the rationale.
+//!
+//! # Eligibility
+//!
+//! For a direct `Aggregate(SequenceMatch)` pair, fusion is eligible when:
+//!
+//! 1. Every group-by expression references only columns present in the
+//!    SequenceMatch's output schema.
+//! 2. Every aggregate argument expression references only columns present in
+//!    the SequenceMatch's output schema (`COUNT(*)` — arg-less — is always
+//!    eligible).
+//!
+//! All Wave 3 aggregate functions are incrementally computable so no
+//! function-level eligibility check is needed (aggregate-operator.md §6.2).
+//!
+//! # Effect
+//!
+//! When fused:
+//! - A [`CompiledFusableAggregate`] is built from the aggregate's
+//!   `aggregates` and `group_by` fields and placed in
+//!   `SequenceMatchPhysical.fused_aggregate`.
+//! - The SequenceMatch's `output_schema` is replaced with the aggregate's
+//!   `output_schema` so downstream operators see the correct column shape.
+//! - The `Aggregate` node is removed from the tree.
+//!
+//! When not fused, the pass recurses into child plans so nested eligible
+//! patterns deeper in the tree can still be discovered.
+//!
+//! # Usage
+//!
+//! Applied as a post-lowering physical optimizer pass in
+//! [`crate::plan`] before predicate pushdown and projection pruning.
+//!
+//! See `docs/design/planner/wave3-lowering.md` §4 and
+//! `docs/design/operators/aggregate-operator.md` §9 for the full spec.
+
+use std::collections::HashSet;
+
+use crate::compiled::{CompiledExpr, CompiledNode};
+use crate::demand::{CompiledAggExpr, CompiledFusableAggregate};
+use crate::physical::{
+    AggregatePhysical, DistinctPhysical, ExplainPhysical, FilterPhysical, LimitPhysical,
+    PhysicalPlan, ProjectPhysical, SequenceMatchPhysical, SortPhysical,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the match-aggregate fusion optimizer pass over a [`PhysicalPlan`] tree.
+///
+/// Returns a new tree where eligible `Aggregate(SequenceMatch(...))` patterns
+/// are fused: the aggregate descriptor is compiled into the SequenceMatch's
+/// `fused_aggregate` field, the SequenceMatch's `output_schema` is updated to
+/// the aggregate's output schema, and the `Aggregate` node is elided.
+///
+/// All other nodes are recursed into so nested eligible patterns are found.
+pub fn fuse_match_aggregate(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        // ── Aggregate: attempt fusion with an immediately adjacent SequenceMatch
+        PhysicalPlan::Aggregate(agg) => {
+            let AggregatePhysical {
+                aggregates,
+                group_by,
+                max_groups,
+                input,
+                output_schema: agg_output_schema,
+            } = agg;
+
+            match *input {
+                // Direct adjacency: Aggregate(SequenceMatch(...))
+                PhysicalPlan::SequenceMatch(seq_match) => {
+                    // Collect column names in the SequenceMatch output schema.
+                    let match_col_names: HashSet<&str> = seq_match
+                        .output_schema
+                        .columns()
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect();
+
+                    if is_eligible(&aggregates, &group_by, &match_col_names) {
+                        // Build the CompiledFusableAggregate from the aggregate descriptor.
+                        // CompiledAgg (physical.rs) and CompiledAggExpr (demand.rs) are
+                        // structurally identical; we copy field-by-field.
+                        // max_groups is propagated from the originating AggregatePhysical
+                        // so the fused HashAccumulator enforces the same cardinality cap
+                        // as the non-fused path.
+                        let fused = CompiledFusableAggregate {
+                            aggregates: aggregates
+                                .iter()
+                                .map(|a| CompiledAggExpr {
+                                    function: a.function,
+                                    arg: a.arg.clone(),
+                                    output_name: a.output_name.clone(),
+                                })
+                                .collect(),
+                            group_by: group_by.clone(),
+                            output_schema: agg_output_schema.clone(),
+                            max_groups,
+                        };
+
+                        // Fuse: embed the aggregate in the SequenceMatch and elide
+                        // the Aggregate node. The output schema changes to the
+                        // aggregate's output schema.
+                        PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
+                            fused_aggregate: Some(fused),
+                            output_schema: agg_output_schema,
+                            ..*seq_match
+                        }))
+                    } else {
+                        // Not eligible — reassemble unchanged, recurse into SequenceMatch.
+                        let seq_input =
+                            fuse_match_aggregate(PhysicalPlan::SequenceMatch(seq_match));
+                        PhysicalPlan::Aggregate(AggregatePhysical {
+                            aggregates,
+                            group_by,
+                            max_groups,
+                            input: Box::new(seq_input),
+                            output_schema: agg_output_schema,
+                        })
+                    }
+                }
+
+                // Non-adjacent: Aggregate over something other than SequenceMatch.
+                // Recurse into the child so nested patterns deeper in the tree
+                // are still discovered.
+                other_input => {
+                    let recursed = fuse_match_aggregate(other_input);
+                    PhysicalPlan::Aggregate(AggregatePhysical {
+                        aggregates,
+                        group_by,
+                        max_groups,
+                        input: Box::new(recursed),
+                        output_schema: agg_output_schema,
+                    })
+                }
+            }
+        }
+
+        // ── Recursive cases: recurse into child plans ─────────────────────────
+        PhysicalPlan::Filter(filter) => {
+            let FilterPhysical {
+                predicate,
+                input,
+                tile_size,
+                output_schema,
+            } = filter;
+            PhysicalPlan::Filter(FilterPhysical {
+                predicate,
+                input: Box::new(fuse_match_aggregate(*input)),
+                tile_size,
+                output_schema,
+            })
+        }
+
+        PhysicalPlan::Project(proj) => {
+            let ProjectPhysical {
+                expressions,
+                input,
+                output_schema,
+            } = proj;
+            PhysicalPlan::Project(ProjectPhysical {
+                expressions,
+                input: Box::new(fuse_match_aggregate(*input)),
+                output_schema,
+            })
+        }
+
+        PhysicalPlan::Limit(limit) => {
+            let LimitPhysical {
+                count,
+                input,
+                output_schema,
+            } = limit;
+            PhysicalPlan::Limit(LimitPhysical {
+                count,
+                input: Box::new(fuse_match_aggregate(*input)),
+                output_schema,
+            })
+        }
+
+        PhysicalPlan::Sort(sort) => {
+            let SortPhysical {
+                keys,
+                max_rows,
+                input,
+                output_schema,
+            } = sort;
+            PhysicalPlan::Sort(SortPhysical {
+                keys,
+                max_rows,
+                input: Box::new(fuse_match_aggregate(*input)),
+                output_schema,
+            })
+        }
+
+        PhysicalPlan::Distinct(distinct) => {
+            let DistinctPhysical {
+                max_groups,
+                input,
+                output_schema,
+            } = distinct;
+            PhysicalPlan::Distinct(DistinctPhysical {
+                max_groups,
+                input: Box::new(fuse_match_aggregate(*input)),
+                output_schema,
+            })
+        }
+
+        // ── SequenceMatch: recurse into child, preserve any existing fused_aggregate.
+        // A SequenceMatch with fused_aggregate already set (e.g. by a prior pass
+        // run or via the logical-level fused_downstream path) must not be
+        // overwritten here — we only recurse into the child scan/filter subtree.
+        PhysicalPlan::SequenceMatch(seq_match) => {
+            let SequenceMatchPhysical {
+                compiled_nfa,
+                strategy,
+                demand,
+                execution_config,
+                fused_aggregate,
+                input,
+                output_schema,
+            } = *seq_match;
+            PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
+                compiled_nfa,
+                strategy,
+                demand,
+                execution_config,
+                fused_aggregate, // preserved — do not re-fuse a node already handled
+                input: Box::new(fuse_match_aggregate(*input)),
+                output_schema,
+            }))
+        }
+
+        PhysicalPlan::Explain(explain) => {
+            let ExplainPhysical {
+                plan: inner,
+                output_schema,
+            } = explain;
+            PhysicalPlan::Explain(ExplainPhysical {
+                plan: Box::new(fuse_match_aggregate(*inner)),
+                output_schema,
+            })
+        }
+
+        // ── Leaf nodes: Scan, DDL, DML — no children to recurse ───────────────
+        other => other,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Eligibility helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Return `true` when all aggregate argument and group-by expressions
+/// reference only columns present in `match_col_names`.
+///
+/// This ensures the aggregate can be evaluated purely from the SequenceMatch's
+/// output, without needing any columns that were dropped at the match boundary.
+fn is_eligible(
+    aggregates: &[crate::physical::CompiledAgg],
+    group_by: &[(CompiledExpr, String)],
+    match_col_names: &HashSet<&str>,
+) -> bool {
+    // Check group-by expressions.
+    for (expr, _name) in group_by {
+        if !refs_only_match_cols(expr, match_col_names) {
+            return false;
+        }
+    }
+    // Check aggregate argument expressions.
+    // COUNT(*) has no argument (arg is None) and is always eligible.
+    for agg in aggregates {
+        if let Some(arg) = &agg.arg {
+            if !refs_only_match_cols(arg, match_col_names) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Return `true` when every `Column` node in `expr` is in `match_col_names`.
+///
+/// Walks the full expression tree recursively. Exhaustively matches every
+/// [`CompiledNode`] variant so that adding a new variant in the same crate
+/// surfaces a compile error here rather than silently admitting ineligible
+/// column references.
+///
+/// **Intra-crate note.** `CompiledNode` is `#[non_exhaustive]`, but since this
+/// function lives in the same crate, the exhaustive match is valid and any new
+/// variant will produce a compile error. If this function is ever moved to a
+/// different crate, a wildcard arm returning `false` (conservative: treat
+/// unknown nodes as ineligible) must be added instead.
+fn refs_only_match_cols(expr: &CompiledExpr, match_col_names: &HashSet<&str>) -> bool {
+    match &expr.node {
+        CompiledNode::Literal(_) => true,
+        CompiledNode::Column { name, .. } => match_col_names.contains(name.as_str()),
+        CompiledNode::Arith { left, right, .. } | CompiledNode::Compare { left, right, .. } => {
+            refs_only_match_cols(left, match_col_names)
+                && refs_only_match_cols(right, match_col_names)
+        }
+        CompiledNode::Unary { operand, .. } => refs_only_match_cols(operand, match_col_names),
+        CompiledNode::And { operands, .. } | CompiledNode::Or { operands, .. } => operands
+            .iter()
+            .all(|op| refs_only_match_cols(op, match_col_names)),
+        CompiledNode::Not(inner) => refs_only_match_cols(inner, match_col_names),
+        CompiledNode::IsNull { input, .. } => refs_only_match_cols(input, match_col_names),
+        CompiledNode::FunctionCall { args, .. } => args
+            .iter()
+            .all(|a| refs_only_match_cols(a, match_col_names)),
+        CompiledNode::Cast { input, .. } | CompiledNode::ImplicitCoerce { input, .. } => {
+            refs_only_match_cols(input, match_col_names)
+        }
+        CompiledNode::InLiteralSet { input, .. } => refs_only_match_cols(input, match_col_names),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use bqlite_ast::expr::CompareOp;
+    use bqlite_core::{AggFunction, BqlType, ColumnDef, OperatorSchema};
+
+    use crate::compile::{
+        CompiledNfa, MatchExecutionConfig, MatchStrategy, NfaState, PatternClass,
+    };
+    use crate::compiled::{ArrowKernelId, CompareKernel, CompiledExpr, CompiledNode};
+    use crate::demand::DemandSet;
+    use crate::physical::{
+        AggregatePhysical, CompiledAgg, FilterPhysical, PhysicalPlan, ProjectPhysical,
+        ProjectPhysicalItem, ScanPhysical, SequenceMatchPhysical, DEFAULT_FILTER_TILE_SIZE,
+        DEFAULT_MAX_GROUPS,
+    };
+
+    use super::*;
+
+    // ── Test schema helpers ───────────────────────────────────────────────────
+
+    fn scan_schema() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+        ])
+        .expect("scan schema")
+    }
+
+    /// SequenceMatch output schema for a 3-step funnel with emit_all=true.
+    fn match_output_schema() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("step_reached", BqlType::Int),
+        ])
+        .expect("match output schema")
+    }
+
+    /// Aggregate output schema: one SUM per funnel step.
+    fn agg_output_schema() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef::nullable("reached_step_2", BqlType::Int),
+            ColumnDef::nullable("reached_step_3", BqlType::Int),
+        ])
+        .expect("agg output schema")
+    }
+
+    /// A minimal CompiledNfa for tests (2-state linear NFA, no transitions).
+    fn minimal_nfa(emit_all: bool) -> CompiledNfa {
+        CompiledNfa {
+            states: vec![
+                NfaState {
+                    transitions: vec![],
+                    poison_transitions: vec![],
+                },
+                NfaState {
+                    transitions: vec![],
+                    poison_transitions: vec![],
+                },
+            ],
+            accept_state: 1,
+            relevant_event_types: BTreeSet::new(),
+            pattern_class: PatternClass::LinearSimple,
+            variable_bindings: vec![],
+            global_window: None,
+            emit_all,
+            state_to_step: vec![0, 1],
+        }
+    }
+
+    fn minimal_scan() -> PhysicalPlan {
+        PhysicalPlan::Scan(ScanPhysical {
+            table: "events".into(),
+            time_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: scan_schema(),
+            entity_key_col: "entity_id".into(),
+            timestamp_col: "ts".into(),
+        })
+    }
+
+    /// Build a SequenceMatchPhysical with the given output schema.
+    fn seq_match_physical(output_schema: OperatorSchema) -> Box<SequenceMatchPhysical> {
+        Box::new(SequenceMatchPhysical {
+            compiled_nfa: minimal_nfa(true),
+            strategy: MatchStrategy::StepCounter,
+            demand: DemandSet::default(),
+            execution_config: MatchExecutionConfig::default(),
+            fused_aggregate: None,
+            input: Box::new(minimal_scan()),
+            output_schema,
+        })
+    }
+
+    /// A column reference expression pointing into the match output schema.
+    fn col_ref(name: &str, idx: usize, ty: BqlType, nullable: bool) -> CompiledExpr {
+        CompiledExpr {
+            node: CompiledNode::Column {
+                index: idx,
+                name: name.into(),
+            },
+            result_type: ty,
+            nullable,
+        }
+    }
+
+    /// `Compare(Column(name), Literal(0))` predicate — used in filter tests.
+    fn compare_pred(col_name: &str, col_idx: usize) -> CompiledExpr {
+        CompiledExpr {
+            node: CompiledNode::Compare {
+                op: CompareOp::Greater,
+                left: Box::new(col_ref(col_name, col_idx, BqlType::Int, false)),
+                right: Box::new(CompiledExpr {
+                    node: CompiledNode::Literal(bqlite_core::PropertyValue::Int(0)),
+                    result_type: BqlType::Int,
+                    nullable: false,
+                }),
+                kernel: CompareKernel::ArrowKernel(ArrowKernelId::GtInt),
+            },
+            result_type: BqlType::Bool,
+            nullable: false,
+        }
+    }
+
+    /// Build an AggregatePhysical that computes SUM(step_reached) over a
+    /// SequenceMatch — the fused-funnel shape. `step_reached` is at index 1
+    /// in match_output_schema().
+    ///
+    /// Both aggregate expressions SUM the same `step_reached` source column
+    /// but produce distinct named output slots (`reached_step_2`,
+    /// `reached_step_3`), mirroring the FUNNEL desugaring pattern where each
+    /// step gets its own `SUM(CAST(step_reached >= N AS INT))` output.
+    fn funnel_aggregate_plan() -> PhysicalPlan {
+        let match_schema = match_output_schema();
+        let seq = seq_match_physical(match_schema);
+
+        PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![
+                // Represents SUM(CAST(step_reached >= 2 AS INT)) for step 2.
+                CompiledAgg {
+                    function: AggFunction::Sum,
+                    arg: Some(col_ref("step_reached", 1, BqlType::Int, false)),
+                    output_name: "reached_step_2".into(),
+                },
+                // Represents SUM(CAST(step_reached >= 3 AS INT)) for step 3.
+                CompiledAgg {
+                    function: AggFunction::Sum,
+                    arg: Some(col_ref("step_reached", 1, BqlType::Int, false)),
+                    output_name: "reached_step_3".into(),
+                },
+            ],
+            group_by: vec![],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::SequenceMatch(seq)),
+            output_schema: agg_output_schema(),
+        })
+    }
+
+    // ── Test: fused-funnel shape (Aggregate directly over SequenceMatch) ──────
+
+    #[test]
+    fn fused_funnel_shape_elides_aggregate_and_sets_fused_aggregate() {
+        let plan = funnel_aggregate_plan();
+        let result = fuse_match_aggregate(plan);
+
+        // The Aggregate node must be gone — the root is now SequenceMatch.
+        let PhysicalPlan::SequenceMatch(fused) = result else {
+            panic!("expected SequenceMatch root after fusion, got {result:?}");
+        };
+
+        // fused_aggregate must be populated.
+        assert!(
+            fused.fused_aggregate.is_some(),
+            "fused_aggregate must be Some after fusion"
+        );
+
+        // The output schema must be the aggregate's output schema, not the
+        // match's output schema.
+        let out_cols: Vec<&str> = fused
+            .output_schema
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            out_cols,
+            vec!["reached_step_2", "reached_step_3"],
+            "output schema must match aggregate schema after fusion"
+        );
+
+        // The fused aggregate must carry both SUM expressions.
+        let fa = fused.fused_aggregate.unwrap();
+        assert_eq!(fa.aggregates.len(), 2);
+        assert_eq!(fa.aggregates[0].function, AggFunction::Sum);
+        assert_eq!(fa.aggregates[0].output_name, "reached_step_2");
+        assert_eq!(fa.aggregates[1].output_name, "reached_step_3");
+        assert!(fa.group_by.is_empty());
+        assert_eq!(fa.output_schema, agg_output_schema());
+    }
+
+    // ── Test: aggregate with COUNT(*) (no arg) is eligible ───────────────────
+
+    #[test]
+    fn count_star_aggregate_fuses_because_no_column_references() {
+        let seq = seq_match_physical(match_output_schema());
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Count,
+                arg: None, // COUNT(*) — no column reference
+                output_name: "n".into(),
+            }],
+            group_by: vec![],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::SequenceMatch(seq)),
+            output_schema: OperatorSchema::new(vec![ColumnDef::required("n", BqlType::Int)])
+                .unwrap(),
+        });
+
+        let result = fuse_match_aggregate(plan);
+
+        let PhysicalPlan::SequenceMatch(fused) = result else {
+            panic!("expected SequenceMatch root after fusion, got {result:?}");
+        };
+        assert!(fused.fused_aggregate.is_some(), "COUNT(*) must fuse");
+    }
+
+    // ── Test: unfused "match then project then aggregate" shape ───────────────
+
+    #[test]
+    fn match_project_aggregate_does_not_fuse() {
+        // Plan shape: Aggregate(Project(SequenceMatch(...)))
+        // The Project sits between Aggregate and SequenceMatch → no fusion.
+        let match_schema = match_output_schema();
+        let seq = seq_match_physical(match_schema.clone());
+
+        // Project that passes step_reached through with a rename.
+        let proj_out = OperatorSchema::new(vec![ColumnDef::required(
+            "step_reached_renamed",
+            BqlType::Int,
+        )])
+        .unwrap();
+        let project = PhysicalPlan::Project(ProjectPhysical {
+            expressions: vec![ProjectPhysicalItem {
+                expr: col_ref("step_reached", 1, BqlType::Int, false),
+                output_name: "step_reached_renamed".into(),
+            }],
+            input: Box::new(PhysicalPlan::SequenceMatch(seq)),
+            output_schema: proj_out.clone(),
+        });
+
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Count,
+                arg: None,
+                output_name: "n".into(),
+            }],
+            group_by: vec![],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(project),
+            output_schema: OperatorSchema::new(vec![ColumnDef::required("n", BqlType::Int)])
+                .unwrap(),
+        });
+
+        let result = fuse_match_aggregate(plan);
+
+        // Root must still be Aggregate (no fusion happened).
+        let PhysicalPlan::Aggregate(agg) = &result else {
+            panic!("expected Aggregate root (no fusion), got {result:?}");
+        };
+
+        // The intermediate Project must be preserved.
+        let PhysicalPlan::Project(_) = agg.input.as_ref() else {
+            panic!("expected Project under Aggregate after no-fusion");
+        };
+    }
+
+    // ── Test: filter between match and aggregate does not fuse in Wave 3 ────────
+    // The FilterThenAggregate pattern is deferred — see module doc and
+    // docs/design/planner/wave3-lowering.md §4.2 for rationale.
+
+    #[test]
+    fn filter_between_match_and_aggregate_is_not_fused_in_wave3() {
+        // Plan shape: Aggregate(Filter(SequenceMatch(...)))
+        // A Filter sits between the Aggregate and the SequenceMatch.
+        // FilterThenAggregate fusion is deferred to a future task — left unchanged.
+        let match_schema = match_output_schema();
+        let seq = seq_match_physical(match_schema.clone());
+
+        // Filter on step_reached > 0.
+        let filter = PhysicalPlan::Filter(FilterPhysical {
+            predicate: compare_pred("step_reached", 1),
+            input: Box::new(PhysicalPlan::SequenceMatch(seq)),
+            tile_size: DEFAULT_FILTER_TILE_SIZE,
+            output_schema: match_schema.clone(),
+        });
+
+        let agg_schema =
+            OperatorSchema::new(vec![ColumnDef::nullable("total", BqlType::Int)]).unwrap();
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Sum,
+                arg: Some(col_ref("step_reached", 1, BqlType::Int, false)),
+                output_name: "total".into(),
+            }],
+            group_by: vec![],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(filter),
+            output_schema: agg_schema,
+        });
+
+        let result = fuse_match_aggregate(plan);
+
+        // Root must still be Aggregate — FilterThenAggregate not fused in Wave 3.
+        let PhysicalPlan::Aggregate(agg) = &result else {
+            panic!(
+                "expected Aggregate root (FilterThenAggregate not fused in Wave 3), \
+                 got {result:?}"
+            );
+        };
+
+        // The Filter must be preserved directly under the Aggregate.
+        let PhysicalPlan::Filter(_) = agg.input.as_ref() else {
+            panic!("expected Filter under Aggregate after no-fusion (Wave 3 scope)");
+        };
+    }
+
+    // ── Test: ineligible — aggregate arg references a scan column (not in match)
+
+    #[test]
+    fn aggregate_referencing_scan_column_does_not_fuse() {
+        // The aggregate references `amount` which is NOT in the SequenceMatch
+        // output schema (which only has entity_id and step_reached).
+        let seq = seq_match_physical(match_output_schema());
+
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Sum,
+                // `amount` (index 3) is a scan column, not in match output.
+                arg: Some(col_ref("amount", 3, BqlType::Int, true)),
+                output_name: "total_amount".into(),
+            }],
+            group_by: vec![],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::SequenceMatch(seq)),
+            output_schema: OperatorSchema::new(vec![ColumnDef::nullable(
+                "total_amount",
+                BqlType::Int,
+            )])
+            .unwrap(),
+        });
+
+        let result = fuse_match_aggregate(plan);
+
+        // Root must still be Aggregate — column eligibility check failed.
+        assert!(
+            matches!(&result, PhysicalPlan::Aggregate(_)),
+            "expected Aggregate root when agg arg references non-match column"
+        );
+    }
+
+    // ── Test: ineligible — group-by key references a scan column ─────────────
+
+    #[test]
+    fn group_by_referencing_scan_column_does_not_fuse() {
+        let seq = seq_match_physical(match_output_schema());
+
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Count,
+                arg: None,
+                output_name: "n".into(),
+            }],
+            // GROUP BY country — not in match output.
+            group_by: vec![(
+                col_ref("country", 5, BqlType::String, true),
+                "country".into(),
+            )],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::SequenceMatch(seq)),
+            output_schema: OperatorSchema::new(vec![
+                ColumnDef::required("country", BqlType::String),
+                ColumnDef::required("n", BqlType::Int),
+            ])
+            .unwrap(),
+        });
+
+        let result = fuse_match_aggregate(plan);
+
+        assert!(
+            matches!(&result, PhysicalPlan::Aggregate(_)),
+            "expected Aggregate root when group-by references non-match column"
+        );
+    }
+
+    // ── Test: aggregate by entity_id (a match-output column) is eligible ──────
+
+    #[test]
+    fn group_by_entity_id_from_match_output_fuses() {
+        // GROUP BY entity_id — entity_id is in match output schema (index 0).
+        let match_schema = match_output_schema();
+        let seq = seq_match_physical(match_schema.clone());
+
+        let agg_schema = OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("n", BqlType::Int),
+        ])
+        .unwrap();
+
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Count,
+                arg: None,
+                output_name: "n".into(),
+            }],
+            group_by: vec![(
+                col_ref("entity_id", 0, BqlType::String, false),
+                "entity_id".into(),
+            )],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::SequenceMatch(seq)),
+            output_schema: agg_schema.clone(),
+        });
+
+        let result = fuse_match_aggregate(plan);
+
+        let PhysicalPlan::SequenceMatch(fused) = result else {
+            panic!("expected SequenceMatch root after GROUP BY entity_id fusion");
+        };
+        assert!(
+            fused.fused_aggregate.is_some(),
+            "must fuse when GROUP BY entity_id"
+        );
+        assert_eq!(fused.output_schema, agg_schema);
+    }
+
+    // ── Test: nested pattern — fusion works on inner Aggregate ───────────────
+
+    #[test]
+    fn nested_aggregate_over_sequence_match_fuses_inner() {
+        // Plan: Limit(Aggregate(SequenceMatch(...)))
+        // The fusion pass recurses into the Limit and fuses the inner pair.
+        let match_schema = match_output_schema();
+        let inner_agg_schema =
+            OperatorSchema::new(vec![ColumnDef::nullable("reached", BqlType::Int)]).unwrap();
+
+        let agg = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Sum,
+                arg: Some(col_ref("step_reached", 1, BqlType::Int, false)),
+                output_name: "reached".into(),
+            }],
+            group_by: vec![],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::SequenceMatch(seq_match_physical(
+                match_schema,
+            ))),
+            output_schema: inner_agg_schema.clone(),
+        });
+
+        let plan = PhysicalPlan::Limit(crate::physical::LimitPhysical {
+            count: 10,
+            input: Box::new(agg),
+            output_schema: inner_agg_schema.clone(),
+        });
+
+        let result = fuse_match_aggregate(plan);
+
+        let PhysicalPlan::Limit(limit) = result else {
+            panic!("expected Limit at root");
+        };
+        let PhysicalPlan::SequenceMatch(fused) = *limit.input else {
+            panic!("expected fused SequenceMatch under Limit");
+        };
+        assert!(
+            fused.fused_aggregate.is_some(),
+            "inner Aggregate must be fused through Limit wrapper"
+        );
+    }
+
+    // ── Test: DDL leaf is returned unchanged ─────────────────────────────────
+
+    #[test]
+    fn ddl_leaf_is_returned_unchanged() {
+        use crate::physical::DropTablePhysical;
+        let plan = PhysicalPlan::DropTable(DropTablePhysical {
+            name: "events".into(),
+            output_schema: OperatorSchema::new(vec![]).expect("empty"),
+        });
+        let result = fuse_match_aggregate(plan);
+        assert!(matches!(result, PhysicalPlan::DropTable(_)));
+    }
+
+    // ── Test: SequenceMatch without aggregate is returned unchanged ───────────
+
+    #[test]
+    fn bare_sequence_match_is_returned_unchanged() {
+        let seq = seq_match_physical(match_output_schema());
+        let plan = PhysicalPlan::SequenceMatch(seq.clone());
+        let result = fuse_match_aggregate(plan);
+
+        let PhysicalPlan::SequenceMatch(result_seq) = result else {
+            panic!("expected SequenceMatch unchanged");
+        };
+        assert!(
+            result_seq.fused_aggregate.is_none(),
+            "bare SequenceMatch must not get a fused_aggregate"
+        );
+    }
+}
