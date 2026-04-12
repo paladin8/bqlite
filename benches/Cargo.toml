@@ -18,6 +18,8 @@ path = "src/lib.rs"
 bqlite-core = { workspace = true }
 bqlite-storage = { workspace = true }
 bqlite-operators = { workspace = true }
+bqlite-planner = { workspace = true }
+bqlite-engine = { workspace = true }
 arrow = { workspace = true }
 criterion = { workspace = true }
 serde_json = { workspace = true }
@@ -57,4 +59,30 @@ harness = false
 [[bench]]
 name = "percentile"
 path = "wave3/percentile.rs"
+harness = false
+
+# Wave 3 benchmark suite (TASK-325).
+[[bench]]
+name = "matcher"
+path = "wave3/matcher.rs"
+harness = false
+
+[[bench]]
+name = "aggregate"
+path = "wave3/aggregate.rs"
+harness = false
+
+[[bench]]
+name = "wave3_sort"
+path = "wave3/sort.rs"
+harness = false
+
+[[bench]]
+name = "wave3_distinct"
+path = "wave3/distinct.rs"
+harness = false
+
+[[bench]]
+name = "funnel"
+path = "wave3/funnel.rs"
 harness = false

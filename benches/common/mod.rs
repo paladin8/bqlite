@@ -373,6 +373,45 @@ impl BenchResultCollector {
     }
 }
 
+// ── Mock child operator for benchmarks ─────────────────────────────────────
+
+/// A simple vector-backed `PhysicalOperator` that yields pre-built batches.
+///
+/// Used by Wave 3 sort and distinct benchmarks (and any future bench that
+/// needs to feed pre-built `RecordBatch` data into an operator).
+pub struct VecOp {
+    schema: bqlite_core::OperatorSchema,
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    idx: usize,
+}
+
+impl VecOp {
+    pub fn new(
+        schema: bqlite_core::OperatorSchema,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Self {
+        Self {
+            schema,
+            batches,
+            idx: 0,
+        }
+    }
+}
+
+impl bqlite_operators::PhysicalOperator for VecOp {
+    fn output_schema(&self) -> &bqlite_core::OperatorSchema {
+        &self.schema
+    }
+    fn next_batch(&mut self) -> bqlite_core::Result<Option<arrow::record_batch::RecordBatch>> {
+        if self.idx >= self.batches.len() {
+            return Ok(None);
+        }
+        let b = self.batches[self.idx].clone();
+        self.idx += 1;
+        Ok(Some(b))
+    }
+}
+
 // ── Arrow array generators ──────────────────────────────────────────────────
 
 /// Deterministic i64 array — sequential values starting at `base`.
