@@ -58,7 +58,8 @@ pub mod project;
 pub mod scan;
 
 pub use aggregate::{
-    Accumulator, AggState, GroupKey, HashAccumulator, SumState, DEFAULT_MAX_GROUPS,
+    Accumulator, AggState, GroupKey, HashAccumulator, HashAggregateOperator, SumState,
+    DEFAULT_MAX_GROUPS,
 };
 pub use filter::FilterOperator;
 pub use limit::LimitOperator;

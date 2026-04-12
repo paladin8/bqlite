@@ -54,6 +54,11 @@ use arrow::datatypes::TimeUnit;
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::{AggFunction, BqlType, BqliteError, OperatorSchema, Result, ScalarValue};
+use bqlite_planner::compiled::CompiledExpr;
+use bqlite_planner::physical::CompiledAgg;
+
+use crate::eval;
+use crate::operator::PhysicalOperator;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // GroupKey
@@ -523,6 +528,15 @@ impl HashAccumulator {
             .collect()
     }
 
+    /// Initialize the default (empty-key) group with zero-valued
+    /// states. Used by `HashAggregateOperator` to ensure ungrouped
+    /// aggregation always produces a single result row, even when no
+    /// input rows are processed.
+    pub fn ensure_default_group(&mut self) -> Result<()> {
+        self.get_or_create_group(GroupKey::empty())?;
+        Ok(())
+    }
+
     /// Get or create the state vector for a group key, enforcing
     /// the `max_groups` cap.
     fn get_or_create_group(&mut self, key: GroupKey) -> Result<&mut Vec<AggState>> {
@@ -574,6 +588,48 @@ impl HashAccumulator {
     }
 }
 
+impl HashAccumulator {
+    /// Update from pre-evaluated arrays.
+    ///
+    /// This is the core row-iteration loop shared by both
+    /// `update_batch` (column-name path) and `HashAggregateOperator`
+    /// (CompiledExpr path). The caller provides pre-resolved arrays
+    /// for group-by keys and aggregate arguments.
+    pub fn update_evaluated(
+        &mut self,
+        num_rows: usize,
+        group_arrays: &[ArrayRef],
+        agg_arrays: &[Option<ArrayRef>],
+    ) -> Result<()> {
+        for row in 0..num_rows {
+            let key = if group_arrays.is_empty() {
+                GroupKey::empty()
+            } else {
+                let key_values: Vec<ScalarValue> = group_arrays
+                    .iter()
+                    .map(|arr| Self::extract_scalar(arr, row))
+                    .collect();
+                GroupKey(key_values)
+            };
+
+            let states = self.get_or_create_group(key)?;
+
+            for (i, state) in states.iter_mut().enumerate() {
+                match state {
+                    AggState::Count(_) => state.update_count_star(),
+                    _ => {
+                        if let Some(arr) = &agg_arrays[i] {
+                            let value = Self::extract_scalar(arr, row);
+                            state.update(&value);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Accumulator for HashAccumulator {
     fn update(&mut self, group_key: Option<&[ScalarValue]>, values: &[ScalarValue]) -> Result<()> {
         let key = match group_key {
@@ -622,35 +678,7 @@ impl Accumulator for HashAccumulator {
             })
             .collect();
 
-        // Process each row.
-        for row in 0..num_rows {
-            // Build group key.
-            let key = if group_arrays.is_empty() {
-                GroupKey::empty()
-            } else {
-                let key_values: Vec<ScalarValue> = group_arrays
-                    .iter()
-                    .map(|arr| Self::extract_scalar(arr, row))
-                    .collect();
-                GroupKey(key_values)
-            };
-
-            let states = self.get_or_create_group(key)?;
-
-            // Update each aggregate.
-            for (i, state) in states.iter_mut().enumerate() {
-                match state {
-                    AggState::Count(_) => state.update_count_star(),
-                    _ => {
-                        if let Some(arr) = &agg_arrays[i] {
-                            let value = Self::extract_scalar(arr, row);
-                            state.update(&value);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.update_evaluated(num_rows, &group_arrays, &agg_arrays)
     }
 
     fn merge(&mut self, other: Box<dyn Accumulator>) -> Result<()> {
@@ -735,6 +763,181 @@ impl Accumulator for HashAccumulator {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HashAggregateOperator
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Internal state machine for the aggregate operator lifecycle.
+enum AggregateOpState {
+    /// Child has not been drained yet. The next `next_batch()` call
+    /// will pull the child to exhaustion, accumulate all rows, call
+    /// `finish()`, and transition to `Emitted`.
+    Accumulating,
+    /// The final result batch has been returned. Subsequent
+    /// `next_batch()` calls return `Ok(None)`.
+    Emitted,
+}
+
+/// Hash-grouped aggregate operator implementing [`PhysicalOperator`].
+///
+/// Drains its child completely, feeding each batch through a
+/// [`HashAccumulator`], then emits a single result batch containing
+/// the aggregated output (group-by columns first, aggregate columns
+/// next, per aggregate-operator.md §7).
+///
+/// Group-by and aggregate argument expressions are evaluated per-batch
+/// via [`crate::eval::evaluate`] from the expression compilation
+/// pipeline (TASK-205). The evaluated arrays are fed directly into
+/// [`HashAccumulator::update_evaluated`], avoiding intermediate
+/// `RecordBatch` construction.
+///
+/// ## Ungrouped aggregation
+///
+/// When no `GROUP BY` is present, the operator ensures at least one
+/// result row exists (the empty-key group) even if the child produces
+/// no input rows. This matches SQL semantics where `SELECT COUNT(*)`
+/// on an empty table returns `0`, not zero rows.
+///
+/// ## Lifecycle
+///
+/// ```text
+/// open() → [drain child, accumulate] → next_batch() returns result → next_batch() returns None → close()
+/// ```
+///
+/// The operator is a blocking operator: it must consume all input
+/// before producing any output. This is inherent to hash aggregation.
+pub struct HashAggregateOperator {
+    child: Box<dyn PhysicalOperator>,
+    accumulator: HashAccumulator,
+    group_by_exprs: Vec<(CompiledExpr, String)>,
+    agg_exprs: Vec<CompiledAgg>,
+    output_schema: OperatorSchema,
+    state: AggregateOpState,
+}
+
+impl HashAggregateOperator {
+    /// Create a new hash aggregate operator.
+    ///
+    /// - `child`: the upstream operator to drain.
+    /// - `aggregates`: compiled aggregate expressions (function + arg +
+    ///   output name) from [`AggregatePhysical`].
+    /// - `group_by`: compiled group-by key expressions paired with
+    ///   their output column names.
+    /// - `max_groups`: hard cap on group cardinality. When exceeded,
+    ///   returns `BqliteError::Execution`.
+    /// - `output_schema`: plan-time output schema (group columns +
+    ///   aggregate columns).
+    pub fn new(
+        child: Box<dyn PhysicalOperator>,
+        aggregates: Vec<CompiledAgg>,
+        group_by: Vec<(CompiledExpr, String)>,
+        max_groups: usize,
+        output_schema: OperatorSchema,
+    ) -> Self {
+        let functions: Vec<AggFunction> = aggregates.iter().map(|a| a.function).collect();
+        let input_types: Vec<Option<BqlType>> = aggregates
+            .iter()
+            .map(|a| a.arg.as_ref().map(|expr| expr.result_type.clone()))
+            .collect();
+
+        // Internal column names used to bridge CompiledExpr evaluation
+        // with HashAccumulator::update_batch. These names are never
+        // visible outside this operator.
+        let group_by_col_names: Vec<String> =
+            (0..group_by.len()).map(|i| format!("__grp_{i}")).collect();
+        let agg_arg_col_names: Vec<Option<String>> = aggregates
+            .iter()
+            .enumerate()
+            .map(|(i, agg)| agg.arg.as_ref().map(|_| format!("__agg_{i}")))
+            .collect();
+
+        let accumulator = HashAccumulator::new(
+            functions,
+            input_types,
+            output_schema.clone(),
+            group_by_col_names,
+            agg_arg_col_names,
+            max_groups,
+        );
+
+        Self {
+            child,
+            accumulator,
+            group_by_exprs: group_by,
+            agg_exprs: aggregates,
+            output_schema,
+            state: AggregateOpState::Accumulating,
+        }
+    }
+
+    /// Evaluate all group-by and aggregate expressions against a
+    /// batch and feed the results into the accumulator.
+    fn process_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let num_rows = batch.num_rows();
+        if num_rows == 0 {
+            return Ok(());
+        }
+
+        // Evaluate group-by expressions.
+        let group_arrays: Vec<ArrayRef> = self
+            .group_by_exprs
+            .iter()
+            .map(|(expr, _)| eval::evaluate(expr, batch))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Evaluate aggregate argument expressions.
+        let agg_arrays: Vec<Option<ArrayRef>> = self
+            .agg_exprs
+            .iter()
+            .map(|agg| {
+                agg.arg
+                    .as_ref()
+                    .map(|arg| eval::evaluate(arg, batch))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.accumulator
+            .update_evaluated(num_rows, &group_arrays, &agg_arrays)
+    }
+}
+
+impl PhysicalOperator for HashAggregateOperator {
+    fn output_schema(&self) -> &OperatorSchema {
+        &self.output_schema
+    }
+
+    fn open(&mut self) -> Result<()> {
+        self.child.open()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self.state {
+            AggregateOpState::Emitted => Ok(None),
+            AggregateOpState::Accumulating => {
+                // Drain the child completely.
+                while let Some(batch) = self.child.next_batch()? {
+                    self.process_batch(&batch)?;
+                }
+
+                // For ungrouped aggregation, ensure at least one result
+                // row (SQL semantics: COUNT(*) on empty table → 0).
+                if self.group_by_exprs.is_empty() && self.accumulator.num_groups() == 0 {
+                    self.accumulator.ensure_default_group()?;
+                }
+
+                let result = self.accumulator.finish()?;
+                self.state = AggregateOpState::Emitted;
+                Ok(Some(result))
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.child.close()
     }
 }
 
@@ -1402,5 +1605,805 @@ mod tests {
         assert_eq!(count_col.value(1), 1);
         assert_eq!(country_col.value(2), "US");
         assert_eq!(count_col.value(2), 3); // 2 + 1
+    }
+
+    // ── HashAggregateOperator ───────────────────────────────────────────
+
+    mod operator_tests {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, Float64Array, Int64Array, StringViewArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+
+        use bqlite_core::{AggFunction, BqlType, BqliteError, ColumnDef, OperatorSchema, Result};
+        use bqlite_planner::compiled::{CompiledExpr, CompiledNode};
+        use bqlite_planner::physical::CompiledAgg;
+
+        use crate::operator::{CancellationToken, PhysicalOperator};
+
+        use super::super::{HashAggregateOperator, DEFAULT_MAX_GROUPS};
+
+        // ── Fixtures ────────────────────────────────────────────────────
+
+        fn col_expr(index: usize, name: &str, bql_type: BqlType) -> CompiledExpr {
+            CompiledExpr {
+                node: CompiledNode::Column {
+                    index,
+                    name: name.to_string(),
+                },
+                result_type: bql_type,
+                nullable: false,
+            }
+        }
+
+        fn count_star_agg(output_name: &str) -> CompiledAgg {
+            CompiledAgg {
+                function: AggFunction::Count,
+                arg: None,
+                output_name: output_name.to_string(),
+            }
+        }
+
+        fn col_agg(
+            function: AggFunction,
+            col_index: usize,
+            col_name: &str,
+            col_type: BqlType,
+            output_name: &str,
+        ) -> CompiledAgg {
+            CompiledAgg {
+                function,
+                arg: Some(col_expr(col_index, col_name, col_type)),
+                output_name: output_name.to_string(),
+            }
+        }
+
+        fn make_output_schema(
+            group_cols: &[(&str, BqlType, bool)],
+            agg_cols: &[(&str, BqlType, bool)],
+        ) -> OperatorSchema {
+            let mut cols: Vec<ColumnDef> = Vec::new();
+            for &(name, ref ty, nullable) in group_cols {
+                if nullable {
+                    cols.push(ColumnDef::nullable(name, ty.clone()));
+                } else {
+                    cols.push(ColumnDef::required(name, ty.clone()));
+                }
+            }
+            for &(name, ref ty, nullable) in agg_cols {
+                if nullable {
+                    cols.push(ColumnDef::nullable(name, ty.clone()));
+                } else {
+                    cols.push(ColumnDef::required(name, ty.clone()));
+                }
+            }
+            OperatorSchema::new(cols).unwrap()
+        }
+
+        // ── Mock child operator ─────────────────────────────────────────
+
+        struct VecChild {
+            schema: OperatorSchema,
+            batches: Vec<RecordBatch>,
+            next_idx: usize,
+            cancel: Option<CancellationToken>,
+            open_count: usize,
+            close_count: usize,
+        }
+
+        impl VecChild {
+            fn new(schema: OperatorSchema, batches: Vec<RecordBatch>) -> Self {
+                Self {
+                    schema,
+                    batches,
+                    next_idx: 0,
+                    cancel: None,
+                    open_count: 0,
+                    close_count: 0,
+                }
+            }
+
+            fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+                self.cancel = Some(cancel);
+                self
+            }
+        }
+
+        impl PhysicalOperator for VecChild {
+            fn output_schema(&self) -> &OperatorSchema {
+                &self.schema
+            }
+            fn open(&mut self) -> Result<()> {
+                self.open_count += 1;
+                Ok(())
+            }
+            fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+                if let Some(ref cancel) = self.cancel {
+                    if cancel.is_cancelled() {
+                        return Err(BqliteError::Cancelled);
+                    }
+                }
+                if self.next_idx >= self.batches.len() {
+                    return Ok(None);
+                }
+                let batch = self.batches[self.next_idx].clone();
+                self.next_idx += 1;
+                Ok(Some(batch))
+            }
+            fn close(&mut self) -> Result<()> {
+                self.close_count += 1;
+                Ok(())
+            }
+        }
+
+        // ── Batch builders ──────────────────────────────────────────────
+
+        fn int_batch(col_name: &str, values: Vec<i64>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                col_name,
+                DataType::Int64,
+                false,
+            )]));
+            let col: ArrayRef = Arc::new(Int64Array::from(values));
+            RecordBatch::try_new(schema, vec![col]).unwrap()
+        }
+
+        fn country_amount_batch(countries: Vec<&str>, amounts: Vec<i64>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("country", DataType::Utf8View, false),
+                Field::new("amount", DataType::Int64, false),
+            ]));
+            let c: ArrayRef = Arc::new(StringViewArray::from(countries));
+            let a: ArrayRef = Arc::new(Int64Array::from(amounts));
+            RecordBatch::try_new(schema, vec![c, a]).unwrap()
+        }
+
+        fn input_schema_int() -> OperatorSchema {
+            OperatorSchema::new(vec![ColumnDef::required("value", BqlType::Int)]).unwrap()
+        }
+
+        fn input_schema_country_amount() -> OperatorSchema {
+            OperatorSchema::new(vec![
+                ColumnDef::required("country", BqlType::String),
+                ColumnDef::required("amount", BqlType::Int),
+            ])
+            .unwrap()
+        }
+
+        // ── Ungrouped COUNT(*) ──────────────────────────────────────────
+
+        #[test]
+        fn ungrouped_count_star_single_batch() {
+            let output_schema = make_output_schema(&[], &[("n", BqlType::Int, false)]);
+            let child = VecChild::new(
+                input_schema_int(),
+                vec![int_batch("value", vec![10, 20, 30])],
+            );
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            assert_eq!(result.num_rows(), 1);
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 3);
+
+            // Exhausted after one result.
+            assert!(op.next_batch().unwrap().is_none());
+            assert!(op.next_batch().unwrap().is_none());
+            op.close().unwrap();
+        }
+
+        #[test]
+        fn ungrouped_count_star_multiple_batches() {
+            let output_schema = make_output_schema(&[], &[("n", BqlType::Int, false)]);
+            let child = VecChild::new(
+                input_schema_int(),
+                vec![
+                    int_batch("value", vec![1, 2]),
+                    int_batch("value", vec![3, 4, 5]),
+                    int_batch("value", vec![6]),
+                ],
+            );
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            assert_eq!(result.num_rows(), 1);
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 6);
+        }
+
+        #[test]
+        fn ungrouped_count_star_empty_input() {
+            // SQL: SELECT COUNT(*) FROM empty_table → 1 row with 0.
+            let output_schema = make_output_schema(&[], &[("n", BqlType::Int, false)]);
+            let child = VecChild::new(input_schema_int(), vec![]);
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            assert_eq!(result.num_rows(), 1);
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 0);
+        }
+
+        // ── Grouped aggregation ─────────────────────────────────────────
+
+        #[test]
+        fn grouped_sum() {
+            let output_schema = make_output_schema(
+                &[("country", BqlType::String, false)],
+                &[("total", BqlType::Int, true)],
+            );
+            let child = VecChild::new(
+                input_schema_country_amount(),
+                vec![country_amount_batch(
+                    vec!["US", "UK", "US", "UK", "US"],
+                    vec![100, 200, 300, 400, 500],
+                )],
+            );
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![col_agg(
+                    AggFunction::Sum,
+                    1,
+                    "amount",
+                    BqlType::Int,
+                    "total",
+                )],
+                vec![(col_expr(0, "country", BqlType::String), "country".into())],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            assert_eq!(result.num_rows(), 2);
+
+            let country_col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            let total_col = result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+
+            // Sorted by GroupKey: UK < US.
+            assert_eq!(country_col.value(0), "UK");
+            assert_eq!(total_col.value(0), 600); // 200 + 400
+            assert_eq!(country_col.value(1), "US");
+            assert_eq!(total_col.value(1), 900); // 100 + 300 + 500
+        }
+
+        #[test]
+        fn grouped_count_star_across_batches() {
+            let output_schema = make_output_schema(
+                &[("country", BqlType::String, false)],
+                &[("n", BqlType::Int, false)],
+            );
+            let child = VecChild::new(
+                input_schema_country_amount(),
+                vec![
+                    country_amount_batch(vec!["US", "UK"], vec![1, 2]),
+                    country_amount_batch(vec!["US", "DE", "DE"], vec![3, 4, 5]),
+                ],
+            );
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![(col_expr(0, "country", BqlType::String), "country".into())],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            assert_eq!(result.num_rows(), 3); // DE, UK, US
+
+            let country_col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            let count_col = result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+
+            // Sorted: DE < UK < US.
+            assert_eq!(country_col.value(0), "DE");
+            assert_eq!(count_col.value(0), 2);
+            assert_eq!(country_col.value(1), "UK");
+            assert_eq!(count_col.value(1), 1);
+            assert_eq!(country_col.value(2), "US");
+            assert_eq!(count_col.value(2), 2);
+        }
+
+        #[test]
+        fn grouped_empty_input_returns_zero_rows() {
+            // SQL: SELECT COUNT(*) FROM empty GROUP BY country → 0 rows.
+            let output_schema = make_output_schema(
+                &[("country", BqlType::String, false)],
+                &[("n", BqlType::Int, false)],
+            );
+            let child = VecChild::new(input_schema_country_amount(), vec![]);
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![(col_expr(0, "country", BqlType::String), "country".into())],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            assert_eq!(result.num_rows(), 0);
+        }
+
+        // ── Multiple aggregate functions ────────────────────────────────
+
+        #[test]
+        fn multiple_aggregates_count_sum_avg() {
+            let output_schema = make_output_schema(
+                &[],
+                &[
+                    ("n", BqlType::Int, false),
+                    ("total", BqlType::Int, true),
+                    ("average", BqlType::Float, true),
+                ],
+            );
+            let child = VecChild::new(
+                input_schema_int(),
+                vec![int_batch("value", vec![10, 20, 30])],
+            );
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![
+                    count_star_agg("n"),
+                    col_agg(AggFunction::Sum, 0, "value", BqlType::Int, "total"),
+                    col_agg(AggFunction::Avg, 0, "value", BqlType::Int, "average"),
+                ],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            assert_eq!(result.num_rows(), 1);
+            assert_eq!(result.num_columns(), 3);
+
+            let count_col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let sum_col = result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let avg_col = result
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+
+            assert_eq!(count_col.value(0), 3);
+            assert_eq!(sum_col.value(0), 60);
+            assert!((avg_col.value(0) - 20.0).abs() < 1e-10);
+        }
+
+        #[test]
+        fn min_max_aggregates() {
+            let output_schema = make_output_schema(
+                &[],
+                &[("lo", BqlType::Int, true), ("hi", BqlType::Int, true)],
+            );
+            let child = VecChild::new(
+                input_schema_int(),
+                vec![int_batch("value", vec![3, 1, 4, 1, 5, 9, 2, 6])],
+            );
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![
+                    col_agg(AggFunction::Min, 0, "value", BqlType::Int, "lo"),
+                    col_agg(AggFunction::Max, 0, "value", BqlType::Int, "hi"),
+                ],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            let lo = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let hi = result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+
+            assert_eq!(lo.value(0), 1);
+            assert_eq!(hi.value(0), 9);
+        }
+
+        #[test]
+        fn count_column_skips_nulls() {
+            let output_schema = make_output_schema(&[], &[("n", BqlType::Int, false)]);
+            // Build a batch with some null values.
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                true,
+            )]));
+            let col: ArrayRef = Arc::new(Int64Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                None,
+                Some(5),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+
+            let input_schema =
+                OperatorSchema::new(vec![ColumnDef::nullable("value", BqlType::Int)]).unwrap();
+            let child = VecChild::new(input_schema, vec![batch]);
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![col_agg(
+                    AggFunction::CountColumn,
+                    0,
+                    "value",
+                    BqlType::Int,
+                    "n",
+                )],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 3);
+        }
+
+        // ── Edge cases ──────────────────────────────────────────────────
+
+        #[test]
+        fn max_groups_exceeded_returns_error() {
+            let output_schema = make_output_schema(
+                &[("value", BqlType::Int, false)],
+                &[("n", BqlType::Int, false)],
+            );
+            let child = VecChild::new(
+                input_schema_int(),
+                vec![int_batch("value", vec![1, 2, 3, 4, 5])],
+            );
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![(col_expr(0, "value", BqlType::Int), "value".into())],
+                2, // max 2 groups
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let err = op.next_batch().unwrap_err();
+            assert!(
+                matches!(err, BqliteError::Execution(ref msg) if msg.contains("cardinality")),
+                "expected group limit error, got: {err}"
+            );
+        }
+
+        #[test]
+        fn empty_batch_is_skipped() {
+            let output_schema = make_output_schema(&[], &[("n", BqlType::Int, false)]);
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )]));
+            let empty_batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![] as Vec<i64>)) as ArrayRef],
+            )
+            .unwrap();
+            let full_batch = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+            )
+            .unwrap();
+
+            let child = VecChild::new(input_schema_int(), vec![empty_batch, full_batch]);
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 3);
+        }
+
+        // ── Lifecycle ───────────────────────────────────────────────────
+
+        #[test]
+        fn output_schema_matches_plan() {
+            let output_schema = make_output_schema(
+                &[("country", BqlType::String, false)],
+                &[("n", BqlType::Int, false)],
+            );
+            let child = VecChild::new(input_schema_country_amount(), vec![]);
+            let op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![(col_expr(0, "country", BqlType::String), "country".into())],
+                DEFAULT_MAX_GROUPS,
+                output_schema.clone(),
+            );
+
+            assert_eq!(op.output_schema().columns().len(), 2);
+            assert_eq!(op.output_schema().columns()[0].name, "country");
+            assert_eq!(op.output_schema().columns()[1].name, "n");
+        }
+
+        #[test]
+        fn lifecycle_forwards_open_close() {
+            let output_schema = make_output_schema(&[], &[("n", BqlType::Int, false)]);
+            let child = VecChild::new(input_schema_int(), vec![]);
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let _ = op.next_batch().unwrap();
+            op.close().unwrap();
+            // Close is idempotent.
+            op.close().unwrap();
+        }
+
+        #[test]
+        fn cancellation_propagates_from_child() {
+            let output_schema = make_output_schema(&[], &[("n", BqlType::Int, false)]);
+            let cancel = CancellationToken::new();
+            let child = VecChild::new(input_schema_int(), vec![int_batch("value", vec![1])])
+                .with_cancel(cancel.clone());
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            cancel.cancel();
+            let err = op.next_batch().unwrap_err();
+            assert!(matches!(err, BqliteError::Cancelled), "{err}");
+        }
+
+        #[test]
+        fn trait_object_compiles() {
+            let output_schema = make_output_schema(&[], &[("n", BqlType::Int, false)]);
+            let child = VecChild::new(input_schema_int(), vec![]);
+            let op: Box<dyn PhysicalOperator> = Box::new(HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            ));
+            let _ = op;
+        }
+
+        // ── Float aggregates ────────────────────────────────────────────
+
+        #[test]
+        fn sum_float_aggregate() {
+            let output_schema = make_output_schema(&[], &[("total", BqlType::Float, true)]);
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "value",
+                DataType::Float64,
+                false,
+            )]));
+            let col: ArrayRef = Arc::new(Float64Array::from(vec![1.5, 2.5, 3.0]));
+            let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+
+            let input_schema =
+                OperatorSchema::new(vec![ColumnDef::required("value", BqlType::Float)]).unwrap();
+            let child = VecChild::new(input_schema, vec![batch]);
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![col_agg(
+                    AggFunction::Sum,
+                    0,
+                    "value",
+                    BqlType::Float,
+                    "total",
+                )],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            assert!((col.value(0) - 7.0).abs() < 1e-10);
+        }
+
+        // ── Grouped with multiple agg functions ─────────────────────────
+
+        #[test]
+        fn grouped_count_and_sum() {
+            let output_schema = make_output_schema(
+                &[("country", BqlType::String, false)],
+                &[("n", BqlType::Int, false), ("total", BqlType::Int, true)],
+            );
+            let child = VecChild::new(
+                input_schema_country_amount(),
+                vec![country_amount_batch(
+                    vec!["US", "UK", "US"],
+                    vec![100, 200, 300],
+                )],
+            );
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![
+                    count_star_agg("n"),
+                    col_agg(AggFunction::Sum, 1, "amount", BqlType::Int, "total"),
+                ],
+                vec![(col_expr(0, "country", BqlType::String), "country".into())],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            assert_eq!(result.num_rows(), 2);
+            assert_eq!(result.num_columns(), 3);
+
+            let country_col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            let count_col = result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let sum_col = result
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+
+            // UK
+            assert_eq!(country_col.value(0), "UK");
+            assert_eq!(count_col.value(0), 1);
+            assert_eq!(sum_col.value(0), 200);
+            // US
+            assert_eq!(country_col.value(1), "US");
+            assert_eq!(count_col.value(1), 2);
+            assert_eq!(sum_col.value(1), 400); // 100 + 300
+        }
+
+        #[test]
+        fn single_row_input() {
+            let output_schema = make_output_schema(&[], &[("n", BqlType::Int, false)]);
+            let child = VecChild::new(input_schema_int(), vec![int_batch("value", vec![42])]);
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![count_star_agg("n")],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 1);
+        }
+
+        #[test]
+        fn count_distinct_through_operator() {
+            let output_schema = make_output_schema(&[], &[("uniq", BqlType::Int, false)]);
+            let child = VecChild::new(
+                input_schema_int(),
+                vec![
+                    int_batch("value", vec![1, 2, 3, 2, 1]),
+                    int_batch("value", vec![3, 4, 4]),
+                ],
+            );
+            let mut op = HashAggregateOperator::new(
+                Box::new(child),
+                vec![col_agg(
+                    AggFunction::CountDistinct,
+                    0,
+                    "value",
+                    BqlType::Int,
+                    "uniq",
+                )],
+                vec![],
+                DEFAULT_MAX_GROUPS,
+                output_schema,
+            );
+
+            op.open().unwrap();
+            let result = op.next_batch().unwrap().unwrap();
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 4); // distinct: 1, 2, 3, 4
+        }
     }
 }
