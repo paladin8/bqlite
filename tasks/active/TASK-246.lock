@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-246",
+  "claimed_at": "2026-04-12T04:17:02Z",
+  "branch": "task/TASK-246",
+  "description": "Reference-dataset bench harness + hard target enforcement"
+}
