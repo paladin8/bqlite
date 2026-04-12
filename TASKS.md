@@ -337,30 +337,33 @@ Unlocks: TASK-115 planner stub (needs `Catalog` to resolve `events`), TASK-118 e
 CREATE TABLE purchases (
   user_id STRING ENTITY KEY,
   ts TIMESTAMP EVENT TIME,
-  event STRING EVENT TYPE,
-  amount FLOAT,
-  country STRING
+  event_type STRING EVENT TYPE,
+  amount INT,
+  category STRING
 );
 
 -- Small literal insert for REPL-style tests
 INSERT INTO purchases VALUES
-    ('u1', '2026-03-01T10:00:00Z', 'view',     12.50, 'US'),
-    ('u1', '2026-03-01T10:05:00Z', 'checkout', 120.00, 'US');
+    ('user_0', 1700000000000000000, 'purchase', 999, 'manual'),
+    ('user_1', 1700000001000000000, 'refund', NULL, NULL);
 
 -- Bulk load from file with column remapping
 INSERT INTO purchases
 FROM 'data.csv'
-WITH (format: 'csv', map: (uid AS user_id, time AS ts, evt AS event));
+WITH (format: 'csv', map: (uid AS user_id, ts_ns AS ts, kind AS event_type));
 
 purchases
-| where event = 'checkout' AND amount > 100
-| select user_id, ts, amount
-| limit 100;
+| where event_type = 'purchase' AND amount > 4500
+| select user_id, amount
+| limit 10;
 
-EXPLAIN purchases | where event = 'checkout' | select user_id;
+EXPLAIN purchases
+| where event_type = 'purchase' AND amount > 4500
+| select user_id, amount
+| limit 10;
 
 DESCRIBE purchases;
-ALTER TABLE purchases ADD COLUMN referrer STRING;
+ALTER TABLE purchases ADD COLUMN source STRING;
 DROP TABLE purchases;
 ```
 
@@ -368,9 +371,9 @@ Source columns not named in the `map` clause pass through if their name matches 
 
 **Performance gate** (blocks wave acceptance; verified by TASK-236 on the reference dataset):
 
-*Reference dataset:* 100M-row synthetic `purchases` stream — 10k distinct `user_id`, 20 distinct `event` types, timestamps spanning 90 days monotonic-within-entity, 7 property columns of mixed types (ints, floats, low-cardinality strings), materialized as CSV on local NVMe.
+*Reference dataset:* 100M-row synthetic `purchases` stream — 10k distinct `user_id`, 20 distinct `event_type` values, timestamps spanning 90 days monotonic-within-entity, 7 property columns of mixed types (ints, floats, low-cardinality strings), materialized as CSV on local NVMe.
 
-*Reference hardware:* Apple M3 Pro, 36GB RAM, macOS 14+, release build (`cargo bench --profile=release-lto`), `/tmp` on APFS SSD. CI gate runs on GitHub Actions `ubuntu-latest` (4 vCPU) with a **1.5× relaxed target** across all numbers below.
+*Reference hardware:* Apple M2 Max, macOS 14+, release build (`cargo bench --profile=release-lto`), `/tmp` on APFS SSD. CI gate runs on GitHub Actions `ubuntu-latest` (4 vCPU) with a **1.5× relaxed target** across all numbers below.
 
 | Metric | Target |
 |---|---|
@@ -669,7 +672,7 @@ Without this task, the storage layer leaks disk space across crashes and the rel
 - **Baseline capture on main.** On every push to `main`, the workflow runs the bench subset and uploads the Criterion `estimates.json` outputs as a workflow artifact named `bench-baseline-main`. The most recent artifact is the canonical "previous green main" baseline.
 - **Comparison on PR.** On pull requests, the workflow runs the same bench subset, downloads the latest `bench-baseline-main` artifact, and runs `scripts/bench-compare.sh` to diff each metric. If any metric slips >10% on at least 3 consecutive Criterion samples (the consecutive-sample rule protects against single noisy runs on shared hardware), the job fails and the PR is blocked.
 - **Opt-out.** PRs labeled `bench-skip` and draft PRs bypass the gate — for docs-only changes and similar.
-- **Reference-hardware verification stays manual.** The pinned Apple M3 Pro numbers remain verified by hand before the wave is declared complete; the CI gate uses only the relaxed CI targets.
+- **Reference-hardware verification stays manual.** The pinned Apple M2 Max numbers remain verified by hand before the wave is declared complete; the CI gate uses only the relaxed CI targets.
 
 ### TASK-242: [RETIRED]
 **Status**: Retired during the post-Wave-2 architecture reconciliation. Originally scoped as "FilteredBatch + SelectionVector + execution tile scaffold" after execution-model.md §3.8 introduced selection vectors as a steady-state design. Review found the selection-vector half of the task only pays off under a fused stateless push segment, which is a Wave 5 concern (TASK-503 "operator fusion" territory) — Wave 2 has no operator chain that can carry a `FilteredBatch` across operator boundaries, because the `PhysicalOperator::next_batch()` boundary is `RecordBatch`. The execution-tile half was small enough to fold into TASK-231 directly (filter operator's constructor grows a `tile_size` parameter; the tile loop is a 10-line helper). Number retired per the "numbers are never reused" rule. The full execution-model.md §3.8 design remains the implementation target for Wave 5 — see the forward reference in TASK-503.
@@ -710,7 +713,7 @@ This task is intentionally tiny (~half a day) and exists to keep the implementat
 ### TASK-247: [HARD][IMPL] Scan-path performance closure for the acceptance query
 **Output**: crates/bqlite-storage/src/{database.rs,segment/reader.rs,segment/merge.rs,zone_map.rs}, crates/bqlite-operators/src/scan.rs, benches/wave2/{scan,acceptance}.rs
 **Depends on**: TASK-216, TASK-227, TASK-230, TASK-243, TASK-244, TASK-246
-**Description**: Profile and optimize the real query scan path until it meets the Wave 2 scan-side gate on reference hardware. This is the closure task for the numbers that currently miss by a wide margin: the end-to-end acceptance query, columnar decode throughput, pushed-down equality throughput, and zone-map pruning effectiveness. Expected work includes eliminating redundant segment-byte copies and reopen churn in the hot path, reusing projection/decoder planning across row-groups where legal, ensuring dictionary/equality pushdown stays in code space rather than devolving to row-level string comparisons, and making pruning effective for the actual acceptance predicate (`event = 'checkout' AND amount > 100`) rather than only for synthetic microbench filters. Success criteria are the published Wave 2 targets in the header, measured by TASK-246's reference-mode benches.
+**Description**: Profile and optimize the real query scan path until it meets the Wave 2 scan-side gate on reference hardware. This is the closure task for the numbers that currently miss by a wide margin: the end-to-end acceptance query, columnar decode throughput, pushed-down equality throughput, and zone-map pruning effectiveness. Expected work includes eliminating redundant segment-byte copies and reopen churn in the hot path, reusing projection/decoder planning across row-groups where legal, ensuring dictionary/equality pushdown stays in code space rather than devolving to row-level string comparisons, and making pruning effective for the actual acceptance predicate (`event_type = 'purchase' AND amount > 4500`) rather than only for synthetic microbench filters. Success criteria are the published Wave 2 targets in the header, measured by TASK-246's reference-mode benches.
 
 ### TASK-248: [HARD][IMPL] CSV ingest throughput closure
 **Output**: crates/bqlite-engine/src/ingest.rs, crates/bqlite-storage/src/{ingest/csv.rs,ingest/partitioner.rs,writer.rs}, benches/wave2/ingest.rs

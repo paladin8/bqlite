@@ -3,9 +3,9 @@
 //! Covers the Wave 2 performance gate "acceptance" line: the full
 //! ingest → scan → decode round-trip that the 100M-row acceptance
 //! test exercises. In CI mode the bench uses a scaled-down dataset
-//! (50k rows) to keep runtimes reasonable; in reference mode
-//! (`BQLITE_BENCH_MODE=reference`) it runs the full 100M-row dataset
-//! and enforces hard performance targets.
+//! (300k rows) so the pruning gate still sees multiple row groups; in
+//! reference mode (`BQLITE_BENCH_MODE=reference`) it runs the full
+//! 100M-row dataset and enforces hard performance targets.
 //!
 //! The acceptance bench measures:
 //! - Full round-trip: ingest events → write segments → read segments
@@ -35,6 +35,8 @@ use bqlite_storage::writer::SegmentWriter;
 use bqlite_storage::zone_map::accepts_row_group;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
+const ACCEPTANCE_SHARD_COUNT: u16 = 4;
+
 /// Ingest events into a database, return (scratch dir, segment file paths,
 /// schema, raw event byte estimate).
 fn setup_acceptance_db(
@@ -45,11 +47,12 @@ fn setup_acceptance_db(
     let scratch = ScratchDir::new("acceptance");
     let mut db = open_db_with_table(scratch.path(), "purchases", schema.clone());
 
-    let events = generate_events(n, entity_count);
+    let events = generate_acceptance_events(n, entity_count, ACCEPTANCE_SHARD_COUNT);
     let raw_bytes: u64 = events.len() as u64 * 120;
 
     let batch_id = db.allocate_batch_id("purchases").unwrap();
-    let mut partitioner = Partitioner::new(4, 30, batch_id, 512 * 1024 * 1024).unwrap();
+    let mut partitioner =
+        Partitioner::new(ACCEPTANCE_SHARD_COUNT, 30, batch_id, 512 * 1024 * 1024).unwrap();
     for event in &events {
         partitioner.push_event(event.clone()).unwrap();
     }
@@ -166,11 +169,17 @@ fn bench_acceptance_pruning(c: &mut Criterion) {
         .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
         .sum();
 
-    let predicate = Arc::new(ScanPredicate::new(vec![ScanConjunct::Range {
-        column: "amount".to_string(),
-        op: bqlite_core::storage::RangeOp::Gt,
-        value: PropertyValue::Int(4500),
-    }]));
+    let predicate = Arc::new(ScanPredicate::new(vec![
+        ScanConjunct::Equal {
+            column: "event_type".to_string(),
+            value: PropertyValue::String("purchase".to_string()),
+        },
+        ScanConjunct::Range {
+            column: "amount".to_string(),
+            op: bqlite_core::storage::RangeOp::Gt,
+            value: PropertyValue::Int(4500),
+        },
+    ]));
 
     let mut collector = BenchResultCollector::new(mode);
 
@@ -252,7 +261,11 @@ fn bench_acceptance_pruning(c: &mut Criterion) {
 fn bench_acceptance_ingest(c: &mut Criterion) {
     let mode = BenchMode::from_env();
     let sizing = BenchSizing::for_mode(mode);
-    let events = generate_events(sizing.acceptance_events, sizing.acceptance_entities);
+    let events = generate_acceptance_events(
+        sizing.acceptance_events,
+        sizing.acceptance_entities,
+        ACCEPTANCE_SHARD_COUNT,
+    );
     let event_bytes: u64 = events.len() as u64 * 120;
 
     let mut collector = BenchResultCollector::new(mode);
@@ -270,7 +283,9 @@ fn bench_acceptance_ingest(c: &mut Criterion) {
                 let mut db = open_db_with_table(scratch.path(), "purchases", schema);
 
                 let batch_id = db.allocate_batch_id("purchases").unwrap();
-                let mut partitioner = Partitioner::new(4, 30, batch_id, 512 * 1024 * 1024).unwrap();
+                let mut partitioner =
+                    Partitioner::new(ACCEPTANCE_SHARD_COUNT, 30, batch_id, 512 * 1024 * 1024)
+                        .unwrap();
                 for event in &events {
                     partitioner.push_event(event.clone()).unwrap();
                 }
@@ -295,7 +310,8 @@ fn bench_acceptance_ingest(c: &mut Criterion) {
         let mut db = open_db_with_table(scratch.path(), "purchases", schema);
 
         let batch_id = db.allocate_batch_id("purchases").unwrap();
-        let mut partitioner = Partitioner::new(4, 30, batch_id, 512 * 1024 * 1024).unwrap();
+        let mut partitioner =
+            Partitioner::new(ACCEPTANCE_SHARD_COUNT, 30, batch_id, 512 * 1024 * 1024).unwrap();
         for event in &events {
             partitioner.push_event(event.clone()).unwrap();
         }

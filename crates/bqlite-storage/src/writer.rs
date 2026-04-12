@@ -1757,6 +1757,179 @@ mod tests {
         assert_eq!(reader.row_group_count(), 3);
     }
 
+    /// Multi-row-group dictionary round-trip: write enough rows to span
+    /// 3+ row groups using a small `row_group_size`, with low-cardinality
+    /// strings that trigger dictionary encoding in each row group. Each
+    /// row group gets its own segment-level dictionary (`dict_id` per
+    /// (row_group, column) pair). Verify that every decoded value matches
+    /// the original event data — a dictionary lookup that resolves codes
+    /// against the wrong `dict_id` would produce corrupted strings.
+    #[test]
+    fn write_bucket_multi_row_group_dictionary_round_trip() {
+        let scratch = Scratch::new("e2e-multi-rg-dict");
+        let mut db = open_db_with_events_table(scratch.path());
+
+        // 10 entities × 50 rows each = 500 total rows.
+        // row_group_size = 100 → at least 5 row groups, each with
+        // dictionary-encoded `event_type` and `country` columns whose
+        // dictionaries differ per row group (different entities land in
+        // different row groups and carry different country values).
+        let row_group_size = 100;
+        let rows_per_entity = 50;
+        let entity_count = 10;
+        let total_rows = entity_count * rows_per_entity;
+
+        let event_types = ["click", "view", "purchase"];
+        let countries = ["US", "UK", "DE", "FR", "JP"];
+
+        let mut events: Vec<Event> = Vec::with_capacity(total_rows);
+        for eid in 0..entity_count {
+            let user = format!("user_{eid:03}");
+            for i in 0..rows_per_entity {
+                let ts = 1_700_000_000_000_000_000_i64 + (eid * rows_per_entity + i) as i64;
+                let et = event_types[(eid + i) % event_types.len()];
+                // Vary country per entity so different row groups get
+                // different dictionary contents.
+                let country = countries[eid % countries.len()];
+                events.push(ev_with(
+                    &user,
+                    ts,
+                    et,
+                    vec![
+                        ("amount", PropertyValue::Int(i as i64 * 10)),
+                        ("country", PropertyValue::String(country.into())),
+                    ],
+                ));
+            }
+        }
+
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        let mut writer = SegmentWriter::with_config(&mut db, WriterConfig { row_group_size });
+        let meta = writer
+            .write_bucket("events", 0, 0, batch_id, &events)
+            .expect("write_bucket");
+        assert_eq!(meta.row_count as usize, total_rows);
+
+        // Open and verify multiple row groups.
+        let path = scratch
+            .path()
+            .join("events")
+            .join("windows")
+            .join("w_000000")
+            .join("shard_00")
+            .join(format!("segment_{}.seg", meta.segment_id));
+        let schema = events_schema();
+        let reader = SegmentFileReader::open(&path, schema.clone()).expect("open segment");
+        assert!(
+            reader.row_group_count() >= 3,
+            "expected ≥3 row groups with row_group_size={row_group_size} and {total_rows} rows, \
+             got {}",
+            reader.row_group_count()
+        );
+        // Multiple dictionaries should have been hoisted (at least one per
+        // dictionary-encoded column per row group).
+        assert!(
+            reader.dictionaries().len() >= reader.row_group_count(),
+            "expected at least one segment-level dictionary per row group, \
+             got {} dicts for {} row groups",
+            reader.dictionaries().len(),
+            reader.row_group_count()
+        );
+
+        // Read back all row groups and collect decoded values.
+        let mut scan = reader.scan(&ColumnProjection::all(), None).expect("scan");
+        let mut decoded_users: Vec<String> = Vec::new();
+        let mut decoded_event_types: Vec<String> = Vec::new();
+        let mut decoded_amounts: Vec<Option<i64>> = Vec::new();
+        let mut decoded_countries: Vec<Option<String>> = Vec::new();
+        let mut row_groups_read = 0usize;
+        while let Some(rg) = scan.next_row_group().expect("decode row group") {
+            row_groups_read += 1;
+            let n = rg.num_rows();
+            // user_id (col 0)
+            let user_col = rg
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("user_id is StringView");
+            for i in 0..n {
+                decoded_users.push(user_col.value(i).to_string());
+            }
+            // event_type (col 2)
+            let et_col = rg
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("event_type is StringView");
+            for i in 0..n {
+                decoded_event_types.push(et_col.value(i).to_string());
+            }
+            // amount (col 3, nullable Int)
+            let amount_col = rg
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("amount is Int64");
+            for i in 0..n {
+                if amount_col.is_null(i) {
+                    decoded_amounts.push(None);
+                } else {
+                    decoded_amounts.push(Some(amount_col.value(i)));
+                }
+            }
+            // country (col 4, nullable String)
+            let country_col = rg
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("country is StringView");
+            for i in 0..n {
+                if country_col.is_null(i) {
+                    decoded_countries.push(None);
+                } else {
+                    decoded_countries.push(Some(country_col.value(i).to_string()));
+                }
+            }
+        }
+
+        assert_eq!(row_groups_read, reader.row_group_count());
+        assert_eq!(decoded_users.len(), total_rows);
+
+        // Verify every decoded row matches the original events.
+        // The segment stores rows in entity-sorted order — same order
+        // as `events`.
+        for (row_idx, event) in events.iter().enumerate() {
+            let expected_user = match &event.entity {
+                EntityId::String(s) => s.as_str(),
+                _ => panic!("expected string entity"),
+            };
+            assert_eq!(
+                decoded_users[row_idx], expected_user,
+                "user_id mismatch at row {row_idx}"
+            );
+            assert_eq!(
+                decoded_event_types[row_idx], event.event_type,
+                "event_type mismatch at row {row_idx} (possible dictionary corruption)"
+            );
+            let expected_amount = match event.get("amount") {
+                Some(PropertyValue::Int(v)) => Some(*v),
+                _ => None,
+            };
+            assert_eq!(
+                decoded_amounts[row_idx], expected_amount,
+                "amount mismatch at row {row_idx}"
+            );
+            let expected_country = match event.get("country") {
+                Some(PropertyValue::String(s)) => Some(s.clone()),
+                _ => None,
+            };
+            assert_eq!(
+                decoded_countries[row_idx], expected_country,
+                "country mismatch at row {row_idx} (possible dictionary corruption)"
+            );
+        }
+    }
+
     #[test]
     fn write_bucket_assigns_consecutive_seq_ids_via_database_counter() {
         let scratch = Scratch::new("e2e-seq-ids");

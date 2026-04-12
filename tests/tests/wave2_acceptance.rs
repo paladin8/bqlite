@@ -135,23 +135,26 @@ fn acceptance_at_scale(row_count: u64) {
     // real segment data from disk; the WHERE filter and LIMIT then
     // operate on those real rows.
     //
-    // The fixture produces 2 rows from VALUES (1 purchase, 1 refund)
-    // plus `row_count` rows from CSV (expected_purchase_count of which
-    // are purchases). LIMIT 10 caps the output at exactly 10 rows.
-    let expected_purchase_from_csv = csv::expected_purchase_count(row_count);
-    let total_purchases = 1 + expected_purchase_from_csv; // 1 purchase from VALUES
-    let expected_limit_result = total_purchases.min(10) as usize;
+    // The fixture produces 2 rows from VALUES, but the literal
+    // purchase has amount=999 and therefore does not satisfy the
+    // acceptance predicate. CSV purchase rows have amount `i * 100 + 1`,
+    // so the first matching row is i=45 (amount=4501). LIMIT 10 caps
+    // the output once enough matching CSV rows exist.
+    let purchase_rows_before_threshold = csv::expected_purchase_count(45);
+    let matching_purchase_from_csv =
+        csv::expected_purchase_count(row_count).saturating_sub(purchase_rows_before_threshold);
+    let expected_limit_result = matching_purchase_from_csv.min(10) as usize;
 
     let pipeline_result = engine
         .query(
-            "purchases | where event_type = 'purchase' | select user_id, amount | limit 10",
+            "purchases | where event_type = 'purchase' AND amount > 4500 | select user_id, amount | limit 10",
             &mut database,
         )
         .expect("WHERE/SELECT/LIMIT pipeline must not error");
     assert_eq!(
         pipeline_result.row_count(),
         expected_limit_result,
-        "WHERE/SELECT/LIMIT should return {} rows (purchase count capped at 10), got {}",
+        "WHERE/SELECT/LIMIT should return {} rows (high-value purchase count capped at 10), got {}",
         expected_limit_result,
         pipeline_result.row_count()
     );
@@ -179,7 +182,7 @@ fn acceptance_at_scale(row_count: u64) {
     // plus what the pushed predicate references.
     let explain = engine
         .query(
-            "EXPLAIN purchases | where event_type = 'purchase' | select user_id, amount | limit 10",
+            "EXPLAIN purchases | where event_type = 'purchase' AND amount > 4500 | select user_id, amount | limit 10",
             &mut database,
         )
         .expect("EXPLAIN");
@@ -209,6 +212,10 @@ fn acceptance_at_scale(row_count: u64) {
         plan_text.contains("event_type = 'purchase'"),
         "EXPLAIN must show the pushed predicate in Scan, got:\n{plan_text}"
     );
+    assert!(
+        plan_text.contains("amount > 4500"),
+        "EXPLAIN must show the pushed amount predicate in Scan, got:\n{plan_text}"
+    );
     // The Filter node must be absent — the optimizer elided it after
     // pushing all conjuncts into the Scan.
     assert!(
@@ -233,7 +240,7 @@ fn acceptance_at_scale(row_count: u64) {
     // - user_id (entity key — always included for k-way merge + in SELECT)
     // - ts (timestamp — always included for k-way merge, even if not in SELECT)
     // - event_type (referenced by the pushed-down predicate)
-    // - amount (in SELECT)
+    // - amount (referenced by both the pushed predicate and SELECT)
     // category must be pruned (not referenced by any operator).
     let scan_start = plan_text
         .find("Scan(purchases)")

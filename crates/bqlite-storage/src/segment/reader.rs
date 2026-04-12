@@ -45,7 +45,7 @@
 //!   decode via the `Plain` encoding directly.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -1433,17 +1433,10 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
             "footer body start {footer_body_start} is before the end of the row groups region {dict_region_start}"
         )));
     }
-    let mut seen_columns: HashSet<u32> = HashSet::new();
     for (i, dict) in footer.dictionaries.iter().enumerate() {
         if (dict.column_ordinal as usize) >= schema_col_count {
             return Err(BqliteError::Corruption(format!(
                 "dictionary {i} column_ordinal {} is out of schema bounds (< {schema_col_count})",
-                dict.column_ordinal
-            )));
-        }
-        if !seen_columns.insert(dict.column_ordinal) {
-            return Err(BqliteError::Corruption(format!(
-                "dictionary {i}: column_ordinal {} already has a dictionary — v1 allows at most one per column",
                 dict.column_ordinal
             )));
         }

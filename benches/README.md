@@ -65,7 +65,7 @@ cargo bench -p bqlite-benches --bench smoke
 cargo bench -p bqlite-benches -- 'smoke/noop'
 
 # Run in reference mode (100M rows, hard targets enforced).
-# Only meaningful on the pinned reference hardware (Apple M3 Pro).
+# Only meaningful on the pinned reference hardware (Apple M2 Max).
 BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches \
     --bench scan --bench encoding --bench ingest --bench acceptance
 ```
@@ -79,9 +79,9 @@ CI artifacts.
 The bench harness supports two modes controlled by the
 `BQLITE_BENCH_MODE` environment variable:
 
-- **`ci`** (default): CI-scaled fixtures (50k rows) for
-  regression-noise control on shared runners. Targets are not
-  enforced — only Criterion's statistical regression gate applies.
+- **`ci`** (default): CI-scaled fixtures for regression-noise control
+  on shared runners. Targets are not enforced — only Criterion's
+  statistical regression gate applies.
 
 - **`reference`**: Full 100M-row acceptance query on the pinned
   reference hardware. Hard performance targets are enforced — the

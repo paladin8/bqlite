@@ -8,9 +8,10 @@
 //!   type, matching the reference `purchases` fixture profile (10k
 //!   entities, 20 event types, monotonic-within-entity timestamps,
 //!   7 mixed-type property columns).
-//! - A synthetic event generator ([`generate_events`]) producing
-//!   `Vec<Event>` sorted by `(entity_id, timestamp)` for ingest and
-//!   acceptance benchmarks.
+//! - Synthetic event generators ([`generate_events`] and
+//!   [`generate_acceptance_events`]) producing `Vec<Event>` sorted by
+//!   `(entity_id, timestamp)` for scan, ingest, and acceptance
+//!   benchmarks.
 //! - Criterion configuration helpers ([`wave2_criterion`]) that apply
 //!   the workspace-standard sample size and measurement time.
 //!
@@ -19,12 +20,12 @@
 //! The bench harness supports two modes controlled by the
 //! `BQLITE_BENCH_MODE` environment variable:
 //!
-//! - **`ci`** (default): CI-scaled fixtures (50k rows) for
-//!   regression-noise control on shared runners. Targets are not
-//!   enforced — only Criterion's statistical comparison applies.
+//! - **`ci`** (default): CI-scaled fixtures for regression-noise
+//!   control on shared runners. Targets are not enforced — only
+//!   Criterion's statistical comparison applies.
 //!
 //! - **`reference`**: Reference-mode runs execute the true 100M-row
-//!   acceptance query on the pinned reference hardware (Apple M3 Pro).
+//!   acceptance query on the pinned reference hardware (Apple M2 Max).
 //!   Hard performance targets are enforced: the bench panics if any
 //!   target is missed. Results are written to a machine-readable JSON
 //!   file at `target/bench-results.json`.
@@ -41,6 +42,8 @@ use bqlite_core::property::PropertyValue;
 use bqlite_core::schema::{ColumnDef, TableSchema};
 use bqlite_core::time::Timestamp;
 use bqlite_core::BqlType;
+use bqlite_storage::ingest::partitioner::shard_id_for;
+use bqlite_storage::writer::DEFAULT_ROW_GROUP_SIZE;
 use bqlite_storage::Database;
 use criterion::Criterion;
 
@@ -113,7 +116,7 @@ impl BenchSizing {
     pub fn for_mode(mode: BenchMode) -> Self {
         match mode {
             BenchMode::Ci => BenchSizing {
-                acceptance_events: 50_000,
+                acceptance_events: 300_000,
                 acceptance_entities: 500,
                 scan_events: 50_000,
                 scan_entities: 500,
@@ -423,6 +426,20 @@ fn event_type_labels() -> Vec<String> {
         .collect()
 }
 
+/// Event type labels for the acceptance query fixture.
+///
+/// The acceptance query filters on `event_type = 'purchase'`, so the
+/// low-cardinality string set reserves one label for that exact value
+/// and keeps the remaining 19 values lexicographically below it
+/// (`event_*`). That keeps zone maps on non-purchase row groups tight
+/// enough to reject the equality without scanning.
+fn acceptance_event_type_labels() -> Vec<String> {
+    let mut labels = Vec::with_capacity(REF_EVENT_TYPE_COUNT);
+    labels.push("purchase".to_string());
+    labels.extend((1..REF_EVENT_TYPE_COUNT).map(|i| format!("event_{i}")));
+    labels
+}
+
 /// Generate `n` synthetic events matching the reference dataset profile:
 /// - `entity_count` distinct string entity ids
 /// - 20 distinct event types
@@ -485,6 +502,180 @@ pub fn generate_events(n: usize, entity_count: usize) -> Vec<Event> {
         }
     }
     events
+}
+
+/// Generate synthetic events tailored to the Wave 2 acceptance query.
+///
+/// The fixture shape is deliberate:
+/// - one shard contains only `purchase` entities, with its tail
+///   entities carrying `amount > 4500`
+/// - every other shard contains non-purchase entities whose amounts
+///   are also `> 4500`
+///
+/// This means:
+/// - `event_type = 'purchase'` alone accepts every row group in the
+///   designated purchase shard
+/// - `amount > 4500` alone accepts the non-purchase shards plus the
+///   tail row group in the purchase shard
+/// - the full acceptance predicate accepts only the tail row group in
+///   the designated shard
+///
+/// The result is a deterministic fixture that makes multi-column
+/// zone-map pruning visible without changing the public acceptance
+/// query shape.
+pub fn generate_acceptance_events(n: usize, entity_count: usize, shard_count: u16) -> Vec<Event> {
+    if n == 0 || entity_count == 0 {
+        return Vec::new();
+    }
+
+    let labels = acceptance_event_type_labels();
+    let purchase_label = &labels[0];
+    let non_purchase_labels = &labels[1..];
+    let base_rows_per_entity = (n / entity_count).max(1);
+    let entity_targets = entity_targets_per_shard(entity_count, shard_count);
+    let mut entities_by_shard = allocate_entities_by_shard(&entity_targets, shard_count);
+    let purchase_shard = entities_by_shard
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, entities)| entities.len())
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let entities_per_row_group = (DEFAULT_ROW_GROUP_SIZE / base_rows_per_entity).max(1);
+    let purchase_tail_len = tail_group_entity_count(
+        entities_by_shard[purchase_shard].len(),
+        entities_per_row_group,
+    );
+    let purchase_tail_start = entities_by_shard[purchase_shard]
+        .len()
+        .saturating_sub(purchase_tail_len);
+
+    let mut entity_specs = Vec::with_capacity(entity_count);
+    for (shard_idx, entities) in entities_by_shard.iter_mut().enumerate() {
+        entities.sort();
+        for (entity_pos, entity_id) in entities.iter().enumerate() {
+            let kind = if shard_idx == purchase_shard {
+                if entity_pos >= purchase_tail_start {
+                    AcceptanceEntityKind::PurchaseHigh
+                } else {
+                    AcceptanceEntityKind::PurchaseLow
+                }
+            } else {
+                let label = non_purchase_labels
+                    [(entity_pos + shard_idx) % non_purchase_labels.len()]
+                .clone();
+                AcceptanceEntityKind::EventHigh(label)
+            };
+            entity_specs.push((entity_id.clone(), kind));
+        }
+    }
+    entity_specs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let base_ns: i64 = 1_735_689_600_000_000_000;
+    let step_ns: i64 = 60_000_000_000;
+    let base_count = n / entity_count;
+    let remainder = n % entity_count;
+    let mut events = Vec::with_capacity(n);
+
+    for (entity_idx, (entity_id, kind)) in entity_specs.into_iter().enumerate() {
+        let row_count = base_count + usize::from(entity_idx < remainder);
+        let entity = EntityId::String(entity_id);
+        let event_type = match &kind {
+            AcceptanceEntityKind::PurchaseLow | AcceptanceEntityKind::PurchaseHigh => {
+                purchase_label.clone()
+            }
+            AcceptanceEntityKind::EventHigh(label) => label.clone(),
+        };
+        let (amount_base, category_prefix, discount) = match kind {
+            AcceptanceEntityKind::PurchaseLow => (100_i64, "purchase_low", 0.0),
+            AcceptanceEntityKind::PurchaseHigh => (4_501_i64, "purchase_high", 0.1),
+            AcceptanceEntityKind::EventHigh(_) => (4_501_i64, "event_high", 0.2),
+        };
+
+        for ev_idx in 0..row_count {
+            let ts = Timestamp::from_nanos(base_ns + (ev_idx as i64) * step_ns);
+            let amount = amount_base + (ev_idx as i64 % 128);
+            let properties = vec![
+                ("amount".into(), PropertyValue::Int(amount)),
+                (
+                    "price".into(),
+                    PropertyValue::Float(9.99 + (ev_idx as f64) * 0.01),
+                ),
+                (
+                    "category".into(),
+                    PropertyValue::String(format!("{category_prefix}_{}", ev_idx % 5)),
+                ),
+                (
+                    "quantity".into(),
+                    PropertyValue::Int((ev_idx as i64) % 10 + 1),
+                ),
+                ("discount".into(), PropertyValue::Float(discount)),
+                (
+                    "region".into(),
+                    PropertyValue::String(format!("region_{}", ev_idx % 8)),
+                ),
+                ("flag".into(), PropertyValue::Bool(ev_idx % 2 == 0)),
+            ];
+            events.push(Event::with_properties(
+                entity.clone(),
+                ts,
+                event_type.clone(),
+                properties,
+            ));
+        }
+    }
+
+    events
+}
+
+#[derive(Clone)]
+enum AcceptanceEntityKind {
+    PurchaseLow,
+    PurchaseHigh,
+    EventHigh(String),
+}
+
+fn entity_targets_per_shard(entity_count: usize, shard_count: u16) -> Vec<usize> {
+    let shard_count = usize::from(shard_count.max(1));
+    let mut targets = vec![entity_count / shard_count; shard_count];
+    for target in targets.iter_mut().take(entity_count % shard_count) {
+        *target += 1;
+    }
+    targets
+}
+
+fn allocate_entities_by_shard(entity_targets: &[usize], shard_count: u16) -> Vec<Vec<String>> {
+    let mut entities_by_shard = vec![Vec::new(); entity_targets.len()];
+    let mut candidate_idx = 0usize;
+
+    while entities_by_shard
+        .iter()
+        .zip(entity_targets)
+        .any(|(entities, target)| entities.len() < *target)
+    {
+        let candidate = format!("user_{candidate_idx:06}");
+        let shard = usize::from(shard_id_for(
+            &EntityId::String(candidate.clone()),
+            shard_count.max(1),
+        ));
+        if entities_by_shard[shard].len() < entity_targets[shard] {
+            entities_by_shard[shard].push(candidate);
+        }
+        candidate_idx += 1;
+    }
+
+    entities_by_shard
+}
+
+fn tail_group_entity_count(entity_count: usize, entities_per_row_group: usize) -> usize {
+    if entity_count == 0 {
+        return 0;
+    }
+    let remainder = entity_count % entities_per_row_group.max(1);
+    if remainder == 0 {
+        entities_per_row_group.min(entity_count)
+    } else {
+        remainder
+    }
 }
 
 /// Compute the total logical data bytes across all events.
@@ -703,7 +894,7 @@ mod tests {
     #[test]
     fn bench_sizing_ci_has_small_datasets() {
         let s = BenchSizing::for_mode(BenchMode::Ci);
-        assert_eq!(s.acceptance_events, 50_000);
+        assert_eq!(s.acceptance_events, 300_000);
         assert_eq!(s.acceptance_entities, 500);
         assert_eq!(s.scan_events, 50_000);
     }
@@ -714,6 +905,59 @@ mod tests {
         assert_eq!(s.acceptance_events, 100_000_000);
         assert_eq!(s.acceptance_entities, REF_ENTITY_COUNT);
         assert_eq!(s.scan_events, 100_000_000);
+    }
+
+    #[test]
+    fn acceptance_events_cluster_purchase_rows_into_single_shard() {
+        let events = generate_acceptance_events(300_000, 500, 4);
+        let mut purchase_shards = std::collections::BTreeSet::new();
+        let mut non_purchase_shards = std::collections::BTreeSet::new();
+        let mut saw_purchase_low = false;
+        let mut saw_purchase_high = false;
+        let mut event_types = std::collections::BTreeSet::new();
+
+        for ev in &events {
+            event_types.insert(ev.event_type.clone());
+            let amount = match ev.get("amount") {
+                Some(PropertyValue::Int(v)) => *v,
+                other => panic!("unexpected amount property: {other:?}"),
+            };
+            let shard = shard_id_for(&ev.entity, 4);
+            if ev.event_type == "purchase" {
+                purchase_shards.insert(shard);
+                saw_purchase_low |= amount <= 4_500;
+                saw_purchase_high |= amount > 4_500;
+            } else {
+                non_purchase_shards.insert(shard);
+                assert!(
+                    amount > 4_500,
+                    "non-purchase amount must be high, got {amount}"
+                );
+            }
+        }
+
+        assert_eq!(
+            purchase_shards.len(),
+            1,
+            "purchase rows should live on one shard"
+        );
+        assert!(
+            !non_purchase_shards.is_empty(),
+            "fixture should still exercise non-purchase shards"
+        );
+        assert!(
+            saw_purchase_low,
+            "fixture should include purchase rows below the threshold"
+        );
+        assert!(
+            saw_purchase_high,
+            "fixture should include purchase rows above the threshold"
+        );
+        assert_eq!(
+            event_types.len(),
+            REF_EVENT_TYPE_COUNT,
+            "fixture should preserve 20 distinct event types"
+        );
     }
 
     // ── BenchResultCollector tests ─────────────────────────────────────────
