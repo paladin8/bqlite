@@ -52,6 +52,11 @@ cargo fmt --check                                         # formatting check
 - Every operator respects configurable memory budgets
 - All errors must be typed and recoverable
 
+## Dependency Conventions
+
+- Prefer built-in std crates (e.g. `std::collections::BinaryHeap`) or popular, well-maintained crates over rolling custom low-level logic. Examples: `compact_str` for small-string optimization, `fastpfor` / `fastlanes` for integer compression, `sketches-ddsketch` for approximate quantiles.
+- Before implementing a non-trivial algorithm or data structure from scratch, check whether a maintained crate already provides it. Custom implementations are justified only when no suitable crate exists or when integration constraints make a dependency impractical.
+
 ## Performance Conventions
 
 - Preserve entity locality: storage, scan, and operator code must not silently break `(entity_id, timestamp)` ordering or split an entity across row groups / batches unless the design doc explicitly allows a streaming boundary for oversized entities.
