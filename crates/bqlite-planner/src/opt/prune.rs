@@ -45,6 +45,8 @@
 
 use std::collections::HashSet;
 
+use bqlite_core::OperatorSchema;
+
 use crate::compiled::{CompiledExpr, CompiledNode};
 use crate::physical::{
     AggregatePhysical, DistinctPhysical, ExplainPhysical, FilterPhysical, LimitPhysical,
@@ -217,10 +219,10 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
         PhysicalPlan::SequenceMatch(seq_match) => {
             let SequenceMatchPhysical {
                 compiled_nfa,
-                strategy,
+                strategy: _,
                 match_all,
                 demand: seq_demand,
-                execution_config,
+                execution_config: _,
                 fused_aggregate,
                 input,
                 output_schema,
@@ -232,15 +234,52 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
                 .iter()
                 .map(|c| c.name.clone())
                 .collect();
+
+            // Prune the SequenceMatch output schema: remove columns not
+            // in the parent demand set. This ensures that `match_duration`
+            // and `match_events` are dropped when the downstream (e.g.
+            // STATS referencing only `step_reached`) does not need them.
+            // `entity_id` is always kept — the SequenceMatchAdapter needs
+            // it for entity boundary detection and output batch construction.
+            let pruned_output = if !demand.is_empty() {
+                let pruned_cols: Vec<_> = output_schema
+                    .columns()
+                    .iter()
+                    .filter(|c| demand.contains(&c.name) || c.name == "entity_id")
+                    .cloned()
+                    .collect();
+                if pruned_cols.len() < output_schema.columns().len() && !pruned_cols.is_empty() {
+                    OperatorSchema::new(pruned_cols).unwrap_or_else(|_| output_schema.clone())
+                } else {
+                    output_schema
+                }
+            } else {
+                output_schema
+            };
+
+            // Recompute strategy after pruning: if match_duration and
+            // match_events are no longer in the output schema, the NFA
+            // strategy is no longer required — step counter suffices.
+            let pruned_needs_match_detail = pruned_output.column("match_duration").is_some()
+                || pruned_output.column("match_events").is_some();
+            let pruned_execution_config = crate::compile::MatchExecutionConfig {
+                track_match_duration: pruned_needs_match_detail,
+                track_match_events: pruned_needs_match_detail,
+            };
+            let pruned_strategy = crate::compile::select_strategy(
+                compiled_nfa.pattern_class,
+                &pruned_execution_config,
+            );
+
             PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
                 compiled_nfa,
-                strategy,
+                strategy: pruned_strategy,
                 match_all,
                 demand: seq_demand,
-                execution_config,
+                execution_config: pruned_execution_config,
                 fused_aggregate,
                 input: Box::new(prune_with_demand(*input, child_demand)),
-                output_schema,
+                output_schema: pruned_output,
             }))
         }
 

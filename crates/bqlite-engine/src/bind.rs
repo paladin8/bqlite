@@ -195,13 +195,13 @@ impl SequenceMatchAdapter {
     /// batch queue (non-fused) or into the aggregate accumulator (fused).
     fn finalize_entity(&mut self, entity: EntityId, state: SequenceMatchState) -> Result<()> {
         if let Some(fused) = &mut self.fused {
-            // Fused path: SequenceMatchOperator::finish_entity_into (overridden
-            // for the fused case) calls finalize_state, counts completions, and
-            // calls accumulator.update(None, &[Null; num_aggs]) once per
-            // completion. For COUNT(*) the AggState::Count branch increments the
-            // count-star counter and ignores the null value. This avoids calling
-            // finish_entity (which would panic when the output_schema has been
-            // replaced with the aggregate schema by the fusion optimizer).
+            // Fused path: SequenceMatchOperator::finish_entity_into builds
+            // an intermediate match-output batch (using the saved
+            // match_output_schema) and feeds it to the accumulator via
+            // update_batch. For simple column-ref aggregates this resolves
+            // columns by name; complex expressions (SUM(CAST(...))) are
+            // blocked from fusion by the is_simple_column_ref eligibility
+            // check and route through the non-fused HashAggregateOperator.
             let acc: &mut dyn Accumulator = &mut fused.accumulator;
             self.operator.finish_entity_into(state, acc)?;
         } else {

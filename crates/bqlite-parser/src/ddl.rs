@@ -300,7 +300,7 @@ fn role_not_allowed_here(p: &Parser) -> ParseError {
 /// Parse a `type_expr` and return the resolved [`BqlType`] plus the
 /// span covering the entire type expression (e.g. from `LIST` through
 /// the closing `)`).
-fn parse_type_expr(p: &mut Parser) -> Result<(BqlType, Span), ParseError> {
+pub(crate) fn parse_type_expr(p: &mut Parser) -> Result<(BqlType, Span), ParseError> {
     let tok = p.peek().clone();
     let tok_span = token_span(&tok);
     match &tok.kind {

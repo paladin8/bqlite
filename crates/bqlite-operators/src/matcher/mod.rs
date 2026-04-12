@@ -28,7 +28,7 @@ pub mod step_counter;
 
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::{EntityId, OperatorSchema, ScalarValue};
+use bqlite_core::{BqlType, ColumnDef, EntityId, OperatorSchema};
 use bqlite_planner::compile::{CompiledNfa, MatchStrategy};
 use bqlite_planner::demand::CompiledFusableAggregate;
 use bqlite_planner::physical::SequenceMatchPhysical;
@@ -74,11 +74,14 @@ pub struct SequenceMatchOperator {
     num_variables: usize,
     /// Fused aggregate descriptor (if match-aggregate fusion is active).
     ///
-    /// When set, `finish_entity_into` uses `finalize_state` directly rather
-    /// than `finish_entity`, because `self.output_schema` has been replaced
-    /// with the aggregate schema and `build_output_batch` cannot produce
-    /// valid values for aggregate result columns.
+    /// When set, `finish_entity_into` builds intermediate match-output
+    /// batches using `match_output_schema` and feeds them into the
+    /// accumulator via `update_batch`.
     fused_aggregate: Option<CompiledFusableAggregate>,
+    /// The original match output schema, preserved when fusion replaces
+    /// `output_schema` with the aggregate schema. Used by the fused
+    /// `finish_entity_into` path to build intermediate batches.
+    match_output_schema: Option<OperatorSchema>,
 }
 
 /// The underlying strategy driver selected at plan time.
@@ -127,6 +130,15 @@ impl SequenceMatchOperator {
             match_all,
         );
 
+        // When fused, `desc.output_schema` has been replaced with the
+        // aggregate schema. Build the original match output schema so
+        // `finish_entity_into` can construct intermediate batches.
+        let match_output_schema = if desc.fused_aggregate.is_some() {
+            Some(Self::build_match_output_schema(emit_all, num_steps))
+        } else {
+            None
+        };
+
         Self {
             strategy,
             match_all,
@@ -136,6 +148,7 @@ impl SequenceMatchOperator {
             required_column_names,
             num_variables,
             fused_aggregate: desc.fused_aggregate.clone(),
+            match_output_schema,
         }
     }
 
@@ -178,6 +191,7 @@ impl SequenceMatchOperator {
             required_column_names,
             num_variables,
             fused_aggregate: None,
+            match_output_schema: None,
         }
     }
 
@@ -203,6 +217,40 @@ impl SequenceMatchOperator {
                 StrategyDriver::Nfa(NfaSimulator::new(compiled_nfa, match_all))
             }
         }
+    }
+
+    /// Build the minimal match output schema needed by the fused
+    /// `finish_entity_into` path to construct intermediate batches.
+    ///
+    /// When the fusion optimizer replaces `output_schema` with the
+    /// aggregate schema, we can no longer call `build_output_batch`
+    /// using `self.output_schema`. This method builds the match-level
+    /// schema with the columns that `build_output_batch` knows how to
+    /// populate: `entity_id`, `match_duration`, and `step_reached`.
+    fn build_match_output_schema(emit_all: bool, _num_steps: u8) -> OperatorSchema {
+        let mut cols = vec![
+            ColumnDef {
+                name: "entity_id".into(),
+                bql_type: BqlType::String,
+                nullable: false,
+                default_value: None,
+            },
+            ColumnDef {
+                name: "match_duration".into(),
+                bql_type: BqlType::Int,
+                nullable: true,
+                default_value: None,
+            },
+        ];
+        if emit_all {
+            cols.push(ColumnDef {
+                name: "step_reached".into(),
+                bql_type: BqlType::Int,
+                nullable: false,
+                default_value: None,
+            });
+        }
+        OperatorSchema::new(cols).expect("match output schema must be valid")
     }
 }
 
@@ -295,21 +343,20 @@ impl EntityOperator for SequenceMatchOperator {
     ) -> bqlite_core::Result<()> {
         // Fused path: when the match-aggregate fusion optimizer is active,
         // `self.output_schema` has been replaced with the aggregate schema.
-        // Calling `finish_entity` → `build_output_batch(agg_schema)` would
-        // panic because `build_output_batch` cannot populate aggregate result
-        // columns (e.g. `n INT NOT NULL`) with non-null values.
-        //
-        // Instead, finalize the NFA state directly, count completions, and
-        // call `accumulator.update` once per completion with a null placeholder
-        // per aggregate function. For COUNT(*) (the primary fused use case),
-        // the `AggState::Count` branch calls `update_count_star()` and ignores
-        // the value — so the null placeholder is safe.
-        if let Some(fa) = &self.fused_aggregate {
-            let (completions, _partials, _dropped) = self.finalize_state(state);
-            if !completions.is_empty() {
-                let null_row: Vec<ScalarValue> = vec![ScalarValue::Null; fa.aggregates.len()];
-                for _ in &completions {
-                    accumulator.update(None, &null_row)?;
+        // We use the saved `match_output_schema` to build an intermediate
+        // match-output batch and feed it into the accumulator.
+        if self.fused_aggregate.is_some() {
+            if let Some(match_schema) = &self.match_output_schema {
+                let (completions, partials, _dropped) = self.finalize_state(state);
+                if !completions.is_empty() || (self.emit_all && !partials.is_empty()) {
+                    let batch = build_output_batch(
+                        match_schema,
+                        &completions,
+                        &partials,
+                        self.emit_all,
+                        self.num_steps,
+                    );
+                    accumulator.update_batch(&batch)?;
                 }
             }
             return Ok(());

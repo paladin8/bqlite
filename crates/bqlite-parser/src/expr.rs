@@ -261,6 +261,7 @@ fn parse_primary(p: &mut Parser) -> Result<Spanned<Expr>, ParseError> {
             p.bump();
             Ok(Spanned::new(Expr::Variable(Name::new(name, span)), span))
         }
+        TokenKind::Kw(Keyword::Cast) => parse_cast(p),
         TokenKind::Ident(_) | TokenKind::QuotedName(_) => parse_name_or_qualified(p),
         TokenKind::LParen => {
             p.bump();
@@ -271,6 +272,32 @@ fn parse_primary(p: &mut Parser) -> Result<Spanned<Expr>, ParseError> {
         }
         _ => Err(p.error_unexpected(Expected::Expression, None)),
     }
+}
+
+/// Parse a `CAST(expr AS type)` expression.
+///
+/// Grammar: `CAST '(' expr 'AS' type_expr ')'`
+///
+/// CAST is a primary expression (same precedence level as literals and
+/// parenthesized sub-expressions). The type portion uses
+/// [`crate::ddl::parse_type_expr`], which supports all BQL types
+/// (BOOL, INT, FLOAT, STRING, TIMESTAMP, LIST(...), MAP(...)).
+fn parse_cast(p: &mut Parser) -> Result<Spanned<Expr>, ParseError> {
+    let cast_span = token_span(p.peek());
+    p.expect_kw(Keyword::Cast)?;
+    p.expect_punct(&TokenKind::LParen, "(")?;
+    let inner = parse_expression(p)?;
+    p.expect_kw(Keyword::As)?;
+    let (target, _type_span) = crate::ddl::parse_type_expr(p)?;
+    let rparen = p.expect_punct(&TokenKind::RParen, ")")?;
+    let span = cast_span.merged(token_span(&rparen));
+    Ok(Spanned::new(
+        Expr::Cast {
+            expr: Box::new(inner),
+            target,
+        },
+        span,
+    ))
 }
 
 /// Parse a bare or qualified name — `col` or `table.col`.
@@ -312,6 +339,7 @@ fn expr_of(source: &str) -> Result<Spanned<Expr>, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bqlite_ast::BqlType;
 
     fn lit_int(e: &Spanned<Expr>) -> i64 {
         match e.node {
@@ -940,5 +968,58 @@ mod tests {
             }
             other => panic!("expected UnexpectedEof/Name, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // CAST expressions
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cast_int() {
+        let e = parse_ok("CAST(x AS INT)");
+        match e.node {
+            Expr::Cast { expr, target } => {
+                assert!(matches!(expr.node, Expr::Column(_)));
+                assert_eq!(target, BqlType::Int);
+            }
+            other => panic!("expected Cast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_bool() {
+        let e = parse_ok("CAST(1 AS BOOL)");
+        match e.node {
+            Expr::Cast { target, .. } => assert_eq!(target, BqlType::Bool),
+            other => panic!("expected Cast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_nested_expression() {
+        // CAST(a >= 1 AS INT) — comparison inside CAST
+        let e = parse_ok("CAST(a >= 1 AS INT)");
+        match e.node {
+            Expr::Cast { expr, target } => {
+                assert!(matches!(expr.node, Expr::Compare { .. }));
+                assert_eq!(target, BqlType::Int);
+            }
+            other => panic!("expected Cast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_missing_as_errors() {
+        assert!(expr_of("CAST(x INT)").is_err());
+    }
+
+    #[test]
+    fn cast_missing_type_errors() {
+        assert!(expr_of("CAST(x AS)").is_err());
+    }
+
+    #[test]
+    fn cast_missing_lparen_errors() {
+        assert!(expr_of("CAST x AS INT)").is_err());
     }
 }

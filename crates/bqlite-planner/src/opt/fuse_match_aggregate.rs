@@ -297,14 +297,32 @@ fn is_eligible(
     }
     // Check aggregate argument expressions.
     // COUNT(*) has no argument (arg is None) and is always eligible.
+    //
+    // Non-trivial expressions (CAST, Compare, Arith, etc.) are NOT
+    // eligible for fusion because the fused path in
+    // `finish_entity_into` passes intermediate match-output batches
+    // through `update_batch`, which resolves columns by name. It
+    // cannot evaluate compiled expressions. These aggregates must go
+    // through the non-fused `HashAggregateOperator` path, which uses
+    // `eval::evaluate` to compute expressions against each batch.
     for agg in aggregates {
         if let Some(arg) = &agg.arg {
+            // Only fuse simple column references, not computed expressions.
+            if !is_simple_column_ref(arg) {
+                return false;
+            }
             if !refs_only_match_cols(arg, match_col_names) {
                 return false;
             }
         }
     }
     true
+}
+
+/// Return `true` when the expression is a simple column reference
+/// (a single `Column` node with no surrounding computation).
+fn is_simple_column_ref(expr: &CompiledExpr) -> bool {
+    matches!(expr.node, CompiledNode::Column { .. })
 }
 
 /// Return `true` when every `Column` node in `expr` is in `match_col_names`.
@@ -857,6 +875,68 @@ mod tests {
         assert!(
             result_seq.fused_aggregate.is_none(),
             "bare SequenceMatch must not get a fused_aggregate"
+        );
+    }
+
+    // ── Test: non-column-ref aggregate arg blocks fusion ───────────────────────
+
+    #[test]
+    fn cast_expression_aggregate_arg_blocks_fusion() {
+        // SUM(CAST(step_reached >= 1 AS INT)) — the arg is a Cast
+        // expression, not a simple column reference. Fusion must be
+        // blocked because the fused path cannot evaluate computed
+        // expressions.
+        let cast_expr = CompiledExpr {
+            node: CompiledNode::Cast {
+                input: Box::new(CompiledExpr {
+                    node: CompiledNode::Compare {
+                        op: bqlite_ast::CompareOp::GreaterOrEqual,
+                        kernel: CompareKernel::ArrowKernel(ArrowKernelId::GeInt),
+                        left: Box::new(col_ref("step_reached", 1, BqlType::Int, false)),
+                        right: Box::new(CompiledExpr {
+                            node: CompiledNode::Literal(bqlite_core::PropertyValue::Int(1)),
+                            result_type: BqlType::Int,
+                            nullable: false,
+                        }),
+                    },
+                    result_type: BqlType::Bool,
+                    nullable: false,
+                }),
+                target_type: BqlType::Int,
+                kernel: crate::compiled::CastKernel::ArrowKernel(ArrowKernelId::CastBoolToInt),
+            },
+            result_type: BqlType::Int,
+            nullable: false,
+        };
+
+        let agg = AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Sum,
+                arg: Some(cast_expr),
+                output_name: "signup".into(),
+            }],
+            group_by: vec![],
+            max_groups: 10_000,
+            input: Box::new(PhysicalPlan::SequenceMatch(seq_match_physical(
+                match_output_schema(),
+            ))),
+            output_schema: agg_output_schema(),
+        };
+
+        let plan = PhysicalPlan::Aggregate(agg);
+        let result = fuse_match_aggregate(plan);
+
+        // Fusion must NOT occur: the Aggregate node must remain.
+        let PhysicalPlan::Aggregate(result_agg) = result else {
+            panic!("expected Aggregate (fusion blocked), got a fused SequenceMatch");
+        };
+        // The child SequenceMatch must not have a fused_aggregate.
+        let PhysicalPlan::SequenceMatch(child_seq) = *result_agg.input else {
+            panic!("expected SequenceMatch child");
+        };
+        assert!(
+            child_seq.fused_aggregate.is_none(),
+            "SequenceMatch must not have fused_aggregate when arg is a CAST expression"
         );
     }
 }

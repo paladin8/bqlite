@@ -146,6 +146,106 @@ pub fn row_timestamp(i: u64) -> i64 {
     BASE_TS_NANOS + (i as i64) * TS_STEP_NANOS
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Funnel fixture generator (Wave 3 acceptance test — TASK-326)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The CREATE TABLE DDL for the funnel `events` schema.
+///
+/// Minimal 3-column table: entity key, event time, event type.
+pub const FUNNEL_EVENTS_CREATE_TABLE: &str = "\
+    CREATE TABLE events (\
+        user_id STRING NOT NULL ENTITY KEY, \
+        ts TIMESTAMP NOT NULL EVENT TIME, \
+        event_type STRING NOT NULL EVENT TYPE\
+    )";
+
+/// Number of distinct entities in the funnel fixture.
+const FUNNEL_ENTITY_COUNT: u64 = 20;
+
+/// Number of entities that reach each funnel step.
+///
+/// - `FUNNEL_SIGNUP_COUNT` entities receive a `signup` event (step 1).
+/// - `FUNNEL_ACTIVATION_COUNT` of those also receive an `activation` event (step 2).
+/// - `FUNNEL_PURCHASE_COUNT` of those also receive a `purchase` event (step 3).
+/// - The remaining entities receive only a `browse` event (no funnel entry).
+const FUNNEL_SIGNUP_COUNT: u64 = 15;
+const FUNNEL_ACTIVATION_COUNT: u64 = 10;
+const FUNNEL_PURCHASE_COUNT: u64 = 5;
+
+/// Nanoseconds between events for the same entity (1 hour).
+///
+/// Well within the 7d WITHIN window constraint used in the acceptance test.
+const FUNNEL_EVENT_SPACING_NS: i64 = 3_600_000_000_000;
+
+/// Write the funnel CSV fixture to an arbitrary [`Write`] sink.
+///
+/// Produces a deterministic event stream where:
+///
+/// - Entities `user_0` .. `user_{FUNNEL_PURCHASE_COUNT - 1}` complete all 3
+///   steps: signup → activation → purchase.
+/// - Entities `user_{FUNNEL_PURCHASE_COUNT}` ..
+///   `user_{FUNNEL_ACTIVATION_COUNT - 1}` complete 2 steps: signup → activation.
+/// - Entities `user_{FUNNEL_ACTIVATION_COUNT}` ..
+///   `user_{FUNNEL_SIGNUP_COUNT - 1}` complete 1 step: signup only.
+/// - Entities `user_{FUNNEL_SIGNUP_COUNT}` ..
+///   `user_{FUNNEL_ENTITY_COUNT - 1}` have only a `browse` event
+///   (do not enter the funnel).
+///
+/// Events are written per-entity (all of entity 0's events, then entity 1's,
+/// etc.) so the ingested data is entity-sorted — matching the storage layer's
+/// requirement for entity-locality.
+pub fn write_funnel_fixture<W: Write>(mut out: W) -> io::Result<()> {
+    writeln!(out, "user_id,ts,event_type")?;
+
+    for user in 0..FUNNEL_ENTITY_COUNT {
+        let mut ts = BASE_TS_NANOS + (user as i64) * FUNNEL_EVENT_SPACING_NS * 4;
+
+        if user < FUNNEL_SIGNUP_COUNT {
+            writeln!(out, "user_{user},{ts},signup")?;
+            ts += FUNNEL_EVENT_SPACING_NS;
+        }
+
+        if user < FUNNEL_ACTIVATION_COUNT {
+            writeln!(out, "user_{user},{ts},activation")?;
+            ts += FUNNEL_EVENT_SPACING_NS;
+        }
+
+        if user < FUNNEL_PURCHASE_COUNT {
+            writeln!(out, "user_{user},{ts},purchase")?;
+        }
+
+        if user >= FUNNEL_SIGNUP_COUNT {
+            // Non-funnel entities get a browse event.
+            writeln!(out, "user_{user},{ts},browse")?;
+        }
+    }
+
+    out.flush()
+}
+
+/// Write the funnel CSV fixture to a file at `dir/<filename>` and return
+/// the full path.
+pub fn write_funnel_fixture_file(dir: &Path, filename: &str) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(filename);
+    let file = std::fs::File::create(&path)?;
+    let buf = io::BufWriter::new(file);
+    write_funnel_fixture(buf)?;
+    Ok(path)
+}
+
+/// Expected funnel step counts for the deterministic fixture.
+///
+/// Returns `(signup_count, activation_count, purchase_count)`.
+pub fn expected_funnel_counts() -> (i64, i64, i64) {
+    (
+        FUNNEL_SIGNUP_COUNT as i64,
+        FUNNEL_ACTIVATION_COUNT as i64,
+        FUNNEL_PURCHASE_COUNT as i64,
+    )
+}
+
 /// Return the entity id string for the row at index `i` given
 /// `entity_count` entities.
 pub fn row_entity_id(i: u64, entity_count: u64) -> String {
@@ -225,6 +325,63 @@ mod tests {
         assert!(lines[2].starts_with("user_2,"));
         assert!(lines[3].starts_with("user_0,"));
         assert!(lines[4].starts_with("user_1,"));
+    }
+
+    #[test]
+    fn funnel_fixture_deterministic() {
+        let mut buf1 = Vec::new();
+        write_funnel_fixture(&mut buf1).unwrap();
+        let mut buf2 = Vec::new();
+        write_funnel_fixture(&mut buf2).unwrap();
+        assert_eq!(buf1, buf2, "funnel fixture must be deterministic");
+    }
+
+    #[test]
+    fn funnel_fixture_has_correct_row_count() {
+        let mut buf = Vec::new();
+        write_funnel_fixture(&mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        // Header + data rows:
+        // - 5 entities × 3 events (signup + activation + purchase) = 15
+        // - 5 entities × 2 events (signup + activation) = 10
+        // - 5 entities × 1 event (signup) = 5
+        // - 5 entities × 1 event (browse) = 5
+        // Total = 35 data rows + 1 header = 36 lines
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 36, "expected 36 lines (1 header + 35 data)");
+        assert_eq!(lines[0], "user_id,ts,event_type");
+    }
+
+    #[test]
+    fn funnel_fixture_entity_sorted() {
+        let mut buf = Vec::new();
+        write_funnel_fixture(&mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().skip(1).collect();
+
+        // Verify events are entity-sorted: all events for user_0 come
+        // before user_1, etc.
+        let mut prev_user = String::new();
+        let mut seen_users: Vec<String> = Vec::new();
+        for line in &lines {
+            let user = line.split(',').next().unwrap().to_string();
+            if user != prev_user {
+                assert!(
+                    !seen_users.contains(&user),
+                    "entity {user} events must be contiguous (entity-sorted)"
+                );
+                seen_users.push(user.clone());
+                prev_user = user;
+            }
+        }
+    }
+
+    #[test]
+    fn funnel_expected_counts() {
+        let (signup, activation, purchase) = expected_funnel_counts();
+        assert_eq!(signup, 15);
+        assert_eq!(activation, 10);
+        assert_eq!(purchase, 5);
     }
 
     #[test]
