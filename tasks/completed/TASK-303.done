@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-303",
   "claimed_at": "2026-04-12T06:52:37Z",
+  "completed_at": "2026-04-12T07:05:54Z",
   "branch": "task/TASK-303",
   "description": "Pattern grammar surface + AST reconciliation"
 }
