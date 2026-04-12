@@ -23,11 +23,12 @@
 //! - **Metadata** (`Describe`, `Explain`): compute the result
 //!   batch during bind and return a
 //!   [`crate::ddl::ResultOperator`] wrapping the batch.
-//! - **INSERT**: deferred to TASK-233.
+//! - **INSERT** (`From`): execute via the CSV ingest pipeline
+//!   (TASK-233). `Values` deferred to TASK-238.
 
 use std::sync::Arc;
 
-use bqlite_core::{BqliteError, Result, SegmentReader};
+use bqlite_core::{Result, SegmentReader};
 use bqlite_operators::{
     CancellationToken, FilterOperator, LimitOperator, PhysicalOperator, ProjectOperator,
     ScanOperator,
@@ -130,10 +131,13 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
             )))
         }
 
-        // ── Deferred to TASK-233 ────────────────────────────────
-        PhysicalPlan::Insert(_) => Err(BqliteError::Plan(
-            "engine bind: INSERT execution lands in TASK-233".into(),
-        )),
+        // ── DML ──────────────────────────────────────────────────
+        PhysicalPlan::Insert(insert) => {
+            crate::ingest::execute_insert(insert, db)?;
+            Ok(Box::new(ResultOperator::empty(
+                insert.output_schema.clone(),
+            )))
+        }
     }
 }
 
