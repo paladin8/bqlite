@@ -827,4 +827,146 @@ mod tests {
         assert!(both_surv.iter().all(|i| category_surv.contains(i)));
         assert!(both_surv.iter().all(|i| amount_surv.contains(i)));
     }
+
+    // ── accepts_row_group_inline (TASK-247) ────────────────────────
+
+    use crate::segment::layout::{ColumnChunkMeta, RowGroupIndex};
+    use bqlite_core::ColumnDef;
+
+    fn make_rg(columns: Vec<ColumnChunkMeta>) -> RowGroupIndex {
+        RowGroupIndex {
+            byte_offset: 0,
+            byte_length: 0,
+            row_count: 100,
+            columns,
+        }
+    }
+
+    fn make_ccm(
+        ordinal: u32,
+        min: Option<PropertyValue>,
+        max: Option<PropertyValue>,
+    ) -> ColumnChunkMeta {
+        ColumnChunkMeta {
+            column_ordinal: ordinal,
+            byte_offset: 0,
+            byte_length: 0,
+            encoding: 0,
+            compression: 0,
+            row_count: 100,
+            null_count: 0,
+            zone_min: min,
+            zone_max: max,
+        }
+    }
+
+    fn schema_cols() -> Vec<ColumnDef> {
+        vec![
+            ColumnDef {
+                name: "amount".into(),
+                bql_type: bqlite_core::BqlType::Int,
+                nullable: false,
+                default_value: None,
+            },
+            ColumnDef {
+                name: "event".into(),
+                bql_type: bqlite_core::BqlType::String,
+                nullable: false,
+                default_value: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn inline_prunes_row_group_with_range_predicate() {
+        let pred = ScanPredicate::new(vec![ScanConjunct::Range {
+            column: "amount".into(),
+            op: RangeOp::Gt,
+            value: PropertyValue::Int(100),
+        }]);
+        let rg_below = make_rg(vec![make_ccm(
+            0,
+            Some(PropertyValue::Int(1)),
+            Some(PropertyValue::Int(50)),
+        )]);
+        let rg_above = make_rg(vec![make_ccm(
+            0,
+            Some(PropertyValue::Int(50)),
+            Some(PropertyValue::Int(200)),
+        )]);
+        let cols = schema_cols();
+        assert!(!accepts_row_group_inline(&pred, &rg_below, &cols));
+        assert!(accepts_row_group_inline(&pred, &rg_above, &cols));
+    }
+
+    #[test]
+    fn inline_multi_conjunct_acceptance_query() {
+        // The Wave 2 acceptance predicate: event = 'checkout' AND amount > 100.
+        let pred = ScanPredicate::new(vec![
+            ScanConjunct::Equal {
+                column: "event".into(),
+                value: PropertyValue::String("checkout".into()),
+            },
+            ScanConjunct::Range {
+                column: "amount".into(),
+                op: RangeOp::Gt,
+                value: PropertyValue::Int(100),
+            },
+        ]);
+        let cols = schema_cols();
+
+        // RG with event='view' and amount=1..50 → both reject.
+        let rg_both_reject = make_rg(vec![
+            make_ccm(0, Some(PropertyValue::Int(1)), Some(PropertyValue::Int(50))),
+            make_ccm(
+                1,
+                Some(PropertyValue::String("view".into())),
+                Some(PropertyValue::String("view".into())),
+            ),
+        ]);
+        assert!(!accepts_row_group_inline(&pred, &rg_both_reject, &cols));
+
+        // RG with event='checkout' and amount=200..500 → both accept.
+        let rg_both_accept = make_rg(vec![
+            make_ccm(
+                0,
+                Some(PropertyValue::Int(200)),
+                Some(PropertyValue::Int(500)),
+            ),
+            make_ccm(
+                1,
+                Some(PropertyValue::String("checkout".into())),
+                Some(PropertyValue::String("checkout".into())),
+            ),
+        ]);
+        assert!(accepts_row_group_inline(&pred, &rg_both_accept, &cols));
+
+        // RG with event='checkout' but amount=1..50 → amount rejects.
+        let rg_amount_rejects = make_rg(vec![
+            make_ccm(0, Some(PropertyValue::Int(1)), Some(PropertyValue::Int(50))),
+            make_ccm(
+                1,
+                Some(PropertyValue::String("checkout".into())),
+                Some(PropertyValue::String("checkout".into())),
+            ),
+        ]);
+        assert!(!accepts_row_group_inline(&pred, &rg_amount_rejects, &cols));
+    }
+
+    #[test]
+    fn inline_missing_column_accepts_conservatively() {
+        let pred = ScanPredicate::new(vec![ScanConjunct::Range {
+            column: "missing".into(),
+            op: RangeOp::Gt,
+            value: PropertyValue::Int(0),
+        }]);
+        let rg = make_rg(vec![make_ccm(
+            0,
+            Some(PropertyValue::Int(1)),
+            Some(PropertyValue::Int(10)),
+        )]);
+        let cols = schema_cols();
+        // Column "missing" not in the row-group → conservative accept.
+        assert!(accepts_row_group_inline(&pred, &rg, &cols));
+    }
 }
