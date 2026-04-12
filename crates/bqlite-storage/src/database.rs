@@ -55,9 +55,6 @@
 //!
 //! - Per-table manifests (later wave) — the open path learns to walk
 //!   a `tables/` subdirectory instead of the single `manifest.json`.
-//! - Real segment I/O — [`Database::segment_reader`] currently hands
-//!   out an empty reader; later waves return a snapshot of the live
-//!   segment inventory (`storage-format.md` §7.6).
 //! - Format-version migration — a later wave reads older manifests
 //!   and upgrades them in-place.
 
@@ -75,9 +72,10 @@ use bqlite_core::time::TimeRange;
 
 use crate::catalog::ManifestCatalog;
 use crate::manifest::{
-    Manifest, SegmentMeta, TableEntry, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION,
+    Manifest, SegmentMeta, TableEntry, WindowManifest, DEFAULT_SHARD_COUNT, MANIFEST_FORMAT_VERSION,
 };
 use crate::segment::cleanup;
+use crate::segment::reader::SegmentFileReader;
 
 /// Name of the advisory lock file at the database root.
 pub const LOCK_FILE_NAME: &str = ".lock";
@@ -289,25 +287,29 @@ impl Database {
         ManifestCatalog::new(&self.manifest)
     }
 
-    /// Open a segment reader for `table_name`.
+    /// Open a manifest-backed segment reader for `table_name`.
     ///
     /// Returns [`BqliteError::Plan`] if no such table exists in the
     /// manifest (via [`bqlite_core::catalog::unknown_table_error`] so
     /// the error format matches the `Catalog` trait's).
     ///
-    /// The Wave 1 reader yields zero segments — real segment
-    /// enumeration lands in later waves. A Wave 1 scan over the
-    /// default bootstrap `events` table (seeded by TASK-125) therefore
-    /// produces an empty result, which is exactly what the Wave 1
-    /// smoke test (TASK-123) expects.
+    /// The returned reader enumerates every live segment for the table
+    /// from the current manifest snapshot. `open_segment` resolves
+    /// handles to on-disk segment files via
+    /// [`SegmentFileReader::open`]. Schema-evolution backfill (NULL
+    /// for columns added after a segment was written) is handled by
+    /// `SegmentFileReader` itself.
     pub fn segment_reader(&self, table_name: &str) -> Result<Box<dyn SegmentReader>> {
         let entry = self
             .manifest
             .tables
             .get(table_name)
             .ok_or_else(|| bqlite_core::catalog::unknown_table_error(table_name))?;
-        Ok(Box::new(EmptySegmentReader {
+        Ok(Box::new(ManifestSegmentReader {
+            root: self.root.clone(),
+            table_name: table_name.to_string(),
             schema: entry.schema.clone(),
+            windows: entry.windows.clone(),
         }))
     }
 
@@ -738,9 +740,107 @@ fn io_ctx(action: &str, path: &Path, err: io::Error) -> BqliteError {
     ))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ManifestSegmentReader — production manifest-backed reader (TASK-244)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Manifest-backed [`SegmentReader`] that enumerates real segments and
+/// opens them from disk via [`SegmentFileReader`].
+///
+/// Constructed by [`Database::segment_reader`], which snapshots the
+/// table's current schema and window inventory from the manifest at
+/// call time. Iteration order is `(window_id ascending, shard_id
+/// ascending, insertion order within shard)` — stable for the reader's
+/// lifetime and monotonically ordered by time window.
+///
+/// `open_segment` validates that the supplied handle came from *this*
+/// reader's snapshot (foreign or stale handles are rejected with
+/// `BqliteError::Execution`), resolves the on-disk path using the
+/// same layout as `storage-format.md` §5.2, and delegates to
+/// [`SegmentFileReader::open`] which handles checksum verification
+/// and schema-evolution backfill.
+struct ManifestSegmentReader {
+    root: PathBuf,
+    table_name: String,
+    schema: TableSchema,
+    windows: Vec<WindowManifest>,
+}
+
+impl SegmentReader for ManifestSegmentReader {
+    fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    fn segments(&self) -> Box<dyn Iterator<Item = Result<SegmentHandle>> + Send + '_> {
+        let iter = self.windows.iter().flat_map(|win| {
+            let window_id = win.window_id;
+            win.shards
+                .iter()
+                .enumerate()
+                .flat_map(move |(shard_idx, segs)| {
+                    let shard_id = shard_idx as u32;
+                    segs.iter().map(move |seg| {
+                        Ok(SegmentHandle {
+                            segment_id: seg.segment_id,
+                            shard_id,
+                            window_id: u64::from(window_id),
+                            row_count: seg.row_count,
+                            schema_version: seg.schema_version,
+                        })
+                    })
+                })
+        });
+        Box::new(iter)
+    }
+
+    fn open_segment(
+        &self,
+        handle: &SegmentHandle,
+        projection: &ColumnProjection,
+        predicate: Option<Arc<dyn Predicate>>,
+    ) -> Result<Box<dyn SegmentScan>> {
+        // Validate that the handle came from this reader's snapshot.
+        let window_id = u32::try_from(handle.window_id).map_err(|_| {
+            BqliteError::Execution(format!(
+                "open_segment: window_id {} overflows u32",
+                handle.window_id
+            ))
+        })?;
+        let found = self.windows.iter().any(|win| {
+            win.window_id == window_id
+                && win
+                    .shards
+                    .get(handle.shard_id as usize)
+                    .is_some_and(|segs| segs.iter().any(|s| s.segment_id == handle.segment_id))
+        });
+        if !found {
+            return Err(BqliteError::Execution(format!(
+                "open_segment: unknown or stale handle (segment_id={}, window_id={}, shard_id={})",
+                handle.segment_id, handle.window_id, handle.shard_id
+            )));
+        }
+
+        let path = self
+            .root
+            .join(&self.table_name)
+            .join("windows")
+            .join(format!("w_{window_id:06}"))
+            .join(format!("shard_{:02}", handle.shard_id))
+            .join(format!("segment_{}.seg", handle.segment_id));
+
+        let file_reader = SegmentFileReader::open(&path, self.schema.clone())?;
+        let scan = file_reader.scan(projection, predicate)?;
+        Ok(Box::new(scan))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EmptySegmentReader — test helper only (TASK-244)
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// `SegmentReader` implementation that owns a schema but yields no
-/// segments. Used by Wave 1 for both [`Database::segment_reader`] and
-/// the standalone [`empty_segment_reader`] constructor.
+/// segments. Retained as a test helper via [`empty_segment_reader`];
+/// the production query path uses [`ManifestSegmentReader`].
 struct EmptySegmentReader {
     schema: TableSchema,
 }
@@ -760,12 +860,8 @@ impl SegmentReader for EmptySegmentReader {
         _projection: &ColumnProjection,
         _predicate: Option<Arc<dyn Predicate>>,
     ) -> Result<Box<dyn SegmentScan>> {
-        // segments() returns an empty iterator, so a caller cannot
-        // legitimately supply a handle this reader produced; any
-        // handle we see here is stale or foreign. The trait docs
-        // specify `BqliteError::Execution` for exactly this case.
         Err(BqliteError::Execution(
-            "no segments are visible in the Wave 1 empty segment reader".into(),
+            "no segments are visible in the empty segment reader".into(),
         ))
     }
 }
@@ -1104,7 +1200,7 @@ mod tests {
         let _second = Database::open(scratch.path()).expect("open after drop");
     }
 
-    // ── SegmentReader stub ──────────────────────────────────────────────────
+    // ── SegmentReader ────────────────────────────────────────────────────────
 
     #[test]
     fn segment_reader_unknown_table_returns_plan_error() {
@@ -1174,6 +1270,167 @@ mod tests {
         let reader = db.segment_reader("events").expect("reader for events");
         assert_eq!(reader.schema().name(), "events");
         assert_eq!(reader.segments().count(), 0);
+    }
+
+    // ── ManifestSegmentReader (TASK-244) ────────────────────────────────────
+
+    use crate::writer::SegmentWriter;
+    use bqlite_core::event::{EntityId, Event};
+    use bqlite_core::storage::ColumnProjection;
+    use bqlite_core::time::Timestamp;
+
+    /// Schema with a nullable `amount` column for manifest-reader
+    /// round-trip tests. Distinct from the minimal
+    /// `sample_events_schema()` (which uses `entity_id` and has no
+    /// nullable columns) because the SegmentWriter tests need a
+    /// column the encoding selector can exercise.
+    fn writer_events_schema() -> TableSchema {
+        TableSchema::new(
+            "events",
+            vec![
+                ColumnDef::required("user_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+                ColumnDef::nullable("amount", BqlType::Int),
+            ],
+            "user_id",
+            "ts",
+            "event_type",
+        )
+        .expect("schema")
+    }
+
+    fn test_event(user: &str, ts_ns: i64, event_type: &str) -> Event {
+        Event::new(EntityId::from(user), Timestamp(ts_ns), event_type)
+    }
+
+    fn create_db_with_writer_schema(path: &Path) -> Database {
+        let mut db = Database::create(path).expect("create");
+        db.create_table("events".into(), writer_events_schema())
+            .expect("create events table");
+        db
+    }
+
+    #[test]
+    fn manifest_reader_enumerates_written_segments() {
+        let scratch = Scratch::new("manifest-reader-enum");
+        let mut db = create_db_with_writer_schema(scratch.path());
+
+        let events = vec![
+            test_event("alice", 1_700_000_000_000_000_000, "click"),
+            test_event("bob", 1_700_000_000_100_000_000, "view"),
+        ];
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        {
+            let mut writer = SegmentWriter::new(&mut db);
+            writer
+                .write_bucket("events", 0, 0, batch_id, &events)
+                .expect("write_bucket");
+        }
+
+        let reader = db.segment_reader("events").expect("reader");
+        let handles: Vec<_> = reader.segments().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(handles.len(), 1, "should enumerate exactly one segment");
+        assert_eq!(handles[0].row_count, 2);
+        assert_eq!(handles[0].shard_id, 0);
+    }
+
+    #[test]
+    fn manifest_reader_open_segment_returns_real_rows() {
+        let scratch = Scratch::new("manifest-reader-open");
+        let mut db = create_db_with_writer_schema(scratch.path());
+
+        let events = vec![
+            test_event("alice", 1_700_000_000_000_000_000, "click"),
+            test_event("bob", 1_700_000_000_100_000_000, "view"),
+            test_event("charlie", 1_700_000_000_200_000_000, "purchase"),
+        ];
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        {
+            let mut writer = SegmentWriter::new(&mut db);
+            writer
+                .write_bucket("events", 0, 0, batch_id, &events)
+                .expect("write_bucket");
+        }
+
+        let reader = db.segment_reader("events").expect("reader");
+        let handles: Vec<_> = reader.segments().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(handles.len(), 1);
+
+        let projection = ColumnProjection::all();
+        let mut scan = reader
+            .open_segment(&handles[0], &projection, None)
+            .expect("open_segment");
+        assert_eq!(scan.row_group_count(), 1);
+
+        let batch = scan
+            .next_row_group()
+            .unwrap()
+            .expect("should have one row group");
+        assert_eq!(batch.num_rows(), 3);
+
+        // Verify exhaustion.
+        assert!(scan.next_row_group().unwrap().is_none());
+    }
+
+    #[test]
+    fn manifest_reader_multiple_segments_across_shards() {
+        let scratch = Scratch::new("manifest-reader-multi");
+        let mut db = create_db_with_writer_schema(scratch.path());
+
+        // Write one segment to shard 0 and one to shard 1.
+        let events1 = vec![test_event("alice", 1_000, "click")];
+        let events2 = vec![test_event("bob", 2_000, "view")];
+
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        {
+            let mut writer = SegmentWriter::new(&mut db);
+            writer
+                .write_bucket("events", 0, 0, batch_id, &events1)
+                .expect("shard 0");
+            writer
+                .write_bucket("events", 0, 1, batch_id, &events2)
+                .expect("shard 1");
+        }
+
+        let reader = db.segment_reader("events").expect("reader");
+        let handles: Vec<_> = reader.segments().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(handles.len(), 2, "two segments across two shards");
+        // Both segments are readable.
+        for h in &handles {
+            let mut scan = reader
+                .open_segment(h, &ColumnProjection::all(), None)
+                .expect("open_segment");
+            let batch = scan
+                .next_row_group()
+                .unwrap()
+                .expect("should have a row group");
+            assert_eq!(batch.num_rows(), 1);
+        }
+    }
+
+    #[test]
+    fn manifest_reader_rejects_foreign_handle() {
+        let scratch = Scratch::new("manifest-reader-foreign");
+        let mut db = Database::create(scratch.path()).expect("create");
+        db.create_table("events".into(), writer_events_schema())
+            .expect("create table");
+
+        let reader = db.segment_reader("events").expect("reader");
+        let foreign = SegmentHandle {
+            segment_id: 999,
+            shard_id: 0,
+            window_id: 0,
+            row_count: 10,
+            schema_version: 1,
+        };
+        match reader.open_segment(&foreign, &ColumnProjection::all(), None) {
+            Err(BqliteError::Execution(msg)) => {
+                assert!(msg.contains("unknown or stale"), "got: {msg}");
+            }
+            Err(other) => panic!("expected Execution, got {other:?}"),
+            Ok(_) => panic!("expected error for foreign handle"),
+        }
     }
 
     // ── Wave 2 add_segment / remove_segment / snapshot_for_query ────────────
