@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-313",
+  "claimed_at": "2026-04-12T07:32:02Z",
+  "branch": "task/TASK-313",
+  "description": "Parser MATCH pipeline stage"
+}
