@@ -308,7 +308,7 @@ impl Database {
         Ok(Box::new(ManifestSegmentReader {
             root: self.root.clone(),
             table_name: table_name.to_string(),
-            schema: entry.schema.clone(),
+            schema: Arc::new(entry.schema.clone()),
             windows: entry.windows.clone(),
         }))
     }
@@ -762,7 +762,10 @@ fn io_ctx(action: &str, path: &Path, err: io::Error) -> BqliteError {
 struct ManifestSegmentReader {
     root: PathBuf,
     table_name: String,
-    schema: TableSchema,
+    /// TASK-247: stored as `Arc` so every `open_segment` call shares
+    /// the same allocation instead of cloning the full `TableSchema`
+    /// (columns, entity-key name, timestamp name) per segment.
+    schema: Arc<TableSchema>,
     windows: Vec<WindowManifest>,
 }
 
@@ -828,7 +831,7 @@ impl SegmentReader for ManifestSegmentReader {
             .join(format!("shard_{:02}", handle.shard_id))
             .join(format!("segment_{}.seg", handle.segment_id));
 
-        let file_reader = SegmentFileReader::open(&path, self.schema.clone())?;
+        let file_reader = SegmentFileReader::open_shared(&path, self.schema.clone())?;
         let scan = file_reader.scan(projection, predicate)?;
         Ok(Box::new(scan))
     }

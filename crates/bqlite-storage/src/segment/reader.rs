@@ -153,6 +153,16 @@ impl SegmentFileReader {
     /// equivalent where available (`posix_fadvise` on Linux-like
     /// targets, Darwin `F_RDADVISE` on Apple targets).
     pub fn open<P: AsRef<Path>>(path: P, current_schema: TableSchema) -> Result<Self> {
+        Self::open_shared(path, Arc::new(current_schema))
+    }
+
+    /// Open a segment file from disk with a pre-shared schema.
+    ///
+    /// Like [`Self::open`] but accepts an `Arc<TableSchema>` to avoid
+    /// cloning the schema for every segment. Used by
+    /// [`ManifestSegmentReader`] (TASK-247) which shares one Arc
+    /// across all segments in a table.
+    pub fn open_shared<P: AsRef<Path>>(path: P, current_schema: Arc<TableSchema>) -> Result<Self> {
         // Path comes from the manifest (trusted internal state), not user input.
         let mut file = fs::File::open(path)?; // nosemgrep
 
@@ -163,7 +173,7 @@ impl SegmentFileReader {
 
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        Self::from_bytes(bytes, current_schema)
+        Self::from_bytes_shared(bytes, current_schema)
     }
 
     /// Parse a segment file from an owned byte buffer.
@@ -173,6 +183,13 @@ impl SegmentFileReader {
     /// the returned reader is guaranteed to satisfy the full format
     /// contract.
     pub fn from_bytes(bytes: Vec<u8>, current_schema: TableSchema) -> Result<Self> {
+        Self::from_bytes_shared(bytes, Arc::new(current_schema))
+    }
+
+    /// Parse a segment file from an owned byte buffer with a
+    /// pre-shared schema (TASK-247). Avoids wrapping the schema in
+    /// a new `Arc` when the caller already holds one.
+    pub fn from_bytes_shared(bytes: Vec<u8>, current_schema: Arc<TableSchema>) -> Result<Self> {
         validate_header(&bytes)?;
         let footer_body_length = parse_trailer(&bytes)?;
         validate_framing_lengths(bytes.len(), footer_body_length)?;
@@ -196,7 +213,7 @@ impl SegmentFileReader {
             bytes: Arc::from(bytes.into_boxed_slice()),
             footer: Arc::new(footer),
             dictionaries: Arc::from(dictionaries.into_boxed_slice()),
-            current_schema: Arc::new(current_schema),
+            current_schema,
         })
     }
 
