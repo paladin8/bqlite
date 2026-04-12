@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-244",
+  "claimed_at": "2026-04-12T04:16:06Z",
+  "branch": "task/TASK-244",
+  "description": "Manifest-backed `SegmentReader` reconciliation"
+}
