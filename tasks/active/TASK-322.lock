@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-322",
+  "claimed_at": "2026-04-12T08:35:13Z",
+  "branch": "task/TASK-322",
+  "description": "Sort + Distinct operators"
+}
