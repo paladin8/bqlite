@@ -11,9 +11,11 @@
 //! - `| LIMIT <integer>` — row cap (§15, TASK-223).
 //! - `| STATS <agg_list> [GROUP BY <group_list>]` — aggregation (§7, TASK-314).
 //! - `| ORDER BY <items>` / `| SORT <items>` — ordering (§15, TASK-315).
+//! - `| MATCH (FIRST|ALL) SEQUENCE(…) [modifiers]` — sequence pattern (§4, TASK-313).
+//! - `| FUNNEL "(" step_list ")" (WITHIN duration)?` — funnel sugar (§6.1, TASK-316).
 //!
 //! The grammar lives in §26 (query-language.md). Every other pipeline
-//! verb (`MATCH`, `FUNNEL`, …) lives in later tasks and produces a
+//! verb lives in later tasks and produces a
 //! `PipelineStage::…`-returning production function alongside these.
 //!
 //! The module surface is crate-private. [`parse_pipeline_stages`] is
@@ -23,9 +25,11 @@
 #![allow(dead_code)] // TASK-221 / TASK-222 productions reach this module later.
 
 use bqlite_ast::{
-    AggItem, Expr, GroupItem, MatchMode, MatchPattern, Name, OrderItem, PipelineStage, SelectItem,
-    SelectItemKind, SortDir,
+    AggItem, Expr, Funnel, GroupItem, MatchMode, MatchPattern, Name, OrderItem, PipelineStage,
+    SelectItem, SelectItemKind, SortDir,
 };
+
+use crate::pattern::parse_step_list;
 
 use crate::error::{Expected, NameRole, ParseError};
 use crate::expr::parse_expression;
@@ -36,11 +40,32 @@ use crate::pattern::{parse_match_modifiers, parse_sequence};
 /// Parse the `("|" stage)*` tail of a pipeline, returning the ordered
 /// stage list. Stops at the first token that is not a `|`. The caller
 /// is responsible for the source expression that precedes the tail.
+///
+/// FUNNEL is a terminal stage — if a `|` appears immediately after a
+/// FUNNEL stage the parser emits an error rather than continuing
+/// (query-language.md §6.1: "FUNNEL is terminal sugar").
 pub(crate) fn parse_pipeline_stages(p: &mut Parser) -> Result<Vec<PipelineStage>, ParseError> {
     let mut stages = Vec::new();
     while matches!(p.peek_kind(), TokenKind::Pipe) {
         p.bump(); // consume `|`
-        stages.push(parse_stage(p)?);
+        let stage = parse_stage(p)?;
+        let is_terminal = matches!(stage, PipelineStage::Funnel(_));
+        stages.push(stage);
+        // FUNNEL cannot be followed by another pipe stage.
+        if is_terminal && matches!(p.peek_kind(), TokenKind::Pipe) {
+            let tok = p.peek().clone();
+            return Err(ParseError::Unexpected {
+                offset: tok.start,
+                line: tok.line,
+                column: tok.column,
+                expected: Expected::Eof,
+                found: "|".to_string(),
+                detail: Some(
+                    "FUNNEL is a terminal stage and cannot be followed by another pipe stage; \
+                     write the desugared MATCH + STATS form explicitly if you need downstream operators",
+                ),
+            });
+        }
     }
     Ok(stages)
 }
@@ -56,11 +81,13 @@ fn parse_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
         TokenKind::Kw(Keyword::Order) | TokenKind::Kw(Keyword::Sort) => parse_order_by_stage(p),
         // `MATCH (FIRST | ALL) SEQUENCE(…) [modifiers]` — sequence pattern (§4).
         TokenKind::Kw(Keyword::Match) => parse_match_stage(p),
+        // `FUNNEL(…) (WITHIN duration)?` — terminal funnel sugar (§6.1, TASK-316).
+        TokenKind::Kw(Keyword::Funnel) => parse_funnel_stage(p),
 
         // Every other first token is either a later-wave verb that
-        // TASK-223 does not yet implement, or an error. The error
-        // message names `PipelineStage` so the user sees `"expected
-        // pipeline stage"` rather than a bare `"unexpected token"`.
+        // is not yet implemented, or an error. The error message names
+        // `PipelineStage` so the user sees `"expected pipeline stage"`
+        // rather than a bare `"unexpected token"`.
         _ => Err(p.error_unexpected(
             Expected::PipelineStage,
             Some("expected a pipeline stage keyword after `|`"),
@@ -593,7 +620,6 @@ fn parse_order_item(p: &mut Parser) -> Result<OrderItem, ParseError> {
     })
 }
 
-// ----------------------------------------------------------------------
 // MATCH
 // ----------------------------------------------------------------------
 
@@ -677,6 +703,95 @@ fn parse_match_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
     };
 
     Ok(PipelineStage::Match { pattern, span })
+}
+
+// ----------------------------------------------------------------------
+// FUNNEL
+// ----------------------------------------------------------------------
+
+/// `FUNNEL "(" step_list ")" (WITHIN duration)?` — §26 line 1570.
+///
+/// Grammar:
+/// ```text
+/// funnel_op        := FUNNEL "(" step_list ")" funnel_modifiers
+/// funnel_modifiers := (WITHIN duration)?
+/// ```
+///
+/// FUNNEL is **terminal sugar**: it cannot be followed by further pipe
+/// stages. The `parse_pipeline_stages` caller enforces this rule after
+/// receiving the `PipelineStage::Funnel` value — the stage parser itself
+/// does not need to peek ahead past its own production.
+///
+/// The step list reuses the full MATCH step sub-grammar (`parse_step_list`
+/// from `crate::pattern`), so named steps, property constraints, variable
+/// bindings, WITHOUT exclusions, alternation, repetition, and IMMEDIATELY
+/// are all accepted. The planner desugars the node to
+/// `MATCH FIRST … EMIT ALL | STATS …` before type-checking
+/// (query-language.md §6.1, planner-pipeline.md §4.3).
+///
+/// Error cases:
+/// - `FUNNEL()` — empty step list → `Expected::Keyword("step")`
+/// - `WITHIN SESSION` instead of a duration → explicit detail message;
+///   `WITHIN SESSION` is a MATCH-only modifier (query-language.md §4.4).
+fn parse_funnel_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    let funnel_tok = p.expect_kw(Keyword::Funnel)?;
+    let start_span = token_span(&funnel_tok);
+
+    p.expect_punct(&TokenKind::LParen, "(")?;
+
+    // Empty step list is a parse error — at least one step is required.
+    if matches!(p.peek_kind(), TokenKind::RParen) {
+        return Err(p.error_unexpected(
+            Expected::Keyword("step"),
+            Some("FUNNEL requires at least one step"),
+        ));
+    }
+
+    let steps = parse_step_list(p)?;
+
+    let rparen_tok = p.expect_punct(&TokenKind::RParen, ")")?;
+    let rparen_span = token_span(&rparen_tok);
+
+    // Optional `WITHIN <duration>`. Note: `WITHIN SESSION` is valid for
+    // MATCH but NOT for FUNNEL — the grammar at §26 line 1571 spells the
+    // modifier as `(WITHIN duration)?` (no SESSION alternative).
+    let window = if p.try_kw(Keyword::Within).is_some() {
+        // Reject WITHIN SESSION — SESSION is only valid in MATCH.
+        if matches!(p.peek_kind(), TokenKind::Kw(Keyword::Session)) {
+            return Err(p.error_unexpected(
+                Expected::Literal,
+                Some(
+                    "FUNNEL WITHIN requires a duration literal (e.g. 7d), not SESSION; \
+                     use MATCH … WITHIN SESSION for session-scoped patterns",
+                ),
+            ));
+        }
+        // Expect a duration literal. `i64` is `Copy`, so the borrow of
+        // the peeked token ends before the mutable `bump()` call (NLL).
+        if let TokenKind::Duration(ns) = p.peek().kind {
+            let dur_tok = p.bump();
+            Some((ns, token_span(&dur_tok)))
+        } else {
+            return Err(p.error_unexpected(
+                Expected::Literal,
+                Some("expected a duration literal (e.g. 7d) after WITHIN"),
+            ));
+        }
+    } else {
+        None
+    };
+
+    // Span: from FUNNEL keyword through the last consumed token.
+    let span = match &window {
+        Some((_, win_span)) => start_span.merged(*win_span),
+        None => start_span.merged(rparen_span),
+    };
+
+    Ok(PipelineStage::Funnel(Funnel {
+        steps,
+        window: window.map(|(ns, _)| ns),
+        span,
+    }))
 }
 
 // ----------------------------------------------------------------------
@@ -1802,6 +1917,18 @@ mod tests {
         }
     }
 
+    // --- FUNNEL -------------------------------------------------------
+
+    /// Extract the `Funnel` from a single-stage pipeline, panicking on mismatch.
+    fn funnel_of(stmt: &Statement) -> &bqlite_ast::Funnel {
+        let stages = stages_of(stmt);
+        assert_eq!(stages.len(), 1, "expected exactly one pipeline stage");
+        match &stages[0] {
+            PipelineStage::Funnel(f) => f,
+            other => panic!("expected Funnel stage, got {other:?}"),
+        }
+    }
+
     #[test]
     fn match_first_single_step() {
         // `MATCH FIRST SEQUENCE(signup)` — one step, no modifiers.
@@ -2051,5 +2178,309 @@ mod tests {
         assert_eq!(b.durations.len(), 3);
         assert!(!b.cumulative);
         assert!(pat.window.is_none());
+    }
+
+    // --- FUNNEL -------------------------------------------------------
+
+    #[test]
+    fn funnel_two_step_no_window() {
+        // `events | FUNNEL(signup THEN purchase)` — basic 2-step without WITHIN.
+        let stmt = parse_stmt("events | FUNNEL(signup THEN purchase)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 2);
+        assert!(f.window.is_none());
+        // Step names should be absent (no `name:` prefix).
+        assert!(f.steps[0].name.is_none());
+        assert!(f.steps[1].name.is_none());
+        // Event types come through as bare names.
+        let event_name = |step: &bqlite_ast::Step| match &step.event {
+            bqlite_ast::StepEvent::Single(er) => er.event.text.as_str().to_string(),
+            _ => panic!("expected Single event ref"),
+        };
+        assert_eq!(event_name(&f.steps[0]), "signup");
+        assert_eq!(event_name(&f.steps[1]), "purchase");
+    }
+
+    #[test]
+    fn funnel_three_step_with_window() {
+        // `events | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d`
+        let stmt = parse_stmt("events | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 3);
+        // 7 days in nanoseconds.
+        let seven_days_ns = 7 * 24 * 60 * 60 * 1_000_000_000_i64;
+        assert_eq!(f.window, Some(seven_days_ns));
+    }
+
+    #[test]
+    fn funnel_named_steps() {
+        // `events | FUNNEL(s1: signup THEN s2: purchase)`
+        let stmt = parse_stmt("events | FUNNEL(s1: signup THEN s2: purchase)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 2);
+        assert_eq!(
+            f.steps[0].name.as_ref().map(|n| n.text.as_str()),
+            Some("s1")
+        );
+        assert_eq!(
+            f.steps[1].name.as_ref().map(|n| n.text.as_str()),
+            Some("s2")
+        );
+    }
+
+    #[test]
+    fn funnel_step_with_where_predicate() {
+        // `events | FUNNEL(signup WHERE plan = 'pro' THEN purchase)`
+        let stmt = parse_stmt("events | FUNNEL(signup WHERE plan = 'pro' THEN purchase)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 2);
+        assert!(
+            f.steps[0].predicate.is_some(),
+            "first step must carry WHERE predicate"
+        );
+        assert!(f.steps[1].predicate.is_none());
+    }
+
+    #[test]
+    fn funnel_step_with_without_exclusion() {
+        // `events | FUNNEL(signup WITHOUT refund THEN purchase)`
+        let stmt = parse_stmt("events | FUNNEL(signup WITHOUT refund THEN purchase)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 2);
+        assert!(
+            f.steps[0].without_next.is_some(),
+            "first step must carry WITHOUT exclusion"
+        );
+    }
+
+    #[test]
+    fn funnel_step_with_alternation() {
+        // `events | FUNNEL((add_to_cart OR add_to_wishlist) THEN purchase)`
+        let stmt = parse_stmt("events | FUNNEL((add_to_cart OR add_to_wishlist) THEN purchase)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 2);
+        assert!(
+            matches!(f.steps[0].event, bqlite_ast::StepEvent::Alternation(_)),
+            "first step must be an alternation"
+        );
+    }
+
+    #[test]
+    fn funnel_step_with_immediately() {
+        // `events | FUNNEL(signup THEN IMMEDIATELY purchase)`
+        let stmt = parse_stmt("events | FUNNEL(signup THEN IMMEDIATELY purchase)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 2);
+        // IMMEDIATELY flag is stored on the *preceding* step.
+        assert!(
+            f.steps[0].immediately_next,
+            "first step must have immediately_next = true"
+        );
+    }
+
+    #[test]
+    fn funnel_within_optional_is_absent() {
+        // No WITHIN → window is None.
+        let stmt = parse_stmt("events | FUNNEL(a THEN b)");
+        let f = funnel_of(&stmt);
+        assert!(f.window.is_none());
+    }
+
+    #[test]
+    fn funnel_within_30d() {
+        let stmt = parse_stmt("events | FUNNEL(a THEN b) WITHIN 30d");
+        let f = funnel_of(&stmt);
+        let thirty_days_ns = 30 * 24 * 60 * 60 * 1_000_000_000_i64;
+        assert_eq!(f.window, Some(thirty_days_ns));
+    }
+
+    #[test]
+    fn funnel_case_insensitive_keyword() {
+        // FUNNEL keyword is case-insensitive per query-language.md §26.3.
+        let stmt = parse_stmt("events | funnel(signup THEN purchase)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 2);
+    }
+
+    #[test]
+    fn funnel_span_covers_keyword_through_rparen_when_no_window() {
+        // When no WITHIN clause is present, the stage span runs from the
+        // `F` of `FUNNEL` through the closing `)`.
+        let src = "events | FUNNEL(a THEN b)";
+        let stmt = parse_stmt(src);
+        let stages = stages_of(&stmt);
+        match &stages[0] {
+            PipelineStage::Funnel(f) => {
+                let funnel_start = src.find("FUNNEL").unwrap();
+                let rparen_end = src.rfind(')').unwrap() + 1;
+                assert_eq!(f.span.start, funnel_start);
+                assert_eq!(f.span.end, rparen_end);
+            }
+            other => panic!("expected Funnel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn funnel_span_covers_keyword_through_window_when_within_present() {
+        // With a WITHIN clause, the stage span runs through the duration token.
+        let src = "events | FUNNEL(a THEN b) WITHIN 7d";
+        let stmt = parse_stmt(src);
+        let stages = stages_of(&stmt);
+        match &stages[0] {
+            PipelineStage::Funnel(f) => {
+                let funnel_start = src.find("FUNNEL").unwrap();
+                // Span end must be at least past `7d`.
+                let dur_end = src.rfind("7d").unwrap() + "7d".len();
+                assert_eq!(f.span.start, funnel_start);
+                assert_eq!(f.span.end, dur_end);
+            }
+            other => panic!("expected Funnel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn funnel_empty_step_list_errors() {
+        // `FUNNEL()` with no steps must be a parse error.
+        match crate::parse("events | FUNNEL()") {
+            Err(ParseError::Unexpected { .. }) | Err(ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected parse error for empty FUNNEL(), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn funnel_missing_lparen_errors() {
+        match crate::parse("events | FUNNEL signup THEN purchase") {
+            Err(ParseError::Unexpected { .. }) | Err(ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected parse error for FUNNEL without opening `(`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn funnel_missing_rparen_errors() {
+        match crate::parse("events | FUNNEL(signup THEN purchase") {
+            Err(ParseError::Unexpected { .. }) | Err(ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected parse error for FUNNEL without closing `)`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn funnel_within_session_is_rejected() {
+        // `WITHIN SESSION` is a MATCH-only modifier — FUNNEL must reject it.
+        match crate::parse("events | FUNNEL(signup THEN purchase) WITHIN SESSION") {
+            Err(ParseError::Unexpected { detail, found, .. }) => {
+                assert_eq!(found, "SESSION", "error should point at SESSION token");
+                assert!(
+                    detail.map(|d| d.contains("SESSION")).unwrap_or(false),
+                    "detail should mention SESSION"
+                );
+            }
+            other => {
+                panic!("expected Unexpected error for WITHIN SESSION in FUNNEL, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn funnel_within_non_duration_errors() {
+        // `WITHIN` without a valid duration literal must error.
+        match crate::parse("events | FUNNEL(a THEN b) WITHIN notaduration") {
+            Err(ParseError::Unexpected { expected, .. })
+            | Err(ParseError::UnexpectedEof { expected, .. }) => {
+                assert_eq!(expected, Expected::Literal);
+            }
+            other => panic!("expected Expected::Literal error after WITHIN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn funnel_is_terminal_pipe_after_errors() {
+        // FUNNEL cannot be followed by another pipe stage — trying to do
+        // so must produce a parse error with a helpful message.
+        match crate::parse("events | FUNNEL(signup THEN purchase) | WHERE x = 1") {
+            Err(ParseError::Unexpected {
+                detail, expected, ..
+            }) => {
+                assert_eq!(expected, Expected::Eof);
+                assert!(
+                    detail.map(|d| d.contains("FUNNEL")).unwrap_or(false),
+                    "error detail should mention FUNNEL terminal constraint"
+                );
+            }
+            other => panic!("expected parse error when piping after FUNNEL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn funnel_is_terminal_pipe_after_with_window_errors() {
+        // The terminal rule applies even when WITHIN is present.
+        match crate::parse("events | FUNNEL(signup THEN purchase) WITHIN 7d | LIMIT 10") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Eof);
+            }
+            other => {
+                panic!("expected parse error when piping after FUNNEL with WITHIN, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn funnel_single_step_is_valid() {
+        // A single-step FUNNEL is syntactically valid (semantic constraints
+        // live in the planner, not the parser).
+        let stmt = parse_stmt("events | FUNNEL(signup)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 1);
+    }
+
+    #[test]
+    fn funnel_qualified_event_refs_accepted() {
+        // query-language.md §19.3: FUNNEL accepts table-qualified event
+        // references in multi-table queries.
+        let stmt = parse_stmt("events | FUNNEL(events.signup THEN events.purchase)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 2);
+        // Verify the qualifier was captured on the first step's event ref.
+        match &f.steps[0].event {
+            bqlite_ast::StepEvent::Single(er) => {
+                assert!(
+                    er.table.is_some(),
+                    "qualified event ref must carry table name"
+                );
+                assert_eq!(er.event.text.as_str(), "signup");
+            }
+            _ => panic!("expected Single event ref"),
+        }
+    }
+
+    #[test]
+    fn funnel_step_repetition_accepted() {
+        // The full MATCH step sub-grammar is accepted, including repetition
+        // modifiers (`+`, `*`). The parser accepts them; semantic constraints
+        // on repetition in FUNNEL are enforced by the planner.
+        let stmt = parse_stmt("events | FUNNEL(signup THEN browse+ THEN purchase)");
+        let f = funnel_of(&stmt);
+        assert_eq!(f.steps.len(), 3);
+        assert!(
+            f.steps[1].repetition.is_some(),
+            "middle step with `+` must carry a repetition"
+        );
+    }
+
+    #[test]
+    fn funnel_is_terminal_stats_after_errors() {
+        // The most natural user mistake: writing `FUNNEL(…) | STATS …`.
+        // This must be caught at parse time with a clear error message.
+        match crate::parse("events | FUNNEL(signup THEN purchase) | STATS n = COUNT(*)") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Eof);
+                assert!(
+                    detail.map(|d| d.contains("FUNNEL")).unwrap_or(false),
+                    "error detail should mention FUNNEL"
+                );
+            }
+            other => panic!("expected parse error for FUNNEL followed by STATS, got {other:?}"),
+        }
     }
 }
