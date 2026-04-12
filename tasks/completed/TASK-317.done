@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-317",
   "claimed_at": "2026-04-12T07:49:51Z",
+  "completed_at": "2026-04-12T08:45:00Z",
   "branch": "task/TASK-317",
   "description": "Logical + physical plan variants for Wave 3"
 }
