@@ -692,21 +692,161 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
             })
         }
 
-        // Wave 3 variants — lowering is implemented in TASK-318.
-        // These arms are unreachable in Wave 2: the logical lowering in
-        // `fold_stage` (logical.rs) still rejects all Wave 3 pipeline
-        // stages with a "not yet supported" error, so the physical
-        // lowering never encounters these variants. TASK-318 will replace
-        // the `unreachable!` calls with real lowering logic.
-        LogicalPlan::SequenceMatch { .. }
-        | LogicalPlan::Aggregate { .. }
-        | LogicalPlan::Sort { .. }
-        | LogicalPlan::Distinct { .. } => {
-            unreachable!(
-                "Wave 3 logical variants are not yet lowered to physical in Wave 2; \
-                 TASK-318 implements the logical→physical lowering for \
-                 SequenceMatch / Aggregate / Sort / Distinct"
-            )
+        // ── Wave 3 variants ────────────────────────────────────────────
+        LogicalPlan::SequenceMatch {
+            pattern,
+            mode: _,
+            emit_all: _,
+            window: _,
+            brackets: _,
+            step_properties,
+            fused_downstream,
+            input,
+            output_schema,
+        } => {
+            // Compile the AST-level pattern into a CompiledNfa via TASK-311's
+            // pattern compiler. Uses the input schema for column resolution.
+            let input_schema = input.output_schema().clone();
+            let registry = crate::expr::FunctionRegistry::with_builtins();
+            let compiled_nfa =
+                crate::compile::compile_pattern(&pattern.inner, &input_schema, &registry)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "compile_pattern failed on pre-validated pattern \
+                             (this indicates a bug in logical lowering): {e}"
+                        )
+                    });
+
+            // Build execution config from demand analysis results.
+            let demand = crate::demand::DemandSet {
+                columns: output_schema
+                    .columns()
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect(),
+                needs_match_detail: output_schema.column("match_duration").is_some()
+                    || output_schema.column("match_events").is_some(),
+                needs_step_reached: output_schema.column("step_reached").is_some(),
+                step_properties: step_properties.clone(),
+                forwarded: Vec::new(),
+                fused_aggregate: None,
+                fused_filter: None,
+            };
+
+            let execution_config = MatchExecutionConfig {
+                track_match_duration: demand.needs_match_detail,
+                track_match_events: demand.needs_match_detail,
+            };
+
+            // Select strategy based on pattern class and demand.
+            let strategy =
+                crate::compile::select_strategy(compiled_nfa.pattern_class, &execution_config);
+
+            // Compile fused downstream aggregate if present (TASK-320).
+            let fused_aggregate =
+                fused_downstream.map(|fd| crate::demand::CompiledFusableAggregate {
+                    aggregates: fd
+                        .aggregate
+                        .aggregates
+                        .iter()
+                        .map(|a| crate::demand::CompiledAggExpr {
+                            function: a.function,
+                            arg: a.arg.as_ref().map(CompiledExpr::from_typed),
+                            output_name: a.output_name.clone(),
+                        })
+                        .collect(),
+                    group_by: fd
+                        .aggregate
+                        .group_by
+                        .iter()
+                        .map(|(e, n)| (CompiledExpr::from_typed(e), n.clone()))
+                        .collect(),
+                    output_schema: fd.aggregate.output_schema.clone(),
+                });
+
+            let child = lower_physical(*input);
+            PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
+                compiled_nfa,
+                strategy,
+                demand,
+                execution_config,
+                fused_aggregate,
+                input: Box::new(child),
+                output_schema,
+            }))
+        }
+
+        LogicalPlan::Aggregate {
+            aggregates,
+            group_by,
+            input,
+            output_schema,
+        } => {
+            // Compile aggregate expressions: TypedAggExpr → CompiledAgg.
+            // All Wave 3 aggregate functions take 0 or 1 argument (§2.2.1).
+            let compiled_aggs: Vec<CompiledAgg> = aggregates
+                .into_iter()
+                .map(|agg| {
+                    debug_assert!(
+                        agg.args.len() <= 1,
+                        "aggregate function {} has {} args, expected 0 or 1",
+                        agg.output_name,
+                        agg.args.len()
+                    );
+                    CompiledAgg {
+                        function: agg.function,
+                        arg: agg.args.first().map(CompiledExpr::from_typed),
+                        output_name: agg.output_name,
+                    }
+                })
+                .collect();
+
+            // Compile group-by expressions.
+            let compiled_group_by: Vec<(CompiledExpr, String)> = group_by
+                .iter()
+                .map(|(expr, name)| (CompiledExpr::from_typed(expr), name.clone()))
+                .collect();
+
+            let child = lower_physical(*input);
+            PhysicalPlan::Aggregate(AggregatePhysical {
+                aggregates: compiled_aggs,
+                group_by: compiled_group_by,
+                max_groups: DEFAULT_MAX_GROUPS,
+                input: Box::new(child),
+                output_schema,
+            })
+        }
+
+        LogicalPlan::Sort {
+            keys,
+            input,
+            output_schema,
+        } => {
+            // Compile sort-key expressions.
+            let compiled_keys: Vec<(CompiledExpr, SortDirection)> = keys
+                .iter()
+                .map(|(expr, dir)| (CompiledExpr::from_typed(expr), *dir))
+                .collect();
+
+            let child = lower_physical(*input);
+            PhysicalPlan::Sort(SortPhysical {
+                keys: compiled_keys,
+                max_rows: DEFAULT_SORT_MAX_ROWS,
+                input: Box::new(child),
+                output_schema,
+            })
+        }
+
+        LogicalPlan::Distinct {
+            input,
+            output_schema,
+        } => {
+            let child = lower_physical(*input);
+            PhysicalPlan::Distinct(DistinctPhysical {
+                max_groups: DEFAULT_MAX_GROUPS,
+                input: Box::new(child),
+                output_schema,
+            })
         }
     }
 }
@@ -1235,5 +1375,135 @@ mod tests {
         let expected = logical.output_schema().clone();
         let physical = lower_physical(logical);
         assert_eq!(physical.output_schema(), &expected);
+    }
+
+    // ── Wave 3: AggregatePhysical ─────────────────────────────────
+
+    #[test]
+    fn lower_stats_count_star_produces_aggregate_physical() {
+        use bqlite_ast::AggItem;
+        let catalog = catalog_with_events();
+        let mut pipeline = bare_pipeline("events");
+        pipeline.stages.push(PipelineStage::Stats {
+            aggregates: vec![AggItem {
+                function: name("count"),
+                args: vec![],
+                distinct: false,
+                alias: name("total"),
+                span: Span::EMPTY,
+            }],
+            group_by: vec![],
+            span: Span::EMPTY,
+        });
+        let stmt = Statement::Query(pipeline);
+        let physical = crate::plan(stmt, &catalog).expect("plan");
+
+        let PhysicalPlan::Aggregate(agg) = physical else {
+            panic!("expected Aggregate, got {physical:?}");
+        };
+        assert_eq!(agg.aggregates.len(), 1);
+        assert_eq!(agg.aggregates[0].function, bqlite_core::AggFunction::Count);
+        assert!(agg.aggregates[0].arg.is_none());
+        assert_eq!(agg.aggregates[0].output_name, "total");
+        assert_eq!(agg.max_groups, DEFAULT_MAX_GROUPS);
+        assert!(agg.group_by.is_empty());
+        assert_eq!(agg.output_schema.columns().len(), 1);
+        assert_eq!(agg.output_schema.columns()[0].name, "total");
+    }
+
+    #[test]
+    fn lower_stats_with_group_by_produces_aggregate_physical() {
+        use bqlite_ast::{AggItem, GroupItem};
+        let catalog = catalog_with_events();
+        let mut pipeline = bare_pipeline("events");
+        pipeline.stages.push(PipelineStage::Stats {
+            aggregates: vec![AggItem {
+                function: name("sum"),
+                args: vec![col_expr("amount")],
+                distinct: false,
+                alias: name("total_amount"),
+                span: Span::EMPTY,
+            }],
+            group_by: vec![GroupItem {
+                expr: col_expr("event_type"),
+                alias: None,
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        });
+        let stmt = Statement::Query(pipeline);
+        let physical = crate::plan(stmt, &catalog).expect("plan");
+
+        let PhysicalPlan::Aggregate(agg) = physical else {
+            panic!("expected Aggregate, got {physical:?}");
+        };
+        assert_eq!(agg.aggregates.len(), 1);
+        assert_eq!(agg.aggregates[0].function, bqlite_core::AggFunction::Sum);
+        assert!(agg.aggregates[0].arg.is_some());
+        assert_eq!(agg.group_by.len(), 1);
+        assert_eq!(agg.group_by[0].1, "event_type");
+        // Output: [event_type, total_amount]
+        let col_names: Vec<&str> = agg
+            .output_schema
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(col_names, vec!["event_type", "total_amount"]);
+    }
+
+    // ── Wave 3: SortPhysical ──────────────────────────────────────
+
+    #[test]
+    fn lower_order_by_produces_sort_physical() {
+        use bqlite_ast::expr::{OrderItem, SortDir};
+        let catalog = catalog_with_events();
+        let mut pipeline = bare_pipeline("events");
+        pipeline.stages.push(PipelineStage::OrderBy {
+            items: vec![OrderItem {
+                expr: col_expr("amount"),
+                direction: SortDir::Desc,
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        });
+        let stmt = Statement::Query(pipeline);
+        let physical = crate::plan(stmt, &catalog).expect("plan");
+
+        let PhysicalPlan::Sort(sort) = physical else {
+            panic!("expected Sort, got {physical:?}");
+        };
+        assert_eq!(sort.keys.len(), 1);
+        assert_eq!(sort.keys[0].1, crate::logical::SortDirection::Desc);
+        assert_eq!(sort.max_rows, DEFAULT_SORT_MAX_ROWS);
+        // Sort output schema == input schema
+        assert_eq!(sort.output_schema, *sort.input.output_schema());
+    }
+
+    // ── Wave 3: DistinctPhysical ──────────────────────────────────
+
+    #[test]
+    fn lower_select_distinct_produces_distinct_project_physical() {
+        let catalog = catalog_with_events();
+        let mut pipeline = bare_pipeline("events");
+        pipeline.stages.push(PipelineStage::Select {
+            distinct: true,
+            items: vec![SelectItem {
+                kind: SelectItemKind::Expr(col_expr("entity_id")),
+                alias: None,
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        });
+        let stmt = Statement::Query(pipeline);
+        let physical = crate::plan(stmt, &catalog).expect("plan");
+
+        let PhysicalPlan::Distinct(distinct) = physical else {
+            panic!("expected Distinct, got {physical:?}");
+        };
+        assert_eq!(distinct.max_groups, DEFAULT_MAX_GROUPS);
+        assert!(matches!(*distinct.input, PhysicalPlan::Project(_)));
+        assert_eq!(distinct.output_schema.columns().len(), 1);
+        assert_eq!(distinct.output_schema.columns()[0].name, "entity_id");
     }
 }

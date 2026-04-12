@@ -47,7 +47,8 @@ use std::collections::HashSet;
 
 use crate::compiled::{CompiledExpr, CompiledNode};
 use crate::physical::{
-    ExplainPhysical, FilterPhysical, LimitPhysical, PhysicalPlan, ProjectPhysical, ScanPhysical,
+    AggregatePhysical, DistinctPhysical, ExplainPhysical, FilterPhysical, LimitPhysical,
+    PhysicalPlan, ProjectPhysical, ScanPhysical, SequenceMatchPhysical, SortPhysical,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -202,6 +203,113 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
                 .collect();
             PhysicalPlan::Explain(ExplainPhysical {
                 plan: Box::new(prune_with_demand(*inner, inner_demand)),
+                output_schema,
+            })
+        }
+
+        // ── Wave 3: SequenceMatch ──────────────────────────────────────────────
+        // SequenceMatch produces its own output columns (entity_id, step_reached,
+        // step properties, etc.) — it does NOT pass input columns through. The
+        // scan-side demand comes from the pattern's predicates, variable bindings,
+        // and step-property forwarding, which are already computed by the physical
+        // lowering. We recurse into the child with the demand the SequenceMatch
+        // already determined (all input schema columns the pattern needs).
+        PhysicalPlan::SequenceMatch(seq_match) => {
+            let SequenceMatchPhysical {
+                compiled_nfa,
+                strategy,
+                demand: seq_demand,
+                execution_config,
+                fused_aggregate,
+                input,
+                output_schema,
+            } = *seq_match;
+            // The SequenceMatch's child demand is all its input schema columns.
+            let child_demand: HashSet<String> = input
+                .output_schema()
+                .columns()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
+                compiled_nfa,
+                strategy,
+                demand: seq_demand,
+                execution_config,
+                fused_aggregate,
+                input: Box::new(prune_with_demand(*input, child_demand)),
+                output_schema,
+            }))
+        }
+
+        // ── Wave 3: Aggregate ───────────────────────────────────────────────────
+        // Aggregate is a demand boundary: the child demand is the set of columns
+        // referenced by group-by expressions and aggregate arguments.
+        PhysicalPlan::Aggregate(agg) => {
+            let AggregatePhysical {
+                aggregates,
+                group_by,
+                max_groups,
+                input,
+                output_schema,
+            } = agg;
+            let mut child_demand = HashSet::new();
+            for (expr, _name) in &group_by {
+                collect_column_names(expr, &mut child_demand);
+            }
+            for compiled_agg in &aggregates {
+                if let Some(arg) = &compiled_agg.arg {
+                    collect_column_names(arg, &mut child_demand);
+                }
+            }
+            PhysicalPlan::Aggregate(AggregatePhysical {
+                aggregates,
+                group_by,
+                max_groups,
+                input: Box::new(prune_with_demand(*input, child_demand)),
+                output_schema,
+            })
+        }
+
+        // ── Wave 3: Sort ─────────────────────────────────────────────────────────
+        // Sort is transparent column-wise (output = input schema), but sort keys
+        // reference columns that must be demanded from the child.
+        PhysicalPlan::Sort(sort) => {
+            let SortPhysical {
+                keys,
+                max_rows,
+                input,
+                output_schema,
+            } = sort;
+            let mut child_demand = demand;
+            for (expr, _dir) in &keys {
+                collect_column_names(expr, &mut child_demand);
+            }
+            PhysicalPlan::Sort(SortPhysical {
+                keys,
+                max_rows,
+                input: Box::new(prune_with_demand(*input, child_demand)),
+                output_schema,
+            })
+        }
+
+        // ── Wave 3: Distinct ─────────────────────────────────────────────────────
+        // Distinct deduplicates on all output columns, so it demands all of its
+        // own output schema columns from the child.
+        PhysicalPlan::Distinct(distinct) => {
+            let DistinctPhysical {
+                max_groups,
+                input,
+                output_schema,
+            } = distinct;
+            let child_demand: HashSet<String> = output_schema
+                .columns()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            PhysicalPlan::Distinct(DistinctPhysical {
+                max_groups,
+                input: Box::new(prune_with_demand(*input, child_demand)),
                 output_schema,
             })
         }

@@ -88,6 +88,58 @@ pub fn pushdown_predicates(plan: PhysicalPlan) -> PhysicalPlan {
             })
         }
 
+        // Wave 3 interior nodes: recurse into children.
+        PhysicalPlan::SequenceMatch(seq_match) => {
+            let mut sm = *seq_match;
+            sm.input = Box::new(pushdown_predicates(*sm.input));
+            PhysicalPlan::SequenceMatch(Box::new(sm))
+        }
+
+        PhysicalPlan::Aggregate(agg) => {
+            let crate::physical::AggregatePhysical {
+                aggregates,
+                group_by,
+                max_groups,
+                input,
+                output_schema,
+            } = agg;
+            PhysicalPlan::Aggregate(crate::physical::AggregatePhysical {
+                aggregates,
+                group_by,
+                max_groups,
+                input: Box::new(pushdown_predicates(*input)),
+                output_schema,
+            })
+        }
+
+        PhysicalPlan::Sort(sort) => {
+            let crate::physical::SortPhysical {
+                keys,
+                max_rows,
+                input,
+                output_schema,
+            } = sort;
+            PhysicalPlan::Sort(crate::physical::SortPhysical {
+                keys,
+                max_rows,
+                input: Box::new(pushdown_predicates(*input)),
+                output_schema,
+            })
+        }
+
+        PhysicalPlan::Distinct(distinct) => {
+            let crate::physical::DistinctPhysical {
+                max_groups,
+                input,
+                output_schema,
+            } = distinct;
+            PhysicalPlan::Distinct(crate::physical::DistinctPhysical {
+                max_groups,
+                input: Box::new(pushdown_predicates(*input)),
+                output_schema,
+            })
+        }
+
         // Leaf nodes — Scan, DDL variants, Insert: no child plan to recurse.
         other => other,
     }
