@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-324",
+  "claimed_at": "2026-04-12T11:23:52Z",
+  "branch": "task/TASK-324",
+  "description": "Matcher integration test suite"
+}
