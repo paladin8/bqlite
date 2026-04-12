@@ -1,4 +1,4 @@
-//! EXPLAIN tree builder and plain-text formatter (TASK-229).
+//! EXPLAIN tree builder and plain-text formatter (TASK-229, TASK-317).
 //!
 //! Walks a [`PhysicalPlan`] and produces an [`ExplainNode`] tree — a
 //! stable, string-based mirror of the plan — then renders it as
@@ -7,16 +7,22 @@
 //!
 //! ## Wave 2 scope
 //!
-//! Only the four Wave 2 pipeline variants are handled:
-//! `Scan`, `Filter`, `Project`, `Limit`. `Explain` is transparently
-//! unwrapped so callers can pass a `PhysicalPlan::Explain` directly.
-//! DDL / DML / future operator variants are not reached by Wave 2
-//! queries.
+//! Four Wave 2 pipeline variants: `Scan`, `Filter`, `Project`, `Limit`.
+//! `Explain` is transparently unwrapped so callers can pass a
+//! `PhysicalPlan::Explain` directly. DDL / DML leaf nodes are not
+//! reachable from `build_explain_node`.
+//!
+//! ## Wave 3 scope (TASK-317)
+//!
+//! Four additional Wave 3 pipeline variants: `SequenceMatch`, `Aggregate`,
+//! `Sort`, `Distinct`. Their physical descriptors are produced by TASK-318;
+//! these arms prevent panics when an `EXPLAIN` wraps a Wave 3 query.
 
 use bqlite_ast::expr::{BinaryOp, CompareOp, UnaryOp};
-use bqlite_core::PropertyValue;
+use bqlite_core::{AggFunction, PropertyValue};
 
 use crate::compiled::{CompiledExpr, CompiledNode};
+use crate::logical::SortDirection;
 use crate::physical::PhysicalPlan;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,6 +53,41 @@ pub enum ExplainNode {
     },
     Limit {
         count: u64,
+        input: Box<ExplainNode>,
+    },
+    /// Wave 3: NFA-based sequence / pattern-match operator.
+    SequenceMatch {
+        /// Human-readable strategy name (`"StepCounter"`, `"ConsecutiveMatcher"`,
+        /// `"FullNfa"`).
+        strategy: String,
+        /// Number of NFA states in the compiled program.
+        step_count: usize,
+        /// Whether the operator emits intermediate step-reached events.
+        emit_all: bool,
+        input: Box<ExplainNode>,
+    },
+    /// Wave 3: hash aggregate operator.
+    Aggregate {
+        /// Formatted aggregate expressions (`"COUNT(*) AS n"`, `"SUM(amount) AS total"`).
+        aggregates: Vec<String>,
+        /// Output column names of the group-by key expressions.
+        group_by: Vec<String>,
+        /// Hard cap on group cardinality.
+        max_groups: usize,
+        input: Box<ExplainNode>,
+    },
+    /// Wave 3: in-memory sort operator.
+    Sort {
+        /// Formatted sort key expressions (`"amount ASC"`, `"ts DESC"`).
+        keys: Vec<String>,
+        /// Hard cap on total input rows.
+        max_rows: usize,
+        input: Box<ExplainNode>,
+    },
+    /// Wave 3: hash-based row deduplication operator.
+    Distinct {
+        /// Hard cap on distinct row count.
+        max_groups: usize,
         input: Box<ExplainNode>,
     },
 }
@@ -110,6 +151,36 @@ pub fn build_explain_node(plan: &PhysicalPlan) -> ExplainNode {
         },
         // Transparently unwrap EXPLAIN so callers can pass either form.
         PhysicalPlan::Explain(explain) => build_explain_node(&explain.plan),
+        // ── Wave 3 variants ────────────────────────────────────────────────
+        PhysicalPlan::SequenceMatch(seq) => ExplainNode::SequenceMatch {
+            strategy: format_match_strategy(&seq.strategy),
+            step_count: seq.compiled_nfa.states.len(),
+            emit_all: seq.demand.needs_step_reached,
+            input: Box::new(build_explain_node(&seq.input)),
+        },
+        PhysicalPlan::Aggregate(agg) => ExplainNode::Aggregate {
+            aggregates: agg.aggregates.iter().map(format_compiled_agg).collect(),
+            group_by: agg
+                .group_by
+                .iter()
+                .map(|(_expr, name)| name.clone())
+                .collect(),
+            max_groups: agg.max_groups,
+            input: Box::new(build_explain_node(&agg.input)),
+        },
+        PhysicalPlan::Sort(sort) => ExplainNode::Sort {
+            keys: sort
+                .keys
+                .iter()
+                .map(|(expr, dir)| format!("{} {}", format_expr(expr), format_sort_dir(dir)))
+                .collect(),
+            max_rows: sort.max_rows,
+            input: Box::new(build_explain_node(&sort.input)),
+        },
+        PhysicalPlan::Distinct(dist) => ExplainNode::Distinct {
+            max_groups: dist.max_groups,
+            input: Box::new(build_explain_node(&dist.input)),
+        },
         other => panic!("build_explain_node: not a query plan node — {other:?}"),
     }
 }
@@ -168,6 +239,63 @@ fn write_node(node: &ExplainNode, indent: usize, buf: &mut String) {
         }
         ExplainNode::Limit { count, input } => {
             buf.push_str(&format!("{pad}Limit {count}\n"));
+            write_node(input, indent + 1, buf);
+        }
+        ExplainNode::SequenceMatch {
+            strategy,
+            step_count,
+            emit_all,
+            input,
+        } => {
+            buf.push_str(&format!("{pad}SequenceMatch\n"));
+            buf.push_str(&format!("{pad}  strategy   : {strategy}\n"));
+            buf.push_str(&format!("{pad}  steps      : {step_count}\n"));
+            buf.push_str(&format!("{pad}  emit_all   : {emit_all}\n"));
+            write_node(input, indent + 1, buf);
+        }
+        ExplainNode::Aggregate {
+            aggregates,
+            group_by,
+            max_groups,
+            input,
+        } => {
+            buf.push_str(&format!("{pad}Aggregate\n"));
+            if aggregates.is_empty() {
+                buf.push_str(&format!("{pad}  agg        : none\n"));
+            } else {
+                buf.push_str(&format!("{pad}  agg        : {}\n", aggregates[0]));
+                for a in &aggregates[1..] {
+                    buf.push_str(&format!("{pad}               {a}\n"));
+                }
+            }
+            if group_by.is_empty() {
+                buf.push_str(&format!("{pad}  group_by   : none\n"));
+            } else {
+                buf.push_str(&format!("{pad}  group_by   : {}\n", group_by.join(", ")));
+            }
+            buf.push_str(&format!("{pad}  max_groups : {max_groups}\n"));
+            write_node(input, indent + 1, buf);
+        }
+        ExplainNode::Sort {
+            keys,
+            max_rows,
+            input,
+        } => {
+            buf.push_str(&format!("{pad}Sort\n"));
+            if keys.is_empty() {
+                buf.push_str(&format!("{pad}  keys       : none\n"));
+            } else {
+                buf.push_str(&format!("{pad}  keys       : {}\n", keys[0]));
+                for k in &keys[1..] {
+                    buf.push_str(&format!("{pad}               {k}\n"));
+                }
+            }
+            buf.push_str(&format!("{pad}  max_rows   : {max_rows}\n"));
+            write_node(input, indent + 1, buf);
+        }
+        ExplainNode::Distinct { max_groups, input } => {
+            buf.push_str(&format!("{pad}Distinct\n"));
+            buf.push_str(&format!("{pad}  max_groups : {max_groups}\n"));
             write_node(input, indent + 1, buf);
         }
     }
@@ -295,6 +423,50 @@ fn format_compare_op(op: CompareOp) -> &'static str {
         CompareOp::LessOrEqual => "<=",
         CompareOp::Greater => ">",
         CompareOp::GreaterOrEqual => ">=",
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 3 formatting helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn format_match_strategy(strategy: &crate::compile::MatchStrategy) -> String {
+    match strategy {
+        crate::compile::MatchStrategy::StepCounter => "StepCounter".to_string(),
+        crate::compile::MatchStrategy::ConsecutiveMatcher => "ConsecutiveMatcher".to_string(),
+        crate::compile::MatchStrategy::FullNfa => "FullNfa".to_string(),
+    }
+}
+
+fn format_compiled_agg(agg: &crate::physical::CompiledAgg) -> String {
+    let func_name = format_agg_function(agg.function);
+    let arg_str = match &agg.arg {
+        None => "*".to_string(),
+        Some(e) => format_expr(e),
+    };
+    format!("{func_name}({arg_str}) AS {}", agg.output_name)
+}
+
+fn format_agg_function(func: AggFunction) -> &'static str {
+    match func {
+        AggFunction::Count => "COUNT",
+        AggFunction::CountColumn => "COUNT",
+        AggFunction::CountDistinct => "COUNT_DISTINCT",
+        AggFunction::Sum => "SUM",
+        AggFunction::Min => "MIN",
+        AggFunction::Max => "MAX",
+        AggFunction::Avg => "AVG",
+        AggFunction::P50 => "P50",
+        AggFunction::P90 => "P90",
+        AggFunction::P95 => "P95",
+        AggFunction::P99 => "P99",
+    }
+}
+
+fn format_sort_dir(dir: &SortDirection) -> &'static str {
+    match dir {
+        SortDirection::Asc => "ASC",
+        SortDirection::Desc => "DESC",
     }
 }
 

@@ -41,6 +41,7 @@
 use std::collections::HashSet;
 
 use bqlite_ast::expr::{Expr, Literal};
+use bqlite_ast::pattern::{BracketSpec, MatchMode, MatchPattern};
 use bqlite_ast::pipeline::{Pipeline, TimeRange};
 use bqlite_ast::{
     AlterAction, AlterTableStmt, ColumnDef as AstColumnDef, ColumnRole, CreateTableStmt,
@@ -48,9 +49,11 @@ use bqlite_ast::{
     Statement,
 };
 use bqlite_core::{
-    BqlType, BqliteError, Catalog, ColumnDef, OperatorSchema, PropertyValue, Result, TableSchema,
+    AggFunction, BqlType, BqliteError, Catalog, ColumnDef, OperatorSchema, PropertyValue, Result,
+    TableSchema,
 };
 
+use crate::demand::{FusableAggregate, StepPropertyRef};
 use crate::expr::{FunctionRegistry, TypedExpr};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +190,98 @@ pub enum LogicalPlan {
         /// Fixed single-column schema: `(plan: String)`.
         output_schema: OperatorSchema,
     },
+
+    // ── Wave 3 variants ────────────────────────────────────────────────────
+    /// `| MATCH <pattern>` — NFA-based sequence pattern matching. Wave 3.
+    ///
+    /// Carries the **AST-level** pattern (`SequencePattern`) — compilation
+    /// to `CompiledNfa` happens during logical→physical lowering (TASK-318).
+    /// `step_properties` starts empty and is filled by demand analysis
+    /// (Pass 4). `fused_downstream` starts `None` and is set by the
+    /// match-aggregate fusion optimizer (TASK-320, Pass 6).
+    ///
+    /// See `docs/design/planner/wave3-lowering.md` §2.1 for the full
+    /// lowering specification.
+    SequenceMatch {
+        /// The validated AST-level pattern. Compiled to `CompiledNfa` in
+        /// TASK-318's physical lowering pass.
+        pattern: SequencePattern,
+        /// First vs. all non-overlapping matches per entity.
+        mode: MatchMode,
+        /// When `true`, every entity emits exactly one row regardless of
+        /// match completion; a synthetic `step_reached` column indicates
+        /// progress. Used internally by FUNNEL / RETENTION desugaring.
+        emit_all: bool,
+        /// Optional time window constraint (nanoseconds or session).
+        window: Option<MatchWindowSpec>,
+        /// Retention bracket durations — always `None` in Wave 3; populated
+        /// by RETENTION desugaring in Wave 4.
+        brackets: Option<BracketSpec>,
+        /// Per-step, per-column properties demanded by downstream.
+        /// Populated by demand analysis (Pass 4); empty at construction.
+        step_properties: Vec<StepPropertyRef>,
+        /// Fused downstream aggregate specification.
+        /// Set by match-aggregate fusion optimizer (TASK-320, Pass 6).
+        fused_downstream: Option<FusedDownstream>,
+        /// Child plan (the scan / filter feeding this match).
+        input: Box<LogicalPlan>,
+        /// Output schema — maximum schema at construction time, pruned by
+        /// demand analysis. See wave3-lowering.md §2.1.3.
+        output_schema: OperatorSchema,
+    },
+
+    /// `| STATS <aggregates> [GROUP BY <keys>]` — hash aggregation. Wave 3.
+    ///
+    /// Output schema is: group-by columns first (in declaration order),
+    /// then aggregate result columns. The input schema is **not** passed
+    /// through — only group-by keys and aggregate results are visible
+    /// downstream (standard SQL aggregate contract).
+    ///
+    /// See `docs/design/planner/wave3-lowering.md` §2.2 for the lowering
+    /// specification.
+    Aggregate {
+        /// Typed, validated aggregate expressions (function + args + names).
+        aggregates: Vec<TypedAggExpr>,
+        /// Group-by key expressions paired with output column names.
+        group_by: Vec<(TypedExpr, String)>,
+        /// Child plan feeding this aggregate.
+        input: Box<LogicalPlan>,
+        /// Output schema: group-by cols + aggregate cols.
+        output_schema: OperatorSchema,
+    },
+
+    /// `| ORDER BY <keys>` — pipeline sort. Wave 3.
+    ///
+    /// Output schema is identical to the input schema: Sort does not add,
+    /// remove, or rename columns. `SortOperator` is a pipeline breaker —
+    /// it materializes all input before emitting sorted output.
+    ///
+    /// See `docs/design/planner/wave3-lowering.md` §2.3 and
+    /// `docs/design/operators/sort-distinct.md` §3 for details.
+    Sort {
+        /// Sort keys in priority order (primary, secondary, …).
+        /// Each key is a typed expression plus a direction.
+        keys: Vec<(TypedExpr, SortDirection)>,
+        /// Child plan feeding this sort.
+        input: Box<LogicalPlan>,
+        /// Identical to `input.output_schema()`.
+        output_schema: OperatorSchema,
+    },
+
+    /// Deduplication node wrapping a `Project`. Wave 3.
+    ///
+    /// Lowered from `SELECT DISTINCT` by wrapping the inner `Project`
+    /// in a `Distinct` node. `DistinctOperator` deduplicates on **all**
+    /// output columns. Output schema is identical to its input's schema.
+    ///
+    /// See `docs/design/planner/wave3-lowering.md` §2.4 and
+    /// `docs/design/operators/sort-distinct.md` §4 for details.
+    Distinct {
+        /// Child plan (must be a `Project` from SELECT DISTINCT lowering).
+        input: Box<LogicalPlan>,
+        /// Identical to `input.output_schema()`.
+        output_schema: OperatorSchema,
+    },
 }
 
 /// A single output item in a `LogicalPlan::Project`.
@@ -259,6 +354,99 @@ pub enum IngestFormat {
     Parquet,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 3 logical plan support types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Planner-owned representation of a MATCH pattern.
+///
+/// Produced by TASK-318's AST→logical lowering from a `MatchPattern`.
+/// For Wave 3, this carries the AST-level pattern after validation
+/// (event type references, predicate type-checks, variable binding scoping).
+/// Compilation to `CompiledNfa` happens later during logical→physical
+/// lowering (TASK-318) via `crate::compile::compile_pattern`.
+///
+/// See `docs/design/planner/wave3-lowering.md` §2.1.1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequencePattern {
+    /// The underlying AST pattern, after planner-level validation.
+    ///
+    /// TASK-318 populates this during AST→logical lowering; TASK-311's
+    /// `compile_pattern` converts it to a `CompiledNfa` during physical
+    /// lowering.
+    pub inner: MatchPattern,
+}
+
+/// Optional time window constraint on a MATCH pattern.
+///
+/// See `docs/design/planner/wave3-lowering.md` §2.1.1 (MatchWindowSpec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MatchWindowSpec {
+    /// `WITHIN <duration>` — nanoseconds. All steps in the pattern must
+    /// complete within this duration from the first matched event.
+    Duration(i64),
+    /// `WITHIN SESSION` — NFA resets on `session_id` column transitions.
+    /// Requires an upstream SESSIONIZE operator (Wave 4). A Wave 3 query
+    /// using this variant will fail at schema validation because the
+    /// `session_id` column is not present without SESSIONIZE.
+    Session,
+}
+
+/// Fused downstream aggregate specification (TASK-320 Pass 6).
+///
+/// Set on `LogicalPlan::SequenceMatch` by the match-aggregate fusion
+/// optimizer (TASK-320) when it detects a fusable Aggregate immediately
+/// downstream (optionally separated by a Filter).
+///
+/// Empty until Pass 6 runs; `None` on every newly constructed node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedDownstream {
+    /// The aggregate specification extracted by the fusion optimizer.
+    pub aggregate: FusableAggregate,
+}
+
+/// A validated, type-checked aggregate expression.
+///
+/// Produced by TASK-318's `PipelineStage::Stats` lowering for each
+/// `AggItem` in the STATS clause. Carries resolved function, type-checked
+/// argument expressions, output column name, and inferred output type.
+///
+/// See `docs/design/planner/wave3-lowering.md` §2.2.1 for the full
+/// lowering rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedAggExpr {
+    /// The resolved aggregate function.
+    pub function: AggFunction,
+    /// Type-checked argument expressions. Empty for `COUNT(*)`.
+    /// One element for all other aggregate functions.
+    pub args: Vec<TypedExpr>,
+    /// Whether this is a `COUNT_DISTINCT`-style distinct aggregate.
+    /// Reserved for v2; always `false` in Wave 3.
+    pub distinct: bool,
+    /// Output column name — from the BQL alias (query-language.md §7.1).
+    pub output_name: String,
+    /// Output BQL type derived from `AggFunction::output_type`.
+    pub output_type: BqlType,
+    /// Whether this aggregate output is nullable (false for COUNT variants).
+    pub nullable: bool,
+    // TODO(TASK-318): add `span: Span` for source-location tracking in type
+    // error messages. Deferred because TASK-317 is scaffolding only — TASK-318
+    // owns the lowering that constructs TypedAggExpr at parse sites.
+}
+
+/// Sort direction for `LogicalPlan::Sort` keys.
+///
+/// Shared between the logical `Sort` node and the physical `SortPhysical`
+/// descriptor. The null-ordering convention is fixed: NULLs last in ASC,
+/// NULLs first in DESC — see `docs/design/operators/sort-distinct.md` §3.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SortDirection {
+    /// Ascending order — NULLs sort last (query-language.md §15).
+    Asc,
+    /// Descending order — NULLs sort first (query-language.md §15).
+    Desc,
+}
+
 impl LogicalPlan {
     /// The cached output schema for this plan node.
     ///
@@ -276,7 +464,12 @@ impl LogicalPlan {
             | LogicalPlan::AlterTableAddColumn { output_schema, .. }
             | LogicalPlan::Describe { output_schema, .. }
             | LogicalPlan::Insert { output_schema, .. }
-            | LogicalPlan::Explain { output_schema, .. } => output_schema,
+            | LogicalPlan::Explain { output_schema, .. }
+            // Wave 3 variants — all carry an output_schema field.
+            | LogicalPlan::SequenceMatch { output_schema, .. }
+            | LogicalPlan::Aggregate { output_schema, .. }
+            | LogicalPlan::Sort { output_schema, .. }
+            | LogicalPlan::Distinct { output_schema, .. } => output_schema,
         }
     }
 

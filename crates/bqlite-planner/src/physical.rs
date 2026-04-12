@@ -48,10 +48,12 @@
 //!   Wave 2 variants.
 
 use bqlite_ast::pipeline::TimeRange;
-use bqlite_core::{ColumnDef, OperatorSchema, TableSchema};
+use bqlite_core::{AggFunction, ColumnDef, OperatorSchema, TableSchema};
 
+use crate::compile::{CompiledNfa, MatchExecutionConfig, MatchStrategy};
 use crate::compiled::CompiledExpr;
-use crate::logical::{InsertLogicalBody, LogicalPlan, ProjectItem};
+use crate::demand::CompiledFusableAggregate;
+use crate::logical::{InsertLogicalBody, LogicalPlan, ProjectItem, SortDirection};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tunables
@@ -123,6 +125,20 @@ pub enum PhysicalPlan {
     Insert(InsertPhysical),
     /// `EXPLAIN` meta-node wrapping a child physical plan. §4.10.
     Explain(ExplainPhysical),
+
+    // ── Wave 3 variants ────────────────────────────────────────────────────
+    /// NFA-based sequence pattern matching. Wave 3.
+    ///
+    /// Boxed because `SequenceMatchPhysical` carries a `CompiledNfa` (a
+    /// heap-owning program object) that is much larger than any other variant.
+    /// Boxing keeps the enum footprint bounded to a single pointer for this arm.
+    SequenceMatch(Box<SequenceMatchPhysical>),
+    /// Hash aggregation over an input plan. Wave 3.
+    Aggregate(AggregatePhysical),
+    /// Pipeline sort (materializes all input, then sorts). Wave 3.
+    Sort(SortPhysical),
+    /// Row deduplication via hash-set (streaming). Wave 3.
+    Distinct(DistinctPhysical),
 }
 
 impl PhysicalPlan {
@@ -145,6 +161,11 @@ impl PhysicalPlan {
             PhysicalPlan::Describe(n) => &n.output_schema,
             PhysicalPlan::Insert(n) => &n.output_schema,
             PhysicalPlan::Explain(n) => &n.output_schema,
+            // Wave 3 variants — all carry an output_schema field.
+            PhysicalPlan::SequenceMatch(n) => &n.output_schema,
+            PhysicalPlan::Aggregate(n) => &n.output_schema,
+            PhysicalPlan::Sort(n) => &n.output_schema,
+            PhysicalPlan::Distinct(n) => &n.output_schema,
         }
     }
 }
@@ -366,6 +387,147 @@ pub struct ExplainPhysical {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Wave 3 physical descriptors
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single compiled aggregate expression on a physical plan node.
+///
+/// Produced by TASK-318's physical lowering from a [`crate::logical::TypedAggExpr`].
+/// Consumed by the `HashAccumulator` inside the `HashAggregateOperator` (TASK-307).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledAgg {
+    /// The resolved aggregate function.
+    pub function: AggFunction,
+    /// Compiled argument expression. `None` for `COUNT(*)`.
+    pub arg: Option<CompiledExpr>,
+    /// Output column name — from the BQL alias.
+    pub output_name: String,
+}
+
+/// Physical descriptor for the sequence-matching operator. Wave 3.
+///
+/// Produced by TASK-318's physical lowering from
+/// [`crate::logical::LogicalPlan::SequenceMatch`]. Materialized into a
+/// `SequenceMatchOperator` (TASK-321) by the engine bind step (TASK-323).
+///
+/// See `docs/design/planner/wave3-lowering.md` §2.1 and
+/// `docs/design/operators/match-operator.md` for the full specification.
+#[derive(Debug, Clone)]
+pub struct SequenceMatchPhysical {
+    /// The compiled NFA program produced by TASK-311's `compile_pattern`.
+    pub compiled_nfa: CompiledNfa,
+    /// Execution strategy selected by `select_strategy(pattern_class, config)`.
+    pub strategy: MatchStrategy,
+    /// Downstream demand set populated by demand analysis (Pass 4).
+    /// Drives column pruning and step-property forwarding.
+    pub demand: crate::demand::DemandSet,
+    /// Execution configuration derived from demand (controls strategy).
+    pub execution_config: MatchExecutionConfig,
+    /// Fused downstream aggregate, if the match-aggregate fusion optimizer
+    /// (TASK-320) detected a fusable Aggregate immediately downstream.
+    /// `None` until Pass 6 runs.
+    pub fused_aggregate: Option<CompiledFusableAggregate>,
+    /// Child plan (scan / filter feeding this match operator).
+    pub input: Box<PhysicalPlan>,
+    /// Output schema — pruned from the maximum schema by demand analysis.
+    pub output_schema: OperatorSchema,
+}
+
+// Manual PartialEq because CompiledNfa derives Debug+Clone but not PartialEq.
+// `compiled_nfa` is intentionally excluded: structural NFA equality is not
+// required for plan-equivalence tests (two compilations of the same pattern
+// produce identical NFA structure, but the comparison cost is unjustified for
+// test assertions). If NFA structural equality becomes necessary, PartialEq
+// must be derived or implemented for CompiledNfa and its subtypes.
+// `execution_config` IS compared: its flags (track_match_duration,
+// track_match_events) are runtime-significant and affect strategy selection.
+impl PartialEq for SequenceMatchPhysical {
+    fn eq(&self, other: &Self) -> bool {
+        self.strategy == other.strategy
+            && self.execution_config == other.execution_config
+            && self.demand == other.demand
+            && self.fused_aggregate == other.fused_aggregate
+            && self.input == other.input
+            && self.output_schema == other.output_schema
+    }
+}
+
+/// Physical descriptor for hash aggregation. Wave 3.
+///
+/// Produced by TASK-318's physical lowering from
+/// [`crate::logical::LogicalPlan::Aggregate`]. Materialized into a
+/// `HashAggregateOperator` (TASK-307) by the engine bind step (TASK-323).
+///
+/// See `docs/design/operators/aggregate-operator.md` for the full spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregatePhysical {
+    /// Compiled aggregate expressions (function + arg + output name).
+    pub aggregates: Vec<CompiledAgg>,
+    /// Compiled group-by key expressions paired with their output column names.
+    pub group_by: Vec<(CompiledExpr, String)>,
+    /// Hard cap on group cardinality. Default: 1,000,000.
+    /// Matches `DEFAULT_MAX_GROUPS` from aggregate-operator.md §4.3.
+    pub max_groups: usize,
+    /// Child plan feeding this aggregate.
+    pub input: Box<PhysicalPlan>,
+    /// Output schema: group-by columns first, aggregate columns next.
+    pub output_schema: OperatorSchema,
+}
+
+/// Default maximum group count for [`AggregatePhysical`] and
+/// [`DistinctPhysical`].
+///
+/// 1,000,000 groups × ~100 bytes each ≈ 100 MB, within the 3 GB query
+/// budget (aggregate-operator.md §4.3, sort-distinct.md §4.6).
+pub const DEFAULT_MAX_GROUPS: usize = 1_000_000;
+
+/// Default maximum row count for [`SortPhysical`].
+///
+/// 10,000,000 rows × ~100 bytes each ≈ 1 GB, with headroom in a 3 GB
+/// query budget (sort-distinct.md §3.6).
+pub const DEFAULT_SORT_MAX_ROWS: usize = 10_000_000;
+
+/// Physical descriptor for pipeline sort. Wave 3.
+///
+/// Produced by TASK-318's physical lowering from
+/// [`crate::logical::LogicalPlan::Sort`]. Materialized into a
+/// `SortOperator` (TASK-322) by the engine bind step (TASK-323).
+///
+/// See `docs/design/operators/sort-distinct.md` §3 for the full spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortPhysical {
+    /// Compiled sort key expressions in priority order (primary, secondary, …).
+    /// Each key is a `CompiledExpr` that evaluates to a scalar value over an
+    /// input batch, plus a direction controlling null-ordering.
+    pub keys: Vec<(CompiledExpr, SortDirection)>,
+    /// Hard cap on total input rows. Default: 10,000,000.
+    /// Returns `BqliteError::Execution` if exceeded — no spill in Wave 3.
+    pub max_rows: usize,
+    /// Child plan feeding this sort.
+    pub input: Box<PhysicalPlan>,
+    /// Identical to `input.output_schema()` — Sort never changes the schema.
+    pub output_schema: OperatorSchema,
+}
+
+/// Physical descriptor for row deduplication. Wave 3.
+///
+/// Produced by TASK-318's physical lowering from
+/// [`crate::logical::LogicalPlan::Distinct`]. Materialized into a
+/// `DistinctOperator` (TASK-322) by the engine bind step (TASK-323).
+///
+/// See `docs/design/operators/sort-distinct.md` §4 for the full spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistinctPhysical {
+    /// Hard cap on distinct row count. Default: 1,000,000.
+    /// Returns `BqliteError::Execution` if exceeded — no spill in Wave 3.
+    pub max_groups: usize,
+    /// Child plan feeding this distinct operator.
+    pub input: Box<PhysicalPlan>,
+    /// Identical to `input.output_schema()` — Distinct never changes the schema.
+    pub output_schema: OperatorSchema,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Logical → physical lowering
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -528,6 +690,23 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                 plan: Box::new(child),
                 output_schema,
             })
+        }
+
+        // Wave 3 variants — lowering is implemented in TASK-318.
+        // These arms are unreachable in Wave 2: the logical lowering in
+        // `fold_stage` (logical.rs) still rejects all Wave 3 pipeline
+        // stages with a "not yet supported" error, so the physical
+        // lowering never encounters these variants. TASK-318 will replace
+        // the `unreachable!` calls with real lowering logic.
+        LogicalPlan::SequenceMatch { .. }
+        | LogicalPlan::Aggregate { .. }
+        | LogicalPlan::Sort { .. }
+        | LogicalPlan::Distinct { .. } => {
+            unreachable!(
+                "Wave 3 logical variants are not yet lowered to physical in Wave 2; \
+                 TASK-318 implements the logical→physical lowering for \
+                 SequenceMatch / Aggregate / Sort / Distinct"
+            )
         }
     }
 }

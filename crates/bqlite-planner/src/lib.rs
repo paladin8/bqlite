@@ -62,6 +62,7 @@ use bqlite_core::{Catalog, Result};
 
 pub mod compile;
 pub mod compiled;
+pub mod demand;
 pub mod explain;
 pub mod expr;
 pub mod logical;
@@ -76,17 +77,23 @@ pub use compiled::{
     ArithKernel, ArrowKernelId, CastKernel, CompareKernel, CompiledExpr, CompiledNode, FunctionId,
     FunctionKernel, InSetKernel, LogicalKernel, UnaryKernel,
 };
+pub use demand::{
+    ColumnId, CompiledAggExpr, CompiledFusableAggregate, DemandSet, FusableAggExpr,
+    FusableAggregate, StepPropertyRef,
+};
 pub use explain::{build_explain_node, format_explain, format_expr, ExplainNode};
 pub use expr::{FunctionRegistry, ScalarFunctionSig, TypedExpr, TypedExprKind};
 pub use logical::{
-    lower_statement, IngestFormat, InsertFromDescriptor, InsertLogicalBody, LogicalPlan,
-    ProjectItem,
+    lower_statement, FusedDownstream, IngestFormat, InsertFromDescriptor, InsertLogicalBody,
+    LogicalPlan, MatchWindowSpec, ProjectItem, SequencePattern, SortDirection, TypedAggExpr,
 };
 pub use physical::{
-    lower_physical, AlterTableAddColumnPhysical, CreateTablePhysical, DescribePhysical,
-    DropTablePhysical, ExplainPhysical, FilterPhysical, InsertPhysical, LimitPhysical,
-    PhysicalPlan, ProjectPhysical, ProjectPhysicalItem, ScanPhysical, DEFAULT_FILTER_TILE_SIZE,
-    MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
+    lower_physical, AggregatePhysical, AlterTableAddColumnPhysical, CompiledAgg,
+    CreateTablePhysical, DescribePhysical, DistinctPhysical, DropTablePhysical, ExplainPhysical,
+    FilterPhysical, InsertPhysical, LimitPhysical, PhysicalPlan, ProjectPhysical,
+    ProjectPhysicalItem, ScanPhysical, SequenceMatchPhysical, SortPhysical,
+    DEFAULT_FILTER_TILE_SIZE, DEFAULT_MAX_GROUPS, DEFAULT_SORT_MAX_ROWS, MAX_FILTER_TILE_SIZE,
+    MIN_FILTER_TILE_SIZE,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

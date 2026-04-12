@@ -138,6 +138,20 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
                 insert.output_schema.clone(),
             )))
         }
+
+        // Wave 3 operators — engine bind step is implemented in TASK-323.
+        // These variants are unreachable in Wave 2: the planner's
+        // `lower_physical` already panics with `unreachable!` for these
+        // logical variants, so they can never appear in a Wave 2 physical
+        // plan. TASK-323 will add real implementations for each.
+        PhysicalPlan::SequenceMatch(_)
+        | PhysicalPlan::Aggregate(_)
+        | PhysicalPlan::Sort(_)
+        | PhysicalPlan::Distinct(_) => unreachable!(
+            "Wave 3 physical variants are not yet bound to operators in Wave 2; \
+             TASK-323 implements the engine bind step for \
+             SequenceMatch / Aggregate / Sort / Distinct"
+        ),
     }
 }
 

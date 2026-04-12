@@ -146,7 +146,7 @@ pub enum MatchStrategy {
 ///
 /// Used by [`select_strategy`] to determine the final execution
 /// strategy (matcher-strategy.md §7.1).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MatchExecutionConfig {
     /// Whether downstream demand requires match-duration tracking.
     pub track_match_duration: bool,
