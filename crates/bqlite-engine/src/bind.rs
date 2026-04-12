@@ -195,10 +195,13 @@ impl SequenceMatchAdapter {
     /// batch queue (non-fused) or into the aggregate accumulator (fused).
     fn finalize_entity(&mut self, entity: EntityId, state: SequenceMatchState) -> Result<()> {
         if let Some(fused) = &mut self.fused {
-            // Fused path: the default EntityOperator::finish_entity_into
-            // materializes the match output via finish_entity and calls
-            // accumulator.update_batch. For COUNT(*) without GROUP BY this
-            // correctly counts one row per completion.
+            // Fused path: SequenceMatchOperator::finish_entity_into (overridden
+            // for the fused case) calls finalize_state, counts completions, and
+            // calls accumulator.update(None, &[Null; num_aggs]) once per
+            // completion. For COUNT(*) the AggState::Count branch increments the
+            // count-star counter and ignores the null value. This avoids calling
+            // finish_entity (which would panic when the output_schema has been
+            // replaced with the aggregate schema by the fusion optimizer).
             let acc: &mut dyn Accumulator = &mut fused.accumulator;
             self.operator.finish_entity_into(state, acc)?;
         } else {
@@ -1060,15 +1063,10 @@ mod tests {
                 raw.push(col.value(i).to_string());
             }
         }
-        let raw_deduped = {
-            let mut d = raw.clone();
-            d.dedup();
-            d.sort();
-            d
-        };
+        let unique_count = raw.iter().collect::<std::collections::HashSet<_>>().len();
         assert_eq!(
             raw.len(),
-            raw_deduped.len(),
+            unique_count,
             "DISTINCT output must have no duplicate rows, got: {:?}",
             raw
         );
@@ -1095,7 +1093,7 @@ mod tests {
 
         let result = engine
             .query(
-                "events | match first sequence(click) | stats n = count(*)",
+                "events | where event_type = 'click' | match first sequence(click) | stats n = count(*)",
                 &mut db,
             )
             .expect("match-stats query");
