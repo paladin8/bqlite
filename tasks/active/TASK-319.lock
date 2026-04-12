@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-319",
+  "claimed_at": "2026-04-12T09:09:07Z",
+  "branch": "task/TASK-319",
+  "description": "FUNNEL desugaring pass"
+}
