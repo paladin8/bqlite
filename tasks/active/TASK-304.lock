@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-304",
+  "claimed_at": "2026-04-12T07:48:17Z",
+  "branch": "task/TASK-304",
+  "description": "NFA runtime simulator"
+}
