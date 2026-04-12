@@ -225,7 +225,7 @@ Each segment records the schema version it was written with (see `TableSchema.ve
 
 Each `(window, shard)` compacts independently. This means compaction is embarrassingly parallel across shards and windows.
 
-**v1 strategy: size-tiered.** Wave 4's compaction (TASK-408) ships pure size-tiered compaction within each `(window, shard)`. This is the cheapest correct strategy, optimal for hot/recent windows where ingest is still active. The roadmap to a temperature-aware hybrid strategy (cold windows compact differently from hot windows) is documented in §7.7 — bqlite is unusual because old windows become read-mostly very quickly, which is exactly where the hybrid wins.
+**Strategy: size-tiered.** Compaction is size-tiered within each `(window, shard)`. This is the cheapest correct strategy and, because bqlite is a query-performance-first engine, there is no separate "cold-window" compaction policy — every window is compacted for read performance, not for storage footprint.
 
 **Scheduling:** Compaction runs as a dedicated background process that activates when query and ingest load is light. It can also be triggered explicitly via API or CLI.
 
@@ -327,35 +327,9 @@ Queries acquire a reference to the current manifest at query start. Compaction p
 - Compaction waits for the old manifest's refcount to reach zero before deleting its segments.
 - No locks on the query read path.
 
-### 7.7 Temperature-Aware Hybrid Compaction
+### 7.7 Subcompaction for Large Merges
 
-Behavioral analytics workloads have a sharp temperature gradient: the current window is write-active (constant ingest, small queries), the previous N windows are read-mostly (drift queries, retention queries, dashboards), and old windows are write-cold and read-cold (occasional historical drilldowns). One compaction policy cannot be optimal for all three. The Wave 4 v1 strategy (§7.1) is uniformly size-tiered, which is the right call for hot windows but leaves performance on the table for cold windows. The temperature-aware extension below is a Wave 5+ enhancement.
-
-#### 7.7.1 Window Temperature Classification
-
-A `(window, shard)` is classified into one of three temperature buckets based on facts already in the manifest:
-
-| Bucket | Definition | Read profile | Write profile |
-|---|---|---|---|
-| **Hot** | Window contains the *current* day or has received an ingest in the past 24h | Frequent small reads | Active ingest |
-| **Warm** | Last ingest 1–30 days ago | Frequent full-window reads | Backfill only |
-| **Cold** | Last ingest > 30 days ago | Occasional reads | Effectively read-only |
-
-The classifier reads `last_ingest_at` per `(window, shard)` from the manifest (an existing-or-trivial field) and walks the active windows once per compaction cycle. The thresholds are configurable and the rules are intentionally simple — fancy temperature heuristics are not the point.
-
-#### 7.7.2 Per-Bucket Policies
-
-| Bucket | Policy | Trigger | Output shape |
-|---|---|---|---|
-| **Hot** | Size-tiered (current §7.1 behavior) | L0 file count > 4 OR L0 size > 256 MB | A new L1 segment per merge; many L1s coexist |
-| **Warm** | Overlap-bounded (leveled-ish) | Sorted-run count > 2 OR total read amplification > 1.5× the optimal | Single sorted run per `(window, shard)`; new ingest writes L0s that get rolled in on the next pass |
-| **Cold** | One-shot consolidation + cold codec promotion | Once, when the window crosses the warm→cold threshold | Single segment per shard, re-encoded with the cold compression policy (§10.7) |
-
-Triggers are *additive* to the L0 count/size triggers from §7.1 — a hot window can also be triggered by sorted-run count, just much less aggressively.
-
-#### 7.7.3 Subcompaction
-
-For very large `(window, shard)` merges (typical of cold-bucket consolidation, where the input may be hundreds of gigabytes), the compaction pass splits the work into **entity-range subcompactions** that run in parallel:
+For very large `(window, shard)` merges (input may be tens or hundreds of gigabytes once a window stabilizes), the compaction pass splits the work into **entity-range subcompactions** that run in parallel:
 
 1. The compaction scheduler computes the target output's row count from the input segments' manifest metadata.
 2. It picks `N = min(num_cores, byte_size / 1 GB)` entity boundaries inside the merged input that approximately equipartition the output.
@@ -364,15 +338,7 @@ For very large `(window, shard)` merges (typical of cold-bucket consolidation, w
 
 Subcompactions never split an entity — the boundary picker snaps to the next entity-id transition, exactly like morsel boundaries in the execution model (execution-model.md §9.3). This preserves the entity-locality invariant the read path relies on.
 
-#### 7.7.4 Concurrency With Hot-Path Ingest
-
-The hot bucket continues to use the existing manifest-MVCC protocol from §7.6. Cold-bucket consolidation can take a long time per `(window, shard)`, but the window is by definition no longer receiving ingest, so manifest contention is bounded — the only contender is another query's snapshot.
-
-#### 7.7.5 Open Questions Deferred to Wave 5
-
-- The exact thresholds (24h, 30d) are placeholders. The bench suite must validate them on real workloads.
-- Whether warm-bucket compaction should also re-run encoding selection (§10.3) is open. Cold-bucket consolidation always does — it pairs naturally with the cold codec promotion in §10.7.
-- Subcompaction parallelism interacts with the query worker pool (execution-model.md §9.4). The compaction scheduler must use the same active-count cooperation as today's compaction (§11 of execution-model.md).
+Subcompaction parallelism interacts with the query worker pool (execution-model.md §9.4). The compaction scheduler uses the same active-count cooperation as the main compaction path.
 
 ---
 
@@ -776,31 +742,9 @@ Null values are encoded as a separate null bitmap (Arrow-compatible) plus dense 
 
 ### 10.7 Compression Layer
 
-**LZ4 is the v1 compression codec.** Speed over size. LZ4 is applied as an optional **post-encoding** compression pass. If lightweight encodings (dictionary, delta+bitpack) are already effective, LZ4 on top adds minimal value. The minimum compression threshold (Section 10.4, LZ4) prevents wasting decode cycles for marginal gains.
+**LZ4, uniformly, for every segment.** Compression is applied as an optional **post-encoding** pass with a fixed minimum-ratio threshold (Section 10.4, LZ4) that skips compression when lightweight encodings have already produced a dense byte stream. This policy is deliberate: bqlite is a query-performance engine, and heavier post-encoding codecs (ZSTD, etc.) trade decode CPU for storage footprint — a trade we do not want to make, even for older windows. There is no "cold" codec, no temperature-aware codec promotion, and no mixed-codec segments. Every segment decodes at LZ4 speed, period.
 
-#### 10.7.1 Hot/Cold Compression Policy
-
-The codec choice is **a function of the segment's temperature bucket** (§7.7.1), not a single format-wide switch. The policy is intentionally simple:
-
-| Bucket | Post-encoding codec | Rationale |
-|---|---|---|
-| **Hot** (active ingest, < 24h) | LZ4, threshold 0.9 | Decode speed dominates; the data turns over too fast to amortize a heavier codec |
-| **Warm** (1–30 days) | LZ4, threshold 0.9 | Same as hot — warm windows still get plenty of reads, decode speed still matters |
-| **Cold** (> 30 days) | ZSTD level 3 on **varlen / high-entropy columns only**; LZ4 elsewhere | Cold windows are read-mostly and storage-bound. ZSTD at level 3 is ~2× LZ4's compression ratio at ~2.5× the decode cost — a net win when the column is rarely read |
-
-**Codec promotion happens at compaction.** A cold-bucket consolidation pass (§7.7.2) re-encodes the segment with the cold policy. There is no "background recompression" — recompression only happens when a `(window, shard)` is being merged anyway, so the I/O cost is paid once.
-
-**Why varlen-only for ZSTD.** Lightweight encodings (Dictionary, Delta, BitPacking, FOR, ALP) already produce dense, near-optimal byte streams. ZSTD on top of `Delta + BitPacking` for a sorted timestamp column buys ~3% size reduction at 2.5× the decode cost — never worth it. The wins from ZSTD are concentrated on:
-
-- Plain-encoded high-entropy strings (when the encoding selector falls back to Plain because FSST didn't help)
-- FSST-encoded long-tail strings (the FSST output is still text-like and compresses)
-- Plain-encoded random floats that didn't decompose into ALP
-
-The encoding selector knows which columns it sent down the lightweight path; the cold-bucket consolidation pass uses that record to apply ZSTD only where it pays.
-
-**No mixed-codec segments below the chunk level.** A given column chunk is either LZ4 or ZSTD, never both, never one for the dictionary and one for the codes. Mixed-codec segments would require carrying the codec choice into per-chunk metadata, which is fine, but the decoder dispatch overhead is real and uniform-codec keeps the hot path branch-free.
-
-**Forward compatibility.** Adding ZSTD to the v1 segment format requires extending `CompressionType` (§10.2). The on-disk shape is forward-compatible: an old reader sees `CompressionType::Zstd` as an unknown variant and rejects the segment with a typed `UnsupportedCompression { codec: Zstd }` error rather than corrupting data. The format version field in the segment header (§9.3) is bumped when ZSTD ships.
+Adding a heavier post-codec later would require extending `CompressionType` (§10.2) and bumping the segment format version (§9.3); the on-disk shape is forward-compatible in that an old reader would reject an unknown `CompressionType` with a typed `UnsupportedCompression { codec }` error rather than corrupt data. But unless a future workload provides clear evidence that decode cost is worth paying, LZ4 is the only codec bqlite uses.
 
 ---
 
@@ -1207,12 +1151,12 @@ Encoded as three components:
 | Partitioning | Time windows (N days, default 30) | Window pruning for time-range queries; keeps merge k small |
 | Sharding | Hash on entity_id (default 32 shards) | Parallel reads/writes, entity locality across windows, one shard per core |
 | Ingestion model | Batch-only, no WAL/memtable | Eliminates recovery complexity; appropriate for analytics workload |
-| Compaction strategy | v1: size-tiered within (window, shard). Roadmap: temperature-aware hybrid (§7.7) — size-tiered for hot, overlap-bounded for warm, one-shot consolidation for cold | Simple to ship, embarrassingly parallel; cold windows benefit from a different policy because they are read-mostly |
-| Compaction parallelism | Subcompaction by entity range for very large `(window, shard)` merges (§7.7.3) | Parallelizes a single compaction without splitting any entity |
+| Compaction strategy | Size-tiered within (window, shard), uniformly across all windows | Simple to ship, embarrassingly parallel; no cold-window specialization — every window is compacted for read performance |
+| Compaction parallelism | Subcompaction by entity range for very large `(window, shard)` merges (§7.7) | Parallelizes a single compaction without splitting any entity |
 | Segment format | Custom container + custom encodings | Full control over read path performance |
 | v1 encodings | Plain, Dictionary, Delta, DoubleDelta, BitPacking, RLE, Constant, FSST, FOR, PFOR, ALP, FreqEncoding, LZ4 | Comprehensive encoding suite; each encoding targets a specific data pattern |
 | Encoding selection | Multi-pass heuristics using statistics | Covers all common patterns; evolve to sampling in v2 |
-| Compression | v1: LZ4. Roadmap: hot/warm = LZ4, cold = ZSTD on varlen/high-entropy columns only (§10.7.1) | Decode speed dominates for hot/warm; cold windows can trade decode CPU for size |
+| Compression | LZ4, uniformly across all segments | Decode speed is the design priority; no storage-focused codec (ZSTD etc.) is planned |
 | Index structures | v1: zone maps (all columns) + dictionary pushdown. Roadmap: tiered secondary-index portfolio (§11.2) — event-type Roaring bitmap → entity-presence bitmap → low-cardinality value sets → Bloom filter as last resort | Nearly free for v1; secondary indexes added in priority order tied to actual query shapes |
 | Access-pattern hints | `posix_fadvise` / `memmap2::Advice` per scan kind (§8.2) | Cheap, embeddable-friendly way to tell the kernel about sequential vs random access |
 | Manifest format | JSON per-table + `db.json` for db-wide settings, atomic rename | Human-readable, debuggable; per-table isolation avoids cross-table lock contention |

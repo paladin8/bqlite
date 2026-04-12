@@ -46,9 +46,12 @@ use bqlite_core::error::{BqliteError, Result};
 
 /// On-disk compression discriminant per `segment-format-v1.md` §8.
 ///
-/// Two variants ship in v1; later waves extend this enum with new
-/// codecs (ZSTD, etc.) alongside a format-version bump. Readers
-/// reject any discriminant outside the v1 set with
+/// Two variants ship: `None` and `Lz4`. No additional codec is
+/// planned — bqlite is a query-performance engine and
+/// storage-focused post-codecs (ZSTD etc.) trade decode CPU for
+/// size, a trade we do not want. The enum is forward-compatible
+/// only in the reader-rejection sense: readers reject any
+/// discriminant outside the known set with
 /// [`BqliteError::Execution`], following the same contract the
 /// [`super::EncodingType`] enum uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

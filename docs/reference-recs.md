@@ -35,7 +35,7 @@ If only a few net-new ideas get adopted, these are the highest-leverage ones:
 2. Keep shards as the ownership boundary, but schedule multiple morsels per shard for load balancing, fairness, and skew resistance.
 3. Add finer-grained marks inside row-groups. A sparse primary index over 4K-8K-row marks is a better pruning unit than a whole 64K row-group.
 4. Make secondary indexes selective and entity-aware. Start with event-type/entity-presence bitmaps and a few cheap skip indexes rather than broad inverted indexing.
-5. Make compaction hybrid and temperature-aware. Hot windows want tiered behavior; cold windows want lower read amplification and possibly colder codecs.
+5. Parallelize large compactions via entity-range subcompaction. A single `(window, shard)` merge can be split across cores without violating entity locality.
 6. Make selection vectors first-class and compact adaptively. Filters should not eagerly materialize new batches unless selectivity demands it.
 7. Push compressed execution deeper. Equality/IN/RLE/FOR/dictionary work should stay compressed longer than the current docs explicitly require.
 8. Treat precomputed behavioral aggregates as an explicit opt-in feature family once the raw engine is solid, not as a vague future capability.
@@ -58,7 +58,7 @@ This section records the incremental takeaway from each Appendix A technology af
 | Technology | What the current docs already have | Net-new takeaway |
 |---|---|---|
 | ClickHouse MergeTree | immutable sorted parts, codecs, zone maps, custom format | Add ClickHouse-style marks/granules inside row-groups and make skip indexes conditional on sort-key correlation. |
-| RocksDB compaction family | immutable-segment compaction; size-tiered compaction chosen for now | Move from fixed size-tiered to hybrid, temperature-aware compaction with overlap/read-amplification triggers. |
+| RocksDB compaction family | immutable-segment compaction; size-tiered compaction chosen | Keep size-tiered (query-performance engines do not need LSM-style temperature tiers), but borrow RocksDB's subcompaction to parallelize large merges. |
 | ScyllaDB shard-per-core | shared-nothing principle already informs per-shard execution | Add optional core pinning / NUMA-local arenas, not as a default requirement but as an expert mode. |
 | Apache Druid | time partitioning, dictionary encoding, Roaring bitmaps discussed | Druid's bitmap lesson is strongest for selective dimensions. For bqlite that means event-type/entity-presence indexes first, not full property indexing. |
 | Firebolt primary + aggregating indexes | appendix already pointed at aggregating indexes as promising v2 | Make aggregating indexes explicit and query-shaped. Also borrow the sparse primary-index granule idea. |
@@ -71,7 +71,7 @@ This section records the incremental takeaway from each Appendix A technology af
 |---|---|---|
 | FastLanes | adopted in spirit for integer lanes and SIMD-friendly decode | Fine-grained access matters as much as the codec itself; don't bind execution to whole row-groups. |
 | FSST | already chosen for high-cardinality strings | Standardize on view/prefix-based string materialization so the decode win is not lost later in the pipeline. |
-| ALP | already included for floating-point columns | Add a hot/cold codec policy so ALP output is not always chained into the same post-compression path. |
+| ALP | already included for floating-point columns | Skip post-codec LZ4 on ALP output when the ratio threshold says it is not paying; do not add a second, heavier post-codec. |
 | Roaring bitmaps | already discussed as deferred | Use only where the unit of skipping matches the execution model: granules or entity ordinals, not arbitrary row-level indexes everywhere. |
 | Apache Arrow | already core to interchange and in-memory execution | Lean harder on Arrow View / Run-End / Dictionary layouts and the C Data Interface, especially at the Python boundary. |
 | Vortex | current docs intentionally avoid depending on it as a container | Borrow its ideas more aggressively: small postscript, file-level stats, registry-like metadata, and compressed compute interfaces. |
@@ -251,57 +251,28 @@ Risk:
 - semantics must stay exact
 - this should be a second-phase optimization after the baseline step-counter/NFA is stable
 
-### 4.7 Make Compaction Hybrid And Temperature-Aware
+### 4.7 Parallelize Large Compactions With Subcompaction
 
 Current gap:
 
-- storage format currently chooses size-tiered compaction within `(window, shard)`.
+- storage format uses size-tiered compaction within `(window, shard)` with no inner parallelism. A single very large merge is bound to one core.
 
 Recommendation:
 
-- use one policy for hot windows, another for cold windows
-- a strong starting point:
-  - hot / ingest-active windows: tiered or nearly-tiered
-  - cooled / stable windows: overlap-bounded or leveled-ish outputs with fewer sorted runs
-- trigger compaction using more than file count:
-  - sorted-run count
-  - overlap/read amplification
-  - old-window mutation activity
-  - query pressure against the window
+- when compacting a very large `(window, shard)`, split by entity range and merge the ranges in parallel, analogous to RocksDB subcompaction.
+- the boundary picker must snap to entity-id transitions so no entity is split across subcompaction outputs.
 
 Why this is worth doing:
 
-- RocksDB and the LSM compaction design-space work both show that no single compaction family is optimal everywhere.
-- bqlite is unusual because old windows become read-mostly very quickly. That is an ideal place to buy read performance with more aggressive compaction.
+- stabilized windows can grow to tens or hundreds of gigabytes per shard; serial compaction of those leaves cores idle and lengthens the window during which reads see extra sorted runs.
+- the read path already relies on entity locality, so subcompaction boundaries align naturally with the invariant rather than fighting it.
 
-Add subcompaction too:
+Explicit non-goals:
 
-- when compacting a very large `(window, shard)`, split by entity range and merge in parallel, analogous to RocksDB subcompaction.
+- **no temperature-aware compaction.** bqlite compacts every window for query performance. There is no separate "cold window" policy, no per-bucket trigger set, no one-shot consolidation phase. Older windows are compacted the same way as hot ones.
+- **no storage-focused compression policy.** We stay on LZ4 uniformly. Swapping in ZSTD for older windows would buy storage at the cost of decode CPU — exactly the wrong trade for a query-performance engine.
 
-### 4.8 Introduce A Hot/Cold Compression Policy
-
-Current gap:
-
-- the design says "LZ4 only for v1," with ZSTD deferred.
-
-Recommendation:
-
-- keep LZ4 for hot segments and recently compacted windows
-- re-encode colder windows with a stronger post-codec compression such as ZSTD once they stabilize
-- do this selectively:
-  - mostly for varlen/high-entropy columns
-  - not for already-small encoded integer streams where the extra CPU buys little
-
-Why this is worth doing:
-
-- ClickHouse and Vortex both separate lightweight semantic encodings from the final container compression choice.
-- older windows are the natural place to trade some decode CPU for lower storage footprint.
-
-This does not need to be global:
-
-- codec policy should be a function of segment temperature, not a single format-wide switch.
-
-### 4.9 Make Selection Vectors First-Class
+### 4.8 Make Selection Vectors First-Class
 
 Current gap:
 
@@ -323,7 +294,7 @@ Why this is worth doing:
 
 This is one of the biggest low-level wins still missing from the docs.
 
-### 4.10 Push Compressed Execution Deeper
+### 4.9 Push Compressed Execution Deeper
 
 Current gap:
 
@@ -344,7 +315,7 @@ Why this is worth doing:
 - DuckDB and Vortex both get a large fraction of their performance by not flattening everything too early.
 - bqlite has even more to gain because event_type and a few core dimensions are likely to remain low-cardinality and heavily filtered.
 
-### 4.11 Standardize On View/Prefix-Based String Materialization
+### 4.10 Standardize On View/Prefix-Based String Materialization
 
 Current gap:
 
@@ -363,7 +334,7 @@ Why this is worth doing:
 - DuckDB's `string_t` follows the same pattern.
 - this matches bqlite's workload well: event types, devices, countries, page names, campaign IDs, and similar strings are short and frequently compared.
 
-### 4.12 Make Precomputed Behavioral Aggregates Explicit
+### 4.11 Make Precomputed Behavioral Aggregates Explicit
 
 Current gap:
 
@@ -394,7 +365,7 @@ Why this should stay opt-in:
 - they complicate mutation/backfill semantics
 - they are easy to overbuild "just in case"
 
-### 4.13 Make JSON Ingest Streaming And Schema-Aware
+### 4.12 Make JSON Ingest Streaming And Schema-Aware
 
 Current gap:
 
@@ -412,7 +383,7 @@ Why this is worth doing:
 - simdjson's published work and production library both exist because DOM-style JSON parsing burns instructions and branches that modern SIMD parsing avoids.
 - bqlite is especially sensitive because JSON is the slow-path ingest format compared with Parquet, so it needs the most help.
 
-### 4.14 Benchmark Allocators Before Choosing A Global One
+### 4.13 Benchmark Allocators Before Choosing A Global One
 
 Current gap:
 
@@ -437,7 +408,7 @@ Recommendation shape:
 - benchmark first
 - if beneficial, expose allocator choice as an integration option before making it the default
 
-### 4.15 Add Explicit Readahead / Access-Pattern Hints
+### 4.14 Add Explicit Readahead / Access-Pattern Hints
 
 Current gap:
 
@@ -458,7 +429,7 @@ Why this is worth doing:
 
 This is a lower-priority recommendation than the batching/pruning work, but it is cheap and nicely aligned with an embedded engine.
 
-### 4.16 Expand Benchmarks From Query Latency To Cost Metrics
+### 4.15 Expand Benchmarks From Query Latency To Cost Metrics
 
 Current gap:
 
@@ -480,7 +451,6 @@ Recommendation:
 Workload matrix:
 
 - warm vs cold cache
-- hot vs cold windows
 - low vs high selectivity filters
 - rare-step funnels
 - high-cardinality GROUP BY
@@ -554,8 +524,7 @@ Reason:
 
 - add thin runtime synopses
 - add selective secondary indexes
-- add hybrid/temperature-aware compaction
-- add hot/cold compression policy
+- add entity-range subcompaction for large `(window, shard)` merges
 - add string view/prefix standardization everywhere
 
 ### Phase 3: Once v1 Semantics Are Proven

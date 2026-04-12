@@ -997,8 +997,9 @@ Deferred without blocking v1 merges.
    is a Wave 5 language decision; v1 commits only to the byte-wise
    order because it matches the Arrow default.
 
-5. **Per-column compression choice.** The v1 selector (TASK-212)
-   may choose different compression codecs per column-chunk in a
-   future wave (e.g. ZSTD for cold columns). The format already
-   tracks `compression` per chunk, so this is a selector change,
-   not a format change.
+5. **Per-column compression choice.** The format tracks
+   `compression` per column-chunk, so the selector (TASK-212) could
+   emit different codecs for different chunks if a future workload
+   justifies it. No such codec is planned — LZ4 remains the only
+   compression in use because bqlite is a query-performance engine
+   and storage-focused codecs (ZSTD etc.) trade decode CPU for size.

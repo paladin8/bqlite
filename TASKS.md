@@ -326,7 +326,7 @@ Unlocks: TASK-115 planner stub (needs `Catalog` to resolve `events`), TASK-118 e
 
 **Goal.** Real queries return real data over user-declared schemas. Segment format v1 with the full v1 encoding set, CSV ingest with column remapping, schema DDL (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE ADD COLUMN`, `DESCRIBE`), `INSERT` (both `VALUES` and `FROM`), `EXPLAIN`, explicit `bqlite init` / split `Database::open` and `Database::create`, retirement of the Wave 1 bootstrap `events` table, scan + filter + select + limit operators, predicate pushdown, projection pruning, zone-map-based row-group skipping, startup reconciliation of orphaned segment files.
 
-**Scope exclusions.** `DELETE` is deferred to Wave 4 alongside tombstones (TASK-404, TASK-410 territory) — the AST already models it, but without the tombstone format on disk there is nothing for the planner to lower it onto. Wave 2 parsers and planners therefore do not handle `DELETE`.
+**Scope exclusions.** `DELETE` is deferred to Wave 4 alongside tombstones (TASK-404 / TASK-433 territory) — the AST already models it, but without the tombstone format on disk there is nothing for the planner to lower it onto. Wave 2 parsers and planners therefore do not handle `DELETE`.
 
 **Size.** ~48 tasks (TASK-242 retired during post-Wave-2 architecture reconciliation; TASK-244 through TASK-248 were added after post-wave acceptance validation found remaining correctness/performance gaps).
 **Parallelism.** 10-14 agents at peak.
@@ -920,67 +920,302 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 
 ## Wave 4: Advanced Analytics
 
-**Goal.** All major query primitives working: cohorts, sessionize, retention, attribution, full encoding suite, compaction, tombstones, JSON/Parquet ingest.
-**Size.** ~35-45 tasks.
-**Parallelism.** 10-15 agents.
-**Acceptance.** Retention curves, cohort-joined funnels, sessionized aggregates, and attribution queries all run against compacted segments with live deletes.
+**Goal.** Advanced analytics end-to-end: RETENTION sugar, SESSIONIZE, FIRST/LAST/NTH, deterministic SAMPLE, ATTRIBUTE, cohorts and aliases, entity-aligned source JOINs, live DELETEs via tombstones, size-tiered compaction, advanced encodings, and JSON/Parquet ingest.
 
-### TASK-401: [DESIGN] Advanced encoding research
+**Scope exclusions.**
+- **Window-function-powered attribution models** remain out of scope. Wave 4 ships the raw `ATTRIBUTE(...)` row form; first-touch / last-touch / time-decay are still expressed later via window functions over that output.
+- **Secondary indexes** remain later-wave work. Wave 4 ships the size-tiered compaction path already described in `storage-format.md`; there is no temperature-aware or cold-window compaction direction on the roadmap.
+- **Persistent aliases / materialized cohorts** remain out of scope. Alias caching in Wave 4 is per top-level query execution only.
+- **General relational joins** remain out of scope. Wave 4 only ships the entity-aligned source `JOIN` form already specified in `query-language.md`.
+
+**Size.** 57 tasks.
+**Parallelism.** 12-16 agents at peak.
+**Acceptance.** Retention curves, cohort-filtered and joined-source funnels, sessionized aggregates, FIRST/LAST/NTH queries, deterministic SAMPLE, and ATTRIBUTE queries all run against compacted segments with live deletes. JSONL + Parquet ingest work end-to-end, and the advanced-encoding / compaction benchmarks are green on the reference machine.
+
+### TASK-401: [HARD][DESIGN] Advanced encoding research
 **Output**: docs/design/storage/advanced-encodings.md
 **Depends on**: none
-**Description**: Reference implementations + microbenchmarks for FSST, ALP, PFOR, FOR, double-delta, RLE, frequency encoding. Very risky — some may not be worth shipping. Deliverable is a go/no-go recommendation per encoding with evidence.
+**Description**: Reference implementations + microbenchmarks for `RLE`, `DoubleDelta`, `FOR`, `PFOR`, `FSST`, `ALP`, and frequency encoding against the Wave 2 baseline set. For each candidate, record compression ratio, decode throughput, predicate-pushdown implications, segment-format impact, and implementation complexity on representative datasets (monotonic timestamps, low-cardinality strings, repeated values, skewed categorical columns, floats). Deliverable is a go / no-go recommendation per encoding with evidence, plus the exact set of codecs Wave 4 should carry forward into the v2 segment format work.
 
-### TASK-402: [DESIGN] Encoding selection policy
-**Output**: docs/design/storage/encoding-selection.md
+### TASK-402: [HARD][DESIGN] Segment format v2 + encoding selection policy
+**Output**: docs/design/storage/segment-format-v2.md
 **Depends on**: TASK-401
-**Description**: Given the encodings that survived TASK-401, the policy the writer uses to pick an encoding per column. Sampling strategy, per-type defaults, override syntax.
+**Description**: Freezes the Wave 4 on-disk format extension for the codecs that survive TASK-401: new encoding IDs, footer/body metadata, any per-segment auxiliary blocks (for example FSST symbol tables), reader compatibility rules for mixed v1/v2 databases, compaction rewrite policy, and the selector heuristics the writer uses to choose among the expanded codec set.
 
-### TASK-403: [DESIGN] Compaction concurrency protocol
+### TASK-403: [HARD][DESIGN] Compaction concurrency protocol
 **Output**: docs/design/storage/compaction-concurrency.md
 **Depends on**: none
-**Description**: How readers and compaction coexist without locking. Snapshot semantics, manifest-swap protocol, merge-scan integration. Risky and cross-cutting.
+**Description**: How readers and compaction coexist without read-path locks. Freezes the unit of work (`(window, shard)`), manifest publication protocol, failure recovery, active-count cooperation with query threads, and restart/orphan cleanup expectations. Size-tiered compaction is the only compaction direction on the roadmap — there is no temperature-aware or cold-window path to carve boundaries for.
 
-### TASK-404: [DESIGN] Tombstone and delete semantics
+### TASK-404: [HARD][DESIGN] Tombstone and delete semantics
 **Output**: docs/design/storage/deletes.md
 **Depends on**: TASK-403
-**Description**: Row/batch/entity-level deletes, merge-scan integration, reclaim during compaction.
+**Description**: Precise semantics for row-, batch-, entity-, and time-range deletes: predicate classes the planner recognizes cheaply, how a DELETE maps to shard-local tombstone files, visibility rules for concurrent queries, scan-time filtering order, compaction-time reclamation, and warning/error behavior for deletes that require a full scan to discover the affected rows.
 
-### TASK-405: [DESIGN] SESSIONIZE operator
+### TASK-405: [HARD][DESIGN] SESSIONIZE operator
 **Output**: docs/design/operators/sessionize.md
 **Depends on**: none
-**Description**: Session boundary definitions, inactivity gap, custom predicates, output schema.
+**Description**: Full operator-level note for `SESSIONIZE(gap: ..., end: ...)`: boundary rules, `session_id` / `session_duration` output schema, `WITHIN SESSION` interaction with MATCH, downstream demand/forwarding requirements, fused aggregate shapes that are worth supporting in v1, state caps for pathological entities, and the benchmark / edge-case matrix the implementation must satisfy.
 
-### TASK-406: [DESIGN] Attribution operator
-**Output**: docs/design/operators/attribution.md
+### TASK-406: [HARD][DESIGN] ATTRIBUTE operator
+**Output**: docs/design/operators/attribute.md
 **Depends on**: none
-**Description**: Which prior events caused which subsequent outcomes. Models: first-touch, last-touch, linear, time-decay, positional. Output schema.
+**Description**: Execution-focused design for the flat-row `ATTRIBUTE(...)` operator described in `query-language.md`: sliding touchpoint deque, `touchpoint_key` typing, left-unnest semantics for unattributed conversions, forwarded conversion-property handling, scan time-range extension, fused aggregate opportunities, and explicit confirmation that built-in credit-allocation modes are out of scope until window functions land.
 
-### TASK-407: [DESIGN] Cohort materialization and alias binding
-**Output**: docs/design/language/cohorts-and-aliases.md
+### TASK-407: [HARD][DESIGN] Cohort materialization, alias binding, and entity joins
+**Output**: docs/design/language/cohorts-aliases-joins.md
 **Depends on**: none
-**Description**: Resolves the open questions from TASK-002 — inline vs materialized cohorts, alias scoping, cohort × query join semantics, eager vs lazy evaluation.
+**Description**: Resolves the Wave 4 language/runtime questions around `alias = pipeline`, `IN QUERY (...)`, bare `IN alias`, multi-column cohort keys, alias cycle detection, per-query caching, and entity-aligned source `JOIN` planning/runtime semantics. This is the design anchor for both cohort execution and the joined-source scan path promised by `query-language.md` §19.
 
-### TASK-408: [IMPL] Compaction scheduler
+### TASK-408: [HARD][IMPL] Compaction executor + scheduler
 **Output**: crates/bqlite-storage/src/compaction.rs
-**Depends on**: TASK-403
-**Description**: Size-tiered compaction with time-window partitioning. Implements the concurrency protocol from TASK-403. Risky.
+**Depends on**: TASK-403, TASK-419
+**Description**: Implements the Wave 4 size-tiered compaction path for a single table: pick eligible `(window, shard)` inputs, k-way merge them in entity order, re-encode through the latest selector, publish the replacement segments atomically, and cooperate with query load per the concurrency protocol from TASK-403. This task lands the plain compaction path; tombstone-aware filtering and reclamation are layered on by TASK-434 / TASK-435.
 
-### TASK-409: [IMPL] Cohort materialization runtime
-**Output**: crates/bqlite-operators/src/cohort.rs, crates/bqlite-planner/src/cohort.rs
-**Depends on**: TASK-407
-**Description**: Materialized cohort support per TASK-407. Planner integration for cohort joins. Operator for cohort membership evaluation.
-
-### TASK-410: [IMPL] JSON and Parquet ingest paths
-**Output**: crates/bqlite-storage/src/ingest/{json,parquet}.rs
+### TASK-409: [HARD][DESIGN][TRAIT] DemandCapabilities protocol
+**Output**: docs/design/planner/demand-protocol.md
 **Depends on**: none
-**Description**: Follows the CSV ingest pattern established in Wave 2 (TASK-233). Parquet path reuses Arrow decode; JSON path handles nested property objects.
+**Description**: Replaces the Wave 1 scaffold with the real operator-side capability advertisement used by `SequenceMatch`, `Sessionize`, `EventSelect`, and `Attribute`. Freezes the shape of `DemandCapabilities`, its relationship to planner-side `DemandSet`, crate placement, forwarding/fusion capability bits, and the migration path away from `bqlite-core`'s placeholder enum so the implementation can land as a single merge-first trait change.
 
-Additional Wave 4 tasks: individual encoding implementations from TASK-401 outcomes, SESSIONIZE impl, retention operator, attribution impl, cohort grammar productions, alias binding in planner, FUNNEL and RETENTION syntactic sugar, tombstone writer, tombstone-aware merge scan, compaction microbenchmarks, integration tests for each new feature.
+### TASK-410: [EASY][IMPL] JSONL ingest path
+**Output**: crates/bqlite-storage/src/ingest/json.rs, crates/bqlite-engine/src/ingest.rs
+**Depends on**: none
+**Description**: Extends the Wave 2 `INSERT ... FROM` pipeline to JSONL. Parses objects into the existing row-coercion pipeline, handles nested property objects and row-numbered schema errors, honors the existing `map: (...)` remapping surface, and plugs into the shared integration-test fixture loader. Parquet is TASK-449.
 
-### TASK-499: [IMPL] Wave 4 quality audit
+### TASK-411: [HARD][DESIGN] EventSelect and SAMPLE operators
+**Output**: docs/design/operators/event-select-sample.md
+**Depends on**: none
+**Description**: Defines the operator contracts for `FIRST`, `LAST`, `NTH`, and `SAMPLE`: selection semantics, per-event candidate filtering order, output schema, omitted-entity rules, deterministic sampling with explicit seed vs database-UUID-derived seed, scan-pushdown contract for sampling, and which downstream demand / fusion cases are worth supporting in Wave 4.
+
+### TASK-412: [HARD][IMPL] Segment-format-v2 reader/writer scaffolding
+**Output**: crates/bqlite-storage/src/segment/{layout,reader,writer}.rs
+**Depends on**: TASK-402
+**Description**: Adds the structural support for segment format v2 without yet landing every codec: new version constants, encoding discriminants, any new footer metadata blocks, v1/v2 reader coexistence, v2 writer plumbing, and mixed-version tests. This is the merge-first format task the individual encoding implementations build on.
+
+### TASK-413: [EASY][IMPL] RLE encoding
+**Output**: crates/bqlite-storage/src/encoding/rle.rs
+**Depends on**: TASK-401
+**Description**: Implements run-length encoding for highly repetitive columns using the same `Encoding` trait / property-test pattern established in Wave 2. If TASK-401 concludes RLE is not worth shipping, retire this task with a short note linking back to the benchmark evidence instead of silently leaving the number unused.
+
+### TASK-414: [EASY][IMPL] DoubleDelta encoding
+**Output**: crates/bqlite-storage/src/encoding/double_delta.rs
+**Depends on**: TASK-401
+**Description**: Implements second-order delta encoding for strongly monotonic integer/timestamp sequences, including overflow edge cases, null handling, round-trip property tests, and microbenchmarks against the existing Delta path. As with TASK-413, retire instead of implementing if TASK-401 records a no-go decision.
+
+### TASK-415: [EASY][IMPL] FOR encoding
+**Output**: crates/bqlite-storage/src/encoding/for.rs
+**Depends on**: TASK-401
+**Description**: Implements frame-of-reference integer encoding: base value selection, bit-packed residuals, decode hot loop, property tests for overflow and the degenerate full-width fallback, and microbenchmarks. Retire with a note linking to TASK-401 evidence if the research task records a no-go. PFOR is TASK-450.
+
+### TASK-416: [HARD][IMPL] FSST encoding
+**Output**: crates/bqlite-storage/src/encoding/fsst.rs
+**Depends on**: TASK-401
+**Description**: String-focused FSST implementation, including symbol-table construction, encode/decode, integration with the segment-format-v2 metadata model from TASK-402, and benchmarks against dictionary + plain + LZ4 on realistic event/property string columns.
+
+### TASK-417: [HARD][IMPL] ALP encoding
+**Output**: crates/bqlite-storage/src/encoding/alp.rs
+**Depends on**: TASK-401
+**Description**: Floating-point ALP codec for numeric columns where the research task shows a real win. Covers the codec implementation itself, null handling, property tests over representative float distributions, and the decode-performance evidence needed to keep it in the selector race.
+
+### TASK-418: [EASY][IMPL] Frequency encoding
+**Output**: crates/bqlite-storage/src/encoding/frequency.rs
+**Depends on**: TASK-401
+**Description**: Implements the frequency-sorted dictionary-style codec evaluated in TASK-401, including its applicability heuristic, property tests, and direct comparisons against the plain dictionary path. Retire if the research task records it as non-competitive.
+
+### TASK-419: [HARD][IMPL] Advanced encoding selector integration + reader/writer compatibility
+**Output**: crates/bqlite-storage/src/{encoding/mod.rs,encoding/selector.rs,segment/reader.rs,segment/writer.rs}
+**Depends on**: TASK-412, TASK-413, TASK-414, TASK-415, TASK-450, TASK-416, TASK-417, TASK-418
+**Description**: Registers the surviving codecs with the selector, wires their metadata into reader/writer paths, and proves mixed-version read/write compatibility end-to-end. This is the task that turns the per-codec modules into a real Wave 4 storage format rather than a set of isolated experiments.
+
+### TASK-420: [EASY][IMPL] Parser RETENTION + SESSIONIZE stages
+**Output**: crates/bqlite-parser/src/pipeline.rs
+**Depends on**: TASK-405
+**Description**: Adds the two pipeline productions already modeled by the AST but still rejected by the parser: terminal `RETENTION(...)` sugar and `SESSIONIZE(gap: ..., end: ...)`. Unit tests cover parameter ordering, duplicate-key diagnostics, terminal-operator restrictions for RETENTION, and the parser-level surface for downstream `WITHIN SESSION` queries.
+
+### TASK-421: [EASY][IMPL] Parser FIRST/LAST/NTH + SAMPLE stages
+**Output**: crates/bqlite-parser/src/pipeline.rs
+**Depends on**: TASK-411
+**Description**: Adds `FIRST(event [WHERE ...])`, `LAST(...)`, `NTH(event, n [WHERE ...])`, and `SAMPLE(fraction: ... | count: ..., seed: ...)` to the pipeline parser. Tests cover the per-operator arity rules, `NTH` argument order, exactly-one-of `fraction` / `count`, and preservation of the AST variants already shipped in `bqlite-ast`.
+
+### TASK-422: [EASY][IMPL] Parser ATTRIBUTE stage
+**Output**: crates/bqlite-parser/src/pipeline.rs
+**Depends on**: TASK-406
+**Description**: Adds `ATTRIBUTE(conversion: ..., touchpoints: ..., window: ..., touchpoint_key: ...)` to the parser, including duplicate/missing key diagnostics and expression parsing for `touchpoint_key`. No planner work here — the task is purely about surface syntax and span-accurate diagnostics.
+
+### TASK-423: [EASY][IMPL] Parser alias definitions
+**Output**: crates/bqlite-parser/src/parser.rs
+**Depends on**: TASK-407
+**Description**: Extends the top-level parser from `pipeline` to `(alias_def)* pipeline` so reusable aliases can precede a query. Covers the `alias = pipeline` production, duplicate-name diagnostics, and span-accurate errors. Planner/runtime semantics are downstream; `IN QUERY` / bare `IN alias` are TASK-451; source `JOIN` is TASK-452.
+
+### TASK-424: [EASY][IMPL] Logical + physical plan variants for Wave 4 query nodes
+**Output**: crates/bqlite-planner/src/{logical.rs,physical.rs,explain.rs}
+**Depends on**: TASK-405, TASK-406, TASK-407, TASK-411
+**Description**: Adds the Wave 4 query-side plan variants promised by `logical-plan-nodes.md`: `Sessionize`, `EventSelect`, `Sample`, `SubqueryFilter`, and `Attribute`, plus their physical mirrors and EXPLAIN rendering. `Delete` remains owned by TASK-433 so the delete/tombstone work stays grouped with storage semantics.
+
+### TASK-425: [HARD][IMPL] AST → logical lowering + logical → physical lowering for Wave 4
+**Output**: crates/bqlite-planner/src/{logical.rs,physical.rs,expr.rs}
+**Depends on**: TASK-420, TASK-421, TASK-422, TASK-423, TASK-451, TASK-452, TASK-424
+**Description**: Extends the planner to lower the new Wave 4 query nodes, resolve aliases recursively, type-check `touchpoint_key` / forwarded conversion-property references, validate table-qualified references in joined-source queries, and emit the corresponding physical descriptors. Also threads scan-range extension for ATTRIBUTE windows and the metadata the joined-source runtime needs for entity-aligned merge execution.
+
+### TASK-426: [EASY][IMPL] RETENTION desugaring pass
+**Output**: crates/bqlite-planner/src/opt/desugar_retention.rs
+**Depends on**: TASK-420, TASK-425
+**Description**: Planner-side rewrite from `RETENTION(...)` sugar to `SequenceMatch(FIRST, brackets, emit_all=true) -> Aggregate(...)`, mirroring the pattern used for FUNNEL in Wave 3. Covers bracket naming, cumulative vs non-cumulative bracket semantics, scan-range widening by the maximum bracket, and EXPLAIN output that still points back to the original RETENTION span when possible.
+
+### TASK-427: [HARD][IMPL][TRAIT] DemandCapabilities relocation + planner/operator wiring
+**Output**: crates/bqlite-planner/src/demand.rs, crates/bqlite-core/src/demand.rs, crates/bqlite-operators/src/operator.rs
+**Depends on**: TASK-409, TASK-424
+**Description**: Lands the real `DemandCapabilities` protocol: move or re-export it into its final crate home, replace the Wave 1 placeholder enum with the real capability shape, and wire planner/operator matching for forwarding/fusion-sensitive stateful operators. This is merge-first because it changes a cross-crate trait surface that Sessionize / EventSelect / Attribute all build on.
+
+### TASK-428: [HARD][IMPL] SessionizeOperator
+**Output**: crates/bqlite-operators/src/sessionize.rs
+**Depends on**: TASK-405, TASK-424, TASK-427
+**Description**: Implements the entity-streaming `SessionizeOperator`: gap/end-event session boundaries, `session_id` / `session_duration` emission, sub-batch continuation for oversized entities, and the fused-aggregate hooks the design doc blesses as worth supporting. Includes exhaustive boundary tests at the exact inactivity threshold and around explicit end events. Consider `CompactString` for any short string fields carried in per-entity session state (see TASK-454).
+
+### TASK-429: [EASY][IMPL] EventSelectOperator
+**Output**: crates/bqlite-operators/src/event_select.rs
+**Depends on**: TASK-411, TASK-424, TASK-427
+**Description**: Implements `FIRST`, `LAST`, and `NTH` as one entity operator parameterized by `EventSelectKind`, including optional per-event predicates, forwarded property demand, omission of entities with no qualifying event, and exact handling of the "third qualifying event" semantics for `NTH(... WHERE ...)`.
+
+### TASK-430: [HARD][IMPL] SAMPLE pushdown path
+**Output**: crates/bqlite-planner/src/physical.rs, crates/bqlite-operators/src/scan.rs, crates/bqlite-storage/src/segment/reader.rs
+**Depends on**: TASK-411, TASK-425
+**Description**: Makes `SAMPLE` real and cheap by pushing deterministic entity sampling all the way into the single-table scan path, so unsampled entities never reach the merge/read hot loop. Covers explicit seed handling, default seed derivation from the database UUID, and sample-spec threading through the physical plan. Joined-source SAMPLE correctness is extended by TASK-436.
+
+### TASK-431: [HARD][IMPL] AttributeOperator
+**Output**: crates/bqlite-operators/src/attribute.rs
+**Depends on**: TASK-406, TASK-424, TASK-427
+**Description**: Implements the flat-row `ATTRIBUTE(...)` operator: maintain the sliding touchpoint deque, evaluate `touchpoint_key`, retain demanded conversion properties, emit LEFT-UNNEST rows for unattributed conversions, and support the fused aggregate cases the design doc approves. The task's tests must prove exact behavior when multiple conversions share the same touchpoints, when the window boundary is hit exactly, and when no touchpoints qualify. Consider `CompactString` for `touchpoint_key` values and any demanded string properties held in the deque (see TASK-454).
+
+### TASK-432: [HARD][IMPL] Tombstone file storage + snapshot loader
+**Output**: crates/bqlite-storage/src/tombstone.rs, crates/bqlite-storage/src/database.rs
+**Depends on**: TASK-404
+**Description**: Adds the concrete tombstone-file API described by the delete design: atomic read/write helpers, shard/window targeting, query-start snapshot loading, and typed helpers for row / batch / entity / time-range deletes. This is the storage-layer foundation both DELETE execution and tombstone-aware scans depend on.
+
+### TASK-433: [EASY][IMPL] DELETE statement parser
+**Output**: crates/bqlite-parser/src/dml.rs
+**Depends on**: TASK-404
+**Description**: Parses `DELETE FROM ... WHERE ...` into the DELETE AST node the logical plan consumes. Covers predicate expression parsing, span-accurate diagnostics for unsupported shapes, and the table-reference surface. Planner lowering and engine execution are TASK-453.
+
+### TASK-434: [HARD][IMPL] Tombstone-aware scan + merge path
+**Output**: crates/bqlite-operators/src/scan.rs, crates/bqlite-storage/src/segment/merge.rs
+**Depends on**: TASK-404, TASK-432
+**Description**: Applies tombstones in the read path after pushdown but before rows leave the scan layer, preserving the exact visibility rules from the delete design. Covers row / batch / entity / time-range checks, query-snapshot isolation, and merge correctness across windows for queries that span multiple segments.
+
+### TASK-435: [HARD][IMPL] Tombstone reclamation during compaction
+**Output**: crates/bqlite-storage/src/compaction.rs, crates/bqlite-storage/src/tombstone.rs
+**Depends on**: TASK-408, TASK-432, TASK-434
+**Description**: Extends compaction so tombstoned rows are physically omitted from compacted outputs and fully reclaimed tombstones are removed from the shard snapshot once the new segments are published. This is the task that turns live deletes from "logically hidden forever" into "hidden immediately, reclaimed eventually."
+
+### TASK-436: [HARD][IMPL] Joined-source scan runtime (+ SAMPLE extension)
+**Output**: crates/bqlite-operators/src/scan.rs, crates/bqlite-storage/src/segment/merge.rs
+**Depends on**: TASK-407, TASK-425, TASK-430, TASK-434
+**Description**: Implements the entity-aligned source `JOIN` form described in `query-language.md` §19 by extending the scan/runtime path to open multiple source tables, align them on entity key, and emit the combined joined schema the planner resolved. Also extends the TASK-430 SAMPLE pushdown to joined-source scans so deterministic entity sampling remains correct across the merged inputs. This is not a general-purpose join operator — it is the specialized source merge path for tables that already share the database's shard function and entity-key type.
+
+### TASK-437: [HARD][IMPL] Cohort subquery runtime + alias execution cache
+**Output**: crates/bqlite-operators/src/cohort.rs, crates/bqlite-engine/src/query.rs
+**Depends on**: TASK-407, TASK-425
+**Description**: Executes `SubqueryFilterPhysical` by materializing inner-query hash sets, supports both inline `IN QUERY (...)` and bare `IN alias` references, caches alias results per top-level query execution, detects alias cycles cleanly, and supports both single-column and tuple cohort keys. Consider `CompactString` for string-typed cohort keys held in the hash set (see TASK-454).
+
+### TASK-438: [EASY][IMPL] Engine bind step extension for Wave 4 query nodes
+**Output**: crates/bqlite-engine/src/bind.rs
+**Depends on**: TASK-424, TASK-425, TASK-428, TASK-429, TASK-430, TASK-431, TASK-436, TASK-437
+**Description**: Extends the bind step to materialize runtime trees for `SessionizePhysical`, `EventSelectPhysical`, `SamplePhysical`, `SubqueryFilterPhysical`, `AttributePhysical`, and joined-source scans. `DELETE` remains out of scope for this task because TASK-433 executes it as a statement-level engine path rather than a bound query pipeline.
+
+### TASK-439: [HARD][IMPL] Advanced analytics integration tests
+**Output**: tests/integration/advanced_analytics/
+**Depends on**: TASK-426, TASK-428, TASK-429, TASK-430, TASK-431, TASK-436, TASK-437, TASK-438
+**Description**: End-to-end integration matrix for the new query primitives: session boundary edge cases, `WITHIN SESSION`, RETENTION bracket semantics (including cumulative mode), FIRST/LAST/NTH with candidate predicates, deterministic SAMPLE behavior, joined-source queries, cohort semi-joins, ATTRIBUTE left-unnest semantics, and exact downstream aggregate results on realistic fixtures.
+
+### TASK-440: [HARD][IMPL] Delete + compaction integration tests
+**Output**: tests/integration/deletes/
+**Depends on**: TASK-408, TASK-433, TASK-453, TASK-434, TASK-435
+**Description**: Integration suite for live-delete correctness: delete-by-entity, delete-by-batch, delete-by-`__seq_id`, time-range delete, query-snapshot visibility during concurrent tombstone updates, and physical reclamation after compaction. This is the correctness evidence the wave acceptance and quality audit lean on for the storage side.
+
+### TASK-441: [HARD][IMPL] Advanced analytics benchmark suite
+**Output**: benches/wave4/
+**Depends on**: TASK-408, TASK-410, TASK-449, TASK-419, TASK-430, TASK-431, TASK-436, TASK-437
+**Description**: Criterion benches for the real Wave 4 performance story: advanced-encoding compression/decode comparisons, compaction throughput and read-amplification reduction, JSONL / Parquet ingest throughput, SAMPLE pushdown savings, ATTRIBUTE latency on realistic conversion/touchpoint ratios, and cohort / joined-source query overhead. The suite's README records the reference-machine targets and the bench gate promotes them into CI.
+
+### TASK-442: [HARD][IMPL] Wave 4 acceptance test
+**Output**: tests/wave4_acceptance.rs
+**Depends on**: TASK-408, TASK-410, TASK-449, TASK-438, TASK-439, TASK-440, TASK-441
+**Description**: The Wave 4 correctness gate per the header. Ingest JSONL and Parquet fixtures, run a sessionized retention query, a cohort-filtered joined-source funnel, a deterministic SAMPLE + FIRST/LAST/NTH query, and an ATTRIBUTE query, then apply live deletes, trigger compaction, and assert that the post-compaction answers remain identical to the pre-compaction logical answers. Wave 4 is not done until this test passes on both macOS and Linux.
+
+### TASK-443: [EASY][IMPL] RETENTION semantic audit
+**Output**: docs/reviews/wave4-retention-audit.md
+**Depends on**: TASK-426, TASK-438, TASK-439
+**Description**: Targeted reading pass: does the shipped RETENTION behavior make sense, and does it match `query-language.md` / `planner-pipeline.md` / the Wave 4 acceptance queries? Walk bracket ordering, cumulative vs non-cumulative semantics, `EMIT ALL` in the desugared match form, scan-range widening by the maximum bracket, aggregate naming, and EXPLAIN fidelity. Record a promise-vs-evidence matrix and flag anywhere the semantics feel wrong or drift from the docs. Drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
+
+### TASK-444: [EASY][IMPL] SESSIONIZE semantic audit
+**Output**: docs/reviews/wave4-sessionize-audit.md
+**Depends on**: TASK-428, TASK-438, TASK-439
+**Description**: Targeted reading pass on `SESSIONIZE(gap: ..., end: ...)`: do the semantics make sense and match the design note? Walk gap-boundary handling, `end:` event precedence, `session_id` monotonicity per entity, `session_duration` calculation, sub-batch continuity for oversized entities, `WITHIN SESSION` interaction with MATCH, and fused vs unfused aggregate equivalence. Record a promise-vs-evidence matrix; drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
+
+### TASK-445: [EASY][IMPL] EventSelect + SAMPLE semantic audit
+**Output**: docs/reviews/wave4-event-select-sample-audit.md
+**Depends on**: TASK-429, TASK-430, TASK-436, TASK-438, TASK-439
+**Description**: Targeted reading pass on `FIRST` / `LAST` / `NTH` and deterministic `SAMPLE`: do the semantics make sense and match the design note? Walk candidate-predicate ordering, omission of entities with no qualifying event, NTH indexing, projection/forwarding correctness, sample determinism across repeated runs, explicit-seed vs database-UUID-derived seed behavior, count-vs-fraction semantics, and pushdown correctness on single-table and joined-source scans. Record a promise-vs-evidence matrix; drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
+
+### TASK-446: [EASY][IMPL] ATTRIBUTE semantic audit
+**Output**: docs/reviews/wave4-attribute-audit.md
+**Depends on**: TASK-431, TASK-438, TASK-439
+**Description**: Targeted reading pass on flat-row `ATTRIBUTE(...)`: do the semantics make sense and match the language/type-system/planner docs? Walk lookback-window boundaries, `touchpoint_key` typing, forwarded conversion-property access, multiple-touchpoint emission, LEFT-UNNEST behavior for unattributed conversions, no-touchpoint cases, and fused-aggregate equivalence to the unfused row-materializing path. Record a promise-vs-evidence matrix; drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
+
+### TASK-447: [EASY][IMPL] Cohort, alias, and joined-source semantic audit
+**Output**: docs/reviews/wave4-cohort-alias-join-audit.md
+**Depends on**: TASK-436, TASK-437, TASK-438, TASK-439
+**Description**: Targeted reading pass on the Wave 4 composition features with the highest semantic surface: alias resolution and per-query caching, alias-cycle diagnostics, inline `IN QUERY (...)` vs bare `IN alias` equivalence, multi-column cohort keys, required table qualification inside joined-source queries, no-self-join enforcement, and the entity-aligned source-join semantics from `query-language.md` §19. Do the semantics make sense and match the docs? Record a promise-vs-evidence matrix; drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
+
+### TASK-448: [EASY][IMPL] Delete, tombstone, and compaction semantic audit
+**Output**: docs/reviews/wave4-delete-tombstone-audit.md
+**Depends on**: TASK-433, TASK-453, TASK-434, TASK-435, TASK-440
+**Description**: Targeted reading pass on live-delete semantics: do they make sense and match the design? Walk immediate visibility of deletes, query-start snapshot isolation, planner routing of cheap delete predicate classes, scan-time tombstone application ordering relative to pushdown/post-filter, compaction-time reclamation, and mixed workloads where deletes interact with joined-source reads, cohorts, or long-running scans. Record a promise-vs-evidence matrix; drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
+
+### TASK-449: [EASY][IMPL] Parquet ingest path
+**Output**: crates/bqlite-storage/src/ingest/parquet.rs, crates/bqlite-engine/src/ingest.rs
+**Depends on**: none
+**Description**: Extends the Wave 2 `INSERT ... FROM` pipeline to Parquet. Consumes Arrow batches via arrow-rs, applies the width-consolidation rules from the type system doc, reuses the partitioner/writer path from Wave 2, honors the existing `map: (...)` remapping surface, and plugs into the shared integration-test fixture loader. JSONL is TASK-410.
+
+### TASK-450: [HARD][IMPL] PFOR encoding
+**Output**: crates/bqlite-storage/src/encoding/pfor.rs
+**Depends on**: TASK-401, TASK-415
+**Description**: Patched frame-of-reference integer codec built on the FOR scaffolding from TASK-415. Covers patch-list layout, sparse-outlier handling, decode hot loop including patch application, and property tests for overflow and the worst-case all-patched fallback. Retire with a note linking to TASK-401 evidence if the research task records a no-go.
+
+### TASK-451: [EASY][IMPL] Parser `IN QUERY` and bare `IN alias` expressions
+**Output**: crates/bqlite-parser/src/expr.rs
+**Depends on**: TASK-407
+**Description**: Adds inline `IN QUERY (...)` and bare `IN alias` forms to the expression grammar. Covers single-column and tuple cohort keys at the syntax level, plus duplicate/empty-tuple diagnostics. Semantic resolution is downstream in TASK-425 / TASK-437.
+
+### TASK-452: [EASY][IMPL] Parser entity-aligned source JOIN
+**Output**: crates/bqlite-parser/src/parser.rs
+**Depends on**: TASK-407
+**Description**: Parses entity-aligned source joins per `query-language.md` §19: `source := name time_range? (JOIN name)*`. Covers join-list parsing, forbidden self-joins at the syntactic level, and table-qualified reference surface syntax. Planner-level validation of qualification rules is TASK-425.
+
+### TASK-453: [HARD][IMPL] DELETE planner + engine tombstone writer
+**Output**: crates/bqlite-planner/src/logical.rs, crates/bqlite-engine/src/query.rs
+**Depends on**: TASK-404, TASK-432, TASK-433
+**Description**: Lowers the parsed DELETE statement onto the delete execution plan, routes cheap predicate classes directly to tombstone updates, warns on full-scan delete shapes, and returns the empty output schema promised by the logical-plan catalog. Owns the statement-level delete plan node because the feature is inseparable from tombstone semantics.
+
+### TASK-454: [EASY][IMPL] CompactString adoption in matcher variable binding + Wave 4 hot paths
+**Output**: crates/bqlite-operators/src/matcher/ (and other identified hot paths)
+**Depends on**: TASK-399
+**Description**: Applies the `CompactString` recommendation from the Wave 3 quality audit (TASK-332 / TASK-399) to the matcher variable-binding path as the primary target — the track binding slots, per-step captured values, and any propagated binding dictionaries that currently use `String`. Also sweeps the Wave 4 call-outs (TASK-428 sessionize state, TASK-431 ATTRIBUTE touchpoint-key deque, TASK-437 cohort hash-set keys) and promotes to `CompactString` where it reduces allocation pressure on representative workloads, backed by benchmark evidence. Retire any subtask where profiling shows no win.
+
+### TASK-455: [EASY][IMPL] Wave 4 post-acceptance closure
+**Output**: TASKS.md, crates as needed
+**Depends on**: TASK-442, TASK-443, TASK-444, TASK-445, TASK-446, TASK-447, TASK-448
+**Description**: Collects the gaps surfaced by the Wave 4 acceptance run (TASK-442) and the targeted semantic audits (TASK-443 through TASK-448). For each flagged drift, missing test, or small implementation gap, either fix it in place or convert it into a concrete follow-up task filed under Wave 5 intake. Mirrors the Wave 3 pattern where closure tasks (e.g. TASK-329, TASK-332) landed after the acceptance gate to turn audit notes into merged work. Wave 4 is not closed until this task is empty or explicitly resolved.
+
+### TASK-456: [EASY][IMPL] Wave 4 docs and examples refresh
+**Output**: docs/design/language/*, docs/design/operators/*, crates/bqlite-cli/ (as needed)
+**Depends on**: TASK-425, TASK-426, TASK-428, TASK-429, TASK-430, TASK-431, TASK-436, TASK-437, TASK-453
+**Description**: Updates the user-facing language and operator docs, plus any CLI help strings, to include worked examples for the features Wave 4 ships: RETENTION, SESSIONIZE + `WITHIN SESSION`, FIRST/LAST/NTH, deterministic SAMPLE, ATTRIBUTE, cohorts and aliases, entity-aligned source JOIN, and live DELETE. Ensures newcomers to the codebase can find a runnable example for each new pipeline stage without having to read a design note.
+
+### TASK-499: [HARD][IMPL] Wave 4 quality audit
 **Output**: docs/quality-score.md
-**Depends on**: TASK-401, TASK-402, TASK-403, TASK-404, TASK-405, TASK-406, TASK-407, TASK-408, TASK-409, TASK-410
-**Description**: Same audit pattern as TASK-199, rescored after Wave 4. Wave 4 adds compaction, tombstones, advanced encodings, SESSIONIZE, attribution, cohorts, and JSON/Parquet ingest — bqlite-storage and bqlite-operators carry the bulk of the new surface. The Benchmarks dimension must reflect the advanced-encoding evidence from TASK-401 and the compaction microbenches. Cross-cutting concerns (tombstone-aware merge scan, compaction concurrency) need integration-test evidence, not just unit tests. Below-C grades get follow-up tasks; Wave 5 does not start until those are filed.
+**Depends on**: TASK-401, TASK-402, TASK-403, TASK-404, TASK-405, TASK-406, TASK-407, TASK-408, TASK-409, TASK-410, TASK-449, TASK-411, TASK-419, TASK-425, TASK-427, TASK-438, TASK-439, TASK-440, TASK-441, TASK-442, TASK-443, TASK-444, TASK-445, TASK-446, TASK-447, TASK-448, TASK-454, TASK-455, TASK-456
+**Description**: Same audit pattern as TASK-199 / TASK-299 / TASK-399, rescored after Wave 4. Focus on the crates Wave 4 grows the most: `bqlite-storage` (advanced encodings, tombstones, compaction, JSON/Parquet ingest), `bqlite-planner` (alias / cohort lowering, joined-source planning, new logical/physical nodes, real demand protocol), and `bqlite-operators` (SESSIONIZE, EventSelect, SAMPLE pushdown, ATTRIBUTE, joined-source scan support). The Tests dimension must explicitly account for the two new integration suites, the full acceptance test, and the targeted semantic audits in TASK-443 through TASK-448 (rolled up by TASK-455); the Benchmarks dimension must reflect the codec and compaction evidence from TASK-441, not just the existence of benches. Any crate slipping vs. Wave 3 is flagged. Below-C grades get follow-up tasks; Wave 5 does not start until those are filed.
 
 ---
 

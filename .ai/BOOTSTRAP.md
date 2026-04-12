@@ -881,7 +881,7 @@ Adaptive Lossless floating-Point compression exploits the observation that most 
 **Delta + LZ4/ZSTD (ClickHouse pattern)**
 ClickHouse chains codecs: apply Delta encoding first (converts monotonic sequences to small values), then compress with LZ4 (fast) or ZSTD (compact). This dramatically improves compression of timestamp columns.
 
-*bqlite relevance*: Direct match for our timestamp columns. Delta-encode nanosecond timestamps, then compress with LZ4 for scan-heavy workloads or ZSTD for storage-heavy. This should be the default timestamp compression strategy.
+*bqlite relevance*: Direct match for our timestamp columns. Delta-encode nanosecond timestamps, then compress with LZ4. bqlite is a query-performance engine and does not adopt storage-focused post-codecs (ZSTD etc.) — the decode cost is the wrong trade for this workload.
 
 **Roaring Bitmaps**
 Roaring divides the integer space into 65536-element chunks. Each chunk uses the optimal representation: sorted array for sparse, bitmap for medium density, run-length encoding for dense. This provides fast set operations (AND, OR, NOT) with good compression. Used by ClickHouse, Druid, Lucene, and many others. Rust crate: `roaring-rs`.
@@ -942,7 +942,7 @@ These papers should be read during the Wave 0 design phase:
 | `thiserror` / `anyhow` | Error handling | Library vs CLI errors |
 | `maturin` | Rust-Python binding build tool | For PyO3 bindings |
 | `pyo3` | Python bindings | Core Python integration |
-| `lz4` / `zstd` | Compression codecs | For segment compression |
+| `lz4` | Compression codec | For segment compression (no ZSTD; storage-focused codecs are not pursued) |
 | `memmap2` | Memory-mapped file I/O | For segment reading |
 | `crossbeam` | Lock-free data structures | For parallel execution |
 | `rayon` | Work-stealing parallelism | For entity-parallel execution |
