@@ -7,7 +7,7 @@ hash aggregation, sort, distinct, and the end-to-end funnel pipeline.
 
 | Bench target     | File            | Coverage                                                                    |
 |------------------|-----------------|-----------------------------------------------------------------------------|
-| `matcher`        | `matcher.rs`    | NFA vs step-counter fast path on 3-step linear funnel; MATCH ALL; windowed  |
+| `matcher`        | `matcher.rs`    | Full strategy matrix (§8.1): all 9 PatternClass scenarios + diagnostic NFA vs step-counter comparison |
 | `aggregate`      | `aggregate.rs`  | HashAccumulator COUNT/SUM/AVG by group count (10, 1k, 1M); ungrouped       |
 | `wave3_sort`     | `sort.rs`       | SortOperator by row count (10k, 100k, 500k); two-key; multi-batch          |
 | `wave3_distinct` | `distinct.rs`   | DistinctOperator by dedup ratio (0%, 50%, 90%, 99%); by row count           |
@@ -31,12 +31,32 @@ BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench funnel
 
 ## Performance Budgets
 
-### Matcher (TASK-302 validation)
+### Matcher (TASK-302 / TASK-330 validation)
 
-The step-counter fast path must be significantly faster than the full NFA
-on the same linear 3-step funnel pattern. This validates the TASK-302
-performance expectation that the pattern classifier correctly routes
-linear patterns to the cheaper strategy.
+The matcher benchmark covers the full strategy matrix from
+matcher-strategy.md §8.1 with explicit `PatternClass` assertions (§8.5)
+to prevent classifier drift from silently invalidating measurements.
+
+**Strategy matrix scenarios** (9 total, per §8.1):
+
+| Scenario                 | PatternClass        | Strategy       | Reference target (ns/event) |
+|--------------------------|---------------------|----------------|-----------------------------|
+| `linear_simple_3step`    | `LinearSimple`      | StepCounter    | ≤ 6                         |
+| `linear_simple_5step`    | `LinearSimple`      | StepCounter    | ≤ 6                         |
+| `linear_immediate_3step` | `LinearImmediate`   | StepCounter    | ≤ 6                         |
+| `linear_negation_3step`  | `LinearWithNegation`| StepCounter    | ≤ 6                         |
+| `linear_bindings_3step`  | `LinearWithBindings`| StepCounter    | ≤ 6                         |
+| `linear_full_3step`      | `LinearFull`        | StepCounter    | ≤ 6                         |
+| `general_nfa_3step`      | `GeneralNfa`        | NFA            | ≤ 60                        |
+| `general_nfa_repetition` | `GeneralNfa`        | NFA            | ≤ 60                        |
+| `nfa_match_events`       | `LinearSimple`†     | NFA (escalated)| ≤ 60                        |
+
+† Escalated to NFA by `track_match_events` demand (§3.2).
+
+Reference-mode targets are 2× the upper bound from §3.1 (generous
+ceiling). Results are recorded to `target/bench-results.json`.
+
+**Diagnostic comparisons** (original TASK-325):
 
 - **Step counter vs NFA speedup**: step counter should be >= 2x faster
   on the 1k-entity linear funnel (measured by Criterion comparison)
