@@ -13,12 +13,13 @@
 //!
 //! 1. **Prime.** Read one `RecordBatch` per scan into `ScanState`.
 //!    Scans that yield `Ok(None)` immediately are marked exhausted.
-//! 2. **Pick.** Walk every non-exhausted scan, compare the
-//!    `(entity_id, ts)` tuple at its current cursor, pick the
-//!    smallest, record `(scan_idx, row_idx)` into an index vector,
-//!    and advance that scan's cursor.
+//! 2. **Pick.** Maintain a small min-heap of active-row entries.
+//!    Pop the smallest `(entity_id, ts)` tuple, record
+//!    `(scan_idx, row_idx)` into an index vector, advance that scan's
+//!    cursor, and push it back onto the heap if the batch still has
+//!    rows remaining.
 //! 3. **Emit.** When the index vector reaches `batch_target_rows`
-//!    or when any scan's current batch is exhausted, call
+//!    or when every currently-loaded row has been consumed, call
 //!    [`arrow::compute::interleave`] once per output column with
 //!    the accumulated indices. This produces the output
 //!    [`RecordBatch`] in one Arrow call per column.
@@ -26,15 +27,11 @@
 //!    exhausted pulls its next row group on the following
 //!    `next_batch` call.
 //!
-//! The merge intentionally stops picking as soon as one scan runs
-//! out of its current batch — emitting the partial output keeps the
-//! interleave call's `values` slice valid. Callers that need a
-//! consistent `batch_target_rows` output can concatenate across
-//! successive `next_batch` calls; the Wave 2 scan operator
-//! (TASK-230) will do that via an Arrow `concat_batches` at the
-//! pipeline boundary. Later waves can switch to a loser-tree for
-//! better comparison counts (currently `O(k)` per pick; a
-//! loser-tree is `O(log k)`).
+//! The active-input heap keeps picks at `O(log k)` instead of the old
+//! `O(k)` linear walk over every live scan on every emitted row. We
+//! still delay reloading an exhausted input batch until after the
+//! current `interleave` call completes so the row references in the
+//! pending index vector stay valid.
 //!
 //! # Key extraction
 //!
@@ -76,6 +73,8 @@
 //! row group and the compaction-specific hint pair are deferred
 //! to Wave 4 per `docs/design/storage-format.md` §8.2.
 
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use ::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray};
@@ -111,9 +110,12 @@ pub struct KWayMergeScan {
     /// Column ordinal of the `ts` key in the shared schema.
     ts_col: usize,
     /// Target row count for each emitted merged batch. The merge
-    /// may emit fewer rows if a scan's current batch is exhausted
-    /// before the target is reached; see the module docs.
+    /// may emit fewer rows when the entire merged stream has fewer
+    /// than `batch_target_rows` rows remaining.
     batch_target_rows: usize,
+    /// BinaryHeap-backed min-heap of active rows, one per scan whose
+    /// current cursor points at a live `(entity_id, ts)` tuple.
+    active_heap: BinaryHeap<Reverse<HeapEntry>>,
     /// Per-column placeholder array used to satisfy
     /// `arrow::compute::interleave` when a scan has no current batch
     /// loaded. Never indexed, so the content is unused; the
@@ -127,6 +129,7 @@ impl std::fmt::Debug for KWayMergeScan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KWayMergeScan")
             .field("inputs", &self.scans.len())
+            .field("active_inputs", &self.active_heap.len())
             .field("entity_key_col", &self.entity_key_col)
             .field("ts_col", &self.ts_col)
             .field("batch_target_rows", &self.batch_target_rows)
@@ -147,6 +150,67 @@ struct ScanState {
     /// will be loaded.
     scan_exhausted: bool,
 }
+
+/// Heap entry for one scan's current row.
+///
+/// We clone just the key/timestamp column [`ArrayRef`]s, not the full
+/// batch, so heap comparisons can use the built-in [`BinaryHeap`]
+/// without allocating owned string keys on every push.
+struct HeapEntry {
+    scan_idx: usize,
+    row_idx: usize,
+    entity_key: ArrayRef,
+    ts: ArrayRef,
+}
+
+impl HeapEntry {
+    fn from_scan(scan_idx: usize, state: &ScanState, entity_key_col: usize, ts_col: usize) -> Self {
+        let batch = state
+            .batch
+            .as_ref()
+            .expect("active-heap entries always point at a loaded batch");
+        Self {
+            scan_idx,
+            row_idx: state.cursor,
+            entity_key: batch.column(entity_key_col).clone(),
+            ts: batch.column(ts_col).clone(),
+        }
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match compare_entity_key(
+            &self.entity_key,
+            self.row_idx,
+            &other.entity_key,
+            other.row_idx,
+        ) {
+            Ordering::Equal => match compare_ts(&self.ts, self.row_idx, &other.ts, other.row_idx) {
+                Ordering::Equal => self
+                    .scan_idx
+                    .cmp(&other.scan_idx)
+                    .then_with(|| self.row_idx.cmp(&other.row_idx)),
+                other => other,
+            },
+            other => other,
+        }
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for HeapEntry {}
 
 impl KWayMergeScan {
     /// Construct a k-way merge over a set of segment scans.
@@ -231,6 +295,7 @@ impl KWayMergeScan {
             entity_key_col,
             ts_col,
             batch_target_rows,
+            active_heap: BinaryHeap::new(),
             placeholders,
             exhausted: false,
         })
@@ -283,29 +348,24 @@ impl KWayMergeScan {
         }
 
         self.reload_needed_batches()?;
-        if self.all_scans_done() {
+        if self.active_heap.is_empty() && self.all_scans_done() {
             self.exhausted = true;
             return Ok(None);
         }
 
         let mut indices: Vec<(usize, usize)> = Vec::with_capacity(self.batch_target_rows);
         while indices.len() < self.batch_target_rows {
-            let best = self.pick_smallest();
-            match best {
-                Some(i) => {
-                    let cursor = self.scans[i].cursor;
-                    indices.push((i, cursor));
-                    self.scans[i].cursor += 1;
-                    let batch_rows = self.scans[i].batch.as_ref().unwrap().num_rows();
-                    if self.scans[i].cursor >= batch_rows {
-                        // This scan is out of data in its current
-                        // batch — we must stop picking now, because
-                        // reloading would invalidate the references
-                        // the pending `interleave` call needs.
-                        break;
-                    }
-                }
-                None => break,
+            let Some(i) = self.pop_smallest() else {
+                break;
+            };
+
+            let cursor = self.scans[i].cursor;
+            indices.push((i, cursor));
+            self.scans[i].cursor += 1;
+
+            let batch_rows = self.scans[i].batch.as_ref().unwrap().num_rows();
+            if self.scans[i].cursor < batch_rows {
+                self.push_active_scan(i);
             }
         }
 
@@ -375,12 +435,13 @@ impl KWayMergeScan {
     /// Skips empty batches and marks the scan exhausted when
     /// `next_row_group` returns `Ok(None)`.
     fn reload_needed_batches(&mut self) -> Result<()> {
-        for (i, state) in self.scans.iter_mut().enumerate() {
-            if state.batch.is_some() || state.scan_exhausted {
+        let mut ready_indices = Vec::new();
+        for i in 0..self.scans.len() {
+            if self.scans[i].batch.is_some() || self.scans[i].scan_exhausted {
                 continue;
             }
             loop {
-                match state.scan.next_row_group()? {
+                match self.scans[i].scan.next_row_group()? {
                     Some(batch) => {
                         if batch.num_rows() == 0 {
                             continue;
@@ -390,16 +451,20 @@ impl KWayMergeScan {
                                 "k-way merge: scan {i}'s batch schema does not match the merge schema"
                             )));
                         }
-                        state.batch = Some(batch);
-                        state.cursor = 0;
+                        self.scans[i].batch = Some(batch);
+                        self.scans[i].cursor = 0;
+                        ready_indices.push(i);
                         break;
                     }
                     None => {
-                        state.scan_exhausted = true;
+                        self.scans[i].scan_exhausted = true;
                         break;
                     }
                 }
             }
+        }
+        for i in ready_indices {
+            self.push_active_scan(i);
         }
         Ok(())
     }
@@ -411,43 +476,22 @@ impl KWayMergeScan {
             .all(|s| s.scan_exhausted && s.batch.is_none())
     }
 
-    /// Return the index of the scan whose current row has the
-    /// smallest `(entity_id, ts)` tuple, or `None` if no scan has
-    /// a row available.
-    ///
-    /// Linear over `self.scans` (`O(k)` per pick). A loser-tree
-    /// would be `O(log k)`, but for Wave 2's expected k (segments
-    /// per shard) the linear walk is cache-friendly and faster in
-    /// practice.
-    fn pick_smallest(&self) -> Option<usize> {
-        let mut best: Option<usize> = None;
-        for (i, state) in self.scans.iter().enumerate() {
-            let Some(batch) = state.batch.as_ref() else {
-                continue;
-            };
-            if state.cursor >= batch.num_rows() {
-                continue;
-            }
-            match best {
-                None => best = Some(i),
-                Some(j) => {
-                    let j_batch = self.scans[j].batch.as_ref().unwrap();
-                    let j_cursor = self.scans[j].cursor;
-                    if compare_rows(
-                        batch,
-                        state.cursor,
-                        j_batch,
-                        j_cursor,
-                        self.entity_key_col,
-                        self.ts_col,
-                    ) == std::cmp::Ordering::Less
-                    {
-                        best = Some(i);
-                    }
-                }
-            }
-        }
-        best
+    /// Push a scan with a live current row into the active-input
+    /// min-heap.
+    fn push_active_scan(&mut self, scan_idx: usize) {
+        let entry = HeapEntry::from_scan(
+            scan_idx,
+            &self.scans[scan_idx],
+            self.entity_key_col,
+            self.ts_col,
+        );
+        self.active_heap.push(Reverse(entry));
+    }
+
+    /// Pop the scan whose current row has the smallest `(entity_id, ts)`
+    /// tuple, or `None` when no scan currently has a live row.
+    fn pop_smallest(&mut self) -> Option<usize> {
+        self.active_heap.pop().map(|Reverse(entry)| entry.scan_idx)
     }
 
     /// Build an output [`RecordBatch`] by interleaving rows from
@@ -512,35 +556,6 @@ fn validate_key_types(schema: &ArrowSchema, entity_key_col: usize, ts_col: usize
         )));
     }
     Ok(())
-}
-
-/// Compare the `(entity_key, ts)` tuple at row `a_row` of `a_batch`
-/// against row `b_row` of `b_batch`. Returns [`std::cmp::Ordering`]
-/// per standard `Ord` conventions.
-///
-/// Panics if either column is out of range — these are internal
-/// calls wrapped by the merge loop, which has already validated
-/// the column ordinals at construction time.
-fn compare_rows(
-    a_batch: &RecordBatch,
-    a_row: usize,
-    b_batch: &RecordBatch,
-    b_row: usize,
-    entity_key_col: usize,
-    ts_col: usize,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    let a_key_col = a_batch.column(entity_key_col);
-    let b_key_col = b_batch.column(entity_key_col);
-    let key_ord = compare_entity_key(a_key_col, a_row, b_key_col, b_row);
-    if key_ord != Ordering::Equal {
-        return key_ord;
-    }
-
-    let a_ts_col = a_batch.column(ts_col);
-    let b_ts_col = b_batch.column(ts_col);
-    compare_ts(a_ts_col, a_row, b_ts_col, b_row)
 }
 
 fn compare_entity_key(
@@ -929,6 +944,45 @@ mod tests {
         assert_eq!(entities, vec!["u1", "u1", "u2", "u3", "u3", "u4"]);
         let event_types: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
         assert_eq!(event_types, vec!["a1", "a2", "b1", "a3", "a4", "b2"]);
+    }
+
+    #[test]
+    fn merge_keeps_filling_output_after_one_input_batch_exhausts() {
+        let schema = events_schema();
+        let scan_a = Box::new(MockScan::new(vec![
+            build_batch(&schema, &["u1"], &[10], &["a1"]),
+            build_batch(&schema, &["u4"], &[40], &["a2"]),
+        ]));
+        let scan_b = Box::new(MockScan::new(vec![build_batch(
+            &schema,
+            &["u2", "u3", "u5"],
+            &[20, 30, 50],
+            &["b1", "b2", "b3"],
+        )]));
+
+        let mut merge =
+            KWayMergeScan::with_batch_size(vec![scan_a, scan_b], schema, 0, 1, 3).unwrap();
+
+        let first = merge.next_batch().unwrap().expect("first batch");
+        let entities = first
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let first_entities: Vec<&str> = (0..first.num_rows()).map(|i| entities.value(i)).collect();
+        assert_eq!(first_entities, vec!["u1", "u2", "u3"]);
+
+        let second = merge.next_batch().unwrap().expect("second batch");
+        let entities = second
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let second_entities: Vec<&str> =
+            (0..second.num_rows()).map(|i| entities.value(i)).collect();
+        assert_eq!(second_entities, vec!["u4", "u5"]);
+
+        assert!(merge.next_batch().unwrap().is_none());
     }
 
     #[test]

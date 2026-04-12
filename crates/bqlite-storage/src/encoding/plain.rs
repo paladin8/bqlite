@@ -49,14 +49,14 @@
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBufferBuilder, Float64Array, Int64Array, StringArray,
-    StringViewArray, TimestampNanosecondArray,
+    StringViewArray, StringViewBuilder, TimestampNanosecondArray,
 };
 use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::{DataType, TimeUnit};
 use bqlite_core::{BqlType, BqliteError, Result};
 use std::sync::Arc;
 
-use super::{require_dense, EncodedChunk, Encoding, EncodingType};
+use super::{require_dense, BorrowedEncodedChunk, EncodedChunk, Encoding, EncodingType};
 
 /// Zero-sized marker for the Plain encoding.
 ///
@@ -180,39 +180,63 @@ impl Encoding for Plain {
     }
 
     fn decode(&self, chunk: &EncodedChunk, ty: &BqlType) -> Result<ArrayRef> {
-        if chunk.encoding != EncodingType::Plain {
-            return Err(BqliteError::Execution(format!(
-                "Plain::decode called on a {:?} chunk — dispatch must \
-                 route each chunk to its declared encoding's decoder",
-                chunk.encoding
-            )));
+        decode_impl(
+            chunk.encoding,
+            &chunk.params,
+            &chunk.payload,
+            chunk.row_count,
+            ty,
+        )
+    }
+
+    fn decode_borrowed(&self, chunk: BorrowedEncodedChunk<'_>, ty: &BqlType) -> Result<ArrayRef> {
+        decode_impl(
+            chunk.encoding,
+            chunk.params,
+            chunk.payload,
+            chunk.row_count,
+            ty,
+        )
+    }
+}
+
+fn decode_impl(
+    encoding: EncodingType,
+    params: &[u8],
+    payload: &[u8],
+    row_count: usize,
+    ty: &BqlType,
+) -> Result<ArrayRef> {
+    if encoding != EncodingType::Plain {
+        return Err(BqliteError::Execution(format!(
+            "Plain::decode called on a {:?} chunk — dispatch must \
+             route each chunk to its declared encoding's decoder",
+            encoding
+        )));
+    }
+    if !params.is_empty() {
+        return Err(BqliteError::Execution(format!(
+            "Plain::decode expects an empty params block per \
+             segment-format-v1.md §9.1, got {} bytes",
+            params.len()
+        )));
+    }
+    match ty {
+        BqlType::Bool => Ok(Arc::new(decode_bool(payload, row_count)?) as ArrayRef),
+        BqlType::Int => Ok(Arc::new(decode_i64(payload, row_count)?) as ArrayRef),
+        BqlType::Float => Ok(Arc::new(decode_f64(payload, row_count)?) as ArrayRef),
+        BqlType::Timestamp => Ok(Arc::new(decode_timestamp(payload, row_count)?) as ArrayRef),
+        BqlType::String => {
+            // Produce the schema-canonical `StringViewArray`
+            // (`Utf8View`) so downstream operators see the same
+            // Arrow type `bqlite_core::arrow::bql_type_to_arrow`
+            // declares for `BqlType::String`.
+            Ok(Arc::new(decode_utf8_view(payload, row_count)?) as ArrayRef)
         }
-        if !chunk.params.is_empty() {
-            return Err(BqliteError::Execution(format!(
-                "Plain::decode expects an empty params block per \
-                 segment-format-v1.md §9.1, got {} bytes",
-                chunk.params.len()
-            )));
-        }
-        let row_count = chunk.row_count;
-        let payload = &chunk.payload;
-        match ty {
-            BqlType::Bool => Ok(Arc::new(decode_bool(payload, row_count)?) as ArrayRef),
-            BqlType::Int => Ok(Arc::new(decode_i64(payload, row_count)?) as ArrayRef),
-            BqlType::Float => Ok(Arc::new(decode_f64(payload, row_count)?) as ArrayRef),
-            BqlType::Timestamp => Ok(Arc::new(decode_timestamp(payload, row_count)?) as ArrayRef),
-            BqlType::String => {
-                // Produce the schema-canonical `StringViewArray`
-                // (`Utf8View`) so downstream operators see the same
-                // Arrow type `bqlite_core::arrow::bql_type_to_arrow`
-                // declares for `BqlType::String`.
-                Ok(Arc::new(decode_utf8_view(payload, row_count)?) as ArrayRef)
-            }
-            BqlType::List(_) | BqlType::Map(_) => Err(BqliteError::Execution(format!(
-                "Plain::decode does not yet support nested type {ty} — \
-                 List and Map decode lands in a later Wave 2 task"
-            ))),
-        }
+        BqlType::List(_) | BqlType::Map(_) => Err(BqliteError::Execution(format!(
+            "Plain::decode does not yet support nested type {ty} — \
+             List and Map decode lands in a later Wave 2 task"
+        ))),
     }
 }
 
@@ -369,7 +393,7 @@ fn decode_timestamp(payload: &[u8], row_count: usize) -> Result<TimestampNanosec
 }
 
 fn decode_utf8_view(payload: &[u8], row_count: usize) -> Result<StringViewArray> {
-    let mut values: Vec<String> = Vec::with_capacity(row_count);
+    let mut builder = StringViewBuilder::with_capacity(row_count);
     let mut offset = 0usize;
     for i in 0..row_count {
         // Length prefix.
@@ -399,7 +423,7 @@ fn decode_utf8_view(payload: &[u8], row_count: usize) -> Result<StringViewArray>
                 "Plain::decode String: invalid UTF-8 at value {i}/{row_count}: {e}"
             ))
         })?;
-        values.push(s.to_owned());
+        builder.append_value(s);
     }
     if offset != payload.len() {
         return Err(BqliteError::Execution(format!(
@@ -407,10 +431,7 @@ fn decode_utf8_view(payload: &[u8], row_count: usize) -> Result<StringViewArray>
             payload.len() - offset
         )));
     }
-    // `StringViewArray::from(Vec<String>)` materialises a view-array
-    // that owns its UTF-8 data, matching the schema-canonical Arrow
-    // type for `BqlType::String`.
-    Ok(StringViewArray::from(values))
+    Ok(builder.finish())
 }
 
 // ── shared downcast helper ──────────────────────────────────────────────────

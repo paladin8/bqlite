@@ -90,7 +90,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray, StringViewArray};
+use arrow::array::{Array, ArrayRef, Int64Array, StringArray, StringViewArray, StringViewBuilder};
 use arrow::datatypes::DataType;
 use bqlite_core::{BqlType, BqliteError, Result};
 
@@ -298,7 +298,7 @@ impl Encoding for Dictionary {
             }
             BqlType::String => {
                 let dict = parse_string_dict(dict_bytes, cardinality)?;
-                let mut values: Vec<String> = Vec::with_capacity(chunk.row_count);
+                let mut builder = StringViewBuilder::with_capacity(chunk.row_count);
                 for code in codes {
                     let idx = code as usize;
                     if idx >= cardinality {
@@ -307,11 +307,11 @@ impl Encoding for Dictionary {
                              for dictionary of size {cardinality}"
                         )));
                     }
-                    values.push(dict[idx].clone());
+                    builder.append_value(dict[idx]);
                 }
                 // Produce the schema-canonical StringViewArray, matching
                 // Plain::decode(String) and bqlite_core::arrow::bql_type_to_arrow.
-                Ok(Arc::new(StringViewArray::from(values)) as ArrayRef)
+                Ok(Arc::new(builder.finish()) as ArrayRef)
             }
             other => Err(BqliteError::Execution(format!(
                 "Dictionary::decode does not support BqlType::{other} — v1 \
@@ -500,7 +500,7 @@ fn code_bit_width_for(cardinality: usize) -> Result<u8> {
 /// Exact payload byte count for a bit-packed code stream: the smallest
 /// multiple of [`SIMD_LANE_BYTES`] that holds `row_count` codes at
 /// `bit_width` bits per code.
-fn payload_byte_count(row_count: usize, bit_width: u8) -> usize {
+pub(crate) fn payload_byte_count(row_count: usize, bit_width: u8) -> usize {
     let unpadded_bits = (bit_width as usize) * row_count;
     let unpadded_bytes = unpadded_bits.div_ceil(8);
     unpadded_bytes.div_ceil(SIMD_LANE_BYTES) * SIMD_LANE_BYTES
@@ -550,7 +550,7 @@ fn pack_codes(codes: &[u32], bit_width: u8, row_count: usize) -> Result<Vec<u8>>
 
 /// Inverse of [`pack_codes`]: reconstruct a `Vec<u32>` of length
 /// `row_count` from a bit-packed code stream.
-fn unpack_codes(payload: &[u8], row_count: usize, bit_width: u8) -> Result<Vec<u32>> {
+pub(crate) fn unpack_codes(payload: &[u8], row_count: usize, bit_width: u8) -> Result<Vec<u32>> {
     if !(1..=MAX_CODE_BIT_WIDTH).contains(&bit_width) {
         return Err(BqliteError::Execution(format!(
             "Dictionary::decode: code_bit_width {bit_width} out of valid range 1..={MAX_CODE_BIT_WIDTH}"
@@ -619,8 +619,8 @@ fn parse_int_dict(bytes: &[u8], cardinality: usize) -> Result<Vec<i64>> {
     Ok(values)
 }
 
-fn parse_string_dict(bytes: &[u8], cardinality: usize) -> Result<Vec<String>> {
-    let mut values: Vec<String> = Vec::with_capacity(cardinality);
+fn parse_string_dict<'a>(bytes: &'a [u8], cardinality: usize) -> Result<Vec<&'a str>> {
+    let mut values: Vec<&'a str> = Vec::with_capacity(cardinality);
     let mut offset = 0usize;
     for i in 0..cardinality {
         if offset + STRING_LENGTH_PREFIX > bytes.len() {
@@ -649,7 +649,7 @@ fn parse_string_dict(bytes: &[u8], cardinality: usize) -> Result<Vec<String>> {
                  {i}/{cardinality}: {e}"
             ))
         })?;
-        values.push(s.to_owned());
+        values.push(s);
     }
     if offset != bytes.len() {
         return Err(BqliteError::Execution(format!(
@@ -836,10 +836,7 @@ mod tests {
         assert_eq!(chunk.params[0], TYPE_TAG_STRING);
         let cardinality = u32::from_le_bytes(chunk.params[2..6].try_into().unwrap()) as usize;
         let dict = parse_string_dict(&chunk.params[PARAMS_HEADER_LEN..], cardinality).unwrap();
-        assert_eq!(
-            dict,
-            vec!["buy".to_string(), "click".to_string(), "view".to_string()]
-        );
+        assert_eq!(dict, vec!["buy", "click", "view"]);
     }
 
     #[test]

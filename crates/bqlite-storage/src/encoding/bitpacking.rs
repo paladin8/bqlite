@@ -59,7 +59,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use bqlite_core::{BqlType, BqliteError, Result};
 use std::sync::Arc;
 
-use super::{require_dense, EncodedChunk, Encoding, EncodingType};
+use super::{require_dense, BorrowedEncodedChunk, EncodedChunk, Encoding, EncodingType};
 
 /// Zero-sized marker for the BitPacking encoding.
 #[derive(Debug, Clone, Copy, Default)]
@@ -120,67 +120,84 @@ impl Encoding for BitPacking {
     }
 
     fn decode(&self, chunk: &EncodedChunk, ty: &BqlType) -> Result<ArrayRef> {
-        if chunk.encoding != EncodingType::BitPacking {
-            return Err(BqliteError::Execution(format!(
-                "BitPacking::decode called on a {:?} chunk — dispatch must \
-                 route each chunk to its declared encoding's decoder",
-                chunk.encoding
-            )));
-        }
-        if chunk.params.len() != PARAMS_BYTE_WIDTH {
-            return Err(BqliteError::Execution(format!(
-                "BitPacking::decode: encoding header must be exactly {} bytes \
-                 (i64 min_value + u8 bit_width), got {}",
-                PARAMS_BYTE_WIDTH,
-                chunk.params.len()
-            )));
-        }
+        decode_impl(
+            chunk.encoding,
+            &chunk.params,
+            &chunk.payload,
+            chunk.row_count,
+            ty,
+        )
+    }
 
-        let min_value =
-            i64::from_le_bytes(chunk.params[..MIN_VALUE_BYTE_WIDTH].try_into().unwrap());
-        let bit_width = chunk.params[MIN_VALUE_BYTE_WIDTH];
+    fn decode_borrowed(&self, chunk: BorrowedEncodedChunk<'_>, ty: &BqlType) -> Result<ArrayRef> {
+        decode_impl(
+            chunk.encoding,
+            chunk.params,
+            chunk.payload,
+            chunk.row_count,
+            ty,
+        )
+    }
+}
 
-        if bit_width == 0 || bit_width > 64 {
-            return Err(BqliteError::Execution(format!(
-                "BitPacking::decode: bit_width must be in 1..=64 per \
-                 segment-format-v1.md §9.4, got {bit_width}"
-            )));
+fn decode_impl(
+    encoding: EncodingType,
+    params: &[u8],
+    payload: &[u8],
+    row_count: usize,
+    ty: &BqlType,
+) -> Result<ArrayRef> {
+    if encoding != EncodingType::BitPacking {
+        return Err(BqliteError::Execution(format!(
+            "BitPacking::decode called on a {:?} chunk — dispatch must \
+             route each chunk to its declared encoding's decoder",
+            encoding
+        )));
+    }
+    if params.len() != PARAMS_BYTE_WIDTH {
+        return Err(BqliteError::Execution(format!(
+            "BitPacking::decode: encoding header must be exactly {} bytes \
+             (i64 min_value + u8 bit_width), got {}",
+            PARAMS_BYTE_WIDTH,
+            params.len()
+        )));
+    }
+
+    let min_value = i64::from_le_bytes(params[..MIN_VALUE_BYTE_WIDTH].try_into().unwrap());
+    let bit_width = params[MIN_VALUE_BYTE_WIDTH];
+
+    if bit_width == 0 || bit_width > 64 {
+        return Err(BqliteError::Execution(format!(
+            "BitPacking::decode: bit_width must be in 1..=64 per \
+             segment-format-v1.md §9.4, got {bit_width}"
+        )));
+    }
+
+    let expected_len = payload_byte_len(row_count, bit_width);
+    if payload.len() != expected_len {
+        return Err(BqliteError::Execution(format!(
+            "BitPacking::decode: expected {expected_len} payload bytes for \
+             {row_count} rows × {bit_width}-bit codes (padded to multiple of {}), got {}",
+            PADDING_GRANULARITY,
+            payload.len()
+        )));
+    }
+
+    let offsets = unpack_offsets(payload, row_count, bit_width);
+    let values: Vec<i64> = offsets
+        .into_iter()
+        .map(|offset| ((min_value as i128) + (offset as i128)) as i64)
+        .collect();
+
+    match ty {
+        BqlType::Int => Ok(Arc::new(Int64Array::from(values)) as ArrayRef),
+        BqlType::Timestamp => {
+            Ok(Arc::new(TimestampNanosecondArray::from(values).with_timezone("UTC")) as ArrayRef)
         }
-
-        let expected_len = payload_byte_len(chunk.row_count, bit_width);
-        if chunk.payload.len() != expected_len {
-            return Err(BqliteError::Execution(format!(
-                "BitPacking::decode: expected {expected_len} payload bytes for \
-                 {} rows × {bit_width}-bit codes (padded to multiple of {}), got {}",
-                chunk.row_count,
-                PADDING_GRANULARITY,
-                chunk.payload.len()
-            )));
-        }
-
-        let offsets = unpack_offsets(&chunk.payload, chunk.row_count, bit_width);
-        let values: Vec<i64> = offsets
-            .into_iter()
-            .map(|offset| {
-                // `min_value + offset` always fits in i64 because
-                // encode picked `min_value` as the true minimum and
-                // the largest offset was `max_value − min_value`,
-                // which is ≤ u64::MAX. Reconstruct via i128 so the
-                // intermediate arithmetic never overflows.
-                ((min_value as i128) + (offset as i128)) as i64
-            })
-            .collect();
-
-        match ty {
-            BqlType::Int => Ok(Arc::new(Int64Array::from(values)) as ArrayRef),
-            BqlType::Timestamp => Ok(Arc::new(
-                TimestampNanosecondArray::from(values).with_timezone("UTC"),
-            ) as ArrayRef),
-            other => Err(BqliteError::Execution(format!(
-                "BitPacking::decode does not support type {other} — v1 \
-                 BitPacking decodes to Int or Timestamp only (segment-format-v1.md §9.4)"
-            ))),
-        }
+        other => Err(BqliteError::Execution(format!(
+            "BitPacking::decode does not support type {other} — v1 \
+             BitPacking decodes to Int or Timestamp only (segment-format-v1.md §9.4)"
+        ))),
     }
 }
 

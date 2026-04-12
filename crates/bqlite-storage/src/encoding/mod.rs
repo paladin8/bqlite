@@ -152,6 +152,25 @@ pub struct EncodedChunk {
     pub row_count: usize,
 }
 
+/// Borrowed view over an encoded column chunk.
+///
+/// This is the read-path counterpart to [`EncodedChunk`]. Writers and
+/// round-trip tests still traffic in owned chunks, but the segment
+/// reader can point decoders directly at the already-parsed params and
+/// payload bytes it holds in memory instead of cloning them into fresh
+/// `Vec<u8>` buffers first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorrowedEncodedChunk<'a> {
+    /// The encoding that produced this chunk.
+    pub encoding: EncodingType,
+    /// Borrowed encoding-specific parameter bytes.
+    pub params: &'a [u8],
+    /// Borrowed uncompressed payload bytes.
+    pub payload: &'a [u8],
+    /// Number of non-null values represented by `payload`.
+    pub row_count: usize,
+}
+
 /// Column encoding trait — the runtime entry point for every v1
 /// encoding.
 ///
@@ -159,7 +178,9 @@ pub struct EncodedChunk {
 /// (TASK-214) dispatches between the handful of concrete encodings
 /// without a trait-parameter stew. The trait is intentionally narrow:
 ///
-/// - No lifetime parameters (chunks own their bytes).
+/// - No lifetime parameters on the trait itself — owned chunks remain
+///   the canonical writer/test form, and read-time borrowing is an
+///   opt-in method-level fast path.
 /// - No generics (dispatch by discriminant, not by type).
 /// - No state — every impl is a zero-sized marker type (see [`Plain`]).
 ///
@@ -202,6 +223,24 @@ pub trait Encoding: Send + Sync {
     /// given [`BqlType`]. The returned array has exactly
     /// `chunk.row_count` elements and no nulls.
     fn decode(&self, chunk: &EncodedChunk, ty: &BqlType) -> Result<ArrayRef>;
+
+    /// Decode a borrowed chunk view back into a dense Arrow array.
+    ///
+    /// The default implementation preserves the original behavior by
+    /// materializing an owned [`EncodedChunk`] and delegating to
+    /// [`Self::decode`]. Performance-sensitive decoders can override
+    /// this to consume the borrowed slices directly and avoid the copy.
+    fn decode_borrowed(&self, chunk: BorrowedEncodedChunk<'_>, ty: &BqlType) -> Result<ArrayRef> {
+        self.decode(
+            &EncodedChunk {
+                encoding: chunk.encoding,
+                params: chunk.params.to_vec(),
+                payload: chunk.payload.to_vec(),
+                row_count: chunk.row_count,
+            },
+            ty,
+        )
+    }
 }
 
 /// Shared helper: reject a nullable array at the `encode` boundary.

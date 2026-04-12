@@ -63,7 +63,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use bqlite_core::{BqlType, BqliteError, Result};
 use std::sync::Arc;
 
-use super::{require_dense, EncodedChunk, Encoding, EncodingType};
+use super::{require_dense, BorrowedEncodedChunk, EncodedChunk, Encoding, EncodingType};
 
 /// Zero-sized marker for the Delta encoding.
 ///
@@ -145,45 +145,68 @@ impl Encoding for Delta {
     }
 
     fn decode(&self, chunk: &EncodedChunk, ty: &BqlType) -> Result<ArrayRef> {
-        if chunk.encoding != EncodingType::Delta {
-            return Err(BqliteError::Execution(format!(
-                "Delta::decode called on a {:?} chunk — dispatch must \
-                 route each chunk to its declared encoding's decoder",
-                chunk.encoding
-            )));
+        decode_impl(
+            chunk.encoding,
+            &chunk.params,
+            &chunk.payload,
+            chunk.row_count,
+            ty,
+        )
+    }
+
+    fn decode_borrowed(&self, chunk: BorrowedEncodedChunk<'_>, ty: &BqlType) -> Result<ArrayRef> {
+        decode_impl(
+            chunk.encoding,
+            chunk.params,
+            chunk.payload,
+            chunk.row_count,
+            ty,
+        )
+    }
+}
+
+fn decode_impl(
+    encoding: EncodingType,
+    params: &[u8],
+    payload: &[u8],
+    row_count: usize,
+    ty: &BqlType,
+) -> Result<ArrayRef> {
+    if encoding != EncodingType::Delta {
+        return Err(BqliteError::Execution(format!(
+            "Delta::decode called on a {:?} chunk — dispatch must \
+             route each chunk to its declared encoding's decoder",
+            encoding
+        )));
+    }
+    if params.len() != PARAMS_LEN {
+        return Err(BqliteError::Execution(format!(
+            "Delta::decode expects a {PARAMS_LEN}-byte params block \
+             (base_value: i64 LE + residual_bit_width: u8) per \
+             segment-format-v1.md §9.3, got {} bytes",
+            params.len()
+        )));
+    }
+    if row_count == 0 {
+        return Err(BqliteError::Execution(
+            "Delta::decode: chunk.row_count == 0 is illegal for Delta \
+             (segment-format-v1.md §9.3)"
+                .into(),
+        ));
+    }
+    let base_value = i64::from_le_bytes(params[..8].try_into().unwrap());
+    let width = params[8];
+    let values = bit_unpack_residuals(payload, base_value, row_count, width)?;
+    match ty {
+        BqlType::Int => Ok(Arc::new(Int64Array::from(values)) as ArrayRef),
+        BqlType::Timestamp => {
+            let array = TimestampNanosecondArray::from(values).with_timezone("UTC");
+            Ok(Arc::new(array) as ArrayRef)
         }
-        if chunk.params.len() != PARAMS_LEN {
-            return Err(BqliteError::Execution(format!(
-                "Delta::decode expects a {PARAMS_LEN}-byte params block \
-                 (base_value: i64 LE + residual_bit_width: u8) per \
-                 segment-format-v1.md §9.3, got {} bytes",
-                chunk.params.len()
-            )));
-        }
-        if chunk.row_count == 0 {
-            return Err(BqliteError::Execution(
-                "Delta::decode: chunk.row_count == 0 is illegal for Delta \
-                 (segment-format-v1.md §9.3)"
-                    .into(),
-            ));
-        }
-        let base_value = i64::from_le_bytes(chunk.params[..8].try_into().unwrap());
-        let width = chunk.params[8];
-        let values = bit_unpack_residuals(&chunk.payload, base_value, chunk.row_count, width)?;
-        match ty {
-            BqlType::Int => Ok(Arc::new(Int64Array::from(values)) as ArrayRef),
-            BqlType::Timestamp => {
-                // Stamp the decoded array with the canonical UTC
-                // timezone per property.rs BqlType::Timestamp → Arrow
-                // Timestamp(Nanosecond, "UTC").
-                let array = TimestampNanosecondArray::from(values).with_timezone("UTC");
-                Ok(Arc::new(array) as ArrayRef)
-            }
-            other => Err(BqliteError::Execution(format!(
-                "Delta::decode does not support BqlType::{other} — \
-                 v1 Delta encoding covers Int and Timestamp only"
-            ))),
-        }
+        other => Err(BqliteError::Execution(format!(
+            "Delta::decode does not support BqlType::{other} — \
+             v1 Delta encoding covers Int and Timestamp only"
+        ))),
     }
 }
 

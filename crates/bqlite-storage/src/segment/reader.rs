@@ -44,6 +44,7 @@
 //!   decode a nullable nested column. Non-nullable nested columns
 //!   decode via the `Plain` encoding directly.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
@@ -52,7 +53,7 @@ use std::sync::Arc;
 
 use ::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringViewArray,
-    TimestampNanosecondArray,
+    StringViewBuilder, TimestampNanosecondArray,
 };
 use ::arrow::buffer::{BooleanBuffer, NullBuffer};
 use ::arrow::datatypes::{Field, Schema as ArrowSchema};
@@ -60,8 +61,11 @@ use bqlite_core::arrow::bql_type_to_arrow;
 use bqlite_core::storage::{ColumnProjection, Predicate, SegmentScan, ZoneMap};
 use bqlite_core::{BqlType, BqliteError, ColumnDef, Result, TableSchema};
 
+use crate::encoding::dictionary::{
+    payload_byte_count as dictionary_payload_byte_count, unpack_codes,
+};
 use crate::encoding::{
-    decompress_lz4, BitPacking, Constant, Delta, Dictionary, EncodedChunk, Encoding, EncodingType,
+    decompress_lz4, BitPacking, BorrowedEncodedChunk, Constant, Delta, Encoding, EncodingType,
     Plain,
 };
 use crate::segment::layout::{
@@ -625,9 +629,9 @@ impl SegmentFileScan {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Decode one column chunk: parse null bitmap + encoding header,
-/// (optionally) LZ4-decompress the payload, reconstruct the
-/// trait-level [`EncodedChunk`], decode via the [`Encoding`] trait,
-/// and splice the null bitmap back into the dense result.
+/// (optionally) LZ4-decompress the payload, decode the dense values
+/// either via the [`Encoding`] trait or the loaded segment-level
+/// dictionary, and splice the null bitmap back into the dense result.
 fn decode_column_chunk(
     bytes: &[u8],
     meta: &ColumnChunkMeta,
@@ -723,7 +727,7 @@ fn decode_column_chunk(
             write_time_col.name
         ))
     })?;
-    let uncompressed_payload: Vec<u8> = match compression {
+    let uncompressed_payload: Cow<'_, [u8]> = match compression {
         CompressionType::None => {
             if on_disk_payload.len() != uncompressed_payload_length {
                 return Err(BqliteError::Corruption(format!(
@@ -734,32 +738,25 @@ fn decode_column_chunk(
                     on_disk_payload.len()
                 )));
             }
-            on_disk_payload.to_vec()
+            Cow::Borrowed(on_disk_payload)
         }
-        CompressionType::Lz4 => decompress_lz4(on_disk_payload, uncompressed_payload_length)
-            .map_err(|e| {
+        CompressionType::Lz4 => Cow::Owned(
+            decompress_lz4(on_disk_payload, uncompressed_payload_length).map_err(|e| {
                 BqliteError::Corruption(format!(
                     "segment reader: column chunk for `{}`: lz4 decompress failed: {e}",
                     write_time_col.name
                 ))
             })?,
+        ),
     };
 
-    // 7. Build a trait-level `EncodedChunk`. For every encoding
-    //    except `Dictionary`, the on-disk params are byte-for-byte
-    //    what the trait decoder expects. `Dictionary` needs the
-    //    self-contained params block reconstructed by looking up the
-    //    segment-level dictionary by `dict_id`.
-    let encoded_chunk = match encoding {
-        EncodingType::Plain
-        | EncodingType::Delta
-        | EncodingType::BitPacking
-        | EncodingType::Constant => EncodedChunk {
-            encoding,
-            params: on_disk_params.to_vec(),
-            payload: uncompressed_payload,
-            row_count: meta.row_count as usize,
-        },
+    // 7. Decode the dense non-null values. Every encoding except
+    //    `Dictionary` routes through the encoding trait's borrowed
+    //    fast path so the common uncompressed case can hand the
+    //    decoder slices directly. `Dictionary` can decode directly
+    //    from the already-loaded segment-level dictionary, avoiding
+    //    per-row-group params reconstruction and reparse.
+    let dense_array: ArrayRef = match encoding {
         EncodingType::Dictionary => {
             if on_disk_params.len() != 5 {
                 return Err(BqliteError::Corruption(format!(
@@ -782,19 +779,27 @@ fn decode_column_chunk(
                 )));
             }
             let dict_values = &dictionaries[dict_id];
-            let trait_params = build_dictionary_trait_params(dict_values, code_bit_width);
-            EncodedChunk {
+            decode_dictionary_chunk(
+                uncompressed_payload.as_ref(),
+                meta.row_count as usize,
+                dict_values,
+                code_bit_width,
+                &write_time_col.bql_type,
+            )?
+        }
+        EncodingType::Plain
+        | EncodingType::Delta
+        | EncodingType::BitPacking
+        | EncodingType::Constant => {
+            let chunk = BorrowedEncodedChunk {
                 encoding,
-                params: trait_params,
-                payload: uncompressed_payload,
+                params: on_disk_params,
+                payload: uncompressed_payload.as_ref(),
                 row_count: meta.row_count as usize,
-            }
+            };
+            dispatch_decode(encoding, chunk, &write_time_col.bql_type)?
         }
     };
-
-    // 8. Decode via the Encoding trait.
-    let dense_array: ArrayRef =
-        dispatch_decode(encoding, &encoded_chunk, &write_time_col.bql_type)?;
 
     // 9. Splice nulls back in (if the column is nullable).
     if let Some(range) = null_bitmap_range {
@@ -877,52 +882,86 @@ fn parse_encoding_params_len(
     }
 }
 
-/// Reconstruct the self-contained trait-level `params` block for a
-/// Dictionary-encoded chunk from the segment-level dictionary
-/// values and the code bit width carried in the on-disk params.
+/// Decode a Dictionary-encoded chunk using the segment-level
+/// dictionary values loaded when the reader opened the segment.
 ///
-/// The self-contained shape (matching the `Dictionary` impl's
-/// module docs) is:
-/// ```text
-/// [type_tag: u8]              // 0 = Int, 1 = String
-/// [code_bit_width: u8]
-/// [cardinality: u32 LE]
-/// [dict_values: variable]
-/// ```
-fn build_dictionary_trait_params(values: &DictionaryValues, code_bit_width: u8) -> Vec<u8> {
-    let mut params = Vec::new();
-    match values {
-        DictionaryValues::Int(vs) => {
-            params.push(0u8); // type_tag = Int
-            params.push(code_bit_width);
-            params.extend_from_slice(&(vs.len() as u32).to_le_bytes());
-            for v in vs {
-                params.extend_from_slice(&v.to_le_bytes());
+/// This bypasses the trait-level self-contained `params` round-trip:
+/// the reader already has the dictionary in typed form, so rebuilding
+/// `[type_tag][code_bit_width][cardinality][dict_values...]` just to
+/// parse it again would be pure copy/reparse churn on every row group.
+fn decode_dictionary_chunk(
+    payload: &[u8],
+    row_count: usize,
+    dict_values: &DictionaryValues,
+    code_bit_width: u8,
+    ty: &BqlType,
+) -> Result<ArrayRef> {
+    let expected_payload_len = dictionary_payload_byte_count(row_count, code_bit_width);
+    if payload.len() != expected_payload_len {
+        return Err(BqliteError::Execution(format!(
+            "segment reader: Dictionary payload length {} does not match \
+             {row_count} rows at {code_bit_width}-bit codes ({expected_payload_len} bytes)",
+            payload.len()
+        )));
+    }
+
+    let codes = unpack_codes(payload, row_count, code_bit_width)?;
+    match (dict_values, ty) {
+        (DictionaryValues::Int(dict), BqlType::Int) => {
+            let mut values = Vec::with_capacity(row_count);
+            for code in codes {
+                let idx = code as usize;
+                if idx >= dict.len() {
+                    return Err(BqliteError::Execution(format!(
+                        "segment reader: Dictionary code {code} out of bounds \
+                         for Int dictionary of size {}",
+                        dict.len()
+                    )));
+                }
+                values.push(dict[idx]);
             }
+            Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
         }
-        DictionaryValues::String(vs) => {
-            params.push(1u8); // type_tag = String
-            params.push(code_bit_width);
-            params.extend_from_slice(&(vs.len() as u32).to_le_bytes());
-            for s in vs {
-                params.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                params.extend_from_slice(s.as_bytes());
+        (DictionaryValues::String(dict), BqlType::String) => {
+            let mut builder = StringViewBuilder::with_capacity(row_count);
+            for code in codes {
+                let idx = code as usize;
+                if idx >= dict.len() {
+                    return Err(BqliteError::Execution(format!(
+                        "segment reader: Dictionary code {code} out of bounds \
+                         for String dictionary of size {}",
+                        dict.len()
+                    )));
+                }
+                builder.append_value(&dict[idx]);
             }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        (DictionaryValues::Int(_), other) | (DictionaryValues::String(_), other) => {
+            Err(BqliteError::Execution(format!(
+                "segment reader: Dictionary values do not match requested type {other:?}"
+            )))
         }
     }
-    params
 }
 
-/// Dispatch a trait-level [`EncodedChunk`] to the concrete
-/// [`Encoding`] impl. Box allocation is avoided by stack-dispatching
-/// each variant to its zero-sized impl.
-fn dispatch_decode(encoding: EncodingType, chunk: &EncodedChunk, ty: &BqlType) -> Result<ArrayRef> {
+/// Dispatch a borrowed chunk view to the concrete [`Encoding`] impl.
+/// Box allocation is avoided by stack-dispatching each variant to its
+/// zero-sized impl.
+fn dispatch_decode(
+    encoding: EncodingType,
+    chunk: BorrowedEncodedChunk<'_>,
+    ty: &BqlType,
+) -> Result<ArrayRef> {
     match encoding {
-        EncodingType::Plain => Plain.decode(chunk, ty),
-        EncodingType::Dictionary => Dictionary.decode(chunk, ty),
-        EncodingType::Delta => Delta.decode(chunk, ty),
-        EncodingType::BitPacking => BitPacking.decode(chunk, ty),
-        EncodingType::Constant => Constant.decode(chunk, ty),
+        EncodingType::Plain => Plain.decode_borrowed(chunk, ty),
+        EncodingType::Dictionary => Err(BqliteError::Execution(
+            "segment reader: Dictionary chunks are decoded directly from loaded segment dictionaries"
+                .into(),
+        )),
+        EncodingType::Delta => Delta.decode_borrowed(chunk, ty),
+        EncodingType::BitPacking => BitPacking.decode_borrowed(chunk, ty),
+        EncodingType::Constant => Constant.decode_borrowed(chunk, ty),
     }
 }
 
@@ -1092,33 +1131,28 @@ fn splice_string(
     row_group_row_count: usize,
     null_buffer: &NullBuffer,
 ) -> Result<ArrayRef> {
-    // Strings don't have a dense-buffer-plus-null-buffer two-part
-    // layout the way fixed-width primitives do — we rebuild a
-    // `StringViewArray` from an `Iterator<Item = Option<&str>>`
-    // instead, which derives its own null buffer from the `None`
-    // entries. We still consult the input `null_buffer` for the
-    // validity check (it carries the on-disk bitmap verbatim) so the
-    // two nulls sets agree by construction.
+    // Strings don't have the fixed-width "values buffer + null buffer"
+    // layout the primitive arrays use, so splicing still has to
+    // rebuild the view array. Use `StringViewBuilder` directly to
+    // avoid the previous `Vec<Option<String>>` transient and its
+    // per-row owned-string allocations.
     let dense = dense
         .as_any()
         .downcast_ref::<StringViewArray>()
         .ok_or_else(|| {
             BqliteError::Execution("segment reader: expected StringViewArray dense input".into())
         })?;
+    let mut builder = StringViewBuilder::with_capacity(row_group_row_count);
     let mut dense_idx = 0usize;
-    let values: Vec<Option<String>> = (0..row_group_row_count)
-        .map(|i| {
-            if null_buffer.is_valid(i) {
-                let v = dense.value(dense_idx).to_string();
-                dense_idx += 1;
-                Some(v)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let arr: StringViewArray = values.into_iter().collect();
-    Ok(Arc::new(arr))
+    for i in 0..row_group_row_count {
+        if null_buffer.is_valid(i) {
+            builder.append_value(dense.value(dense_idx));
+            dense_idx += 1;
+        } else {
+            builder.append_null();
+        }
+    }
+    Ok(Arc::new(builder.finish()))
 }
 
 /// Fabricate an all-null Arrow array of the given BQL type for
@@ -1753,6 +1787,7 @@ pub(crate) mod test_fixture {
 mod tests {
     use super::test_fixture::*;
     use super::*;
+    use crate::encoding::EncodedChunk;
     use crate::segment::layout::{ColumnChunkMeta, RowGroupIndex, SegmentDictRef};
     use bqlite_core::{ColumnDef, PropertyValue, TableSchema};
 

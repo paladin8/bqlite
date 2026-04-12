@@ -62,7 +62,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use bqlite_core::{BqlType, BqliteError, Result};
 use std::sync::Arc;
 
-use super::{require_dense, EncodedChunk, Encoding, EncodingType};
+use super::{require_dense, BorrowedEncodedChunk, EncodedChunk, Encoding, EncodingType};
 
 /// Zero-sized marker for the Constant encoding.
 #[derive(Debug, Clone, Copy, Default)]
@@ -170,48 +170,74 @@ impl Encoding for Constant {
     }
 
     fn decode(&self, chunk: &EncodedChunk, ty: &BqlType) -> Result<ArrayRef> {
-        if chunk.encoding != EncodingType::Constant {
-            return Err(BqliteError::Execution(format!(
-                "Constant::decode called on a {:?} chunk — dispatch must \
-                 route each chunk to its declared encoding's decoder",
-                chunk.encoding
-            )));
-        }
-        if !chunk.payload.is_empty() {
-            return Err(BqliteError::Execution(format!(
-                "Constant::decode expects an empty payload per \
-                 segment-format-v1.md §9.5, got {} bytes",
-                chunk.payload.len()
-            )));
-        }
-        if chunk.params.is_empty() {
-            return Err(BqliteError::Execution(
-                "Constant::decode: encoding header is missing the value_kind byte".to_owned(),
-            ));
-        }
+        decode_impl(
+            chunk.encoding,
+            &chunk.params,
+            &chunk.payload,
+            chunk.row_count,
+            ty,
+        )
+    }
 
-        let value_kind = chunk.params[0];
-        let rest = &chunk.params[1..];
+    fn decode_borrowed(&self, chunk: BorrowedEncodedChunk<'_>, ty: &BqlType) -> Result<ArrayRef> {
+        decode_impl(
+            chunk.encoding,
+            chunk.params,
+            chunk.payload,
+            chunk.row_count,
+            ty,
+        )
+    }
+}
 
-        match value_kind {
-            VALUE_KIND_LITERAL => decode_literal(rest, ty, chunk.row_count),
-            VALUE_KIND_ALL_NULL => Err(BqliteError::Execution(
-                "Constant::decode: value_kind = 1 (all-null) is reserved by \
-                 segment-format-v1.md §9.5 but not yet supported by v1 \
-                 readers. The writer orchestration handles all-null column \
-                 chunks via the null bitmap + an empty payload of another \
-                 encoding; any Constant chunk in a v1 segment should use \
-                 value_kind = 0. Seeing value_kind = 1 is a corruption \
-                 signal in v1 and will be reconsidered when a later wave \
-                 lifts the all-null case to the encoding trait."
-                    .to_owned(),
-            )),
-            other => Err(BqliteError::Execution(format!(
-                "Constant::decode: unknown value_kind {other} — only 0 \
-                 (literal) and 1 (all-null, reserved) are defined by \
-                 segment-format-v1.md §9.5"
-            ))),
-        }
+fn decode_impl(
+    encoding: EncodingType,
+    params: &[u8],
+    payload: &[u8],
+    row_count: usize,
+    ty: &BqlType,
+) -> Result<ArrayRef> {
+    if encoding != EncodingType::Constant {
+        return Err(BqliteError::Execution(format!(
+            "Constant::decode called on a {:?} chunk — dispatch must \
+             route each chunk to its declared encoding's decoder",
+            encoding
+        )));
+    }
+    if !payload.is_empty() {
+        return Err(BqliteError::Execution(format!(
+            "Constant::decode expects an empty payload per \
+             segment-format-v1.md §9.5, got {} bytes",
+            payload.len()
+        )));
+    }
+    if params.is_empty() {
+        return Err(BqliteError::Execution(
+            "Constant::decode: encoding header is missing the value_kind byte".to_owned(),
+        ));
+    }
+
+    let value_kind = params[0];
+    let rest = &params[1..];
+
+    match value_kind {
+        VALUE_KIND_LITERAL => decode_literal(rest, ty, row_count),
+        VALUE_KIND_ALL_NULL => Err(BqliteError::Execution(
+            "Constant::decode: value_kind = 1 (all-null) is reserved by \
+             segment-format-v1.md §9.5 but not yet supported by v1 \
+             readers. The writer orchestration handles all-null column \
+             chunks via the null bitmap + an empty payload of another \
+             encoding; any Constant chunk in a v1 segment should use \
+             value_kind = 0. Seeing value_kind = 1 is a corruption \
+             signal in v1 and will be reconsidered when a later wave \
+             lifts the all-null case to the encoding trait."
+                .to_owned(),
+        )),
+        other => Err(BqliteError::Execution(format!(
+            "Constant::decode: unknown value_kind {other} — only 0 \
+             (literal) and 1 (all-null, reserved) are defined by \
+             segment-format-v1.md §9.5"
+        ))),
     }
 }
 
