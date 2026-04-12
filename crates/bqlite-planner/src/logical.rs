@@ -892,6 +892,22 @@ fn lower_match(
         )));
     }
 
+    // Pre-collect variable binding columns from step predicates BEFORE
+    // type-checking. Step predicates may reference `$var` variables that
+    // are not in the input schema — they are created by the MATCH operator.
+    // We must build an augmented schema that includes these variable columns
+    // so that `TypedExpr::from_ast` can resolve `$var` references.
+    let var_columns = collect_variable_columns(&pattern, input_schema);
+    let owned_step_schema;
+    let step_schema: &OperatorSchema = if var_columns.is_empty() {
+        input_schema
+    } else {
+        let mut cols = input_schema.columns().to_vec();
+        cols.extend(var_columns.iter().cloned());
+        owned_step_schema = OperatorSchema::new(cols)?;
+        &owned_step_schema
+    };
+
     // Collect step name → event type mapping. Validate event types against
     // the catalog and check for duplicate step names.
     let mut step_names: Vec<(String, String)> = Vec::new(); // (step_name, event_type)
@@ -910,11 +926,13 @@ fn lower_match(
             }
         };
 
-        // Type-check step predicates against the input schema.
-        // Step predicates can reference columns from the input schema
-        // (which includes entity_id, ts, event_type, and any declared columns).
+        // Type-check step predicates against the augmented schema that
+        // includes `$var` columns, so `column = $var` resolves correctly.
+        // Full variable-usage validation (equality-only, no bare $var
+        // outside comparisons) is enforced by the pattern compiler's
+        // `collect_variable_comparisons` in compile.rs.
         if let Some(pred) = &step.predicate {
-            let typed = TypedExpr::from_ast(pred, input_schema, registry)?;
+            let typed = TypedExpr::from_ast(pred, step_schema, registry)?;
             if typed.result_type != BqlType::Bool {
                 return Err(BqliteError::Plan(format!(
                     "MATCH step predicate must have type `Bool`, got `{}`",
@@ -965,11 +983,9 @@ fn lower_match(
         )));
     }
 
-    // 2. Variable binding columns — collect $var bindings from step predicates.
-    // We use a two-pass approach: first collect refined types from Compare
-    // expressions (Variable = Column), then fill in remaining variables with
-    // defaults. This ensures the best type inference ordering.
-    collect_variable_binding_columns(&pattern, input_schema, &mut output_columns);
+    // 2. Variable binding columns — already collected above for the
+    // augmented step-predicate schema. Reuse them here.
+    output_columns.extend(var_columns);
 
     // 3. step_reached column when emit_all is true.
     if emit_all {
@@ -1053,20 +1069,21 @@ fn lower_match(
 }
 
 /// Collect `$var` binding declarations from the MATCH pattern's step
-/// predicates and add corresponding columns to the output schema.
+/// predicates and return them as `ColumnDef` entries.
 ///
 /// Uses a two-pass approach: first collects type-refined bindings from
 /// `Compare(Variable, Column)` patterns, then fills in remaining variables
 /// with a default `String` type. This ensures variables compared against
 /// typed columns get the correct type regardless of expression tree order.
 ///
+/// Returns columns named `$<name>` in deterministic (sorted) order.
+///
 /// Full variable type inference and validation is deferred to the pattern
 /// compiler (TASK-311's `compile_pattern`).
-fn collect_variable_binding_columns(
+fn collect_variable_columns(
     pattern: &MatchPattern,
     input_schema: &OperatorSchema,
-    output_columns: &mut Vec<ColumnDef>,
-) {
+) -> Vec<ColumnDef> {
     // Pass 1: collect type-refined bindings from Compare(Variable, Column).
     let mut refined: std::collections::HashMap<String, BqlType> = std::collections::HashMap::new();
     for step in &pattern.steps {
@@ -1086,15 +1103,18 @@ fn collect_variable_binding_columns(
     // Emit columns in deterministic order.
     let mut var_list: Vec<String> = seen_vars.into_iter().collect();
     var_list.sort();
-    for var_name in var_list {
-        let bql_type = refined.get(&var_name).cloned().unwrap_or(BqlType::String);
-        output_columns.push(ColumnDef {
-            name: var_name,
-            bql_type,
-            nullable: false, // bindings are non-nullable per §2.1.3
-            default_value: None,
-        });
-    }
+    var_list
+        .into_iter()
+        .map(|var_name| {
+            let bql_type = refined.get(&var_name).cloned().unwrap_or(BqlType::String);
+            ColumnDef {
+                name: var_name,
+                bql_type,
+                nullable: false, // bindings are non-nullable per §2.1.3
+                default_value: None,
+            }
+        })
+        .collect()
 }
 
 /// Pass 1: Scan expressions for `Compare($var, column)` patterns and record
