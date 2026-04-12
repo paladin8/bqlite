@@ -52,5 +52,11 @@ pub use storage::{
     ScanPredicate, SegmentHandle, SegmentReader, SegmentScan, ZoneMap,
 };
 
+pub mod scalar;
+pub use scalar::ScalarValue;
+
+pub mod aggregate;
+pub use aggregate::AggFunction;
+
 pub mod catalog;
 pub use catalog::Catalog;
