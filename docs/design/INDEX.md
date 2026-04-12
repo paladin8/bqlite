@@ -32,6 +32,7 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 
 - **planner/logical-plan-nodes.md** — authoritative enumeration of logical plan nodes across all waves, with Wave 2 depth nodes (Scan, Filter, Project, Limit, DDL/DML, Explain) fully specified and later-wave nodes stubbed so the catalog doesn't churn (TASK-204, Wave 2)
 - **planner/expression-compilation.md** — two-stage expression pipeline (`Expr → TypedExpr → CompiledExpr`), type-check rules, kernel-selection between Arrow compute and monomorphized fast paths, null propagation, scalar function registry, predicate-pushdown integration (TASK-205, Wave 2)
+- **planner/wave3-lowering.md** — AST→logical lowering rules for Match/Stats/OrderBy/Distinct, `DemandSet` type definition, backward demand propagation algorithm, step-property resolution, fusion setup protocol, schema validation rules for step references and variable bindings through aggregates (TASK-309, Wave 3)
 
 ### Storage
 
