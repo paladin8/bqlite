@@ -266,6 +266,22 @@ impl KWayMergeScan {
         if self.exhausted {
             return Ok(None);
         }
+
+        // TASK-247: single-scan fast path. When there is exactly one
+        // input scan (the common case for a freshly ingested table
+        // before compaction) and the batch target is at least as
+        // large as the default row-group size, bypass the comparison
+        // / interleave machinery entirely and pass row-group batches
+        // through unchanged. This avoids the O(rows) interleave copy
+        // and the per-row pick_smallest overhead.
+        //
+        // The batch_target_rows guard ensures callers that explicitly
+        // request smaller batches (e.g. tests with batch_size=2)
+        // still get correct splitting through the standard path.
+        if self.scans.len() == 1 && self.batch_target_rows >= DEFAULT_MERGE_BATCH_ROWS {
+            return self.next_batch_single();
+        }
+
         self.reload_needed_batches()?;
         if self.all_scans_done() {
             self.exhausted = true;
@@ -319,6 +335,40 @@ impl KWayMergeScan {
         }
 
         Ok(Some(out_batch))
+    }
+
+    /// Single-scan fast path: yield row-group batches directly from
+    /// the only input scan without interleave or comparison overhead.
+    fn next_batch_single(&mut self) -> Result<Option<RecordBatch>> {
+        let state = &mut self.scans[0];
+        if state.scan_exhausted {
+            self.exhausted = true;
+            return Ok(None);
+        }
+        loop {
+            match state.scan.next_row_group()? {
+                Some(batch) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    // Validate the schema on every batch to honour the
+                    // same invariant the k-way path enforces in
+                    // `reload_needed_batches`.
+                    if batch.schema() != self.schema {
+                        return Err(BqliteError::Execution(
+                            "k-way merge: scan 0's batch schema does not match the merge schema"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(Some(batch));
+                }
+                None => {
+                    state.scan_exhausted = true;
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+            }
+        }
     }
 
     /// Fill every scan's `batch` slot if it is currently empty.
