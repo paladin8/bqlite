@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-305",
   "claimed_at": "2026-04-12T09:08:08Z",
+  "completed_at": "2026-04-12T10:15:00Z",
   "branch": "task/TASK-305",
   "description": "Step counter fast path"
 }
