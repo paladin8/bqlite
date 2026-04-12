@@ -240,6 +240,7 @@ pub fn fuse_match_aggregate(plan: PhysicalPlan) -> PhysicalPlan {
             let SequenceMatchPhysical {
                 compiled_nfa,
                 strategy,
+                match_all,
                 demand,
                 execution_config,
                 fused_aggregate,
@@ -249,6 +250,7 @@ pub fn fuse_match_aggregate(plan: PhysicalPlan) -> PhysicalPlan {
             PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
                 compiled_nfa,
                 strategy,
+                match_all,
                 demand,
                 execution_config,
                 fused_aggregate, // preserved — do not re-fuse a node already handled
@@ -434,6 +436,7 @@ mod tests {
         Box::new(SequenceMatchPhysical {
             compiled_nfa: minimal_nfa(true),
             strategy: MatchStrategy::StepCounter,
+            match_all: false,
             demand: DemandSet::default(),
             execution_config: MatchExecutionConfig::default(),
             fused_aggregate: None,

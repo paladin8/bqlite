@@ -218,6 +218,7 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
             let SequenceMatchPhysical {
                 compiled_nfa,
                 strategy,
+                match_all,
                 demand: seq_demand,
                 execution_config,
                 fused_aggregate,
@@ -234,6 +235,7 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
             PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
                 compiled_nfa,
                 strategy,
+                match_all,
                 demand: seq_demand,
                 execution_config,
                 fused_aggregate,

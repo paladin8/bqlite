@@ -1,4 +1,5 @@
-//! Sequence matcher module — NFA runtime, step counter, and variable bindings.
+//! Sequence matcher module — NFA runtime, step counter, variable bindings,
+//! and the top-level `SequenceMatchOperator`.
 //!
 //! This module tree implements the per-event simulation engine that
 //! evaluates MATCH pipeline stages. The compiled NFA program
@@ -10,7 +11,680 @@
 //! - [`nfa`] — General-path NFA runtime simulator (TASK-304). Thompson's
 //!   algorithm with candidate-deque propagation, poison transitions,
 //!   global time-window enforcement, and EMIT ALL support.
+//! - [`step_counter`] — Step counter fast path for linear patterns (TASK-305).
+//! - [`bindings`] — Variable binding tracks and extraction (TASK-306).
+//! - [`output`] — Arrow `RecordBatch` construction from match results.
+//!
+//! ## `SequenceMatchOperator` (TASK-321)
+//!
+//! The top-level `EntityOperator` implementation that ties together the
+//! NFA simulator, step counter, and variable bindings into a single
+//! operator driven by the engine's entity-aligned sub-batch protocol.
 
 pub mod bindings;
 pub mod nfa;
+pub mod output;
 pub mod step_counter;
+
+use arrow::record_batch::RecordBatch;
+
+use bqlite_core::{EntityId, OperatorSchema};
+use bqlite_planner::compile::{CompiledNfa, MatchStrategy};
+use bqlite_planner::demand::CompiledFusableAggregate;
+use bqlite_planner::physical::SequenceMatchPhysical;
+
+use crate::aggregate::Accumulator;
+use crate::operator::EntityOperator;
+
+use self::bindings::EntityBindingState;
+use self::nfa::{MatchCompletion, NfaSimulator, PartialMatch};
+use self::output::build_output_batch;
+use self::step_counter::StepCounterSimulator;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SequenceMatchOperator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Physical `EntityOperator` for MATCH pipeline stages.
+///
+/// Constructed from a [`SequenceMatchPhysical`] descriptor by the engine
+/// bind step (TASK-323). Dispatches between the step counter fast path
+/// and the full NFA simulator based on the pattern classification and
+/// downstream demand determined at plan time.
+///
+/// See `docs/design/operators/match-operator.md` for the full spec.
+#[derive(Debug)]
+pub struct SequenceMatchOperator {
+    /// The execution strategy driver.
+    strategy: StrategyDriver,
+    /// Whether this is MATCH ALL mode (reset on match, keep scanning).
+    /// Passed to the simulator at construction; retained for diagnostics
+    /// and future use by the engine bind step.
+    #[allow(dead_code)]
+    match_all: bool,
+    /// Whether EMIT ALL is enabled (emit partials at entity end).
+    emit_all: bool,
+    /// Number of pattern steps (= accept state index).
+    num_steps: u8,
+    /// Output schema for the operator's results.
+    output_schema: OperatorSchema,
+    /// Column names required from the input batch.
+    required_column_names: Vec<String>,
+    /// Number of variable bindings (0 for no-binding patterns).
+    num_variables: usize,
+    /// Fused aggregate descriptor (if match-aggregate fusion is active).
+    _fused_aggregate: Option<CompiledFusableAggregate>,
+}
+
+/// The underlying strategy driver selected at plan time.
+#[derive(Debug)]
+enum StrategyDriver {
+    /// Step counter fast path for linear patterns.
+    StepCounter(StepCounterSimulator),
+    /// Full NFA simulator for general patterns or match-detail demand.
+    Nfa(NfaSimulator),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Construction
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl SequenceMatchOperator {
+    /// Construct from a physical plan descriptor.
+    ///
+    /// The descriptor is produced by the physical planner and carried on
+    /// [`SequenceMatchPhysical`]. This constructor resolves column indices,
+    /// selects the strategy, and freezes configuration.
+    pub fn new(desc: &SequenceMatchPhysical) -> Self {
+        let match_all = desc.match_all;
+        let emit_all = desc.compiled_nfa.emit_all;
+        let num_steps = desc.compiled_nfa.accept_state as u8;
+        let num_variables = desc.compiled_nfa.variable_bindings.len();
+
+        // Build required column names from the NFA's relevant event types
+        // and variable bindings. At minimum we need entity_id, ts, event_type.
+        let mut required_column_names = vec![
+            "entity_id".to_string(),
+            "ts".to_string(),
+            "event_type".to_string(),
+        ];
+        // Add columns referenced by variable bindings.
+        for vb in &desc.compiled_nfa.variable_bindings {
+            if !required_column_names.contains(&vb.source_column) {
+                required_column_names.push(vb.source_column.clone());
+            }
+        }
+
+        let strategy = Self::build_strategy(
+            desc.compiled_nfa.clone(),
+            desc.strategy,
+            &desc.execution_config,
+            match_all,
+        );
+
+        Self {
+            strategy,
+            match_all,
+            emit_all,
+            num_steps,
+            output_schema: desc.output_schema.clone(),
+            required_column_names,
+            num_variables,
+            _fused_aggregate: desc.fused_aggregate.clone(),
+        }
+    }
+
+    /// Construct from a pre-built `CompiledNfa` and configuration.
+    ///
+    /// Convenience constructor for tests and direct usage without a full
+    /// physical plan descriptor.
+    pub fn from_compiled_nfa(
+        compiled_nfa: CompiledNfa,
+        match_all: bool,
+        output_schema: OperatorSchema,
+    ) -> Self {
+        let emit_all = compiled_nfa.emit_all;
+        let num_steps = compiled_nfa.accept_state as u8;
+        let num_variables = compiled_nfa.variable_bindings.len();
+        let exec_config = bqlite_planner::compile::MatchExecutionConfig::default();
+
+        let strategy_kind =
+            bqlite_planner::compile::select_strategy(compiled_nfa.pattern_class, &exec_config);
+
+        let mut required_column_names = vec![
+            "entity_id".to_string(),
+            "ts".to_string(),
+            "event_type".to_string(),
+        ];
+        for vb in &compiled_nfa.variable_bindings {
+            if !required_column_names.contains(&vb.source_column) {
+                required_column_names.push(vb.source_column.clone());
+            }
+        }
+
+        let strategy = Self::build_strategy(compiled_nfa, strategy_kind, &exec_config, match_all);
+
+        Self {
+            strategy,
+            match_all,
+            emit_all,
+            num_steps,
+            output_schema,
+            required_column_names,
+            num_variables,
+            _fused_aggregate: None,
+        }
+    }
+
+    fn build_strategy(
+        compiled_nfa: CompiledNfa,
+        strategy_kind: MatchStrategy,
+        _exec_config: &bqlite_planner::compile::MatchExecutionConfig,
+        match_all: bool,
+    ) -> StrategyDriver {
+        match strategy_kind {
+            MatchStrategy::StepCounter => {
+                StrategyDriver::StepCounter(StepCounterSimulator::new(compiled_nfa, match_all))
+            }
+            MatchStrategy::ConsecutiveMatcher => {
+                // ConsecutiveMatcher uses the step counter with the same
+                // interface — the consecutive constraint is encoded in the
+                // NFA transitions (IMMEDIATELY transitions require
+                // `last_step_ts + 1 == event_ts`). For now, route through
+                // the step counter.
+                StrategyDriver::StepCounter(StepCounterSimulator::new(compiled_nfa, match_all))
+            }
+            MatchStrategy::FullNfa => {
+                StrategyDriver::Nfa(NfaSimulator::new(compiled_nfa, match_all))
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-entity state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-entity mutable state. Variant selected at plan time based on
+/// [`PatternClass`] and demand (match-operator.md §4.1).
+pub enum SequenceMatchState {
+    /// Step counter fast path for linear patterns.
+    /// Boxed because `StepCounterState` (~496 bytes) is significantly
+    /// larger than the NFA variants; boxing keeps the enum at pointer
+    /// size for the non-step-counter paths.
+    StepCounter(Box<step_counter::StepCounterState>),
+    /// Full NFA with binding tracks for general patterns or when variable
+    /// bindings are present.
+    NfaWithBindings(EntityBindingState),
+    /// Full NFA without binding tracks (single default track).
+    NfaSingle(nfa::EntityNfaState),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EntityOperator implementation
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl EntityOperator for SequenceMatchOperator {
+    type State = SequenceMatchState;
+
+    fn create_state(&self, _entity_id: &EntityId) -> Self::State {
+        match &self.strategy {
+            StrategyDriver::StepCounter(sim) => {
+                SequenceMatchState::StepCounter(Box::new(sim.create_state()))
+            }
+            StrategyDriver::Nfa(sim) => {
+                if self.num_variables > 0 {
+                    SequenceMatchState::NfaWithBindings(EntityBindingState::new(
+                        self.num_variables,
+                        sim.nfa().states.len(),
+                    ))
+                } else {
+                    SequenceMatchState::NfaSingle(sim.create_state())
+                }
+            }
+        }
+    }
+
+    fn output_schema(&self) -> &OperatorSchema {
+        &self.output_schema
+    }
+
+    fn process_sub_batch(&self, state: &mut Self::State, batch: &RecordBatch) {
+        match (state, &self.strategy) {
+            (SequenceMatchState::StepCounter(sc_state), StrategyDriver::StepCounter(sim)) => {
+                sim.process_batch(sc_state, batch, "event_type", "ts");
+            }
+            (SequenceMatchState::NfaSingle(nfa_state), StrategyDriver::Nfa(sim)) => {
+                sim.process_batch(nfa_state, batch, "event_type", "ts");
+            }
+            (SequenceMatchState::NfaWithBindings(binding_state), StrategyDriver::Nfa(sim)) => {
+                sim.process_batch_with_bindings(binding_state, batch, "event_type", "ts");
+            }
+            _ => {
+                // State/strategy mismatch — programming error.
+                debug_assert!(false, "state/strategy variant mismatch");
+            }
+        }
+    }
+
+    fn finish_entity(&self, state: Self::State) -> Option<RecordBatch> {
+        let (completions, partials, _dropped_count) = self.finalize_state(state);
+
+        if completions.is_empty() && partials.is_empty() {
+            return None;
+        }
+
+        Some(build_output_batch(
+            &self.output_schema,
+            &completions,
+            &partials,
+            self.emit_all,
+            self.num_steps,
+        ))
+    }
+
+    fn finish_entity_into(
+        &self,
+        state: Self::State,
+        accumulator: &mut dyn Accumulator,
+    ) -> bqlite_core::Result<()> {
+        // Default path: materialize and feed into accumulator.
+        if let Some(batch) = self.finish_entity(state) {
+            accumulator.update_batch(&batch)?;
+        }
+        Ok(())
+    }
+
+    fn required_columns(&self) -> &[String] {
+        &self.required_column_names
+    }
+}
+
+impl SequenceMatchOperator {
+    /// Finalize per-entity state, collecting completions and partials.
+    ///
+    /// Returns `(completions, partials, dropped_count)`.
+    fn finalize_state(
+        &self,
+        state: SequenceMatchState,
+    ) -> (Vec<MatchCompletion>, Vec<PartialMatch>, u64) {
+        match (state, &self.strategy) {
+            (SequenceMatchState::StepCounter(mut sc_state), StrategyDriver::StepCounter(sim)) => {
+                sim.finish_entity(&mut sc_state);
+                let completions = sc_state.completions().to_vec();
+                let partials = sc_state.partials().to_vec();
+                let dropped = sc_state.dropped_count();
+                (completions, partials, dropped)
+            }
+            (SequenceMatchState::NfaSingle(nfa_state), StrategyDriver::Nfa(_sim)) => {
+                let dropped = nfa_state.dropped_count();
+                let final_state = _sim.finish_entity(nfa_state);
+                let completions = final_state.completions().to_vec();
+                let partials = final_state.partials().to_vec();
+                (completions, partials, dropped)
+            }
+            (SequenceMatchState::NfaWithBindings(mut binding_state), StrategyDriver::Nfa(sim)) => {
+                let mut completions = Vec::new();
+                let mut partials = Vec::new();
+                let mut total_dropped: u64 = binding_state.dropped_track_count();
+
+                for (_key, completion) in binding_state.all_completions() {
+                    completions.push(completion);
+                }
+
+                // Collect already-emitted partials (from window expiry).
+                for (_key, partial) in binding_state.all_partials() {
+                    if self.emit_all {
+                        partials.push(partial);
+                    }
+                }
+
+                // Drain remaining in-progress candidates as partials
+                // (EMIT ALL at entity end per match-operator.md §6.3).
+                // Must finish each track's NFA state to convert active
+                // candidates into partial matches.
+                for track in binding_state.tracks_mut() {
+                    total_dropped += track.nfa_state.dropped_count();
+                    if self.emit_all {
+                        let final_state = sim.finish_entity(std::mem::replace(
+                            &mut track.nfa_state,
+                            nfa::EntityNfaState::new(0),
+                        ));
+                        for partial in final_state.partials() {
+                            partials.push(*partial);
+                        }
+                    }
+                }
+
+                (completions, partials, total_dropped)
+            }
+            _ => {
+                debug_assert!(false, "state/strategy variant mismatch");
+                (Vec::new(), Vec::new(), 0)
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringViewArray};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::record_batch::RecordBatch;
+
+    use bqlite_core::{BqlType, ColumnDef};
+    use bqlite_planner::compile::{CompiledNfa, NfaState, PatternClass, Transition};
+
+    /// Helper: build a simple RecordBatch with event_type and ts columns.
+    fn make_batch(events: &[(&str, i64)]) -> RecordBatch {
+        let event_types: Vec<&str> = events.iter().map(|(e, _)| *e).collect();
+        let timestamps: Vec<i64> = events.iter().map(|(_, t)| *t).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("event_type", DataType::Utf8View, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringViewArray::from(event_types)),
+                Arc::new(Int64Array::from(timestamps)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Build a minimal NFA for a linear pattern: A THEN B THEN C.
+    fn linear_nfa(steps: &[&str]) -> CompiledNfa {
+        let num_steps = steps.len();
+        let mut states = Vec::with_capacity(num_steps + 1);
+        let mut relevant = BTreeSet::new();
+
+        for (i, &event_type) in steps.iter().enumerate() {
+            relevant.insert(event_type.to_string());
+            states.push(NfaState {
+                transitions: vec![Transition {
+                    event_type: event_type.to_string(),
+                    predicates: Vec::new(),
+                    bind_variables: Vec::new(),
+                    check_variables: Vec::new(),
+                    target: (i + 1) as u16,
+                }],
+                poison_transitions: Vec::new(),
+            });
+        }
+        // Accept state.
+        states.push(NfaState {
+            transitions: Vec::new(),
+            poison_transitions: Vec::new(),
+        });
+
+        let state_to_step: Vec<u8> = (0..=num_steps as u8).collect();
+
+        CompiledNfa {
+            states,
+            accept_state: num_steps as u16,
+            relevant_event_types: relevant,
+            pattern_class: PatternClass::LinearSimple,
+            variable_bindings: Vec::new(),
+            global_window: None,
+            emit_all: false,
+            state_to_step,
+        }
+    }
+
+    fn match_output_schema() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef {
+                name: "entity_id".into(),
+                bql_type: BqlType::String,
+                nullable: false,
+                default_value: None,
+            },
+            ColumnDef {
+                name: "match_duration".into(),
+                bql_type: BqlType::Int,
+                nullable: true,
+                default_value: None,
+            },
+        ])
+        .unwrap()
+    }
+
+    fn emit_all_schema() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef {
+                name: "entity_id".into(),
+                bql_type: BqlType::String,
+                nullable: false,
+                default_value: None,
+            },
+            ColumnDef {
+                name: "step_reached".into(),
+                bql_type: BqlType::Int,
+                nullable: false,
+                default_value: None,
+            },
+        ])
+        .unwrap()
+    }
+
+    // ── Basic match tests ────────────────────────────────────────────
+
+    #[test]
+    fn simple_match_first_completes() {
+        let nfa = linear_nfa(&["signup", "purchase"]);
+        let op = SequenceMatchOperator::from_compiled_nfa(
+            nfa,
+            false, // MATCH FIRST
+            match_output_schema(),
+        );
+
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+
+        let batch = make_batch(&[("signup", 100), ("view", 200), ("purchase", 300)]);
+        op.process_sub_batch(&mut state, &batch);
+
+        let result = op.finish_entity(state);
+        assert!(result.is_some());
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // match_duration = 300 - 100 = 200
+        let durations = batch
+            .column_by_name("match_duration")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(durations.value(0), 200);
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        let nfa = linear_nfa(&["signup", "purchase"]);
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, match_output_schema());
+
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+
+        let batch = make_batch(&[
+            ("signup", 100),
+            ("view", 200),
+            // No purchase event.
+        ]);
+        op.process_sub_batch(&mut state, &batch);
+
+        let result = op.finish_entity(state);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn match_all_returns_multiple() {
+        let nfa = linear_nfa(&["signup", "purchase"]);
+        let op = SequenceMatchOperator::from_compiled_nfa(
+            nfa,
+            true, // MATCH ALL
+            match_output_schema(),
+        );
+
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+
+        let batch = make_batch(&[
+            ("signup", 100),
+            ("purchase", 200),
+            ("signup", 300),
+            ("purchase", 400),
+        ]);
+        op.process_sub_batch(&mut state, &batch);
+
+        let result = op.finish_entity(state);
+        assert!(result.is_some());
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn match_across_sub_batches() {
+        let nfa = linear_nfa(&["signup", "purchase"]);
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, match_output_schema());
+
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+
+        // First sub-batch: step 1.
+        let batch1 = make_batch(&[("signup", 100)]);
+        op.process_sub_batch(&mut state, &batch1);
+
+        // Second sub-batch: step 2.
+        let batch2 = make_batch(&[("purchase", 300)]);
+        op.process_sub_batch(&mut state, &batch2);
+
+        let result = op.finish_entity(state);
+        assert!(result.is_some());
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let durations = batch
+            .column_by_name("match_duration")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(durations.value(0), 200);
+    }
+
+    #[test]
+    fn emit_all_includes_partials() {
+        let mut nfa = linear_nfa(&["signup", "purchase", "activate"]);
+        nfa.emit_all = true;
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, emit_all_schema());
+
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+
+        // Only completes 2 of 3 steps.
+        let batch = make_batch(&[("signup", 100), ("purchase", 200)]);
+        op.process_sub_batch(&mut state, &batch);
+
+        let result = op.finish_entity(state);
+        assert!(result.is_some());
+        let batch = result.unwrap();
+        // Should have exactly one partial match row.
+        assert_eq!(batch.num_rows(), 1);
+
+        let steps = batch
+            .column_by_name("step_reached")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // step_reached is 1-indexed: reaching step 2 of 3 → step_reached = 2.
+        assert_eq!(steps.value(0), 2);
+    }
+
+    #[test]
+    fn three_step_match_with_window() {
+        let mut nfa = linear_nfa(&["signup", "activate", "purchase"]);
+        nfa.global_window = Some(1000); // 1000 ns window
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, match_output_schema());
+
+        let entity = EntityId::String("user1".into());
+
+        // Within window.
+        let mut state = op.create_state(&entity);
+        let batch = make_batch(&[("signup", 100), ("activate", 500), ("purchase", 900)]);
+        op.process_sub_batch(&mut state, &batch);
+        let result = op.finish_entity(state);
+        assert!(result.is_some());
+
+        // Outside window.
+        let mut state2 = op.create_state(&entity);
+        let batch2 = make_batch(&[("signup", 100), ("activate", 500), ("purchase", 1200)]);
+        op.process_sub_batch(&mut state2, &batch2);
+        let result2 = op.finish_entity(state2);
+        assert!(result2.is_none());
+    }
+
+    #[test]
+    fn empty_batch_no_panic() {
+        let nfa = linear_nfa(&["signup", "purchase"]);
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, match_output_schema());
+
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+
+        let batch = make_batch(&[]);
+        op.process_sub_batch(&mut state, &batch);
+
+        let result = op.finish_entity(state);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn nfa_strategy_simple_match() {
+        let mut nfa = linear_nfa(&["signup", "purchase"]);
+        // Force GeneralNfa to test the NFA path.
+        nfa.pattern_class = PatternClass::GeneralNfa;
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, match_output_schema());
+
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+
+        let batch = make_batch(&[("signup", 100), ("purchase", 200)]);
+        op.process_sub_batch(&mut state, &batch);
+
+        let result = op.finish_entity(state);
+        assert!(result.is_some());
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn required_columns_includes_basics() {
+        let nfa = linear_nfa(&["signup", "purchase"]);
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, match_output_schema());
+
+        let cols = op.required_columns();
+        assert!(cols.contains(&"entity_id".to_string()));
+        assert!(cols.contains(&"ts".to_string()));
+        assert!(cols.contains(&"event_type".to_string()));
+    }
+
+    #[test]
+    fn output_schema_matches() {
+        let nfa = linear_nfa(&["signup", "purchase"]);
+        let schema = match_output_schema();
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, schema.clone());
+        assert_eq!(op.output_schema().columns().len(), schema.columns().len());
+    }
+}

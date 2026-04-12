@@ -418,6 +418,11 @@ pub struct SequenceMatchPhysical {
     pub compiled_nfa: CompiledNfa,
     /// Execution strategy selected by `select_strategy(pattern_class, config)`.
     pub strategy: MatchStrategy,
+    /// Whether to reset and continue after each match (MATCH ALL) or
+    /// stop after the first match per binding track (MATCH FIRST).
+    /// Derived from `MatchMode::All` vs `MatchMode::First` during
+    /// physical lowering. `emit_all` is already on `CompiledNfa`.
+    pub match_all: bool,
     /// Downstream demand set populated by demand analysis (Pass 4).
     /// Drives column pruning and step-property forwarding.
     pub demand: crate::demand::DemandSet,
@@ -444,6 +449,7 @@ pub struct SequenceMatchPhysical {
 impl PartialEq for SequenceMatchPhysical {
     fn eq(&self, other: &Self) -> bool {
         self.strategy == other.strategy
+            && self.match_all == other.match_all
             && self.execution_config == other.execution_config
             && self.demand == other.demand
             && self.fused_aggregate == other.fused_aggregate
@@ -695,7 +701,7 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
         // ── Wave 3 variants ────────────────────────────────────────────
         LogicalPlan::SequenceMatch {
             pattern,
-            mode: _,
+            mode,
             emit_all: _,
             window: _,
             brackets: _,
@@ -772,9 +778,12 @@ pub fn lower_physical(plan: LogicalPlan) -> PhysicalPlan {
                 });
 
             let child = lower_physical(*input);
+            let match_all = mode == bqlite_ast::pattern::MatchMode::All;
+
             PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
                 compiled_nfa,
                 strategy,
+                match_all,
                 demand,
                 execution_config,
                 fused_aggregate,

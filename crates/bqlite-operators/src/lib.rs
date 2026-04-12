@@ -68,6 +68,7 @@ pub use aggregate::{
 pub use distinct::DistinctOperator;
 pub use filter::FilterOperator;
 pub use limit::LimitOperator;
+pub use matcher::SequenceMatchOperator;
 pub use operator::{
     CancellationToken, EntityOperator, PhysicalOperator, DEFAULT_OUTPUT_BATCH_SIZE,
 };
