@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-315",
+  "claimed_at": "2026-04-12T07:15:13Z",
+  "branch": "task/TASK-315",
+  "description": "Parser ORDER BY stage + SORT alias"
+}
