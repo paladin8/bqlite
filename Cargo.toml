@@ -33,6 +33,7 @@ bqlite-engine = { path = "crates/bqlite-engine" }
 bqlite-ffi = { path = "crates/bqlite-ffi" }
 
 # External dependencies
+ahash = "0.8"
 arrow = "54"
 thiserror = "2"
 anyhow = "1"

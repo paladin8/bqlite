@@ -10,6 +10,7 @@ repository.workspace = true
 bqlite-core = { workspace = true }
 bqlite-storage = { workspace = true }
 bqlite-planner = { workspace = true }
+ahash = { workspace = true }
 arrow = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }

@@ -13,6 +13,8 @@
 //! - **cohort**: behavioral cohort materializer
 //! - **paths**: Sankey-style path aggregation
 //! - **limit**: row-count cutoff with early child termination
+//! - **sort**: in-memory pipeline sort (materializes all input, applies Arrow lexsort)
+//! - **distinct**: streaming hash-set deduplication (first-occurrence rows only)
 //!
 //! ## Trait surface
 //!
@@ -49,6 +51,7 @@
 //! [`bqlite_planner::compiled::CompiledExpr`].
 
 pub mod aggregate;
+pub mod distinct;
 pub mod eval;
 pub mod filter;
 pub mod limit;
@@ -56,13 +59,18 @@ pub mod matcher;
 pub mod operator;
 pub mod project;
 pub mod scan;
+pub mod sort;
 
 pub use aggregate::{
     Accumulator, AggState, GroupKey, HashAccumulator, HashAggregateOperator, SumState,
     DEFAULT_MAX_GROUPS,
 };
+pub use distinct::DistinctOperator;
 pub use filter::FilterOperator;
 pub use limit::LimitOperator;
-pub use operator::{CancellationToken, EntityOperator, PhysicalOperator};
+pub use operator::{
+    CancellationToken, EntityOperator, PhysicalOperator, DEFAULT_OUTPUT_BATCH_SIZE,
+};
 pub use project::ProjectOperator;
 pub use scan::ScanOperator;
+pub use sort::SortOperator;

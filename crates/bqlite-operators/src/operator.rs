@@ -50,6 +50,18 @@ use arrow::record_batch::RecordBatch;
 use bqlite_core::{DemandCapabilities, EntityId, OperatorSchema, Result};
 
 // ---------------------------------------------------------------------------
+// Pipeline-wide constants
+// ---------------------------------------------------------------------------
+
+/// Default output batch size for operators that split a large materialized
+/// result into pipeline-friendly chunks (e.g. `SortOperator`).
+///
+/// 65,536 rows is the pipeline-wide default from `execution-model.md §4.2`.
+/// Operators must reference this constant by name — not hardcode the integer
+/// — so that the value can be changed in one place.
+pub const DEFAULT_OUTPUT_BATCH_SIZE: usize = 65_536;
+
+// ---------------------------------------------------------------------------
 // CancellationToken
 // ---------------------------------------------------------------------------
 
