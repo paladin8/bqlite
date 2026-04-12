@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-320",
   "claimed_at": "2026-04-12T09:15:30Z",
+  "completed_at": "2026-04-12T10:42:00Z",
   "branch": "task/TASK-320",
   "description": "Match-aggregate fusion optimizer pass"
 }
