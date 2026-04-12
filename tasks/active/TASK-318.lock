@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-318",
+  "claimed_at": "2026-04-12T08:33:20Z",
+  "branch": "task/TASK-318",
+  "description": "AST \u2192 logical lowering + logical \u2192 physical lowering for Wave 3"
+}
