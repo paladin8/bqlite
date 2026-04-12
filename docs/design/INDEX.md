@@ -19,6 +19,7 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 ### Operators
 
 - **operators/operator-traits.md** — `PhysicalOperator` + `EntityOperator` trait surface, lifecycle, cancellation, sub-batch streaming (TASK-108, Wave 1)
+- **operators/match-operator.md** — MATCH operator architecture: state layout, EntityOperator integration, output schema, emission points, active-state cap, demand-driven column reduction (TASK-301, Wave 3)
 - **operators/sort-distinct.md** — `SortOperator` + `DistinctOperator` contracts: physical descriptors, key compilation, null-ordering rules, hard-cap overflow policy, plan-tree placement, no-spill rationale (TASK-310, Wave 3)
 
 ### Language
