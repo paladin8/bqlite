@@ -58,6 +58,7 @@ mod error;
 mod expr;
 mod lex;
 mod parser;
+mod pattern;
 mod pipeline;
 
 use bqlite_ast::Statement;

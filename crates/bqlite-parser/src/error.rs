@@ -121,6 +121,11 @@ pub enum Expected {
     PipelineStage,
     /// A column definition inside `CREATE TABLE (...)`.
     ColumnDef,
+    /// An event reference: `event_name` or `table.event_name`.
+    EventRef,
+    /// The end of the match-modifier sequence; signals an out-of-order
+    /// modifier (e.g. `WITHIN` appearing after `EMIT ALL`).
+    EndOfModifiers,
     /// End of input (no more tokens).
     Eof,
 }
@@ -138,6 +143,8 @@ impl fmt::Display for Expected {
             Self::Expression => f.write_str("expression"),
             Self::PipelineStage => f.write_str("pipeline stage"),
             Self::ColumnDef => f.write_str("column definition"),
+            Self::EventRef => f.write_str("event reference"),
+            Self::EndOfModifiers => f.write_str("end of match modifiers"),
             Self::Eof => f.write_str("end of input"),
         }
     }
