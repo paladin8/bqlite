@@ -46,7 +46,10 @@
 
 use std::collections::HashMap;
 
+use bqlite_core::storage::ScanPredicate;
 use bqlite_core::{Predicate, Result, SegmentScan, ZoneMap};
+
+use crate::segment::layout::RowGroupIndex;
 
 /// Decide whether a single row group should be decoded given its
 /// zone maps and a predicate.
@@ -131,6 +134,60 @@ pub fn surviving_row_groups(
         }
     }
     Ok(survivors)
+}
+
+/// Evaluate a [`ScanPredicate`] directly against a row-group's footer
+/// metadata, avoiding the [`HashMap`] allocation that the
+/// trait-based [`should_decode_row_group`] path requires.
+///
+/// This is the performance-critical pruning entry point used by
+/// `SegmentFileScan::next_row_group` (TASK-247). For every conjunct
+/// in the predicate, it finds the matching column's
+/// [`ColumnChunkMeta`] by name (using the write-time schema to map
+/// `column_ordinal` → name), constructs an ephemeral [`ZoneMap`] on
+/// the stack, and calls `accepts_zone`. A conjunct whose column is
+/// absent from the row-group's metadata is conservatively accepted
+/// (per `predicate-pushdown.md` §6).
+///
+/// Returns `true` iff every conjunct accepts the row-group — same
+/// semantics as [`accepts_row_group`], but without allocating.
+#[inline]
+pub fn accepts_row_group_inline(
+    predicate: &ScanPredicate,
+    rg: &RowGroupIndex,
+    schema_columns: &[bqlite_core::ColumnDef],
+) -> bool {
+    if predicate.conjuncts.is_empty() {
+        return true;
+    }
+    predicate.conjuncts.iter().all(|conj| {
+        let col_name = conj.column();
+        // Find the column chunk whose write-time schema name matches.
+        let meta = rg.columns.iter().find(|cc| {
+            schema_columns
+                .get(cc.column_ordinal as usize)
+                .is_some_and(|c| c.name == col_name)
+        });
+        match meta {
+            Some(cc) => {
+                // Build an ephemeral ZoneMap on the stack. The min/max
+                // Option<PropertyValue> clones are cheap for Int/Float
+                // (Copy-sized) and slightly less so for String (heap
+                // alloc). Even for String columns, this is far cheaper
+                // than the old path which allocated a full HashMap plus
+                // cloned *every* column's zone bounds.
+                conj.accepts_zone(&ZoneMap {
+                    min: cc.zone_min.as_ref().cloned(),
+                    max: cc.zone_max.as_ref().cloned(),
+                    null_count: cc.null_count,
+                    row_count: rg.row_count,
+                })
+            }
+            // Column absent from this row-group's metadata →
+            // conservative accept (schema evolution, §9).
+            None => true,
+        }
+    })
 }
 
 #[cfg(test)]

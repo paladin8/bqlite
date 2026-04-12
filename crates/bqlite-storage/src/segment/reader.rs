@@ -492,29 +492,39 @@ impl SegmentScan for SegmentFileScan {
             let idx = self.next_idx;
             self.next_idx += 1;
 
-            // Predicate pruning — delegated to the crate-local
-            // `zone_map` module, which wraps
-            // `Predicate::accepts_zone_group` (the Wave 2
-            // multi-column pruning entry point). Per
-            // `docs/design/storage/predicate-pushdown.md` §6, the
-            // multi-column form is strictly preferred over the
-            // per-column `accepts_zone` loop we used previously — it
-            // is the only shape where conjuncts on columns *absent*
-            // from the row-group's zone map (schema evolution,
-            // all-null columns) are handled correctly.
+            // Predicate pruning — two paths (TASK-247):
             //
-            // `should_decode_row_group` owns the full three-step
-            // decision — referenced-columns short-circuit, zone-map
-            // load, predicate evaluation — so the reader's hot path
-            // stays focused on iteration bookkeeping.
+            // 1. **Inline fast path:** when the predicate downcasts
+            //    to a concrete `ScanPredicate` (pointer comparison,
+            //    effectively free), evaluate conjuncts directly
+            //    against the footer's `ColumnChunkMeta` zone-map
+            //    fields without constructing a `HashMap`. This avoids
+            //    a heap allocation per row-group and is the common
+            //    production path (the scan operator always wraps a
+            //    `ScanPredicate`).
+            //
+            // 2. **Trait fallback:** for any other `Predicate` impl
+            //    (tests, future custom predicates), delegate to the
+            //    original `zone_map::should_decode_row_group` which
+            //    builds the `HashMap` and calls the trait method.
             if let Some(pred) = &self.predicate {
-                let scan: &dyn SegmentScan = &*self;
-                if !crate::zone_map::should_decode_row_group(scan, &**pred, idx)? {
-                    // Per the trait: "Implementations may return
-                    // `Ok(None)` early if they know every remaining
-                    // row-group is pruned." We can't assume that in
-                    // general, so we just skip this one and continue.
-                    continue;
+                if let Some(sp) = pred
+                    .as_any()
+                    .downcast_ref::<bqlite_core::storage::ScanPredicate>()
+                {
+                    let rg = &self.footer.row_groups[idx];
+                    if !crate::zone_map::accepts_row_group_inline(
+                        sp,
+                        rg,
+                        self.footer.schema.columns(),
+                    ) {
+                        continue;
+                    }
+                } else {
+                    let scan: &dyn SegmentScan = &*self;
+                    if !crate::zone_map::should_decode_row_group(scan, &**pred, idx)? {
+                        continue;
+                    }
                 }
             }
 
@@ -590,7 +600,11 @@ fn decode_column_chunk(
     let mut cursor = 0usize;
 
     // 1. Null bitmap (if the column is nullable).
-    let null_bitmap = if write_time_col.nullable {
+    //
+    // TASK-247: reference the bitmap slice directly from the segment
+    // bytes instead of copying into a Vec. `splice_nulls` already
+    // takes `&[u8]`, so the downstream path is unchanged.
+    let null_bitmap_range = if write_time_col.nullable {
         let bitmap_len = row_group_row_count.div_ceil(8);
         if chunk_bytes.len() < bitmap_len {
             return Err(BqliteError::Corruption(format!(
@@ -601,9 +615,8 @@ fn decode_column_chunk(
                 chunk_bytes.len()
             )));
         }
-        let bitmap = chunk_bytes[..bitmap_len].to_vec();
         cursor += bitmap_len;
-        Some(bitmap)
+        Some(0..bitmap_len)
     } else {
         None
     };
@@ -735,10 +748,10 @@ fn decode_column_chunk(
         dispatch_decode(encoding, &encoded_chunk, &write_time_col.bql_type)?;
 
     // 9. Splice nulls back in (if the column is nullable).
-    if let Some(bitmap) = null_bitmap {
+    if let Some(range) = null_bitmap_range {
         splice_nulls(
             &dense_array,
-            &bitmap,
+            &chunk_bytes[range],
             row_group_row_count,
             &write_time_col.bql_type,
         )

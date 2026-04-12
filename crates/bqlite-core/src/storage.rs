@@ -313,11 +313,11 @@ pub enum ScanConjunct {
 }
 
 impl ScanConjunct {
-    /// Column name this conjunct filters on. Private accessor used by
-    /// [`ScanPredicate::accepts_zone_group`] and the dictionary
-    /// rewriter to group conjuncts by their target column without
-    /// exposing the match machinery to callers.
-    pub(crate) fn column(&self) -> &str {
+    /// Column name this conjunct filters on. Used by
+    /// [`ScanPredicate::accepts_zone_group`], the dictionary
+    /// rewriter, and inline zone-map evaluation in the storage reader
+    /// (TASK-247) to group conjuncts by their target column.
+    pub fn column(&self) -> &str {
         match self {
             ScanConjunct::Equal { column, .. }
             | ScanConjunct::NotEqual { column, .. }
@@ -340,7 +340,7 @@ impl ScanConjunct {
     /// negatives invariant (no matching row is ever pruned) is what
     /// makes the pruning correct. Every per-variant branch below is
     /// conservative: when in doubt, it accepts.
-    pub(crate) fn accepts_zone(&self, zone: &ZoneMap) -> bool {
+    pub fn accepts_zone(&self, zone: &ZoneMap) -> bool {
         let nulls = zone.null_count;
         let rows = zone.row_count;
         match self {
@@ -549,7 +549,17 @@ impl DictionaryIndex<'_> {
 ///
 /// Implementations are held behind `Arc` so many `SegmentScan`s can
 /// share a single predicate without per-scan cloning.
-pub trait Predicate: Send + Sync + std::fmt::Debug {
+pub trait Predicate: Send + Sync + std::fmt::Debug + 'static {
+    /// Downcast hook for the inline zone-map evaluation fast path
+    /// (TASK-247). Implementors that override this method with
+    /// `self` enable the storage reader to downcast `Arc<dyn
+    /// Predicate>` to a concrete type without changing the trait's
+    /// object-safety story.
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Default: return nothing useful. ScanPredicate overrides.
+        &()
+    }
+
     /// True if the predicate **might** accept at least one row in a
     /// column range described by `zone`.
     ///
@@ -628,6 +638,10 @@ pub trait Predicate: Send + Sync + std::fmt::Debug {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl Predicate for ScanPredicate {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn accepts_zone(&self, column: &str, zone: &ZoneMap) -> bool {
         // Only the conjuncts that reference `column` have anything to
         // say about this zone — conjuncts on other columns are not
