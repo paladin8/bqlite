@@ -43,7 +43,7 @@ Every wave satisfies:
 Every task satisfies:
 
 1. **1-2 days of senior engineer effort.** Tasks larger than this split. Tasks smaller than ~half a day fold into a neighbor.
-2. **Explicit dependencies.** Each task lists its `Depends on:` set. Tasks with no internal deps are the parallelism budget for the wave.
+2. **Explicit dependencies.** Each task lists its `Depends on:` set. Tasks with no internal deps are the parallelism budget for the wave. Dependencies are **intra-wave only** — since waves execute sequentially (Rule 5), every task in a prior wave is guaranteed complete before the current wave starts, so cross-wave edges are redundant and clutter the dependency graph.
 3. **Self-contained checkpoints.** The implementing agent breaks the task into checkpoints per AGENTS.md — compile, test, lint, merge to main.
 4. **Names its key output paths.** Code tasks name the 1-2 primary files they create or substantially modify (not every touched file). Design tasks name the doc path they produce.
 
@@ -744,7 +744,7 @@ Wave 3 is a strategy wave: the design anchors (301, 302, 308, 309, 310) land fir
 
 ### TASK-301: [HARD][DESIGN] MATCH operator architecture
 **Output**: docs/design/operators/match-operator.md
-**Depends on**: TASK-108, TASK-204, TASK-230
+**Depends on**: none
 **Description**: Connects sequence-matching.md to an implementable operator. Pins down: operator state layout (per-entity NFA candidate deques vs. step-counter tracks), the `EntityOperator` integration (entity boundary detection, `finish_entity()` semantics, sub-batch streaming of oversized entities per execution-model.md §5), output schema including `entity_id`, `$var` binding columns, step-property columns, `step_reached` under EMIT ALL, and the emission points (match completion, window expiry, entity end). Specifies the active-state cap (execution-model.md §16.1, default 10,000 candidates per entity) and the typed error returned on overflow. Also specifies how demand-driven column reduction (execution-model.md §8) avoids materializing unreferenced step properties. Risky anchor — unblocks TASK-304, TASK-306, TASK-311, TASK-321.
 
 ### TASK-302: [HARD][DESIGN] Sequence matcher strategy selection
@@ -754,7 +754,7 @@ Wave 3 is a strategy wave: the design anchors (301, 302, 308, 309, 310) land fir
 
 ### TASK-303: [EASY][DESIGN] Pattern grammar surface + AST reconciliation
 **Output**: docs/design/language/pattern-grammar.md
-**Depends on**: TASK-203
+**Depends on**: none
 **Description**: Reconciliation note, not a new AST. Wave 2 already shipped the pattern AST in `bqlite-ast/src/pattern.rs` (`MatchPattern`, `Step`, `StepEvent`, `MatchMode`, `Repetition`, `Exclusion`, `MatchWindow`, `BracketSpec`) and the `PipelineStage::{Match, Stats, OrderBy, Funnel, Retention}` variants in `operator.rs` as part of TASK-221 / TASK-224. This task produces the grammar-facing design doc: the concrete syntax for `MATCH (FIRST|ALL) SEQUENCE(step THEN step THEN ...) [WITHIN d] [EMIT ALL]`, step syntax (`[name:] event [WHERE predicate] [IMMEDIATELY] [+|*] [WITHOUT excl]`), alternation inside sequences, `$var` binding references, and a gap analysis identifying any shipped-AST field that the design doc does not cover (or vice versa). Precise token-to-AST map that TASK-312 / TASK-313 implement directly. Unblocks all parser pattern work.
 
 ### TASK-304: [HARD][IMPL] NFA runtime simulator
@@ -774,22 +774,22 @@ Wave 3 is a strategy wave: the design anchors (301, 302, 308, 309, 310) land fir
 
 ### TASK-307: [HARD][IMPL] Hash aggregate operator
 **Output**: crates/bqlite-operators/src/aggregate.rs
-**Depends on**: TASK-108, TASK-205, TASK-308, TASK-317
+**Depends on**: TASK-308, TASK-317
 **Description**: `AggregateOperator` — hash-grouped aggregation implementing `PhysicalOperator`. Per TASK-308, ships the `HashAccumulator` trait and built-in accumulators for `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`, `COUNT_DISTINCT(col)`. Percentile accumulators (`P50`/`P90`/`P95`/`P99`) are deferred to TASK-327. Group keys derived from a `Vec<CompiledExpr>` via TASK-205's expression kernel. State is `HashMap<GroupKey, AccumulatorState>` with the `max_groups` hard cap (default 1M per execution-model.md §9.4) returning `AggregateError::GroupLimitExceeded` on overflow — no spill in Wave 3. Works on columnar Arrow batches; pre-sizes builders per CLAUDE.md performance conventions. Supports both standalone use and the fused-downstream path emitted by MATCH/SESSIONIZE in later waves (Wave 3 only wires the standalone path end-to-end). Foundational — every funnel output and every `STATS` stage routes through it.
 
 ### TASK-308: [HARD][DESIGN][TRAIT] Aggregate + hash-accumulator architecture
 **Output**: docs/design/operators/aggregate-operator.md
-**Depends on**: TASK-108, TASK-204, TASK-205
+**Depends on**: none
 **Description**: The design note TASK-307 and TASK-320 both consume. Pins down: the `HashAccumulator` trait surface (`init`, `update_batch`, `merge`, `finalize`, `size_bytes`), the built-in accumulator set for Wave 3 (`COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`, `COUNT_DISTINCT(col)` — percentiles deferred to TASK-327), state-sizing rules feeding `max_groups` accounting, null-propagation per type-system.md, how aggregate expressions are compiled through TASK-205's `CompiledExpr` kernel, the output schema rules (`output_schema`: group columns + one column per aggregate with stable synthetic names), and the fused-downstream protocol that lets MATCH/SESSIONIZE feed entities directly into an accumulator without a standalone Aggregate operator node (the protocol ships as a hook in Wave 3; the matcher consumes it in TASK-321). Also specifies the `HashAccumulator` extensibility contract that TASK-327 uses to add DDSketch-based percentile accumulators without modifying existing code. Merge-first — blocks TASK-307, TASK-317, TASK-318, TASK-320, TASK-321.
 
 ### TASK-309: [HARD][DESIGN] Logical lowering + demand propagation for Match / Stats / OrderBy
 **Output**: docs/design/planner/wave3-lowering.md
-**Depends on**: TASK-204, TASK-301, TASK-308
+**Depends on**: TASK-301, TASK-308
 **Description**: Spec-level design for the AST → logical lowering that TASK-318 implements. Covers: (1) `PipelineStage::Match` → `LogicalPlan::SequenceMatch { pattern, mode, emit_all, window, brackets: None, step_properties, fused_downstream: None, input, output_schema }`, (2) `PipelineStage::Stats` → `LogicalPlan::Aggregate { aggregates, group_by, input, output_schema }`, (3) `PipelineStage::OrderBy` → `LogicalPlan::Sort`, (4) `PipelineStage::Select { distinct: true }` → `LogicalPlan::Distinct(Project(...))`. Specifies the `DemandSet { columns, needs_match_detail, needs_step_reached, step_properties: Vec<(step_name, column_name)>, fused_aggregate }` shape, the backward-propagation algorithm (consumer → producer, stopping at `Scan`), and how `fused_downstream` is populated by TASK-320 after demand resolves. Schema-validation rules for `step_name.column` references, for `$var` references surviving through aggregate group-by, and for the `step_reached` synthetic column under EMIT ALL. Risky because the demand-set shape persists into Waves 4-5.
 
 ### TASK-310: [EASY][DESIGN] Sort + Distinct operator contracts
 **Output**: docs/design/operators/sort-distinct.md
-**Depends on**: TASK-108, TASK-204
+**Depends on**: none
 **Description**: Smaller design note for the two non-matching stateful operators Wave 3 ships. `SortOperator` — key compilation via TASK-205, stable vs unstable (Wave 3 ships stable), in-memory-only with a hard `max_rows` cap and typed overflow error (spill is Wave 5 TASK-502), null-ordering rules from type-system.md, output schema unchanged from input. `DistinctOperator` — hash-set dedup reusing TASK-307's hash-key kernel, `max_groups` cap matching aggregate, output schema unchanged from input. Specifies how both operators interact with entity ordering — neither preserves `(entity_id, ts)` order, which is fine because they sit above any entity-aware operator in the Wave 3 plan tree. Unblocks TASK-317 + TASK-322.
 
 ### TASK-311: [HARD][IMPL] Pattern compiler: SequencePattern → CompiledNfa
@@ -799,7 +799,7 @@ Wave 3 is a strategy wave: the design anchors (301, 302, 308, 309, 310) land fir
 
 ### TASK-312: [EASY][IMPL] Parser pattern productions
 **Output**: crates/bqlite-parser/src/pattern.rs
-**Depends on**: TASK-220, TASK-303
+**Depends on**: TASK-303
 **Description**: Hand-rolled productions for pattern syntax that feed the `MatchPattern` AST. Covers: `SEQUENCE ( step ( THEN step )+ )`, step shape `[name :] event [WHERE expr] [IMMEDIATELY] [+|*] [WITHOUT event]`, event alternation `( e1 OR e2 OR ... )` inside a step slot, `$var` binding references inside WHERE predicates, `WITHIN <duration>` window clause, and precise span tracking for diagnostics. Reuses TASK-220's expression parser for WHERE predicates. Halt-on-first-error per language-doc §policy. Separate from TASK-313 so the pattern sub-grammar can be unit-tested in isolation, matching the separation Wave 2 used for `expr.rs` vs `pipeline.rs`.
 
 ### TASK-313: [EASY][IMPL] Parser MATCH pipeline stage
@@ -809,17 +809,17 @@ Wave 3 is a strategy wave: the design anchors (301, 302, 308, 309, 310) land fir
 
 ### TASK-314: [EASY][IMPL] Parser STATS stage
 **Output**: crates/bqlite-parser/src/pipeline.rs (extension)
-**Depends on**: TASK-220
+**Depends on**: none
 **Description**: `STATS <agg_list> [GROUP BY <group_list>]` production emitting `PipelineStage::Stats { aggregates: Vec<AggItem>, group_by: Vec<GroupItem>, span }` per query-language.md §7.2 and §26. BQL uses `GROUP BY`, not bare `BY` — the parser must reject `STATS ... BY ...` as a syntax error. Supports the full v1 aggregate keyword set: `COUNT`, `COUNT_DISTINCT`, `SUM`, `MIN`, `MAX`, `AVG`, `P50`, `P90`, `P95`, `P99` per query-language.md §7.1. Arg expressions compiled through TASK-220's expression parser. `COUNT_DISTINCT(col)` is the only distinct form — `COUNT(DISTINCT col)` is a parse error per query-language.md §7.3. The `AggItem`, `GroupItem`, and the `Stats` variant already exist in `bqlite-ast::operator`; this task lands the surface-to-AST production only. (Percentile runtime is TASK-327; the parser accepts the keywords regardless.)
 
 ### TASK-315: [EASY][IMPL] Parser ORDER BY stage + SORT alias
 **Output**: crates/bqlite-parser/src/pipeline.rs (extension)
-**Depends on**: TASK-220
+**Depends on**: none
 **Description**: `ORDER BY <expr> [ASC|DESC] (, <expr> [ASC|DESC])*` and the `SORT` alias per query-language.md §13. Emits `PipelineStage::OrderBy { items: Vec<OrderItem>, span }`. Unit tests cover default-direction-is-ASC, mixed direction, and the `SORT`/`ORDER BY` equivalence.
 
 ### TASK-316: [EASY][IMPL] Parser FUNNEL stage
 **Output**: crates/bqlite-parser/src/pipeline.rs (extension)
-**Depends on**: TASK-220, TASK-303, TASK-312
+**Depends on**: TASK-303, TASK-312
 **Description**: `FUNNEL( step THEN step [THEN step]... ) WITHIN <duration>` production per query-language.md §6.1, emitting `PipelineStage::Funnel(Funnel { steps, window, span })`. Reuses TASK-312's pattern step sub-grammar — FUNNEL accepts the full MATCH step grammar (named steps, property constraints, variable bindings, WITHOUT exclusions, alternation, repetition, IMMEDIATELY). The `Funnel` struct and the variant already exist in `bqlite-ast::operator`. FUNNEL is **terminal sugar** — it cannot be followed by `| STATS` or any downstream pipe stage; the parser emits an error if the user attempts to pipe after FUNNEL. Desugaring lives in TASK-319. RETENTION is explicitly out of scope — its AST variant stays unparsed in Wave 3 per the scope exclusions.
 
 ### TASK-317: [EASY][IMPL] Logical + physical plan variants for Wave 3
@@ -865,7 +865,7 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 
 ### TASK-324: [HARD][IMPL] Matcher integration test suite
 **Output**: tests/integration/matcher/
-**Depends on**: TASK-233, TASK-318, TASK-321, TASK-323
+**Depends on**: TASK-318, TASK-321, TASK-323
 **Description**: Integration-level test suite reusing the TASK-120 fixture framework. Covers the full matcher semantics matrix from sequence-matching.md: linear patterns, branching alternation, one-or-more repetition, zero-or-more repetition, `WITHOUT` negation (including eager kill inside the negation scope), `$var` binding tracks (single binding, multiple bindings per track, NULL binding short-circuit), `IMMEDIATELY` modifier, time-window expiry (before, at boundary, after), EMIT ALL with each step reached, MATCH ALL rebinding per entity, and the entity-sub-batch streaming path for oversized entities. Each test ingests a small CSV fixture, runs the query through the engine, and asserts the exact result set. Pattern-class coverage forms the Tests-dimension evidence for TASK-399's audit.
 
 ### TASK-325: [HARD][IMPL] Wave 3 benchmark suite + matcher microbenchmarks
@@ -875,7 +875,7 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 
 ### TASK-326: [HARD][IMPL] Wave 3 acceptance test
 **Output**: tests/wave3_acceptance.rs
-**Depends on**: TASK-233, TASK-307, TASK-319, TASK-321, TASK-323
+**Depends on**: TASK-307, TASK-319, TASK-321, TASK-323
 **Description**: The Wave 3 correctness gate per the header. Ingests a synthetic CSV event stream via the TASK-233 ingest path, runs `events LAST 30d | FUNNEL(signup THEN activation THEN purchase) WITHIN 7d`, and asserts the per-step conversion counts (`signup`, `activation`, `purchase` output columns per query-language.md §6.1 naming rules) match hand-computed expected values. Also runs the equivalent desugared form `events LAST 30d | MATCH FIRST SEQUENCE(signup THEN activation THEN purchase) WITHIN 7d EMIT ALL | STATS signup = SUM(CAST(step_reached >= 1 AS INT)), activation = SUM(CAST(step_reached >= 2 AS INT)), purchase = SUM(CAST(step_reached >= 3 AS INT))` and asserts result equality with the FUNNEL form (validating TASK-319's desugaring). Wave 3 is done when this test passes in CI on both macOS and Linux.
 
 ### TASK-327: [HARD][IMPL] DDSketch percentile accumulators (P50/P90/P95/P99)
@@ -899,7 +899,7 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 
 ### TASK-401: [DESIGN] Advanced encoding research
 **Output**: docs/design/storage/advanced-encodings.md
-**Depends on**: TASK-201
+**Depends on**: none
 **Description**: Reference implementations + microbenchmarks for FSST, ALP, PFOR, FOR, double-delta, RLE, frequency encoding. Very risky — some may not be worth shipping. Deliverable is a go/no-go recommendation per encoding with evidence.
 
 ### TASK-402: [DESIGN] Encoding selection policy
@@ -909,27 +909,27 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 
 ### TASK-403: [DESIGN] Compaction concurrency protocol
 **Output**: docs/design/storage/compaction-concurrency.md
-**Depends on**: TASK-201
+**Depends on**: none
 **Description**: How readers and compaction coexist without locking. Snapshot semantics, manifest-swap protocol, merge-scan integration. Risky and cross-cutting.
 
 ### TASK-404: [DESIGN] Tombstone and delete semantics
 **Output**: docs/design/storage/deletes.md
-**Depends on**: TASK-201, TASK-403
+**Depends on**: TASK-403
 **Description**: Row/batch/entity-level deletes, merge-scan integration, reclaim during compaction.
 
 ### TASK-405: [DESIGN] SESSIONIZE operator
 **Output**: docs/design/operators/sessionize.md
-**Depends on**: TASK-108
+**Depends on**: none
 **Description**: Session boundary definitions, inactivity gap, custom predicates, output schema.
 
 ### TASK-406: [DESIGN] Attribution operator
 **Output**: docs/design/operators/attribution.md
-**Depends on**: TASK-301
+**Depends on**: none
 **Description**: Which prior events caused which subsequent outcomes. Models: first-touch, last-touch, linear, time-decay, positional. Output schema.
 
 ### TASK-407: [DESIGN] Cohort materialization and alias binding
 **Output**: docs/design/language/cohorts-and-aliases.md
-**Depends on**: TASK-204
+**Depends on**: none
 **Description**: Resolves the open questions from TASK-002 — inline vs materialized cohorts, alias scoping, cohort × query join semantics, eager vs lazy evaluation.
 
 ### TASK-408: [IMPL] Compaction scheduler
@@ -944,7 +944,7 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 
 ### TASK-410: [IMPL] JSON and Parquet ingest paths
 **Output**: crates/bqlite-storage/src/ingest/{json,parquet}.rs
-**Depends on**: TASK-233
+**Depends on**: none
 **Description**: Follows the CSV ingest pattern established in Wave 2 (TASK-233). Parquet path reuses Arrow decode; JSON path handles nested property objects.
 
 Additional Wave 4 tasks: individual encoding implementations from TASK-401 outcomes, SESSIONIZE impl, retention operator, attribution impl, cohort grammar productions, alias binding in planner, FUNNEL and RETENTION syntactic sugar, tombstone writer, tombstone-aware merge scan, compaction microbenchmarks, integration tests for each new feature.
@@ -965,7 +965,7 @@ Additional Wave 4 tasks: individual encoding implementations from TASK-401 outco
 
 ### TASK-501: [DESIGN] Memory budget enforcement model
 **Output**: docs/design/engine/memory-budget.md
-**Depends on**: TASK-111
+**Depends on**: none
 **Description**: Every operator's reservation contract, overcommit policy, spill triggers, error handling on OOM. Cross-cutting — touches every operator.
 
 ### TASK-502: [DESIGN] Spill-to-disk protocol
@@ -975,29 +975,29 @@ Additional Wave 4 tasks: individual encoding implementations from TASK-401 outco
 
 ### TASK-503: [DESIGN] Operator fusion
 **Output**: docs/design/engine/operator-fusion.md
-**Depends on**: TASK-110
+**Depends on**: none
 **Description**: Which operators fuse, the fusion rewriter's place in the planner, code generation vs template strategies, DemandCapabilities integration. Risky.
 
 **Load-bearing forward reference:** execution-model.md §3.8 already specifies the steady-state stateless-segment design — `FilteredBatch`, `SelectionVector`, `StatelessKernel`, `materialize_filtered_batch`, and the three explicit materialization triggers (sparsity, push-segment boundary, aggregation hand-off — note the deliberate "materialization" terminology in §3.8.3, distinct from storage-format.md §7 "compaction"). The Wave 2 filter/project/limit operators (TASK-231) deliberately ship without that infrastructure because a fused push segment is required to make the selection-vector chain pay off. This design task is the point at which §3.8 moves from "documented target" to "implemented contract." It should produce the `[IMPL]` tasks that refactor TASK-231's operators into kernels that implement `StatelessKernel` and plug into a new fused-segment driver, **not** leave §3.8 to a later wave. See also the TASK-242 retirement stub for the history of how this design got deferred from Wave 2.
 
 ### TASK-504: [DESIGN] Cost model and statistics source
 **Output**: docs/design/planner/cost-model.md
-**Depends on**: TASK-204
+**Depends on**: none
 **Description**: Resolves the open questions from TASK-006 — rule-based vs cost-based, where statistics come from (zone maps, manifest metadata), how cardinality is estimated, which optimizer rules become cost-gated. Risky.
 
 ### TASK-505: [DESIGN] Cancellation and timeout protocol
 **Output**: docs/design/engine/cancellation.md
-**Depends on**: TASK-108
+**Depends on**: none
 **Description**: How cancellation propagates through the operator tree, cleanup responsibilities, how timeouts are enforced, how cancellation interacts with spilled state.
 
 ### TASK-506: [IMPL] Optimizer rule set
 **Output**: crates/bqlite-planner/src/optimizer/
-**Depends on**: TASK-204, TASK-504
+**Depends on**: TASK-504
 **Description**: The full optimizer rule set — predicate pushdown, projection pruning, constant folding, filter-before-match reordering, match-pushdown to scan, cost-gated fusion decisions. Each rule is its own sub-task filled in as Wave 5 progresses.
 
 ### TASK-507: [IMPL] Per-operator microbenchmark coverage audit
 **Output**: benches/coverage-report.md
-**Depends on**: TASK-121
+**Depends on**: none
 **Description**: Audit every operator introduced in Waves 2-4 for microbenchmark coverage. File follow-up tasks for any missing benches. Ensures the core belief "microbenchmark frequently" has actually happened.
 
 Additional Wave 5 tasks: individual optimizer rule implementations, spill implementations per spillable operator, fusion implementations for specific operator pairs, cancellation plumbing per operator, property tests, stress tests, memory-pressure integration tests.
@@ -1018,12 +1018,12 @@ Additional Wave 5 tasks: individual optimizer rule implementations, spill implem
 
 ### TASK-601: [DESIGN] Python API surface
 **Output**: docs/design/interfaces/python-api.md
-**Depends on**: TASK-118
+**Depends on**: none
 **Description**: Idiomatic Python wrapper over the engine API. Query, ingest, iterate results, type coercion, error mapping, async support question.
 
 ### TASK-602: [DESIGN] CLI command structure
 **Output**: docs/design/interfaces/cli.md
-**Depends on**: TASK-119
+**Depends on**: none
 **Description**: `query`, `ingest`, `explain`, `repl`, `compact`, `stats` subcommands, flag conventions, output formats.
 
 ### TASK-603: [IMPL] PyO3 integration skeleton
@@ -1033,7 +1033,7 @@ Additional Wave 5 tasks: individual optimizer rule implementations, spill implem
 
 ### TASK-604: [IMPL] C ABI surface
 **Output**: crates/bqlite-ffi/src/c.rs
-**Depends on**: TASK-118
+**Depends on**: none
 **Description**: Stable, versioned C ABI. Opaque handle types, error-code returns, minimal allocation ownership rules.
 
 Additional Wave 6 tasks: CLI subcommand implementations, repl line editing, explain output formatting, Python test suite, Python packaging (wheels for macOS/Linux), example scripts.
@@ -1054,22 +1054,22 @@ Additional Wave 6 tasks: CLI subcommand implementations, repl line editing, expl
 
 ### TASK-701: [DESIGN] End-to-end benchmark suite
 **Output**: docs/design/benchmarks/suite.md
-**Depends on**: TASK-121
+**Depends on**: none
 **Description**: Datasets, query mix, comparison baselines, reporting format. Drives the public benchmark story.
 
 ### TASK-702: [DESIGN] User documentation plan
 **Output**: docs/design/interfaces/docs-plan.md
-**Depends on**: TASK-601, TASK-602
+**Depends on**: none
 **Description**: Getting started, query language guide, operator reference, API reference, FAQ. Audience segmentation and reading order.
 
 ### TASK-703: [IMPL] Error message audit
 **Output**: tests/errors/
-**Depends on**: TASK-102
+**Depends on**: none
 **Description**: Every user-facing error has a test asserting the message is clear, actionable, and mentions the source location where applicable.
 
 ### TASK-704: [IMPL] Edge case audit
 **Output**: tests/edge_cases/
-**Depends on**: TASK-120
+**Depends on**: none
 **Description**: Systematic review of edge cases — empty datasets, single-event entities, segment boundary crossings, huge entities, zero-time-range queries, schema mismatches, ingest partial failures.
 
 Additional Wave 7 tasks: benchmark dataset acquisition, benchmark runner, public benchmark report, getting-started guide, query language guide, operator reference, error taxonomy document, README polish.
