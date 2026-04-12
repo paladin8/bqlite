@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-240",
   "claimed_at": "2026-04-12T00:04:05Z",
+  "completed_at": "2026-04-12T01:45:00Z",
   "branch": "task/TASK-240",
   "description": "Database open/create split + `bqlite init` + bootstrap retirement"
 }
