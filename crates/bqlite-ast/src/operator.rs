@@ -59,8 +59,9 @@ pub enum PipelineStage {
     /// (query-language.md §8).
     Sessionize(Sessionize),
 
-    /// `| STATS <aggregates> [BY <group>]` — aggregation with optional
-    /// grouping (query-language.md §7).
+    /// `| STATS <aggregates> [GROUP BY <group>]` — aggregation with
+    /// optional grouping (query-language.md §7). The two-keyword form
+    /// `GROUP BY` is required; bare `BY` is a parse error (§7.2).
     Stats {
         aggregates: Vec<AggItem>,
         group_by: Vec<GroupItem>,
@@ -184,7 +185,10 @@ pub struct AggItem {
     /// (or zero for `count(*)`). `Vec` accommodates multi-argument
     /// extensions like `quantile(x, 0.95)`.
     pub args: Vec<Spanned<Expr>>,
-    /// `DISTINCT` modifier — `count(DISTINCT user_id)`.
+    /// Reserved for future use. The parser always sets this to `false`
+    /// because `COUNT(DISTINCT col)` is a parse error per §7.1 —
+    /// the correct distinct-count form is `COUNT_DISTINCT(col)`.
+    /// Builder APIs may set this field; the planner validates it.
     pub distinct: bool,
     /// Output column name — required by the parser
     /// (query-language.md §7.1), so stored as a non-optional `Name`.

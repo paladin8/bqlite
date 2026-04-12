@@ -37,7 +37,7 @@
 
 #![allow(dead_code)] // TASK-221 / TASK-222 productions reach this module later.
 
-use bqlite_ast::{Expr, Name, PipelineStage, SelectItem, SelectItemKind};
+use bqlite_ast::{AggItem, Expr, GroupItem, Name, PipelineStage, SelectItem, SelectItemKind};
 
 use crate::error::{Expected, NameRole, ParseError};
 use crate::expr::parse_expression;
@@ -62,6 +62,7 @@ fn parse_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
         TokenKind::Kw(Keyword::Where) => parse_where_stage(p),
         TokenKind::Kw(Keyword::Select) => parse_select_stage(p),
         TokenKind::Kw(Keyword::Limit) => parse_limit_stage(p),
+        TokenKind::Kw(Keyword::Stats) => parse_stats_stage(p),
 
         // Every other first token is either a later-wave verb that
         // TASK-223 does not yet implement, or an error. The error
@@ -250,6 +251,271 @@ fn parse_select_item(p: &mut Parser) -> Result<SelectItem, ParseError> {
 /// without an `AS` alias.
 fn is_bare_or_qualified_column(expr: &Expr) -> bool {
     matches!(expr, Expr::Column(_) | Expr::Qualified { .. })
+}
+
+// ----------------------------------------------------------------------
+// STATS
+// ----------------------------------------------------------------------
+
+/// `STATS agg_list [GROUP BY group_list]` — §26 line 1576.
+///
+/// Grammar:
+/// ```text
+/// stats_op   := STATS agg_list (GROUP BY group_list)?
+/// agg_list   := agg_item ("," agg_item)*
+/// agg_item   := identifier "=" agg_expr
+/// agg_expr   := agg_func "(" (expr | "*") ")"
+/// agg_func   := COUNT | COUNT_DISTINCT | SUM | AVG | MIN | MAX
+///             | P50 | P90 | P95 | P99
+/// group_list := group_item ("," group_item)*
+/// group_item := name
+///             | expr AS identifier
+/// ```
+///
+/// Per §7.2, `GROUP BY` is the required two-keyword form. A bare `BY`
+/// without `GROUP` is rejected with a helpful error. Per §7.1,
+/// `COUNT(DISTINCT col)` is a parse error — use `COUNT_DISTINCT(col)`.
+fn parse_stats_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    let stats_tok = p.expect_kw(Keyword::Stats)?;
+    let start_span = token_span(&stats_tok);
+
+    let aggregates = parse_agg_list(p)?;
+
+    // Optional GROUP BY clause.
+    //
+    // Bare `BY` without `GROUP` is a syntax error: BQL always uses
+    // `GROUP BY` (two keywords), never a standalone `BY`
+    // (query-language.md §7.2 and the grammar at §26 line 1576).
+    let group_by = match p.peek_kind() {
+        TokenKind::Kw(Keyword::By) => {
+            let by_tok = p.peek().clone();
+            return Err(ParseError::Unexpected {
+                offset: by_tok.start,
+                line: by_tok.line,
+                column: by_tok.column,
+                expected: Expected::Keyword("GROUP"),
+                found: "BY".to_string(),
+                detail: Some("STATS uses `GROUP BY` (two keywords), not bare `BY`"),
+            });
+        }
+        TokenKind::Kw(Keyword::Group) => {
+            p.bump(); // consume GROUP
+            p.expect_kw(Keyword::By)?;
+            parse_group_list(p)?
+        }
+        _ => vec![],
+    };
+
+    // `parse_agg_list` always returns at least one item — enforce the
+    // invariant explicitly so the `unwrap_or` below is clearly a
+    // dead-code safety net, not a real fallback.
+    debug_assert!(
+        !aggregates.is_empty(),
+        "agg list must have at least one item"
+    );
+
+    // Span: STATS keyword through the last token consumed.
+    let last_span = group_by
+        .last()
+        .map(|g: &GroupItem| g.span)
+        .or_else(|| aggregates.last().map(|a: &AggItem| a.span))
+        .map(|s| start_span.merged(s))
+        .unwrap_or(start_span);
+
+    Ok(PipelineStage::Stats {
+        aggregates,
+        group_by,
+        span: last_span,
+    })
+}
+
+/// Parse the required aggregate item list: at least one `agg_item`,
+/// comma-separated.
+fn parse_agg_list(p: &mut Parser) -> Result<Vec<AggItem>, ParseError> {
+    let mut items = Vec::new();
+    items.push(parse_agg_item(p)?);
+    while matches!(p.peek_kind(), TokenKind::Comma) {
+        p.bump(); // consume `,`
+        items.push(parse_agg_item(p)?);
+    }
+    Ok(items)
+}
+
+/// Parse one `identifier "=" agg_expr`.
+///
+/// The output alias (`identifier`) is required per §7.1 — bare
+/// aggregate expressions without an alias are a parse error.
+fn parse_agg_item(p: &mut Parser) -> Result<AggItem, ParseError> {
+    // Output alias — bare identifier (not a backtick name; §26 line 1578
+    // uses `identifier`, not `name`).
+    let (alias_text, alias_span) = p.expect_ident(NameRole::AliasName)?;
+    let alias = Name::new(alias_text, alias_span);
+
+    // `=` assignment separator.
+    p.expect_punct(&TokenKind::Eq, "=")?;
+
+    // Aggregate expression.
+    parse_agg_expr(p, alias)
+}
+
+/// True when `kw` is one of the ten supported aggregate function
+/// keywords per §7.1 and §26 line 1580.
+fn is_agg_func(kw: Keyword) -> bool {
+    matches!(
+        kw,
+        Keyword::Count
+            | Keyword::CountDistinct
+            | Keyword::Sum
+            | Keyword::Avg
+            | Keyword::Min
+            | Keyword::Max
+            | Keyword::P50
+            | Keyword::P90
+            | Keyword::P95
+            | Keyword::P99
+    )
+}
+
+/// Parse `agg_func "(" (expr | "*") ")"` and assemble an [`AggItem`].
+///
+/// `alias` is the output name already parsed by the caller. The
+/// function name is stored as the lowercase canonical keyword string
+/// in `AggItem::function` (e.g. `"count"`, `"count_distinct"`, `"p95"`).
+///
+/// `COUNT(DISTINCT col)` is explicitly rejected here per §7.1 —
+/// `DISTINCT` is not a valid argument modifier for any aggregate. Use
+/// `COUNT_DISTINCT(col)` instead.
+fn parse_agg_expr(p: &mut Parser, alias: Name) -> Result<AggItem, ParseError> {
+    // Match the aggregate function keyword.
+    let (kw, func_span) = match p.peek_kind() {
+        TokenKind::Kw(k) if is_agg_func(*k) => {
+            let k = *k;
+            let tok = p.bump();
+            (k, token_span(&tok))
+        }
+        _ => {
+            return Err(p.error_unexpected(
+                Expected::Expression,
+                Some(
+                    "expected an aggregate function: \
+                     COUNT, COUNT_DISTINCT, SUM, AVG, MIN, MAX, P50, P90, P95, P99",
+                ),
+            ));
+        }
+    };
+
+    // Opening paren.
+    p.expect_punct(&TokenKind::LParen, "(")?;
+
+    // `COUNT(DISTINCT col)` is a parse error per §7.1 — `DISTINCT` is
+    // not valid inside any aggregate expression. The correct form for
+    // distinct counting is `COUNT_DISTINCT(col)`.
+    if matches!(p.peek_kind(), TokenKind::Kw(Keyword::Distinct)) {
+        let tok = p.peek().clone();
+        return Err(ParseError::Unexpected {
+            offset: tok.start,
+            line: tok.line,
+            column: tok.column,
+            expected: Expected::Expression,
+            found: "DISTINCT".to_string(),
+            detail: Some(
+                "`DISTINCT` is not valid inside aggregate expressions; \
+                 use `COUNT_DISTINCT(col)` for distinct counting",
+            ),
+        });
+    }
+
+    // Argument: `*` (star form — maps to empty args list, e.g. COUNT(*))
+    // or a regular expression. The `*` token is the same as the
+    // multiplication token; we intercept it here before delegating to
+    // `parse_expression` which would interpret a leading `*` as an error.
+    let args = if matches!(p.peek_kind(), TokenKind::Star) {
+        p.bump(); // consume `*`
+        vec![]
+    } else {
+        let expr = parse_expression(p)?;
+        vec![expr]
+    };
+
+    // Closing paren.
+    let close_tok = p.expect_punct(&TokenKind::RParen, ")")?;
+
+    // Span covers from the alias name through the closing `)`.
+    // `alias.span` precedes `func_span`, so the merge correctly extends
+    // from the alias start to the `)` end.
+    let item_span = alias.span.merged(func_span.merged(token_span(&close_tok)));
+
+    Ok(AggItem {
+        // Store lowercase canonical name: "count", "count_distinct", etc.
+        function: Name::new(kw.canonical().to_lowercase(), func_span),
+        args,
+        // `COUNT(DISTINCT col)` is rejected above — the `distinct` flag
+        // on AggItem is always false for parser-produced nodes.
+        distinct: false,
+        alias,
+        span: item_span,
+    })
+}
+
+/// Parse the GROUP BY item list: at least one `group_item`,
+/// comma-separated.
+fn parse_group_list(p: &mut Parser) -> Result<Vec<GroupItem>, ParseError> {
+    let mut items = Vec::new();
+    items.push(parse_group_item(p)?);
+    while matches!(p.peek_kind(), TokenKind::Comma) {
+        p.bump(); // consume `,`
+        items.push(parse_group_item(p)?);
+    }
+    Ok(items)
+}
+
+/// Parse one GROUP BY item.
+///
+/// ```text
+/// group_item := name                    -- bare column reference
+///             | expr AS identifier      -- computed group key
+/// ```
+///
+/// Bare column references do not require an `AS` alias. Computed
+/// expressions **must** carry an `AS alias` per §7.2 — the same rule
+/// as SELECT computed items (§10).
+fn parse_group_item(p: &mut Parser) -> Result<GroupItem, ParseError> {
+    let item_start = token_span(p.peek());
+
+    let expr = parse_expression(p)?;
+    let expr_span = expr.span;
+
+    // Optional `AS identifier` alias.
+    if p.try_kw(Keyword::As).is_some() {
+        let (alias_text, alias_span) = p.expect_ident(NameRole::AliasName)?;
+        let alias = Name::new(alias_text, alias_span);
+        let span = expr_span.merged(alias_span);
+        return Ok(GroupItem {
+            expr,
+            alias: Some(alias),
+            span,
+        });
+    }
+
+    // No alias — the expression must be a bare or qualified column
+    // reference. Computed expressions require `AS alias` in GROUP BY
+    // (query-language.md §7.2).
+    if is_bare_or_qualified_column(&expr.node) {
+        return Ok(GroupItem {
+            expr,
+            alias: None,
+            span: expr_span,
+        });
+    }
+
+    Err(ParseError::Unexpected {
+        offset: item_start.start,
+        line: item_start.line,
+        column: item_start.column,
+        expected: Expected::Keyword("AS"),
+        found: "computed expression".to_string(),
+        detail: Some("computed GROUP BY expressions must have an `AS <alias>` name"),
+    })
 }
 
 // ----------------------------------------------------------------------
@@ -771,5 +1037,370 @@ mod tests {
             right: Box::new(Spanned::new(lit, bqlite_ast::Span::EMPTY)),
         };
         assert!(!is_bare_or_qualified_column(&bin));
+    }
+
+    // --- STATS --------------------------------------------------------
+
+    // Helper: extract AggItems from the first Stats stage.
+    fn agg_items_of(stages: &[PipelineStage]) -> &[AggItem] {
+        match &stages[0] {
+            PipelineStage::Stats { aggregates, .. } => aggregates.as_slice(),
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    // Helper: extract GroupItems from the first Stats stage.
+    fn group_items_of(stages: &[PipelineStage]) -> &[GroupItem] {
+        match &stages[0] {
+            PipelineStage::Stats { group_by, .. } => group_by.as_slice(),
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_count_star_single_aggregate() {
+        // `| STATS total = COUNT(*)` — COUNT(*) maps to empty args list.
+        let stmt = parse_stmt("events | STATS total = COUNT(*)");
+        let items = agg_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].alias.text, "total");
+        assert_eq!(items[0].function.text, "count");
+        assert!(items[0].args.is_empty(), "COUNT(*) should have no args");
+        assert!(!items[0].distinct);
+    }
+
+    #[test]
+    fn stats_count_with_column_argument() {
+        let stmt = parse_stmt("events | STATS n = COUNT(user_id)");
+        let items = agg_items_of(stages_of(&stmt));
+        assert_eq!(items[0].function.text, "count");
+        assert_eq!(items[0].args.len(), 1);
+        match &items[0].args[0].node {
+            Expr::Column(c) => assert_eq!(c.text, "user_id"),
+            other => panic!("expected Column arg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_count_distinct() {
+        // `COUNT_DISTINCT(col)` is the valid distinct-count form.
+        let stmt = parse_stmt("events | STATS uv = COUNT_DISTINCT(user_id)");
+        let items = agg_items_of(stages_of(&stmt));
+        assert_eq!(items[0].function.text, "count_distinct");
+        assert_eq!(items[0].args.len(), 1);
+        assert!(!items[0].distinct);
+    }
+
+    #[test]
+    fn stats_all_ten_aggregate_functions() {
+        // Smoke-test that each aggregate function keyword is accepted
+        // and stored with the correct lowercase name.
+        let cases: &[(&str, &str)] = &[
+            ("n = COUNT(*)", "count"),
+            ("u = COUNT_DISTINCT(x)", "count_distinct"),
+            ("s = SUM(amount)", "sum"),
+            ("a = AVG(amount)", "avg"),
+            ("lo = MIN(amount)", "min"),
+            ("hi = MAX(amount)", "max"),
+            ("q50 = P50(latency)", "p50"),
+            ("q90 = P90(latency)", "p90"),
+            ("q95 = P95(latency)", "p95"),
+            ("q99 = P99(latency)", "p99"),
+        ];
+        for (agg_src, expected_fn) in cases {
+            let src = format!("events | STATS {agg_src}");
+            let stmt = parse_stmt(&src);
+            let items = agg_items_of(stages_of(&stmt));
+            assert_eq!(
+                items[0].function.text, *expected_fn,
+                "function name mismatch for `{agg_src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn stats_multiple_aggregates() {
+        let stmt =
+            parse_stmt("events | STATS total = COUNT(*), avg_amt = AVG(amount), mx = MAX(amount)");
+        let items = agg_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].alias.text, "total");
+        assert_eq!(items[1].alias.text, "avg_amt");
+        assert_eq!(items[2].alias.text, "mx");
+        assert_eq!(items[0].function.text, "count");
+        assert_eq!(items[1].function.text, "avg");
+        assert_eq!(items[2].function.text, "max");
+    }
+
+    #[test]
+    fn stats_with_group_by_single_bare_column() {
+        let stmt = parse_stmt("events | STATS n = COUNT(*) GROUP BY device");
+        let groups = group_items_of(stages_of(&stmt));
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].alias.is_none());
+        match &groups[0].expr.node {
+            Expr::Column(c) => assert_eq!(c.text, "device"),
+            other => panic!("expected Column in GROUP BY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_with_group_by_multiple_bare_columns() {
+        let stmt = parse_stmt("events | STATS n = COUNT(*) GROUP BY device, plan");
+        let groups = group_items_of(stages_of(&stmt));
+        assert_eq!(groups.len(), 2);
+        match &groups[0].expr.node {
+            Expr::Column(c) => assert_eq!(c.text, "device"),
+            other => panic!("expected first GROUP BY column, got {other:?}"),
+        }
+        match &groups[1].expr.node {
+            Expr::Column(c) => assert_eq!(c.text, "plan"),
+            other => panic!("expected second GROUP BY column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_with_group_by_computed_expression_requires_alias() {
+        // Computed expressions in GROUP BY must have an AS alias.
+        // `amount * 2` is an arithmetic expression — a computed expression.
+        // (Function calls like QUANTIZE are deferred to a later wave task.)
+        let stmt = parse_stmt("events | STATS n = COUNT(*) GROUP BY amount * 2 AS doubled");
+        let groups = group_items_of(stages_of(&stmt));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].alias.as_ref().unwrap().text, "doubled");
+        match &groups[0].expr.node {
+            Expr::Binary {
+                op: BinaryOp::Multiply,
+                ..
+            } => {}
+            other => panic!("expected Binary Multiply in GROUP BY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_with_group_by_mixed_bare_and_computed() {
+        let stmt = parse_stmt("events | STATS n = COUNT(*) GROUP BY device, amount * 2 AS doubled");
+        let groups = group_items_of(stages_of(&stmt));
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].alias.is_none()); // bare column
+        assert!(groups[1].alias.is_some()); // computed
+        assert_eq!(groups[1].alias.as_ref().unwrap().text, "doubled");
+    }
+
+    #[test]
+    fn stats_case_insensitive_keywords() {
+        // Parser is case-insensitive per §2.2.
+        let stmt = parse_stmt("events | stats total = count(*) group by device");
+        let stages = stages_of(&stmt);
+        assert!(matches!(stages[0], PipelineStage::Stats { .. }));
+        let items = agg_items_of(stages);
+        assert_eq!(items[0].function.text, "count");
+    }
+
+    #[test]
+    fn stats_without_group_by_has_empty_group_list() {
+        let stmt = parse_stmt("events | STATS n = COUNT(*)");
+        match &stages_of(&stmt)[0] {
+            PipelineStage::Stats { group_by, .. } => assert!(group_by.is_empty()),
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_span_covers_keyword_through_last_token() {
+        let src = "events | STATS total = COUNT(*)";
+        let stmt = parse_stmt(src);
+        match &stages_of(&stmt)[0] {
+            PipelineStage::Stats { span, .. } => {
+                let stats_start = src.find("STATS").unwrap();
+                assert_eq!(span.start, stats_start);
+                // Span end should be at or past the closing `)`.
+                assert!(span.end > stats_start);
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_span_covers_group_by_when_present() {
+        let src = "events | STATS n = COUNT(*) GROUP BY device";
+        let stmt = parse_stmt(src);
+        match &stages_of(&stmt)[0] {
+            PipelineStage::Stats { span, .. } => {
+                let stats_start = src.find("STATS").unwrap();
+                let device_end = src.find("device").unwrap() + "device".len();
+                assert_eq!(span.start, stats_start);
+                assert_eq!(span.end, device_end);
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    // --- STATS error cases -------------------------------------------
+
+    #[test]
+    fn stats_count_distinct_syntax_rejected() {
+        // `COUNT(DISTINCT col)` is a parse error per §7.1 — use
+        // `COUNT_DISTINCT(col)` instead.
+        match crate::parse("events | STATS n = COUNT(DISTINCT user_id)") {
+            Err(ParseError::Unexpected {
+                found,
+                detail,
+                expected,
+                ..
+            }) => {
+                assert_eq!(found, "DISTINCT");
+                assert_eq!(expected, Expected::Expression);
+                assert!(detail.unwrap_or("").contains("COUNT_DISTINCT"));
+            }
+            other => panic!("expected DISTINCT-inside-agg error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_bare_by_without_group_rejected() {
+        // `STATS n = COUNT(*) BY device` — bare BY must be rejected.
+        match crate::parse("events | STATS n = COUNT(*) BY device") {
+            Err(ParseError::Unexpected {
+                found,
+                expected,
+                detail,
+                ..
+            }) => {
+                assert_eq!(found, "BY");
+                assert_eq!(expected, Expected::Keyword("GROUP"));
+                assert!(detail.unwrap_or("").contains("GROUP BY"));
+            }
+            other => panic!("expected bare-BY error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_missing_alias_errors_on_agg_function() {
+        // `STATS COUNT(*)` without `alias =` is a parse error — the
+        // parser expects an identifier (the alias) before the `=`.
+        // The aggregate function keyword (COUNT) is reserved and so
+        // the parser will see it where it expects an identifier and
+        // emit `ReservedKeyword`.
+        match crate::parse("events | STATS COUNT(*)") {
+            Err(ParseError::ReservedKeyword { keyword, .. }) => {
+                assert_eq!(keyword, "COUNT");
+            }
+            other => panic!("expected ReservedKeyword(COUNT) error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_missing_equals_errors() {
+        // `STATS total COUNT(*)` — missing `=` between alias and agg expr.
+        match crate::parse("events | STATS total COUNT(*)") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Punct("="));
+            }
+            other => panic!("expected Punct(=) error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_unknown_function_errors() {
+        // `STATS n = MEDIAN(x)` — MEDIAN is not a supported agg function
+        // keyword; it would be tokenised as an `Ident("MEDIAN")` which
+        // is not an agg keyword.
+        match crate::parse("events | STATS n = MEDIAN(x)") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Expression);
+            }
+            other => panic!("expected Expression error for unknown function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_group_by_computed_without_alias_errors() {
+        // Computed GROUP BY item without `AS alias` is a parse error.
+        match crate::parse("events | STATS n = COUNT(*) GROUP BY amount * 2") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("AS"));
+                assert!(detail.unwrap_or("").contains("GROUP BY"));
+            }
+            other => panic!("expected AS error on computed GROUP BY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_in_multi_stage_pipeline() {
+        // STATS followed by a WHERE stage (post-aggregation filter).
+        let stmt = parse_stmt("events | STATS n = COUNT(*) GROUP BY device | WHERE n > 100");
+        let stages = stages_of(&stmt);
+        assert_eq!(stages.len(), 2);
+        assert!(matches!(stages[0], PipelineStage::Stats { .. }));
+        assert!(matches!(stages[1], PipelineStage::Where { .. }));
+    }
+
+    #[test]
+    fn stats_span_does_not_include_trailing_pipe() {
+        // The span of a STATS stage must end before the `|` of the next stage.
+        let src = "events | STATS n = COUNT(*) | LIMIT 10";
+        let stmt = parse_stmt(src);
+        let stages = stages_of(&stmt);
+        assert_eq!(stages.len(), 2);
+        let stats_span = stages[0].span();
+        let pipe_pos = src.rfind('|').unwrap(); // position of the last `|`
+        assert!(
+            stats_span.end <= pipe_pos,
+            "stats span end ({}) should not reach the `|` at {pipe_pos}",
+            stats_span.end
+        );
+    }
+
+    #[test]
+    fn stats_agg_item_with_expression_argument() {
+        // AVG of a binary expression `amount * rate`.
+        let stmt = parse_stmt("orders | STATS wa = AVG(amount * rate)");
+        let items = agg_items_of(stages_of(&stmt));
+        assert_eq!(items[0].function.text, "avg");
+        assert_eq!(items[0].args.len(), 1);
+        match &items[0].args[0].node {
+            Expr::Binary {
+                op: BinaryOp::Multiply,
+                ..
+            } => {}
+            other => panic!("expected Binary Multiply arg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_missing_agg_list_errors_on_reserved_keyword() {
+        // `STATS GROUP BY device` — no aggregate items before GROUP BY.
+        // `parse_agg_item` sees `GROUP` (a reserved keyword) where it
+        // expects an identifier (the aggregate alias), so the error is
+        // `ReservedKeyword { keyword: "GROUP", role: AliasName }`.
+        match crate::parse("events | STATS GROUP BY device") {
+            Err(ParseError::ReservedKeyword { keyword, role, .. }) => {
+                assert_eq!(keyword, "GROUP");
+                assert_eq!(role, NameRole::AliasName);
+            }
+            other => panic!("expected ReservedKeyword(GROUP) error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_group_by_qualified_column_reference() {
+        // GROUP BY accepts a qualified column reference (`table.col`)
+        // via the `name` branch of `group_item`. No alias is required
+        // because `is_bare_or_qualified_column` returns true for
+        // `Expr::Qualified`.
+        let stmt = parse_stmt("events | STATS n = COUNT(*) GROUP BY events.device");
+        let groups = group_items_of(stages_of(&stmt));
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].alias.is_none());
+        match &groups[0].expr.node {
+            Expr::Qualified { table, column } => {
+                assert_eq!(table.text, "events");
+                assert_eq!(column.text, "device");
+            }
+            other => panic!("expected Qualified in GROUP BY, got {other:?}"),
+        }
     }
 }
