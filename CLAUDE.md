@@ -71,6 +71,7 @@ cargo fmt --check                                         # formatting check
 
 - Hot-path changes should come with benchmark coverage or benchmark updates in `benches/`. If a change affects scan, filter, encoding, ingest, merge, or sequence-matching performance, measure it.
 - Use property tests for components with large input spaces and clear invariants: codecs, planner rewrites, merge/order guarantees, compaction, and sequence evaluation. Example tests alone are not enough for these surfaces; `docs/core-beliefs.md` §11 is the default bar, and `tests/src/strategies.rs` is the canonical source of Arrow-shaped generators to reuse.
+- When a test fails, fix the code, not the test. Only modify the test after confirming its expected behavior is actually wrong (e.g. the spec changed, the invariant was miswritten). A failing test is signal — silencing it by adjusting expectations hides real regressions.
 
 ## Documentation
 
