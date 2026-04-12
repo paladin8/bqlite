@@ -68,10 +68,12 @@ pub enum PipelineStage {
         span: Span,
     },
 
-    /// `| ORDER BY <items>` — total ordering (query-language.md §13).
+    /// `| ORDER BY <items>` or `| SORT <items>` — total ordering
+    /// (query-language.md §15). `SORT` is a parser-level alias; both
+    /// forms produce this variant.
     OrderBy { items: Vec<OrderItem>, span: Span },
 
-    /// `| LIMIT <count>` — row cap (query-language.md §13).
+    /// `| LIMIT <count>` — row cap (query-language.md §15).
     Limit { count: u64, span: Span },
 
     /// `| PIVOT <pivot_column> ON <value_column> [IN (values)]` —

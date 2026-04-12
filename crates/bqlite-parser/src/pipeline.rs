@@ -4,32 +4,17 @@
 //! docs/design/language/grammar-framework.md §7.
 //!
 //! This module implements the `|`-separated continuation of a pipeline
-//! after the source expression. Wave 2 / TASK-223 lands the Wave 2
-//! verbs:
+//! after the source expression. Implemented verbs (in grammar-section order):
 //!
-//! - `| WHERE <predicate>` — row filter (§9).
-//! - `| SELECT [DISTINCT] <items>` — projection (§10).
-//! - `| LIMIT <integer>` — row cap (§13).
+//! - `| WHERE <predicate>` — row filter (§9, TASK-223).
+//! - `| SELECT [DISTINCT] <items>` — projection (§10, TASK-223).
+//! - `| LIMIT <integer>` — row cap (§15, TASK-223).
+//! - `| STATS <agg_list> [GROUP BY <group_list>]` — aggregation (§7, TASK-314).
+//! - `| ORDER BY <items>` / `| SORT <items>` — ordering (§15, TASK-315).
 //!
-//! The grammar lives in §26 lines 1520–1601. The precise productions:
-//!
-//! ```text
-//! pipeline    := source ("|" operator)*
-//! operator    := where_op | select_op | limit_op | ...
-//!
-//! where_op    := WHERE predicate
-//! select_op   := SELECT DISTINCT? select_list
-//! select_list := select_item ("," select_item)*
-//! select_item := "*"
-//!              | name                    -- bare column
-//!              | name "." name           -- qualified column
-//!              | expr AS identifier      -- computed expression
-//! limit_op    := LIMIT integer
-//! ```
-//!
-//! Every other Wave 2+ pipeline verb (`MATCH`, `FUNNEL`, `STATS`, …)
-//! lives in later tasks and produces a `PipelineStage::…`-returning
-//! production function sitting alongside the ones here.
+//! The grammar lives in §26 (query-language.md). Every other pipeline
+//! verb (`MATCH`, `FUNNEL`, …) lives in later tasks and produces a
+//! `PipelineStage::…`-returning production function alongside these.
 //!
 //! The module surface is crate-private. [`parse_pipeline_stages`] is
 //! called from `crate::parser::parse_pipeline`; outside callers reach
@@ -37,7 +22,9 @@
 
 #![allow(dead_code)] // TASK-221 / TASK-222 productions reach this module later.
 
-use bqlite_ast::{AggItem, Expr, GroupItem, Name, PipelineStage, SelectItem, SelectItemKind};
+use bqlite_ast::{
+    AggItem, Expr, GroupItem, Name, OrderItem, PipelineStage, SelectItem, SelectItemKind, SortDir,
+};
 
 use crate::error::{Expected, NameRole, ParseError};
 use crate::expr::parse_expression;
@@ -63,6 +50,8 @@ fn parse_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
         TokenKind::Kw(Keyword::Select) => parse_select_stage(p),
         TokenKind::Kw(Keyword::Limit) => parse_limit_stage(p),
         TokenKind::Kw(Keyword::Stats) => parse_stats_stage(p),
+        // `ORDER BY …` and its `SORT …` alias (query-language.md §15).
+        TokenKind::Kw(Keyword::Order) | TokenKind::Kw(Keyword::Sort) => parse_order_by_stage(p),
 
         // Every other first token is either a later-wave verb that
         // TASK-223 does not yet implement, or an error. The error
@@ -519,13 +508,95 @@ fn parse_group_item(p: &mut Parser) -> Result<GroupItem, ParseError> {
 }
 
 // ----------------------------------------------------------------------
+// ORDER BY
+// ----------------------------------------------------------------------
+
+/// `ORDER BY <items>` or `SORT <items>` — §15 / §26 line 1601.
+///
+/// Both keywords produce an identical `PipelineStage::OrderBy` node.
+/// `SORT` is a convenience alias recognised by the parser only — the AST
+/// and planner see no distinction (query-language.md §15).
+///
+/// Grammar:
+/// ```text
+/// order_op  := ORDER BY order_item ("," order_item)*
+///            | SORT    order_item ("," order_item)*
+/// order_item := expr (ASC | DESC)?
+/// ```
+///
+/// Default direction is `ASC` when the keyword is absent (§15: "default
+/// direction is ascending").
+fn parse_order_by_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    // `SORT` is a single keyword; `ORDER BY` is a two-keyword form.
+    let start_span = if matches!(p.peek_kind(), TokenKind::Kw(Keyword::Sort)) {
+        let tok = p.bump(); // consume SORT
+        token_span(&tok)
+    } else {
+        let tok = p.expect_kw(Keyword::Order)?;
+        let start = token_span(&tok);
+        // `ORDER` must be followed by `BY` — bare `ORDER` is a syntax
+        // error (query-language.md §15). The error message points at the
+        // token after `ORDER` so the user sees what was found instead.
+        p.expect_kw(Keyword::By)?;
+        start
+    };
+
+    // At least one order item is required.
+    let mut items = Vec::new();
+    items.push(parse_order_item(p)?);
+    while matches!(p.peek_kind(), TokenKind::Comma) {
+        p.bump(); // consume `,`
+        items.push(parse_order_item(p)?);
+    }
+
+    let last_span = items
+        .last()
+        .expect("loop above pushes at least one item")
+        .span;
+    let span = start_span.merged(last_span);
+
+    Ok(PipelineStage::OrderBy { items, span })
+}
+
+/// Parse one `order_item`: `expr (ASC | DESC)?`.
+///
+/// The direction keyword is optional; the default is [`SortDir::Asc`]
+/// when omitted (query-language.md §15). `NULLS FIRST` / `NULLS LAST`
+/// are not part of the v1 grammar (§26 line 1602).
+fn parse_order_item(p: &mut Parser) -> Result<OrderItem, ParseError> {
+    let expr = parse_expression(p)?;
+    let expr_span = expr.span;
+
+    // Optional `ASC` or `DESC` direction keyword. Track the token span
+    // so the item span correctly covers keyword-through-direction.
+    let (direction, span) = match p.peek_kind() {
+        TokenKind::Kw(Keyword::Asc) => {
+            let tok = p.bump();
+            (SortDir::Asc, expr_span.merged(token_span(&tok)))
+        }
+        TokenKind::Kw(Keyword::Desc) => {
+            let tok = p.bump();
+            (SortDir::Desc, expr_span.merged(token_span(&tok)))
+        }
+        // No direction keyword — default is ASC; span is the expression.
+        _ => (SortDir::Asc, expr_span),
+    };
+
+    Ok(OrderItem {
+        expr,
+        direction,
+        span,
+    })
+}
+
+// ----------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bqlite_ast::{BinaryOp, CompareOp, Literal, Spanned, Statement};
+    use bqlite_ast::{BinaryOp, CompareOp, Literal, OrderItem, SortDir, Spanned, Statement};
 
     // --- helpers ------------------------------------------------------
 
@@ -1401,6 +1472,231 @@ mod tests {
                 assert_eq!(column.text, "device");
             }
             other => panic!("expected Qualified in GROUP BY, got {other:?}"),
+        }
+    }
+
+    // --- ORDER BY -----------------------------------------------------
+
+    /// Helper: extract OrderItems from the first OrderBy stage.
+    fn order_items_of(stages: &[PipelineStage]) -> &[OrderItem] {
+        match &stages[0] {
+            PipelineStage::OrderBy { items, .. } => items.as_slice(),
+            other => panic!("expected OrderBy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_single_column_default_asc() {
+        // Default direction is ASC when no keyword is supplied (§15).
+        let stmt = parse_stmt("events | ORDER BY amount");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].direction, SortDir::Asc);
+        match &items[0].expr.node {
+            Expr::Column(c) => assert_eq!(c.text, "amount"),
+            other => panic!("expected Column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_explicit_asc() {
+        let stmt = parse_stmt("events | ORDER BY amount ASC");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].direction, SortDir::Asc);
+    }
+
+    #[test]
+    fn order_by_explicit_desc() {
+        let stmt = parse_stmt("events | ORDER BY amount DESC");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].direction, SortDir::Desc);
+    }
+
+    #[test]
+    fn order_by_mixed_directions() {
+        // `ORDER BY device ASC, amount DESC` — multiple items, mixed direction.
+        let stmt = parse_stmt("events | ORDER BY device ASC, amount DESC");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].direction, SortDir::Asc);
+        assert_eq!(items[1].direction, SortDir::Desc);
+        match &items[0].expr.node {
+            Expr::Column(c) => assert_eq!(c.text, "device"),
+            other => panic!("expected Column[0], got {other:?}"),
+        }
+        match &items[1].expr.node {
+            Expr::Column(c) => assert_eq!(c.text, "amount"),
+            other => panic!("expected Column[1], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_multiple_items_default_directions() {
+        // All directions absent — all default to ASC.
+        let stmt = parse_stmt("events | ORDER BY a, b, c");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 3);
+        for item in items {
+            assert_eq!(item.direction, SortDir::Asc);
+        }
+    }
+
+    #[test]
+    fn sort_alias_produces_identical_stage_to_order_by() {
+        // `SORT col` is the alias for `ORDER BY col` — both produce
+        // `PipelineStage::OrderBy` (query-language.md §15).
+        let stmt_order = parse_stmt("events | ORDER BY amount DESC");
+        let stmt_sort = parse_stmt("events | SORT amount DESC");
+
+        let items_order = order_items_of(stages_of(&stmt_order));
+        let items_sort = order_items_of(stages_of(&stmt_sort));
+
+        assert_eq!(items_order.len(), items_sort.len());
+        assert_eq!(items_order[0].direction, items_sort[0].direction);
+        match (&items_order[0].expr.node, &items_sort[0].expr.node) {
+            (Expr::Column(a), Expr::Column(b)) => assert_eq!(a.text, b.text),
+            other => panic!("expression mismatch: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_alias_single_column_default_asc() {
+        // `SORT col` without direction keyword defaults to ASC.
+        let stmt = parse_stmt("events | SORT user_id");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].direction, SortDir::Asc);
+        match &items[0].expr.node {
+            Expr::Column(c) => assert_eq!(c.text, "user_id"),
+            other => panic!("expected Column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_alias_multiple_items() {
+        let stmt = parse_stmt("events | SORT device ASC, amount DESC");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].direction, SortDir::Asc);
+        assert_eq!(items[1].direction, SortDir::Desc);
+    }
+
+    #[test]
+    fn order_by_case_insensitive() {
+        // Parser accepts keywords case-insensitively (§2.2).
+        let stmt = parse_stmt("events | order by amount desc");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items[0].direction, SortDir::Desc);
+    }
+
+    #[test]
+    fn sort_alias_case_insensitive() {
+        let stmt = parse_stmt("events | sort amount asc");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items[0].direction, SortDir::Asc);
+    }
+
+    #[test]
+    fn order_by_span_covers_keyword_through_last_item() {
+        let src = "events | ORDER BY amount DESC";
+        let stmt = parse_stmt(src);
+        match &stages_of(&stmt)[0] {
+            PipelineStage::OrderBy { span, .. } => {
+                let order_start = src.find("ORDER").unwrap();
+                let desc_end = src.find("DESC").unwrap() + "DESC".len();
+                assert_eq!(span.start, order_start);
+                assert_eq!(span.end, desc_end);
+            }
+            other => panic!("expected OrderBy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_bare_without_by_errors() {
+        // `ORDER amount` — missing the `BY` keyword. The parser expects
+        // `BY` after `ORDER` and emits a keyword error.
+        match crate::parse("events | ORDER amount") {
+            Err(ParseError::Unexpected { .. }) | Err(ParseError::ReservedKeyword { .. }) => {}
+            other => panic!("expected parse error for ORDER without BY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_missing_expression_errors() {
+        match crate::parse("events | ORDER BY") {
+            Err(ParseError::UnexpectedEof { expected, .. }) => {
+                assert_eq!(expected, Expected::Expression);
+            }
+            other => panic!("expected UnexpectedEof/Expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_missing_expression_errors() {
+        match crate::parse("events | SORT") {
+            Err(ParseError::UnexpectedEof { expected, .. }) => {
+                assert_eq!(expected, Expected::Expression);
+            }
+            other => panic!("expected UnexpectedEof/Expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_in_multi_stage_pipeline() {
+        // `STATS n = COUNT(*) GROUP BY device | ORDER BY n DESC | LIMIT 10`
+        let stmt =
+            parse_stmt("events | STATS n = COUNT(*) GROUP BY device | ORDER BY n DESC | LIMIT 10");
+        let stages = stages_of(&stmt);
+        assert_eq!(stages.len(), 3);
+        assert!(matches!(stages[0], PipelineStage::Stats { .. }));
+        assert!(matches!(stages[1], PipelineStage::OrderBy { .. }));
+        assert!(matches!(stages[2], PipelineStage::Limit { .. }));
+    }
+
+    #[test]
+    fn order_by_with_expression_not_just_column() {
+        // ORDER BY can sort on any expression, not just bare columns
+        // (§26 line 1602: `order_item := expr (ASC | DESC)?`).
+        let stmt = parse_stmt("events | ORDER BY amount * 2 DESC");
+        let items = order_items_of(stages_of(&stmt));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].direction, SortDir::Desc);
+        match &items[0].expr.node {
+            Expr::Binary {
+                op: BinaryOp::Multiply,
+                ..
+            } => {}
+            other => panic!("expected Binary Multiply expression in ORDER BY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_trailing_comma_errors() {
+        // `ORDER BY amount,` — trailing comma must be a parse error.
+        // `parse_expression` errors when it sees EOF or `|` after the comma.
+        match crate::parse("events | ORDER BY amount,") {
+            Err(ParseError::UnexpectedEof { .. }) | Err(ParseError::Unexpected { .. }) => {}
+            other => panic!("expected trailing-comma error in ORDER BY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_alias_span_covers_keyword_through_last_item() {
+        // For the SORT form, the stage span must start at the `S` of
+        // `SORT` and end at the last token consumed (the direction keyword
+        // or the final expression token, whichever is last).
+        let src = "events | SORT amount DESC";
+        let stmt = parse_stmt(src);
+        match &stages_of(&stmt)[0] {
+            PipelineStage::OrderBy { span, .. } => {
+                let sort_start = src.find("SORT").unwrap();
+                let desc_end = src.find("DESC").unwrap() + "DESC".len();
+                assert_eq!(span.start, sort_start);
+                assert_eq!(span.end, desc_end);
+            }
+            other => panic!("expected OrderBy, got {other:?}"),
         }
     }
 }

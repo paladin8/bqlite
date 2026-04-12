@@ -951,9 +951,17 @@ events LAST 60d
 | ORDER BY device ASC, amount DESC
 | LIMIT 100
 | ORDER BY count DESC | LIMIT 10      -- top-N pattern
+
+-- SORT is a single-keyword alias for ORDER BY:
+| SORT amount DESC
+| SORT device ASC, amount DESC
 ```
 
-ORDER BY requires orderable types (all scalar types). List and Map are not orderable (type-system.md Section 6.12). NULL ordering follows the convention: NULLs sort **last** in ASC, **first** in DESC. This is the same convention Oracle, DuckDB, and BigQuery use by default (Postgres defaults differ — NULLS LAST regardless of direction — so queries ported from Postgres that depend on NULL position should be reviewed).
+`SORT` is a convenience alias for `ORDER BY`. Both forms accept the same item list and produce identical AST nodes (`PipelineStage::OrderBy`). The planner sees no distinction between them. `SORT` is slightly more concise for interactive use; `ORDER BY` is the canonical SQL-compatible spelling.
+
+ORDER BY / SORT requires orderable types (all scalar types). List and Map are not orderable (type-system.md Section 6.12). NULL ordering follows the convention: NULLs sort **last** in ASC, **first** in DESC. This is the same convention Oracle, DuckDB, and BigQuery use by default (Postgres defaults differ — NULLS LAST regardless of direction — so queries ported from Postgres that depend on NULL position should be reviewed).
+
+The direction keyword (`ASC` or `DESC`) is optional on each item; the default is **ascending** when omitted.
 
 LIMIT takes a non-negative integer literal. There is no OFFSET in v1 — pagination over analytical queries is typically a client concern, and large OFFSETs on sorted data defeat the sort optimization.
 
@@ -1597,8 +1605,9 @@ attribute_op     := ATTRIBUTE "(" "conversion" ":" event_ref ","
                                   "window" ":" duration ","
                                   "touchpoint_key" ":" expr ")"
 
--- ORDER BY
+-- ORDER BY / SORT (SORT is a single-keyword alias for ORDER BY)
 order_op         := ORDER BY order_item ("," order_item)*
+                  | SORT    order_item ("," order_item)*
 order_item       := expr (ASC | DESC)?
 
 -- LIMIT
