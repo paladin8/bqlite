@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-317",
+  "claimed_at": "2026-04-12T07:49:51Z",
+  "branch": "task/TASK-317",
+  "description": "Logical + physical plan variants for Wave 3"
+}
