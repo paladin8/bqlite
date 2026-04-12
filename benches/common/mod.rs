@@ -487,6 +487,36 @@ pub fn generate_events(n: usize, entity_count: usize) -> Vec<Event> {
     events
 }
 
+/// Compute the total logical data bytes across all events.
+///
+/// Counts entity overhead (32 bytes — entity-id struct + string), the
+/// timestamp (8 bytes), the event-type string, and each property's key
+/// length plus its payload size. This matches the partitioner's
+/// per-event byte accounting so that throughput numbers are consistent
+/// across the partitioner, end-to-end, and reference benchmarks.
+pub fn compute_event_bytes(events: &[Event]) -> u64 {
+    events
+        .iter()
+        .map(|e| {
+            let prop_bytes: usize = e
+                .properties
+                .iter()
+                .map(|(k, v)| {
+                    k.len()
+                        + match v {
+                            PropertyValue::Int(_) => 8,
+                            PropertyValue::Float(_) => 8,
+                            PropertyValue::String(s) => s.len(),
+                            PropertyValue::Bool(_) => 1,
+                            _ => 8,
+                        }
+                })
+                .sum();
+            (32 + 8 + e.event_type.len() + prop_bytes) as u64
+        })
+        .sum()
+}
+
 // ── Database setup helpers ───────────────────────────────────────────────────
 
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);

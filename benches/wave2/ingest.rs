@@ -26,26 +26,7 @@ fn bench_partitioner(c: &mut Criterion) {
     let mode = BenchMode::from_env();
     let sizing = BenchSizing::for_mode(mode);
     let events = generate_events(sizing.ingest_events_small, sizing.ingest_entities_small);
-    let event_bytes: u64 = events
-        .iter()
-        .map(|e| {
-            let prop_bytes: usize = e
-                .properties
-                .iter()
-                .map(|(k, v)| {
-                    k.len()
-                        + match v {
-                            bqlite_core::property::PropertyValue::Int(_) => 8,
-                            bqlite_core::property::PropertyValue::Float(_) => 8,
-                            bqlite_core::property::PropertyValue::String(s) => s.len(),
-                            bqlite_core::property::PropertyValue::Bool(_) => 1,
-                            _ => 8,
-                        }
-                })
-                .sum();
-            (32 + 8 + e.event_type.len() + prop_bytes) as u64
-        })
-        .sum();
+    let event_bytes = compute_event_bytes(&events);
 
     let mut group = c.benchmark_group("ingest/partitioner");
     group.throughput(Throughput::Bytes(event_bytes));
@@ -81,7 +62,7 @@ fn bench_ingest_end_to_end(c: &mut Criterion) {
     let mode = BenchMode::from_env();
     let sizing = BenchSizing::for_mode(mode);
     let events = generate_events(sizing.ingest_events_small, sizing.ingest_entities_small);
-    let event_bytes: u64 = events.len() as u64 * 120;
+    let event_bytes = compute_event_bytes(&events);
 
     let mut group = c.benchmark_group("ingest/end_to_end");
     group.throughput(Throughput::Bytes(event_bytes));
@@ -120,7 +101,7 @@ fn bench_ingest_larger(c: &mut Criterion) {
     let mode = BenchMode::from_env();
     let sizing = BenchSizing::for_mode(mode);
     let events = generate_events(sizing.ingest_events_large, sizing.ingest_entities_large);
-    let event_bytes: u64 = events.len() as u64 * 120;
+    let event_bytes = compute_event_bytes(&events);
 
     let mut collector = BenchResultCollector::new(mode);
 

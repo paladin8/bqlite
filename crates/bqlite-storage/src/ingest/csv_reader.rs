@@ -78,6 +78,10 @@ pub struct CsvEventReader<R: BufRead> {
     /// 1-based row number for error messages (header is row 1 when
     /// present, data rows start at 2).
     row_number: u64,
+    /// Cached count of `ColumnRole::Property` entries in `columns`,
+    /// used to pre-allocate the per-event property `Vec` without
+    /// re-scanning the mapping on every row.
+    property_count: usize,
 }
 
 /// Configuration extracted from the planner's `WITH (...)` options.
@@ -200,9 +204,15 @@ impl<R: BufRead> CsvEventReader<R> {
             record: csv::StringRecord::new(),
             columns: Vec::new(),
             row_number: if options.has_header { 1 } else { 0 },
+            property_count: 0,
         };
 
         me.resolve_columns(table, column_map, options.has_header)?;
+        me.property_count = me
+            .columns
+            .iter()
+            .filter(|c| c.role == ColumnRole::Property)
+            .count();
         Ok(me)
     }
 
@@ -364,7 +374,7 @@ impl<R: BufRead> CsvEventReader<R> {
         let mut entity: Option<EntityId> = None;
         let mut timestamp: Option<Timestamp> = None;
         let mut event_type: Option<String> = None;
-        let mut properties: Vec<(String, PropertyValue)> = Vec::new();
+        let mut properties: Vec<(String, PropertyValue)> = Vec::with_capacity(self.property_count);
 
         for col in &self.columns {
             let field = self.record.get(col.source_index).ok_or_else(|| {
@@ -503,13 +513,23 @@ fn parse_property_value(
     row: u64,
 ) -> Result<PropertyValue> {
     match target_type {
-        BqlType::Bool => match field.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Ok(PropertyValue::Bool(true)),
-            "false" | "0" | "no" => Ok(PropertyValue::Bool(false)),
-            _ => Err(BqliteError::Execution(format!(
-                "CSV reader row {row}: cannot parse '{field}' as Bool for column '{col_name}'"
-            ))),
-        },
+        BqlType::Bool => {
+            if field.eq_ignore_ascii_case("true")
+                || field == "1"
+                || field.eq_ignore_ascii_case("yes")
+            {
+                Ok(PropertyValue::Bool(true))
+            } else if field.eq_ignore_ascii_case("false")
+                || field == "0"
+                || field.eq_ignore_ascii_case("no")
+            {
+                Ok(PropertyValue::Bool(false))
+            } else {
+                Err(BqliteError::Execution(format!(
+                    "CSV reader row {row}: cannot parse '{field}' as Bool for column '{col_name}'"
+                )))
+            }
+        }
         BqlType::Int => {
             let n: i64 = field.parse().map_err(|_| {
                 BqliteError::Execution(format!(

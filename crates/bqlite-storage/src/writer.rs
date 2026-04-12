@@ -531,6 +531,11 @@ pub(crate) fn plan_row_groups(events: &[Event], target_size: usize) -> Vec<Range
 /// Project a sorted event slice into an Arrow [`RecordBatch`] matching
 /// `schema`'s column order.
 ///
+/// Uses a single pass over the event slice to populate all column
+/// builders simultaneously, minimizing cache-line re-reads for the
+/// property `Vec` — each event's heap data is pulled into cache exactly
+/// once instead of once per column.
+///
 /// Role columns (entity key, event time, event type) are populated
 /// from `event.entity`, `event.timestamp`, and `event.event_type`
 /// respectively. All other columns are looked up by name in
@@ -546,23 +551,175 @@ pub(crate) fn events_to_record_batch(
     events: &[Event],
 ) -> Result<RecordBatch> {
     let row_count = events.len();
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.columns().len());
+    let cols = schema.columns();
+    let n_cols = cols.len();
+    let entity_idx = schema.entity_key_index();
+    let ts_idx = schema.timestamp_index();
+    let et_idx = schema.event_type_index();
 
-    for (col_idx, col_def) in schema.columns().iter().enumerate() {
-        let array = if col_idx == schema.entity_key_index() {
-            entity_key_column(events, col_def)?
-        } else if col_idx == schema.timestamp_index() {
-            timestamp_column(events)
-        } else if col_idx == schema.event_type_index() {
-            event_type_column(events)
-        } else {
-            property_column(events, col_def)?
-        };
-        arrays.push(array);
+    // Reject nested types up front so the single-pass loop can assume
+    // only primitive types.
+    for col in cols {
+        if matches!(col.bql_type, BqlType::List(_) | BqlType::Map(_)) {
+            return Err(BqliteError::Execution(format!(
+                "writer: nested column `{}` (type {:?}) is not yet supported by Wave 2 ingest",
+                col.name, col.bql_type
+            )));
+        }
     }
 
-    let arrow_fields: Vec<Field> = schema
-        .columns()
+    // Pre-compute property hints for all property columns. Role columns
+    // get `None` — they are populated from direct struct fields.
+    let hints: Vec<Option<usize>> = (0..n_cols)
+        .map(|i| {
+            if i == entity_idx || i == ts_idx || i == et_idx {
+                None
+            } else {
+                property_hint(events, &cols[i])
+            }
+        })
+        .collect();
+
+    // Per-column role tag, precomputed to avoid repeated comparisons
+    // inside the inner loop.
+    #[derive(Clone, Copy)]
+    enum ColRole {
+        EntityKey,
+        Timestamp,
+        EventType,
+        Property,
+    }
+    let roles: Vec<ColRole> = (0..n_cols)
+        .map(|i| {
+            if i == entity_idx {
+                ColRole::EntityKey
+            } else if i == ts_idx {
+                ColRole::Timestamp
+            } else if i == et_idx {
+                ColRole::EventType
+            } else {
+                ColRole::Property
+            }
+        })
+        .collect();
+
+    // Typed builder enum — holds one builder per column so the single-
+    // pass loop can append to any column via a match on the enum arm.
+    enum ColBuilder {
+        StringView(StringViewBuilder),
+        Int64(Int64Builder),
+        Float64(Float64Builder),
+        Bool(BooleanBuilder),
+        TimestampNs(TimestampNanosecondBuilder),
+    }
+
+    let mut builders: Vec<ColBuilder> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            // The timestamp column uses a timezone-aware builder
+            // regardless of whether it's declared as Timestamp in the
+            // schema (the role column is always Timestamp(Ns, UTC)).
+            if i == ts_idx {
+                return ColBuilder::TimestampNs(
+                    TimestampNanosecondBuilder::with_capacity(row_count).with_timezone("UTC"),
+                );
+            }
+            match col.bql_type {
+                BqlType::String => {
+                    ColBuilder::StringView(StringViewBuilder::with_capacity(row_count))
+                }
+                BqlType::Int => ColBuilder::Int64(Int64Builder::with_capacity(row_count)),
+                BqlType::Float => ColBuilder::Float64(Float64Builder::with_capacity(row_count)),
+                BqlType::Bool => ColBuilder::Bool(BooleanBuilder::with_capacity(row_count)),
+                BqlType::Timestamp => ColBuilder::TimestampNs(
+                    TimestampNanosecondBuilder::with_capacity(row_count).with_timezone("UTC"),
+                ),
+                // Nested types were rejected above.
+                BqlType::List(_) | BqlType::Map(_) => unreachable!(),
+            }
+        })
+        .collect();
+
+    // ── Single pass over all events ────────────────────────────────
+    for event in events {
+        for col_idx in 0..n_cols {
+            match roles[col_idx] {
+                ColRole::EntityKey => match (&mut builders[col_idx], &event.entity) {
+                    (ColBuilder::StringView(b), EntityId::String(s)) => b.append_value(s),
+                    (ColBuilder::Int64(b), EntityId::Int(n)) => b.append_value(*n),
+                    _ => {
+                        return Err(BqliteError::Execution(format!(
+                            "writer: entity key column `{}` type mismatch with event entity {:?}",
+                            cols[col_idx].name, event.entity
+                        )));
+                    }
+                },
+                ColRole::Timestamp => match &mut builders[col_idx] {
+                    ColBuilder::TimestampNs(b) => b.append_value(event.timestamp_nanos()),
+                    _ => unreachable!("timestamp column always uses TimestampNs builder"),
+                },
+                ColRole::EventType => match &mut builders[col_idx] {
+                    ColBuilder::StringView(b) => b.append_value(&event.event_type),
+                    _ => unreachable!("event-type column always uses StringView builder"),
+                },
+                ColRole::Property => {
+                    let col_def = &cols[col_idx];
+                    let value = fast_property_for(event, col_def, hints[col_idx])?;
+                    match (&mut builders[col_idx], value) {
+                        (ColBuilder::Bool(b), Some(PropertyValue::Bool(v))) => {
+                            b.append_value(*v);
+                        }
+                        (ColBuilder::Int64(b), Some(PropertyValue::Int(n))) => {
+                            b.append_value(*n);
+                        }
+                        (ColBuilder::Float64(b), Some(PropertyValue::Float(f))) => {
+                            b.append_value(*f);
+                        }
+                        (ColBuilder::StringView(b), Some(PropertyValue::String(s))) => {
+                            b.append_value(s);
+                        }
+                        (ColBuilder::TimestampNs(b), Some(PropertyValue::Timestamp(ns))) => {
+                            b.append_value(*ns);
+                        }
+                        // All nullable builder types: append null.
+                        (ColBuilder::Bool(b), Some(PropertyValue::Null) | None) => {
+                            b.append_null();
+                        }
+                        (ColBuilder::Int64(b), Some(PropertyValue::Null) | None) => {
+                            b.append_null();
+                        }
+                        (ColBuilder::Float64(b), Some(PropertyValue::Null) | None) => {
+                            b.append_null();
+                        }
+                        (ColBuilder::StringView(b), Some(PropertyValue::Null) | None) => {
+                            b.append_null();
+                        }
+                        (ColBuilder::TimestampNs(b), Some(PropertyValue::Null) | None) => {
+                            b.append_null();
+                        }
+                        (_, Some(other)) => return Err(type_mismatch(col_def, other)),
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Finish builders and assemble RecordBatch ───────────────────
+    let arrays: Vec<ArrayRef> = builders
+        .into_iter()
+        .map(|b| -> ArrayRef {
+            match b {
+                ColBuilder::StringView(mut b) => Arc::new(b.finish()),
+                ColBuilder::Int64(mut b) => Arc::new(b.finish()),
+                ColBuilder::Float64(mut b) => Arc::new(b.finish()),
+                ColBuilder::Bool(mut b) => Arc::new(b.finish()),
+                ColBuilder::TimestampNs(mut b) => Arc::new(b.finish()),
+            }
+        })
+        .collect();
+
+    let arrow_fields: Vec<Field> = cols
         .iter()
         .map(|c| {
             let dt = bql_type_to_arrow(&c.bql_type);
@@ -578,132 +735,27 @@ pub(crate) fn events_to_record_batch(
     })
 }
 
-fn entity_key_column(events: &[Event], col: &ColumnDef) -> Result<ArrayRef> {
-    match col.bql_type {
-        BqlType::String => {
-            let mut builder = StringViewBuilder::with_capacity(events.len());
-            for event in events {
-                match &event.entity {
-                    EntityId::String(s) => builder.append_value(s),
-                    EntityId::Int(_) => {
-                        return Err(BqliteError::Execution(format!(
-                            "writer: entity key column `{}` is String but event has Int entity",
-                            col.name
-                        )));
-                    }
-                }
-            }
-            Ok(Arc::new(builder.finish()))
+/// Look up the property value for `col` on `event` using a precomputed
+/// `hint_idx` to skip the O(n) linear scan in the common case where
+/// every event carries properties in the same order (true for all
+/// events produced by the CSV reader or INSERT VALUES path in a single
+/// ingest call). Falls back to the full name scan when the hint misses.
+///
+/// Returns `None` when the property is absent. Errors when the column
+/// is non-nullable and the property is missing or null.
+#[inline]
+fn fast_property_for<'a>(
+    event: &'a Event,
+    col: &ColumnDef,
+    hint_idx: Option<usize>,
+) -> Result<Option<&'a PropertyValue>> {
+    let value = match hint_idx {
+        Some(idx) if idx < event.properties.len() && event.properties[idx].0 == col.name => {
+            Some(&event.properties[idx].1)
         }
-        BqlType::Int => {
-            let mut builder = Int64Builder::with_capacity(events.len());
-            for event in events {
-                match &event.entity {
-                    EntityId::Int(n) => builder.append_value(*n),
-                    EntityId::String(_) => {
-                        return Err(BqliteError::Execution(format!(
-                            "writer: entity key column `{}` is Int but event has String entity",
-                            col.name
-                        )));
-                    }
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        ref other => Err(BqliteError::Execution(format!(
-            "writer: entity key column `{}` has unsupported type {other:?} \
-             (expected String or Int — type-system.md §5.1)",
-            col.name
-        ))),
-    }
-}
-
-fn timestamp_column(events: &[Event]) -> ArrayRef {
-    let mut builder = TimestampNanosecondBuilder::with_capacity(events.len()).with_timezone("UTC");
-    for event in events {
-        builder.append_value(event.timestamp_nanos());
-    }
-    Arc::new(builder.finish())
-}
-
-fn event_type_column(events: &[Event]) -> ArrayRef {
-    let mut builder = StringViewBuilder::with_capacity(events.len());
-    for event in events {
-        builder.append_value(&event.event_type);
-    }
-    Arc::new(builder.finish())
-}
-
-fn property_column(events: &[Event], col: &ColumnDef) -> Result<ArrayRef> {
-    match col.bql_type {
-        BqlType::Bool => {
-            let mut builder = BooleanBuilder::with_capacity(events.len());
-            for event in events {
-                match property_for(event, col)? {
-                    Some(PropertyValue::Bool(b)) => builder.append_value(*b),
-                    Some(PropertyValue::Null) | None => builder.append_null(),
-                    Some(other) => return Err(type_mismatch(col, other)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        BqlType::Int => {
-            let mut builder = Int64Builder::with_capacity(events.len());
-            for event in events {
-                match property_for(event, col)? {
-                    Some(PropertyValue::Int(n)) => builder.append_value(*n),
-                    Some(PropertyValue::Null) | None => builder.append_null(),
-                    Some(other) => return Err(type_mismatch(col, other)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        BqlType::Float => {
-            let mut builder = Float64Builder::with_capacity(events.len());
-            for event in events {
-                match property_for(event, col)? {
-                    Some(PropertyValue::Float(f)) => builder.append_value(*f),
-                    Some(PropertyValue::Null) | None => builder.append_null(),
-                    Some(other) => return Err(type_mismatch(col, other)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        BqlType::String => {
-            let mut builder = StringViewBuilder::with_capacity(events.len());
-            for event in events {
-                match property_for(event, col)? {
-                    Some(PropertyValue::String(s)) => builder.append_value(s),
-                    Some(PropertyValue::Null) | None => builder.append_null(),
-                    Some(other) => return Err(type_mismatch(col, other)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        BqlType::Timestamp => {
-            let mut builder =
-                TimestampNanosecondBuilder::with_capacity(events.len()).with_timezone("UTC");
-            for event in events {
-                match property_for(event, col)? {
-                    Some(PropertyValue::Timestamp(ns)) => builder.append_value(*ns),
-                    Some(PropertyValue::Null) | None => builder.append_null(),
-                    Some(other) => return Err(type_mismatch(col, other)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        BqlType::List(_) | BqlType::Map(_) => Err(BqliteError::Execution(format!(
-            "writer: nested column `{}` (type {:?}) is not yet supported by Wave 2 ingest",
-            col.name, col.bql_type
-        ))),
-    }
-}
-
-/// Look up the property value for `col` on `event`. Returns `None`
-/// when the property is absent. Errors when the column is non-nullable
-/// and the property is missing or null.
-fn property_for<'a>(event: &'a Event, col: &ColumnDef) -> Result<Option<&'a PropertyValue>> {
-    match event.get(&col.name) {
+        _ => event.get(&col.name),
+    };
+    match value {
         Some(PropertyValue::Null) | None if !col.nullable => Err(BqliteError::Execution(format!(
             "writer: NOT NULL column `{}` has no value for an event (entity={:?}, ts={})",
             col.name,
@@ -712,6 +764,16 @@ fn property_for<'a>(event: &'a Event, col: &ColumnDef) -> Result<Option<&'a Prop
         ))),
         v => Ok(v),
     }
+}
+
+/// Precompute the index of `col` within the first event's properties
+/// list. Returns `None` when `events` is empty or the column is not
+/// present on the first event.
+#[inline]
+fn property_hint(events: &[Event], col: &ColumnDef) -> Option<usize> {
+    events
+        .first()
+        .and_then(|e| e.properties.iter().position(|(k, _)| k == &col.name))
 }
 
 fn type_mismatch(col: &ColumnDef, value: &PropertyValue) -> BqliteError {
@@ -805,20 +867,43 @@ fn densify(array: &ArrayRef) -> Result<ArrayRef> {
 fn build_null_bitmap_lsb_first(array: &dyn Array) -> Vec<u8> {
     let row_count = array.len();
     let bytes_needed = row_count.div_ceil(8);
-    let mut bitmap = vec![0u8; bytes_needed];
+
     if let Some(nulls) = array.nulls() {
         let buf = nulls.inner();
-        for i in 0..row_count {
-            if buf.value(i) {
-                bitmap[i / 8] |= 1 << (i % 8);
+        let offset = buf.offset();
+        if offset % 8 == 0 {
+            // Fast path: byte-aligned validity buffer — bulk copy the
+            // bytes instead of iterating per-bit.
+            let byte_offset = offset / 8;
+            let src = &buf.values()[byte_offset..byte_offset + bytes_needed];
+            let mut bitmap = src.to_vec();
+            // Clear any trailing bits beyond row_count so downstream
+            // consumers see exact zeros past the last valid row.
+            if !row_count.is_multiple_of(8) {
+                let mask = (1u8 << (row_count % 8)) - 1;
+                bitmap[bytes_needed - 1] &= mask;
             }
+            bitmap
+        } else {
+            // Slow path: non-byte-aligned offset requires per-bit copy.
+            let mut bitmap = vec![0u8; bytes_needed];
+            for i in 0..row_count {
+                if buf.value(i) {
+                    bitmap[i / 8] |= 1 << (i % 8);
+                }
+            }
+            bitmap
         }
     } else {
-        for i in 0..row_count {
-            bitmap[i / 8] |= 1 << (i % 8);
+        // No null buffer = all non-null. Fill with 0xFF and mask the
+        // trailing byte.
+        let mut bitmap = vec![0xFFu8; bytes_needed];
+        if !row_count.is_multiple_of(8) {
+            let mask = (1u8 << (row_count % 8)) - 1;
+            bitmap[bytes_needed - 1] = mask;
         }
+        bitmap
     }
-    bitmap
 }
 
 // ── Zone map extraction ─────────────────────────────────────────────────────
