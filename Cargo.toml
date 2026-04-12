@@ -43,6 +43,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.14", default-features = false, features = ["flamegraph", "criterion"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 smallvec = { version = "1", features = ["const_generics"] }

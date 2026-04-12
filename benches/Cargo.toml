@@ -22,6 +22,7 @@ bqlite-planner = { workspace = true }
 bqlite-engine = { workspace = true }
 arrow = { workspace = true }
 criterion = { workspace = true }
+pprof = { workspace = true }
 serde_json = { workspace = true }
 
 # Wave 1 smoke benchmark — exercises the Criterion harness in CI so that
@@ -86,3 +87,9 @@ harness = false
 name = "funnel"
 path = "wave3/funnel.rs"
 harness = false
+
+# Profiling binary for funnel query analysis (TASK-331).
+# Run with: cargo run -p bqlite-benches --release --example funnel_profile
+[[example]]
+name = "funnel_profile"
+path = "wave3/funnel_profile.rs"

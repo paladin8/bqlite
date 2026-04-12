@@ -151,16 +151,80 @@ struct ScanState {
     scan_exhausted: bool,
 }
 
+/// Pre-extracted entity key for zero-dispatch heap comparisons.
+///
+/// Storing the entity key value directly in the heap entry avoids
+/// `as_any().downcast_ref()` dynamic dispatch on every comparison
+/// (the #1 hotspot in pprof profiles of the 100M funnel query).
+#[derive(Debug, Clone)]
+enum EntityKeyValue {
+    /// Inline string key. Short strings (common for entity IDs like
+    /// `"user_000042"`) are stored directly without heap allocation
+    /// via `SmallVec`. Longer strings fall back to heap.
+    Str(smallvec::SmallVec<[u8; 24]>),
+    /// Integer entity key.
+    Int(i64),
+}
+
+impl EntityKeyValue {
+    fn extract(col: &ArrayRef, row: usize) -> Self {
+        if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+            let s = arr.value(row).as_bytes();
+            EntityKeyValue::Str(smallvec::SmallVec::from_slice(s))
+        } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            let s = arr.value(row).as_bytes();
+            EntityKeyValue::Str(smallvec::SmallVec::from_slice(s))
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            EntityKeyValue::Int(arr.value(row))
+        } else {
+            unreachable!(
+                "entity key type {:?} not supported — should have been rejected by \
+                 validate_key_types at construction",
+                col.data_type()
+            )
+        }
+    }
+}
+
+impl Ord for EntityKeyValue {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (EntityKeyValue::Str(a), EntityKeyValue::Str(b)) => a.as_slice().cmp(b.as_slice()),
+            (EntityKeyValue::Int(a), EntityKeyValue::Int(b)) => a.cmp(b),
+            // Mixed types cannot occur (all scans share the same schema),
+            // but give a stable ordering to avoid UB if it ever happens.
+            (EntityKeyValue::Str(_), EntityKeyValue::Int(_)) => Ordering::Less,
+            (EntityKeyValue::Int(_), EntityKeyValue::Str(_)) => Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for EntityKeyValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for EntityKeyValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for EntityKeyValue {}
+
 /// Heap entry for one scan's current row.
 ///
-/// We clone just the key/timestamp column [`ArrayRef`]s, not the full
-/// batch, so heap comparisons can use the built-in [`BinaryHeap`]
-/// without allocating owned string keys on every push.
+/// Stores pre-extracted `(entity_key, ts)` values so heap comparisons
+/// are pure scalar/byte-slice operations with no dynamic dispatch.
+/// This avoids the `as_any().downcast_ref().type_id()` overhead that
+/// dominated pprof profiles of the k-way merge hot path (TASK-331).
 struct HeapEntry {
     scan_idx: usize,
     row_idx: usize,
-    entity_key: ArrayRef,
-    ts: ArrayRef,
+    entity_key: EntityKeyValue,
+    ts_nanos: i64,
 }
 
 impl HeapEntry {
@@ -169,32 +233,35 @@ impl HeapEntry {
             .batch
             .as_ref()
             .expect("active-heap entries always point at a loaded batch");
+        let entity_key = EntityKeyValue::extract(batch.column(entity_key_col), state.cursor);
+        let ts_nanos = extract_ts_nanos(batch.column(ts_col), state.cursor);
         Self {
             scan_idx,
             row_idx: state.cursor,
-            entity_key: batch.column(entity_key_col).clone(),
-            ts: batch.column(ts_col).clone(),
+            entity_key,
+            ts_nanos,
         }
     }
 }
 
+/// Extract the i64 nanosecond timestamp from a column at a given row.
+#[inline]
+fn extract_ts_nanos(col: &ArrayRef, row: usize) -> i64 {
+    use ::arrow::array::TimestampNanosecondArray;
+    col.as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("ts column validated as TimestampNanosecond at construction")
+        .value(row)
+}
+
 impl Ord for HeapEntry {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        match compare_entity_key(
-            &self.entity_key,
-            self.row_idx,
-            &other.entity_key,
-            other.row_idx,
-        ) {
-            Ordering::Equal => match compare_ts(&self.ts, self.row_idx, &other.ts, other.row_idx) {
-                Ordering::Equal => self
-                    .scan_idx
-                    .cmp(&other.scan_idx)
-                    .then_with(|| self.row_idx.cmp(&other.row_idx)),
-                other => other,
-            },
-            other => other,
-        }
+        self.entity_key
+            .cmp(&other.entity_key)
+            .then_with(|| self.ts_nanos.cmp(&other.ts_nanos))
+            .then_with(|| self.scan_idx.cmp(&other.scan_idx))
+            .then_with(|| self.row_idx.cmp(&other.row_idx))
     }
 }
 
@@ -556,48 +623,6 @@ fn validate_key_types(schema: &ArrowSchema, entity_key_col: usize, ts_col: usize
         )));
     }
     Ok(())
-}
-
-fn compare_entity_key(
-    a: &ArrayRef,
-    a_row: usize,
-    b: &ArrayRef,
-    b_row: usize,
-) -> std::cmp::Ordering {
-    match (a.data_type(), b.data_type()) {
-        (DataType::Utf8View, DataType::Utf8View) => {
-            let a = a.as_any().downcast_ref::<StringViewArray>().unwrap();
-            let b = b.as_any().downcast_ref::<StringViewArray>().unwrap();
-            a.value(a_row).cmp(b.value(b_row))
-        }
-        (DataType::Utf8, DataType::Utf8) => {
-            let a = a.as_any().downcast_ref::<StringArray>().unwrap();
-            let b = b.as_any().downcast_ref::<StringArray>().unwrap();
-            a.value(a_row).cmp(b.value(b_row))
-        }
-        (DataType::Int64, DataType::Int64) => {
-            let a = a.as_any().downcast_ref::<Int64Array>().unwrap();
-            let b = b.as_any().downcast_ref::<Int64Array>().unwrap();
-            a.value(a_row).cmp(&b.value(b_row))
-        }
-        (other_a, other_b) => unreachable!(
-            "k-way merge: entity_key columns with types {other_a:?} / {other_b:?} \
-             should have been rejected by validate_key_types at construction"
-        ),
-    }
-}
-
-fn compare_ts(a: &ArrayRef, a_row: usize, b: &ArrayRef, b_row: usize) -> std::cmp::Ordering {
-    use ::arrow::array::TimestampNanosecondArray;
-    let a = a
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .unwrap();
-    let b = b
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .unwrap();
-    a.value(a_row).cmp(&b.value(b_row))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
