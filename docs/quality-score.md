@@ -27,8 +27,8 @@ below the table. Grade changes from Wave 2 are annotated with arrows.
 | bqlite-core | **A** · 246 unit + 3 doctest; covers every type including Wave 3 additions (ScalarValue, AggFunction) *(↑ from 217)* | **A-** · foundational trait surface + types; Wave 3 additive extensions (ScalarValue, AggFunction shared types) preserve backward compat | **B+** · exhaustive module docs with design-doc refs; 4 rustdoc warnings persist (intra-doc links) | **C** · no per-crate benches (appropriate — pure types) | **A-** |
 | bqlite-ast | **A-** · 49 unit across expr/operator/pattern/pipeline/span/statement | **A-** · AST node enums for every BQL construct through Wave 3 (STATS, ORDER BY/SORT additions) *(↑ from B+)* | **B** · per-module docs on every file | **C** · no per-crate benches | **A-** *(↑ from B+)* |
 | bqlite-storage | **A** · 426 unit + 79 workspace property tests (encoding roundtrips, zone-map no-false-negatives) *(↑ from 417)* | **A** · complete v1 segment format; no Wave 3 API changes | **A-** · extensive module docs with design-doc §-refs; 18 rustdoc warnings (private-item links, +2 new) | **A-** · 4 Wave 2 bench groups covering all perf-gate metrics; bench CI wired | **A** |
-| bqlite-parser | **A** · 403 unit + 1 doctest; new pattern module (49 tests) + MATCH/FUNNEL/STATS/ORDER BY pipeline productions (85+ new tests); every production has happy-path + error-case coverage *(↑ from 263)* | **A** · full Wave 3 grammar: MATCH (FIRST/ALL), FUNNEL, STATS (10 agg functions + GROUP BY), ORDER BY/SORT, SEQUENCE patterns with WITHIN/BRACKETS/EMIT ALL/WITHOUT/IMMEDIATELY/repetition *(↑ from A-)* | **A-** · module docs with grammar-section refs and design-doc cross-references (pattern-grammar.md, query-language.md §4–§26); 3 rustdoc warnings persist *(↑ from B+)* | **C** · no per-crate benches (parser is not perf-critical path) | **A** *(↑ from A-)* |
-| bqlite-planner | **A** · 259 unit + 1 doctest; pattern compiler (41 tests), FUNNEL desugaring (10), match-aggregate fusion (11), logical/physical lowering for 4 new plan variants *(↑ from 173)* | **A** · AST → LogicalPlan → PhysicalPlan with 4 new plan nodes (SequenceMatch, Aggregate, Sort, Distinct), pattern compiler (CompiledNfa), 4 optimizer passes (pushdown, pruning, fusion, demand propagation), DemandSet backward analysis *(↑ from A-)* | **A-** · module docs with design-doc refs (wave3-lowering.md §2–§4, sequence-matching.md §14.2, aggregate-operator.md §9); 5 rustdoc warnings (+2 new: `desugar_funnel`/`fuse_match_aggregate` name collisions) *(↑ from B+)* | **C** · no per-crate benches (planner is not hot path) | **A** *(↑ from A-)* |
+| bqlite-parser | **A** · 415 unit + 1 doctest; new pattern module (49 tests) + MATCH/FUNNEL/STATS/ORDER BY pipeline productions (85+ new tests) + source time-range parsing (12 tests, TASK-328); every production has happy-path + error-case coverage *(↑ from 263)* | **A** · full Wave 3 grammar: MATCH (FIRST/ALL), FUNNEL, STATS (10 agg functions + GROUP BY), ORDER BY/SORT, SEQUENCE patterns with WITHIN/BRACKETS/EMIT ALL/WITHOUT/IMMEDIATELY/repetition, source time-range (LAST/BETWEEN) *(↑ from A-)* | **A-** · module docs with grammar-section refs and design-doc cross-references (pattern-grammar.md, query-language.md §4–§26); 3 rustdoc warnings persist *(↑ from B+)* | **C** · no per-crate benches (parser is not perf-critical path) | **A** *(↑ from A-)* |
+| bqlite-planner | **A** · 272 unit + 1 doctest; pattern compiler (41 tests), FUNNEL desugaring (10), match-aggregate fusion (11), logical/physical lowering for 4 new plan variants, scan time-range extension + EXPLAIN formatting (13 tests, TASK-328), variable-binding validation (TASK-329) *(↑ from 173)* | **A** · AST → LogicalPlan → PhysicalPlan with 4 new plan nodes (SequenceMatch, Aggregate, Sort, Distinct), pattern compiler (CompiledNfa), 4 optimizer passes (pushdown, pruning, fusion, demand propagation), DemandSet backward analysis, scan time-range extension *(↑ from A-)* | **A-** · module docs with design-doc refs (wave3-lowering.md §2–§4, sequence-matching.md §14.2, aggregate-operator.md §9); 5 rustdoc warnings (+2 new: `desugar_funnel`/`fuse_match_aggregate` name collisions) *(↑ from B+)* | **C** · no per-crate benches (planner is not hot path) | **A** *(↑ from A-)* |
 | bqlite-operators | **A** · 331 unit; MATCH operator (99 tests across 5 matcher submodules), hash aggregate (59 tests), DDSketch percentiles (30 tests), sort (15 tests), distinct (15 tests) + Wave 2 operators (113 tests) *(↑↑ from 113)* | **A** · complete Wave 3 operator set: SequenceMatchOperator (NFA + step-counter strategies, variable bindings, EMIT ALL), HashAggregateOperator (8 agg functions incl. DDSketch P50/P90/P95/P99), SortOperator, DistinctOperator — all with cancellation, memory caps, fused-aggregate protocol *(↑ from A-)* | **A-** · every module has section-level design-doc cross-references (match-operator.md, sequence-matching.md, matcher-strategy.md, aggregate-operator.md, sort-distinct.md); 3 rustdoc warnings (+2 new: AggregatePhysical, PatternClass links) *(↑ from B+)* | **A-** · 6 dedicated Wave 3 bench groups (matcher, aggregate, sort, distinct, funnel, percentile) covering step-counter vs NFA comparison, grouped aggregation scaling, DDSketch throughput, sort/distinct at multiple row counts *(↑↑ from B+)* | **A** *(↑ from A-)* |
 | bqlite-engine | **B+** · 58 unit covering parse → plan → bind → drive + DDL/DML execution + Wave 3 bind step for SequenceMatch/Aggregate/Sort/Distinct *(↑ from 51)* | **A-** · `Engine::query` extended with Wave 3 plan-to-operator binding for all 4 new physical descriptors *(↑ from B+)* | **B** · module docs present; **6 rustdoc warnings** (+1 new: `SequenceMatchAdapter` private-item link) | **C+** · no per-crate benches; covered transitively by workspace funnel + acceptance benches | **B+** |
 | bqlite-cli | **A-** · 84 unit covering 3 subcommands (init, query, ingest), auto-limit machinery, argument parsing *(↑ from 80)* | **A-** · unchanged API surface; Wave 3 features available via `bqlite query` | **B+** · extensive module docs; clean rustdoc (0 warnings) | **C** · no per-crate benches (CLI frontend not perf-critical) | **A-** |
@@ -39,7 +39,7 @@ below the table. Grade changes from Wave 2 are annotated with arrows.
 | Target | Count | Purpose |
 |--------|-------|---------|
 | `tests/common_smoke.rs` | 13 | Integration fixture framework (TASK-120) — temp DB helper, assert_batches_eq, CSV loader |
-| `tests/matcher_integration.rs` | 37 | **NEW** Matcher integration test suite (TASK-324) — linear patterns, MATCH FIRST/ALL, negation, repetition, time windows, EMIT ALL, alternation, IMMEDIATELY, sub-batch streaming |
+| `tests/matcher_integration.rs` | 45 | **NEW** Matcher integration test suite (TASK-324, TASK-329) — linear patterns, MATCH FIRST/ALL, negation, repetition, time windows, EMIT ALL, alternation, IMMEDIATELY, sub-batch streaming, variable bindings (8 E2E tests added by TASK-329) |
 | `tests/prop_property_value.rs` | 12 | Property-test harness (TASK-124) — `PropertyValue` round-trips via `proptest` |
 | `tests/prop_arrow.rs` | 1 | Arrow ↔ BqlType round-trip property test |
 | `tests/prop_encoding_plain.rs` | 13 | Plain encoding encode/decode round-trip property tests |
@@ -52,7 +52,7 @@ below the table. Grade changes from Wave 2 are annotated with arrows.
 | `tests/prop_time.rs` | 7 | TimeRange intersection/shift property tests |
 | `tests/smoke.rs` | 8 | Wave 1+2 acceptance gates (TASK-123) — CLI subprocess, `(0 rows)` footer, unknown-table error |
 | `tests/wave2_acceptance.rs` | 8 (1 ign) | Wave 2 acceptance gate (TASK-235) — CREATE TABLE, INSERT FROM CSV, INSERT VALUES, DESCRIBE, ALTER, DROP, end-to-end query |
-| `tests/wave3_acceptance.rs` | 3 | **NEW** Wave 3 acceptance gate (TASK-326) — FUNNEL sugar, desugared MATCH+STATS, FUNNEL-desugared equivalence |
+| `tests/wave3_acceptance.rs` | 6 | **NEW** Wave 3 acceptance gate (TASK-326, TASK-328) — FUNNEL sugar, desugared MATCH+STATS, FUNNEL-desugared equivalence, EXPLAIN time-range display, BETWEEN time-range, backward-compat without time-range |
 | `benches/benches/smoke.rs` | 1 | Criterion harness smoke (TASK-121) — no-op bench to exercise wiring |
 | `benches/wave2/scan.rs` | — | Columnar decode throughput: int64, string, float, with/without zone-map pruning |
 | `benches/wave2/encoding.rs` | — | Per-encoding encode/decode microbenches (Plain, Dictionary, Delta, BitPacking, Constant, LZ4) |
@@ -65,7 +65,7 @@ below the table. Grade changes from Wave 2 are annotated with arrows.
 | `benches/wave3/funnel.rs` | — | **NEW** End-to-end 3-step funnel: CI mode (50K events), reference mode (100M events, <10s target) |
 | `benches/wave3/percentile.rs` | — | **NEW** DDSketch insert/quantile/merge throughput, AggState integration, grouped P50 |
 
-**Evidence aggregate**: **2,040 passing tests** via `cargo test --workspace --all-targets` (1,856 per-crate unit + 170 workspace integration/property + 14 bench-crate unit), **1 ignored** (1 wave2 100M-row acceptance), **0 failing tests**. Separately, `cargo test --workspace --doc` adds **5 passing doctests** and **5 ignored doctests**. Of the 170 workspace tests, **89 are property tests** covering encoding roundtrips (5 encodings × all applicable types), PropertyValue coercion, TimeRange algebra, Arrow type mapping, NFA simulator invariants, and variable binding semantics. **10 Criterion bench groups** cover both Wave 2 and Wave 3 performance gate metrics.
+**Evidence aggregate**: **2,076 passing tests** via `cargo test --workspace --all-targets` (1,881 per-crate unit + 181 workspace integration/property + 14 bench-crate unit), **1 ignored** (1 wave2 100M-row acceptance), **0 failing tests**. Separately, `cargo test --workspace --doc` adds **5 passing doctests** and **5 ignored doctests**. Of the 181 workspace tests, **89 are property tests** covering encoding roundtrips (5 encodings × all applicable types), PropertyValue coercion, TimeRange algebra, Arrow type mapping, NFA simulator invariants, and variable binding semantics. **10 Criterion bench groups** cover both Wave 2 and Wave 3 performance gate metrics.
 
 ## Evidence
 
@@ -78,15 +78,15 @@ and `find crates/<crate>/src -name '*.rs'`.
 | bqlite            |   0 |  0 (1 ign) |     33 |    5 | 1 (output collision) |
 | bqlite-core       | 246 |  3         |  7,318 |  157 | 4 (intra-doc links) |
 | bqlite-ast        |  49 |  0         |  2,197 |   68 | 0 |
-| bqlite-storage    | 426 |  0 (1 ign) | 21,970 |  155 | 18 (private-item links) |
-| bqlite-parser     | 403 |  1         |  9,375 |    7 | 3 (private-item links) |
-| bqlite-planner    | 259 |  1         | 14,776 |  108 | 5 (private-item + name collisions) |
-| bqlite-operators  | 331 |  0         | 15,738 |  163 | 3 (unresolved links) |
+| bqlite-storage    | 426 |  0 (1 ign) | 21,995 |  155 | 18 (private-item links) |
+| bqlite-parser     | 415 |  1         |  9,581 |    7 | 3 (private-item links) |
+| bqlite-planner    | 272 |  1         | 15,208 |  108 | 5 (private-item + name collisions) |
+| bqlite-operators  | 331 |  0         | 15,894 |  163 | 3 (unresolved links) |
 | bqlite-engine     |  58 |  0         |  3,428 |   24 | 6 (1 link, 4 redundant, 1 private-item) |
 | bqlite-cli        |  84 |  0         |  2,054 |    6 | 0 |
 | bqlite-ffi        |   0 |  0         |     10 |    0 | 0 |
-| bqlite-benches    |  14 |  0         |  2,299 |    — | 1 (unresolved link) |
-| bqlite-tests      | 170 (1 ign) |  0 | —  |    — | 0 |
+| bqlite-benches    |  14 |  0         |  5,204 |    — | 1 (unresolved link) |
+| bqlite-tests      | 181 (1 ign) |  0 | —  |    — | 0 |
 
 - **Bench harness** compiles cleanly (`cargo bench -p bqlite-benches --no-run` → `Finished bench profile`, builds `src/lib.rs` + `benches/smoke.rs` + 4 Wave 2 benches + 6 Wave 3 benches).
 - **Bench CI** wired via `.github/workflows/bench.yml` (TASK-241): baseline capture on main push, regression gate on PRs (>10% on 3 consecutive samples), `bench-skip` label opt-out. All 6 Wave 3 benches registered in baseline/gate/reference jobs.
@@ -94,7 +94,7 @@ and `find crates/<crate>/src -name '*.rs'`.
 - **Clippy** clean at `-D warnings` across the workspace (`scripts/local-ci.sh` passing).
 - **Formatting** clean at `cargo fmt --all --check`.
 - **Dep-direction** check clean (`scripts/check-dep-direction.sh`).
-- **End-to-end acceptance**: Wave 3 acceptance test (`tests/wave3_acceptance.rs`) exercises FUNNEL sugar → desugared MATCH+STATS → equivalence check against deterministic 20-entity funnel fixture, all passing.
+- **End-to-end acceptance**: Wave 3 acceptance test (`tests/wave3_acceptance.rs`, 6 tests) exercises FUNNEL sugar → desugared MATCH+STATS → equivalence check against deterministic 20-entity funnel fixture, canonical `LAST 30d | FUNNEL(...)` query, BETWEEN time-range, EXPLAIN time-range display, all passing.
 
 ## Findings
 
@@ -153,24 +153,24 @@ Combined with the 79 inherited Wave 2 property tests, property-test coverage
 continues to match `docs/core-beliefs.md` §11 for codecs, merge guarantees,
 and now extends to matcher invariants.
 
-### 5 — Variable-binding E2E integration tests absent (known gap, tracked)
+### 5 — Variable-binding E2E integration gap closed (TASK-329)
 
-The matcher integration test suite (`tests/matcher_integration.rs`, 37 tests)
-provides comprehensive coverage of linear patterns, MATCH FIRST/ALL, negation,
-repetition, time windows, EMIT ALL, alternation, IMMEDIATELY, and sub-batch
-streaming. However, **variable-binding tracks have zero E2E integration tests**.
+TASK-329 resolved the variable-binding E2E gap identified in the pre-closure
+audit. The planner's `TypedExpr` type-checking now recognizes `$var` references
+in MATCH step predicates (via `validate_variable_usage()` in `compile.rs`),
+and the binding values propagate from NFA tracks through the output builder
+to typed Arrow columns.
 
-This is a known limitation documented in the test file: the planner's `TypedExpr`
-type-checking does not yet recognize `$var` references in step predicates,
-blocking end-to-end testing through `Engine::query`. Variable-binding semantics
-are validated at the operator level (32 unit tests in `matcher/bindings.rs` +
-5 property tests in `prop_bindings.rs`), so the coverage gap is integration-only,
-not a correctness gap.
+The matcher integration test suite (`tests/matcher_integration.rs`, 45 tests)
+now includes **8 E2E variable-binding tests**: single-binding, commuted form
+(`$var = col`), multi-entity, multi-variable, NULL short-circuit, MATCH ALL
+rebinding, mixed binding + negation, and non-equality rejection error. Combined
+with the operator-level coverage (32 unit tests in `matcher/bindings.rs` +
+5 property tests in `prop_bindings.rs`), variable-binding coverage is now
+comprehensive at both the unit and integration levels.
 
-**Impact on grades**: does not drop any crate below C. The operators-level
-binding tests are thorough (bind-once-then-check, NULL short-circuit,
-OrderedFloat NaN equality, multi-variable tracks). A follow-up task to close
-the E2E gap should be filed when the planner limitation is resolved.
+**Impact on grades**: reinforces the **A** Tests grade for bqlite-operators
+and strengthens integration confidence for bqlite-planner.
 
 ### 6 — Matcher benchmark scenario coverage is partial vs TASK-302 spec
 
@@ -196,7 +196,26 @@ the overall Wave 3 performance gate. Worth a follow-up task.
 FFI lands in Wave 6; its `C` across every dimension reflects that scope,
 not a quality gap. Same disposition as Wave 1/2 findings.
 
-### 8 — No crate slipped vs Wave 2 grades
+### 8 — CompactString recommendation: conditional go for BindingValue only (TASK-332)
+
+TASK-332 evaluated `compact_str::CompactString` (v0.9) for matcher hot paths.
+The full evaluation is at `docs/design/operators/compactstring-evaluation.md`.
+
+**Decision: CONDITIONAL GO** — adopt CompactString for `BindingValue::String`
+only. For strings ≤ 24 bytes (the overwhelming majority of analytics event
+properties), CompactString clone is ~10× faster than `Box<str>` because
+clone is a 24-byte stack memcpy with zero allocator interaction. The remaining
+surfaces (`Transition.event_type`, `PoisonTransition.event_type`,
+`relevant_event_types`) should keep `String` — they are never cloned in hot
+paths and comparison cost is identical across representations.
+
+The recommendation would flip to NO-GO if binding values were routinely > 24
+bytes (URLs, free-form text). The `compact_str` crate dependency is
+lightweight (MIT licensed, well-maintained, compile-time-only transitive deps).
+Migration is not yet applied — a follow-up implementation task should be filed
+in Wave 4 if binding-heavy workloads materialize.
+
+### 9 — No crate slipped vs Wave 2 grades
 
 Every crate either maintained or improved its Overall grade from Wave 2.
 The largest movements:
@@ -213,12 +232,13 @@ under the `below-C → file a follow-up` rule.
 
 ## Wave 3 status
 
-**Wave 3 is complete.** All 27 tasks in TASK-3xx have `.done` markers in
-`tasks/completed/` (TASK-301 through TASK-327); the Wave 3 acceptance gate
-(`tests/wave3_acceptance.rs`) passes end-to-end; per-crate grades all sit
-at or above **C** on every dimension; no crate slipped from its Wave 2
-grade. The bench CI regression gate covers all 10 benchmark groups (4 Wave 2
-+ 6 Wave 3). Wave 4 can begin.
+**Wave 3 is complete.** All 32 tasks in TASK-3xx have `.done` markers in
+`tasks/completed/` (TASK-301 through TASK-332, including 5 closure tasks
+TASK-328–332); the Wave 3 acceptance gate (`tests/wave3_acceptance.rs`)
+passes end-to-end with 6 tests (including the canonical `LAST 30d | FUNNEL(...)`
+query); per-crate grades all sit at or above **C** on every dimension; no
+crate slipped from its Wave 2 grade. The bench CI regression gate covers
+all 10 benchmark groups (4 Wave 2 + 6 Wave 3). Wave 4 can begin.
 
 ---
 
