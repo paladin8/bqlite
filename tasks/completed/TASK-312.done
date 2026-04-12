@@ -3,5 +3,6 @@
   "task_id": "TASK-312",
   "claimed_at": "2026-04-12T07:06:25Z",
   "branch": "task/TASK-312",
-  "description": "Parser pattern productions"
+  "description": "Parser pattern productions",
+  "completed_at": "2026-04-12T08:30:00Z"
 }
