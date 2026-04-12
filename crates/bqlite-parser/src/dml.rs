@@ -11,12 +11,13 @@
 //! - `INSERT INTO <table> FROM '<path>' WITH ( ... )` — with a flat
 //!   `key: literal` option list and an optional structured
 //!   `map: (src AS dst, ...)` column-rename clause.
+//! - `INSERT INTO <table> VALUES (lit, ...), (lit, ...), ...` — the
+//!   literal-tuple form (TASK-238). Positional only, no column list,
+//!   literals only — matches the AST's `Vec<Vec<Literal>>` shape and
+//!   the §20.1 v1 restriction.
 //!
 //! ## Not landed here
 //!
-//! - `INSERT INTO <table> VALUES (...)` — the literal-tuple form is
-//!   TASK-238. `parse_insert` emits a specific "not yet implemented"
-//!   error so the user can tell the difference.
 //! - `DELETE FROM ... WHERE ...` — Wave 4 (tombstones).
 //!
 //! ## Grammar conformance
@@ -45,10 +46,9 @@ use crate::parser::Parser;
 
 /// Parse an `INSERT INTO ...` statement.
 ///
-/// Dispatches on the body form: `FROM '<path>' [WITH (...)]` (TASK-222)
-/// vs `VALUES (...)` (TASK-238). The `VALUES` arm returns a specific
-/// not-yet-implemented error so users can tell the parser reached the
-/// body dispatcher but simply hasn't grown that production yet.
+/// Dispatches on the body form:
+/// - `FROM '<path>' [WITH (...)]` (TASK-222)
+/// - `VALUES (lit, ...), ...` (TASK-238)
 pub(crate) fn parse_insert(p: &mut Parser) -> Result<Statement, ParseError> {
     let insert_tok = p.expect_kw(Keyword::Insert)?;
     let start_span = token_span(&insert_tok);
@@ -61,13 +61,14 @@ pub(crate) fn parse_insert(p: &mut Parser) -> Result<Statement, ParseError> {
             let span = start_span.merged(body_end_span);
             Ok(Statement::Insert(InsertStmt { table, body, span }))
         }
-        TokenKind::Kw(Keyword::Values) => Err(p.error_unexpected(
-            Expected::Keyword("FROM"),
-            Some("INSERT ... VALUES is not yet implemented (TASK-238)"),
-        )),
+        TokenKind::Kw(Keyword::Values) => {
+            let (body, body_end_span) = parse_insert_values_body(p)?;
+            let span = start_span.merged(body_end_span);
+            Ok(Statement::Insert(InsertStmt { table, body, span }))
+        }
         _ => Err(p.error_unexpected(
-            Expected::Keyword("FROM"),
-            Some("INSERT INTO <table> must be followed by `FROM <path>` or `VALUES ...`"),
+            Expected::Keyword("FROM or VALUES"),
+            Some("INSERT INTO <table> must be followed by `FROM <path>` or `VALUES (...)`"),
         )),
     }
 }
@@ -217,6 +218,64 @@ fn parse_option_literal(p: &mut Parser) -> Result<(Literal, bqlite_ast::Span), P
             Some("WITH option value must be a literal"),
         )),
     }
+}
+
+// ----------------------------------------------------------------------
+// INSERT ... VALUES
+// ----------------------------------------------------------------------
+
+/// Parse `VALUES "(" literal ("," literal)* ")" ("," "(" ... ")")*`.
+///
+/// Per §20.1 the VALUES form is positional-only and accepts the same
+/// literal grammar as WITH option values: `Null`, `Bool`, `Int`,
+/// `Float`, `String`, `Duration`. Returns the [`InsertBody::Values`]
+/// and the span of the last token consumed.
+fn parse_insert_values_body(p: &mut Parser) -> Result<(InsertBody, bqlite_ast::Span), ParseError> {
+    let values_tok = p.expect_kw(Keyword::Values)?;
+    let start_span = token_span(&values_tok);
+
+    // Parse the first tuple; at least one is required.
+    let (first_row, mut end_span) = parse_values_tuple(p)?;
+    let mut rows = vec![first_row];
+
+    // Parse additional tuples separated by commas.
+    while matches!(p.peek_kind(), TokenKind::Comma) {
+        p.bump(); // consume `,`
+        let (row, row_end) = parse_values_tuple(p)?;
+        rows.push(row);
+        end_span = row_end;
+    }
+
+    let span = start_span.merged(end_span);
+    Ok((InsertBody::Values(rows), span))
+}
+
+/// Parse one `"(" literal ("," literal)* ")"` tuple.
+///
+/// An empty tuple `()` is a parse error — the grammar requires at
+/// least one literal per tuple per §20.1.
+fn parse_values_tuple(p: &mut Parser) -> Result<(Vec<Literal>, bqlite_ast::Span), ParseError> {
+    p.expect_punct(&TokenKind::LParen, "(")?;
+
+    if matches!(p.peek_kind(), TokenKind::RParen) {
+        return Err(p.error_unexpected(
+            Expected::Literal,
+            Some("VALUES tuple requires at least one literal value"),
+        ));
+    }
+
+    let (first_lit, _) = parse_option_literal(p)?;
+    let mut values = vec![first_lit];
+
+    while matches!(p.peek_kind(), TokenKind::Comma) {
+        p.bump(); // consume `,`
+        let (lit, _) = parse_option_literal(p)?;
+        values.push(lit);
+    }
+
+    let rparen = p.expect_punct(&TokenKind::RParen, ")")?;
+    let end_span = token_span(&rparen);
+    Ok((values, end_span))
 }
 
 // ----------------------------------------------------------------------
@@ -528,19 +587,137 @@ mod tests {
         match crate::parse("INSERT INTO events") {
             Err(ParseError::UnexpectedEof { expected, .. })
             | Err(ParseError::Unexpected { expected, .. }) => {
-                assert_eq!(expected, Expected::Keyword("FROM"));
+                // After TASK-238, the error names both accepted body forms.
+                assert_eq!(expected, Expected::Keyword("FROM or VALUES"));
             }
-            other => panic!("expected Unexpected/FROM, got {other:?}"),
+            other => panic!("expected Unexpected/FROM or VALUES, got {other:?}"),
+        }
+    }
+
+    // --- VALUES body -------------------------------------------------
+
+    #[test]
+    fn insert_values_single_row() {
+        let stmt =
+            parse_ok("INSERT INTO events VALUES ('alice', 1700000000000000000, 'click', 42)");
+        match stmt {
+            Statement::Insert(i) => match i.body {
+                InsertBody::Values(rows) => {
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].len(), 4);
+                    assert_eq!(rows[0][0], Literal::String("alice".into()));
+                    assert_eq!(rows[0][1], Literal::Int(1700000000000000000_i64));
+                    assert_eq!(rows[0][2], Literal::String("click".into()));
+                    assert_eq!(rows[0][3], Literal::Int(42));
+                }
+                other => panic!("expected Values body, got {other:?}"),
+            },
+            other => panic!("expected Insert, got {other:?}"),
         }
     }
 
     #[test]
-    fn insert_values_errors_with_task_238_note() {
-        match crate::parse("INSERT INTO events VALUES (1, 2)") {
-            Err(ParseError::Unexpected { detail, .. }) => {
-                assert!(detail.unwrap_or("").contains("TASK-238"));
+    fn insert_values_multi_row() {
+        let stmt = parse_ok(
+            "INSERT INTO events VALUES ('alice', 1700000000000000000, 'click', 1), \
+             ('bob', 1700000000100000000, 'view', NULL)",
+        );
+        match stmt {
+            Statement::Insert(i) => match i.body {
+                InsertBody::Values(rows) => {
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(rows[0][0], Literal::String("alice".into()));
+                    assert_eq!(rows[1][0], Literal::String("bob".into()));
+                    assert_eq!(rows[1][3], Literal::Null);
+                }
+                other => panic!("expected Values body, got {other:?}"),
+            },
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_span_covers_entire_statement() {
+        let src = "INSERT INTO events VALUES ('alice', 1700000000000000000, 'click')";
+        let stmt = parse_ok(src);
+        match stmt {
+            Statement::Insert(i) => {
+                assert_eq!(i.span.start, 0);
+                assert_eq!(i.span.end, src.len());
             }
-            other => panic!("expected Unexpected/TASK-238, got {other:?}"),
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn insert_values_with_bool_and_float_literals() {
+        let stmt = parse_ok("INSERT INTO t VALUES (true, 1.5, NULL)");
+        match stmt {
+            Statement::Insert(i) => match i.body {
+                InsertBody::Values(rows) => {
+                    assert_eq!(rows[0][0], Literal::Bool(true));
+                    assert_eq!(rows[0][1], Literal::Float(1.5));
+                    assert_eq!(rows[0][2], Literal::Null);
+                }
+                other => panic!("expected Values, got {other:?}"),
+            },
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_with_trailing_semicolon() {
+        let stmt = parse_ok("INSERT INTO events VALUES ('alice', 0, 'click');");
+        assert!(matches!(stmt, Statement::Insert(_)));
+    }
+
+    #[test]
+    fn insert_values_empty_tuple_errors() {
+        match crate::parse("INSERT INTO events VALUES ()") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Literal);
+            }
+            other => panic!("expected Unexpected/Literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_missing_open_paren_errors() {
+        match crate::parse("INSERT INTO events VALUES 1, 2") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Punct("("));
+            }
+            other => panic!("expected Unexpected/`(`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_missing_close_paren_errors() {
+        match crate::parse("INSERT INTO events VALUES ('alice', 0, 'click'") {
+            Err(ParseError::UnexpectedEof { expected, .. }) => {
+                assert_eq!(expected, Expected::Punct(")"));
+            }
+            other => panic!("expected UnexpectedEof/`)`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_trailing_comma_in_row_errors() {
+        match crate::parse("INSERT INTO events VALUES ('alice', 0, 'click',)") {
+            Err(ParseError::Unexpected { .. }) => {}
+            Err(ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected error on trailing comma in row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_non_literal_in_tuple_errors() {
+        // Bare identifier is not a literal.
+        match crate::parse("INSERT INTO events VALUES (alice, 0, 'click')") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Literal);
+            }
+            other => panic!("expected Unexpected/Literal, got {other:?}"),
         }
     }
 
