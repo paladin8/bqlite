@@ -334,7 +334,9 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bqlite-core",
+ "bqlite-engine",
  "bqlite-operators",
+ "bqlite-planner",
  "bqlite-storage",
  "criterion",
  "serde_json",

@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-325",
   "claimed_at": "2026-04-12T11:54:17Z",
+  "completed_at": "2026-04-12T12:45:00Z",
   "branch": "task/TASK-325",
   "description": "Wave 3 benchmark suite + matcher microbenchmarks"
 }
