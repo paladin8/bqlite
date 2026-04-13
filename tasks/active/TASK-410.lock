@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-410",
+  "claimed_at": "2026-04-13T02:17:42Z",
+  "branch": "task/TASK-410",
+  "description": "JSONL ingest path"
+}
