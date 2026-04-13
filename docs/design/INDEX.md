@@ -30,6 +30,7 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 ### Language
 
 - **language/grammar-framework.md** — Parser implementation technology (hand-rolled recursive descent + custom lexer), error strategy (halt on first error), span tracking, production-addition recipe, `WITH (...)` option-list surface for INSERT FROM (TASK-203, Wave 2)
+- **language/cohorts-aliases-joins.md** — Cohort materialization, alias binding, and entity-aligned source JOINs: alias scoping/caching/cycle-detection, `IN QUERY`/`IN alias` equivalence, multi-column positional binding, `MergeSources` n-ary merge operator, `__source_table_id` discriminator, `SubqueryFilter` hash-set probe with entity-id pushdown (TASK-407, Wave 4)
 
 ### Planner
 
