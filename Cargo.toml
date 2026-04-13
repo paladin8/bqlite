@@ -35,6 +35,7 @@ bqlite-ffi = { path = "crates/bqlite-ffi" }
 # External dependencies
 ahash = "0.8"
 arrow = "54"
+parquet = { version = "54", features = ["arrow", "snap", "brotli", "lz4", "zstd"] }
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

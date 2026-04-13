@@ -24,6 +24,7 @@ autobenches = false
 
 [dependencies]
 arrow = { workspace = true }
+parquet = { workspace = true }
 bqlite-ast = { workspace = true }
 bqlite-core = { workspace = true }
 bqlite-engine = { workspace = true }

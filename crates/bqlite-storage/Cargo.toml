@@ -18,6 +18,7 @@ twox-hash = { workspace = true }
 lz4_flex = { workspace = true }
 postcard = { workspace = true }
 csv = { workspace = true }
+parquet = { workspace = true }
 bitpacking = { workspace = true }
 fsst-rs = { workspace = true }
 
