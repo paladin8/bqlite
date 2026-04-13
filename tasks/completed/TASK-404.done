@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-404",
   "claimed_at": "2026-04-13T02:06:28Z",
+  "completed_at": "2026-04-13T03:15:00Z",
   "branch": "task/TASK-404",
   "description": "Tombstone and delete semantics"
 }
