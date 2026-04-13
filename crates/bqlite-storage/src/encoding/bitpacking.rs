@@ -12,10 +12,12 @@
 //!     min_value: i64 LE          // subtracted from each value before packing
 //!     bit_width: u8              // 1..=64
 //! payload:
-//!     packed bit stream of `row_count` unsigned offsets, LSB-first
-//!     within each byte, padded up to the next multiple of 8 bytes
-//!     so a SIMD decoder can read one full 8-byte lane past the last
-//!     code without a bounds check.
+//!     zero or more full `bitpacking::BitPacker4x` blocks
+//!     (`128 * bit_width / 8` bytes each), followed by an optional
+//!     scalar tail of at most 127 offsets packed LSB-first within
+//!     each byte, padded up to the next multiple of 8 bytes so the
+//!     decoder can read one full 8-byte lane past the last code
+//!     without a bounds check.
 //! ```
 //!
 //! # Bit width selection
@@ -44,18 +46,18 @@
 //!
 //! # v1 implementation notes
 //!
-//! `segment-format-v1.md` §9.4 mentions "SIMD-accelerated unpacking
-//! via the `bitpacking` crate's FastLanes layout". The v1 BitPacking
-//! impl lands a **portable, non-SIMD** packer/unpacker to keep the
-//! dep surface minimal. The byte layout it produces is compatible
-//! with any LSB-first bit-packed decoder — a later performance task
-//! can swap the hot loop for `bitpacking::BitPacker4x` without
-//! changing the on-disk bytes. The 8-byte tail padding documented
-//! in §9.4 is already emitted, so the SIMD swap is strictly
-//! additive.
+//! The hot path uses `bitpacking::BitPacker4x`, which stores offsets
+//! in 128-value interleaved blocks that the crate can decode with
+//! SSE3/NEON acceleration and a scalar fallback at runtime. Because
+//! the crate only accepts `u32` inputs, this module routes `bit_width`
+//! `1..=32` full blocks through `BitPacker4x` and keeps a tiny scalar
+//! fallback for any final partial block and for the rare `33..=64`
+//! widths. The 8-byte tail padding documented in §9.4 is still
+//! emitted unchanged.
 
 use arrow::array::{Array, ArrayRef, Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
+use bitpacking::{BitPacker, BitPacker4x};
 use bqlite_core::{BqlType, BqliteError, Result};
 use std::sync::Arc;
 
@@ -84,6 +86,10 @@ const PARAMS_BYTE_WIDTH: usize = MIN_VALUE_BYTE_WIDTH + BIT_WIDTH_BYTE_WIDTH;
 /// a future SIMD decoder can read one full u64 lane past the last
 /// packed code without a bounds check.
 const PADDING_GRANULARITY: usize = 8;
+/// `BitPacker4x` only supports `u32` values.
+const BITPACKER4X_MAX_BIT_WIDTH: u8 = 32;
+/// `BitPacker4x` operates on fixed-size 128-value blocks.
+const BITPACKER4X_BLOCK_LEN: usize = <BitPacker4x as BitPacker>::BLOCK_LEN;
 
 impl Encoding for BitPacking {
     fn encoding_type(&self) -> EncodingType {
@@ -275,6 +281,10 @@ fn estimated_payload_bytes(values: &[i64]) -> usize {
 
 // ── bit packing / unpacking ─────────────────────────────────────────────────
 
+fn bitpacker4x_block_bytes(bit_width: u8) -> usize {
+    (BITPACKER4X_BLOCK_LEN * bit_width as usize) / 8
+}
+
 /// Pack `values` into a bit stream, LSB-first within each byte.
 ///
 /// Offsets are computed as `(value − min_value) as u64` via `i128`
@@ -289,9 +299,37 @@ fn pack_offsets(values: &[i64], min_value: i64, bit_width: u8) -> Vec<u8> {
         return bytes;
     }
     let width = bit_width as usize;
-    for (i, &value) in values.iter().enumerate() {
+    let full_block_row_count = if bit_width <= BITPACKER4X_MAX_BIT_WIDTH {
+        let bitpacker = BitPacker4x::new();
+        let block_bytes = bitpacker4x_block_bytes(bit_width);
+        let mut block = [0u32; BITPACKER4X_BLOCK_LEN];
+        let full_block_row_count = row_count / BITPACKER4X_BLOCK_LEN * BITPACKER4X_BLOCK_LEN;
+        let mut byte_cursor = 0usize;
+
+        for chunk in values[..full_block_row_count].chunks_exact(BITPACKER4X_BLOCK_LEN) {
+            for (slot, &value) in block.iter_mut().zip(chunk) {
+                let offset = ((value as i128) - (min_value as i128)) as u64;
+                *slot = u32::try_from(offset)
+                    .expect("bit_width <= 32 guarantees BitPacker4x offsets fit in u32");
+            }
+            let written = bitpacker.compress(&block, &mut bytes[byte_cursor..], bit_width);
+            debug_assert_eq!(written, block_bytes);
+            byte_cursor += written;
+        }
+
+        full_block_row_count
+    } else {
+        0
+    };
+
+    for (tail_idx, &value) in values[full_block_row_count..].iter().enumerate() {
         let offset = ((value as i128) - (min_value as i128)) as u64;
-        write_bits(&mut bytes, i * width, width, offset);
+        write_bits(
+            &mut bytes,
+            (full_block_row_count + tail_idx) * width,
+            width,
+            offset,
+        );
     }
     bytes
 }
@@ -303,7 +341,23 @@ fn unpack_offsets(bytes: &[u8], row_count: usize, bit_width: u8) -> Vec<u64> {
         return offsets;
     }
     let width = bit_width as usize;
-    for i in 0..row_count {
+    let full_block_row_count = if bit_width <= BITPACKER4X_MAX_BIT_WIDTH {
+        let bitpacker = BitPacker4x::new();
+        let block_bytes = bitpacker4x_block_bytes(bit_width);
+        let full_block_row_count = row_count / BITPACKER4X_BLOCK_LEN * BITPACKER4X_BLOCK_LEN;
+        let mut block = [0u32; BITPACKER4X_BLOCK_LEN];
+
+        for chunk in bytes[..full_block_row_count * width / 8].chunks_exact(block_bytes) {
+            bitpacker.decompress(chunk, &mut block, bit_width);
+            offsets.extend(block.iter().copied().map(u64::from));
+        }
+
+        full_block_row_count
+    } else {
+        0
+    };
+
+    for i in full_block_row_count..row_count {
         offsets.push(read_bits(bytes, i * width, width));
     }
     offsets
@@ -312,6 +366,10 @@ fn unpack_offsets(bytes: &[u8], row_count: usize, bit_width: u8) -> Vec<u64> {
 /// Write `width` bits of `value` at bit offset `start` into `out`,
 /// LSB-first within each byte. `width` must be ≤ 64 and
 /// `value >> width` must be zero.
+///
+/// This is the byte-exact fallback for tail fragments and `33..=64`
+/// bit widths, and it also serves as the reference layout check for
+/// the scalar tail after a `BitPacker4x` block prefix.
 ///
 /// Each iteration writes at most 8 bits (`chunk_bits <= 8`) because
 /// the step size is bounded by `8 - bit_in_byte`. The `chunk_mask`
@@ -336,6 +394,8 @@ fn write_bits(out: &mut [u8], start: usize, width: usize, value: u64) {
 
 /// Read `width` bits at bit offset `start` from `bytes`, LSB-first
 /// within each byte. `width` must be in 1..=64.
+///
+/// Mirrors [`write_bits`] for the decode-side fallback path.
 fn read_bits(bytes: &[u8], start: usize, width: usize) -> u64 {
     let mut value = 0u64;
     let mut bits_read = 0usize;
@@ -503,6 +563,79 @@ mod tests {
                 "estimate mismatch for values: {values:?}"
             );
         }
+    }
+
+    #[test]
+    fn pack_offsets_matches_bitpacker4x_layout_for_full_block() {
+        let values: Vec<i64> = (0..BITPACKER4X_BLOCK_LEN)
+            .map(|i| 10 + ((i * 7) % 17) as i64)
+            .collect();
+        let (min_value, bit_width) = select_frame(&values);
+        assert!(bit_width <= BITPACKER4X_MAX_BIT_WIDTH);
+
+        let actual = pack_offsets(&values, min_value, bit_width);
+        let mut expected = vec![0u8; payload_byte_len(values.len(), bit_width)];
+        let bitpacker = BitPacker4x::new();
+        let block: Vec<u32> = values
+            .iter()
+            .map(|&value| ((value as i128) - (min_value as i128)) as u32)
+            .collect();
+        let expected_len = bitpacker.compress(&block, &mut expected, bit_width);
+        assert_eq!(expected_len, bitpacker4x_block_bytes(bit_width));
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pack_offsets_matches_bitpacker4x_prefix_and_scalar_tail() {
+        let values: Vec<i64> = (0..(BITPACKER4X_BLOCK_LEN + 5))
+            .map(|i| 100 + ((i * 11) % 29) as i64)
+            .collect();
+        let (min_value, bit_width) = select_frame(&values);
+        assert!(bit_width <= BITPACKER4X_MAX_BIT_WIDTH);
+
+        let actual = pack_offsets(&values, min_value, bit_width);
+        let mut expected = vec![0u8; payload_byte_len(values.len(), bit_width)];
+        let bitpacker = BitPacker4x::new();
+        let block_bytes = bitpacker4x_block_bytes(bit_width);
+        let block: Vec<u32> = values[..BITPACKER4X_BLOCK_LEN]
+            .iter()
+            .map(|&value| ((value as i128) - (min_value as i128)) as u32)
+            .collect();
+        let written = bitpacker.compress(&block, &mut expected[..block_bytes], bit_width);
+        assert_eq!(written, block_bytes);
+
+        for (tail_idx, &value) in values[BITPACKER4X_BLOCK_LEN..].iter().enumerate() {
+            let offset = ((value as i128) - (min_value as i128)) as u64;
+            write_bits(
+                &mut expected,
+                (BITPACKER4X_BLOCK_LEN + tail_idx) * bit_width as usize,
+                bit_width as usize,
+                offset,
+            );
+        }
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn int_round_trip_full_bitpacker_block_at_width_thirtytwo() {
+        let max_offset = i64::from(u32::MAX);
+        let values: Vec<i64> = (0..BITPACKER4X_BLOCK_LEN)
+            .map(|i| {
+                if i % 2 == 0 {
+                    i64::MIN
+                } else {
+                    i64::MIN + max_offset
+                }
+            })
+            .collect();
+        let array: ArrayRef = Arc::new(Int64Array::from(values));
+        let decoded = round_trip(array.clone(), BqlType::Int);
+        assert_eq!(decoded.as_ref(), array.as_ref());
+
+        let chunk = BitPacking.encode(array.as_ref()).unwrap();
+        assert_eq!(chunk.params[MIN_VALUE_BYTE_WIDTH], 32);
     }
 
     #[test]

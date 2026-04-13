@@ -524,20 +524,27 @@ min_value:  i64 LE   // subtracted from each value before packing
 bit_width:  u8       // 1..=64
 ```
 
-**Payload.** `row_count − null_count` unsigned offsets `value − min_value`,
-bit-packed at `bit_width` bits per offset. Byte count
-`ceil(bit_width × (row_count − null_count) / 8)` rounded up to the
-next multiple of 8. Trailing padding is counted in both
-`uncompressed_payload_length` and `byte_length`, same rule as §9.2
-and §9.3.
+**Payload.** `row_count − null_count` unsigned offsets `value − min_value`.
+For every full 128-value prefix whose `bit_width <= 32`, the writer
+emits one `bitpacking::BitPacker4x` block (`128 × bit_width / 8`
+bytes). Any remaining suffix shorter than 128 values, or any chunk
+whose offsets need `33..=64` bits, is encoded with a scalar
+LSB-first bit stream at the same `bit_width`. Total byte count is
+therefore still `ceil(bit_width × (row_count − null_count) / 8)`
+rounded up to the next multiple of 8. Trailing padding is counted in
+both `uncompressed_payload_length` and `byte_length`, same rule as
+§9.2 and §9.3.
 
 **Applicable types.** `Int`, `Timestamp`. Readers decode into
 Arrow `Int64Array` or `TimestampArray` respectively.
 
-**SIMD.** The decoder targets the `bitpacking` crate's FastLanes
-layout (storage-format.md §10.1). The writer guarantees the payload
-is padded to the FastLanes lane size so the SIMD decoder never reads
-out of bounds.
+**Implementation note.** Full `BitPacker4x` blocks use the crate's
+interleaved-by-4 layout, which is not byte-compatible with the
+earlier scalar LSB-first stream. Readers must therefore decode the
+payload as "zero or more `BitPacker4x` blocks, then an optional
+scalar tail", not as one uniform scalar bitstream. The writer still
+pads the final payload to 8 bytes so the decoder can over-read one
+lane without a bounds check.
 
 ### 9.5 Constant (`encoding = 6`)
 

@@ -18,6 +18,7 @@ twox-hash = { workspace = true }
 lz4_flex = { workspace = true }
 postcard = { workspace = true }
 csv = { workspace = true }
+bitpacking = { workspace = true }
 
 # `libc` is only pulled in on platforms where the segment reader emits
 # an OS-specific sequential-read hint: `posix_fadvise(2)` on
