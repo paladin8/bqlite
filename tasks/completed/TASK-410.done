@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-410",
   "claimed_at": "2026-04-13T02:17:42Z",
+  "completed_at": "2026-04-13T08:00:00Z",
   "branch": "task/TASK-410",
   "description": "JSONL ingest path"
 }
