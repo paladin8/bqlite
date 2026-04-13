@@ -30,6 +30,8 @@
 //!
 //! Expected funnel: signup = 15, activation = 10, purchase = 5.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use arrow::array::Int64Array;
 use bqlite_engine::{Database, Engine, ExecutionResult};
 use bqlite_tests::common::TempDb;
@@ -38,6 +40,9 @@ use bqlite_tests::csv;
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+const DAY_NS: i64 = 86_400_000_000_000;
+const RECENT_FIXTURE_AGE_DAYS: i64 = 14;
 
 /// Set up a database with the funnel events table and ingest the CSV fixture.
 fn setup_funnel(db: &TempDb) -> (Database, Engine) {
@@ -52,6 +57,41 @@ fn setup_funnel(db: &TempDb) -> (Database, Engine) {
     // Write and ingest the funnel CSV fixture.
     let csv_path =
         csv::write_funnel_fixture_file(db.path(), "funnel_events.csv").expect("write CSV fixture");
+    let insert_sql = format!(
+        "INSERT INTO events FROM '{}' WITH (format: 'csv')",
+        csv_path.display()
+    );
+    engine
+        .query(&insert_sql, &mut database)
+        .expect("INSERT FROM CSV");
+
+    (database, engine)
+}
+
+/// Set up a database with the funnel fixture anchored safely inside
+/// `LAST 30d` so relative-range acceptance tests exercise the current
+/// scan-pruning semantics instead of relying on stale historical data.
+fn setup_recent_funnel(db: &TempDb) -> (Database, Engine) {
+    let mut database = Database::create(db.path()).expect("Database::create");
+    let engine = Engine::new();
+
+    engine
+        .query(csv::FUNNEL_EVENTS_CREATE_TABLE, &mut database)
+        .expect("CREATE TABLE events");
+
+    let now_ns: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after Unix epoch")
+        .as_nanos()
+        .try_into()
+        .expect("current time must fit in i64 nanoseconds");
+    let base_ts_nanos = now_ns - (RECENT_FIXTURE_AGE_DAYS * DAY_NS);
+    let csv_path = csv::write_funnel_fixture_file_with_base_ts(
+        db.path(),
+        "recent_funnel_events.csv",
+        base_ts_nanos,
+    )
+    .expect("write recent CSV fixture");
     let insert_sql = format!(
         "INSERT INTO events FROM '{}' WITH (format: 'csv')",
         csv_path.display()
@@ -97,7 +137,7 @@ fn extract_i64_column(result: &ExecutionResult, col_name: &str) -> i64 {
 #[test]
 fn funnel_sugar_produces_correct_counts() {
     let db = TempDb::new();
-    let (mut database, engine) = setup_funnel(&db);
+    let (mut database, engine) = setup_recent_funnel(&db);
     let (expected_signup, expected_activation, expected_purchase) = csv::expected_funnel_counts();
 
     let result = run(
@@ -131,7 +171,7 @@ fn funnel_sugar_produces_correct_counts() {
 #[test]
 fn desugared_match_stats_produces_correct_counts() {
     let db = TempDb::new();
-    let (mut database, engine) = setup_funnel(&db);
+    let (mut database, engine) = setup_recent_funnel(&db);
     let (expected_signup, expected_activation, expected_purchase) = csv::expected_funnel_counts();
 
     let result = run(
@@ -174,7 +214,7 @@ fn desugared_match_stats_produces_correct_counts() {
 #[test]
 fn funnel_equals_desugared_form() {
     let db = TempDb::new();
-    let (mut database, engine) = setup_funnel(&db);
+    let (mut database, engine) = setup_recent_funnel(&db);
 
     let funnel_result = run(
         &engine,
@@ -227,14 +267,12 @@ fn funnel_equals_desugared_form() {
 /// EXPLAIN must show the LAST time range, widened by the WITHIN window.
 /// `LAST 30d` + `WITHIN 7d` → scan should show `LAST 37d`.
 ///
-/// Note: `LAST 30d` is planner-level metadata — the scan reads all
-/// data regardless until storage-level time-range pushdown is
-/// implemented. The fixture timestamps predate the relative window
-/// but the planner correctly threads and widens the range.
+/// The runtime now treats `LAST` as a real scan-pruning hint, so this test
+/// uses a recent fixture rather than relying on historical timestamps.
 #[test]
 fn explain_shows_widened_time_range() {
     let db = TempDb::new();
-    let (mut database, engine) = setup_funnel(&db);
+    let (mut database, engine) = setup_recent_funnel(&db);
 
     let result = run(
         &engine,

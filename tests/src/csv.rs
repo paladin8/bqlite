@@ -178,7 +178,8 @@ const FUNNEL_PURCHASE_COUNT: u64 = 5;
 /// Well within the 7d WITHIN window constraint used in the acceptance test.
 const FUNNEL_EVENT_SPACING_NS: i64 = 3_600_000_000_000;
 
-/// Write the funnel CSV fixture to an arbitrary [`Write`] sink.
+/// Write the funnel CSV fixture to an arbitrary [`Write`] sink using an
+/// explicit base timestamp.
 ///
 /// Produces a deterministic event stream where:
 ///
@@ -195,11 +196,14 @@ const FUNNEL_EVENT_SPACING_NS: i64 = 3_600_000_000_000;
 /// Events are written per-entity (all of entity 0's events, then entity 1's,
 /// etc.) so the ingested data is entity-sorted — matching the storage layer's
 /// requirement for entity-locality.
-pub fn write_funnel_fixture<W: Write>(mut out: W) -> io::Result<()> {
+pub fn write_funnel_fixture_with_base_ts<W: Write>(
+    mut out: W,
+    base_ts_nanos: i64,
+) -> io::Result<()> {
     writeln!(out, "user_id,ts,event_type")?;
 
     for user in 0..FUNNEL_ENTITY_COUNT {
-        let mut ts = BASE_TS_NANOS + (user as i64) * FUNNEL_EVENT_SPACING_NS * 4;
+        let mut ts = base_ts_nanos + (user as i64) * FUNNEL_EVENT_SPACING_NS * 4;
 
         if user < FUNNEL_SIGNUP_COUNT {
             writeln!(out, "user_{user},{ts},signup")?;
@@ -224,6 +228,12 @@ pub fn write_funnel_fixture<W: Write>(mut out: W) -> io::Result<()> {
     out.flush()
 }
 
+/// Write the canonical deterministic funnel CSV fixture to an arbitrary
+/// [`Write`] sink.
+pub fn write_funnel_fixture<W: Write>(out: W) -> io::Result<()> {
+    write_funnel_fixture_with_base_ts(out, BASE_TS_NANOS)
+}
+
 /// Write the funnel CSV fixture to a file at `dir/<filename>` and return
 /// the full path.
 pub fn write_funnel_fixture_file(dir: &Path, filename: &str) -> io::Result<PathBuf> {
@@ -232,6 +242,21 @@ pub fn write_funnel_fixture_file(dir: &Path, filename: &str) -> io::Result<PathB
     let file = std::fs::File::create(&path)?;
     let buf = io::BufWriter::new(file);
     write_funnel_fixture(buf)?;
+    Ok(path)
+}
+
+/// Write the funnel fixture to a file at `dir/<filename>` using an explicit
+/// base timestamp and return the full path.
+pub fn write_funnel_fixture_file_with_base_ts(
+    dir: &Path,
+    filename: &str,
+    base_ts_nanos: i64,
+) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(filename);
+    let file = std::fs::File::create(&path)?;
+    let buf = io::BufWriter::new(file);
+    write_funnel_fixture_with_base_ts(buf, base_ts_nanos)?;
     Ok(path)
 }
 
@@ -374,6 +399,19 @@ mod tests {
                 prev_user = user;
             }
         }
+    }
+
+    #[test]
+    fn funnel_fixture_allows_custom_base_timestamp() {
+        let custom_base = 1_900_000_000_000_000_000;
+        let mut buf = Vec::new();
+        write_funnel_fixture_with_base_ts(&mut buf, custom_base).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let first_row = output.lines().nth(1).unwrap();
+        assert!(
+            first_row.contains(&format!(",{custom_base},signup")),
+            "first signup row must use the caller-provided base timestamp"
+        );
     }
 
     #[test]
