@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-412",
+  "claimed_at": "2026-04-13T02:34:40Z",
+  "branch": "task/TASK-412",
+  "description": "Segment-format-v2 reader/writer scaffolding"
+}
