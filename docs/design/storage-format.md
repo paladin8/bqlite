@@ -302,9 +302,10 @@ pub struct TombstoneFile {
     /// Batch-level deletes: specific batch IDs.
     pub batch_deletes: HashSet<u64>,
 
-    /// Time-range delete: all events whose timestamps fall within the
-    /// configured bounds are dropped.
-    pub time_range_delete: Option<TimeRangeDelete>,
+    /// Time-range deletes: all events whose timestamps fall within any
+    /// of the configured bounds are dropped. Vec supports multiple
+    /// independent time-range DELETE operations.
+    pub time_range_deletes: Vec<TimeRangeDelete>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -330,6 +331,8 @@ Tombstone lifecycle:
 - Per-shard files keep delete writes local: a delete to shard 3 does not block ingest on shards 0–2, 4–31.
 
 Tombstone files are small (`__seq_id`, `__batch_id`, entity ID values, and bounded timestamp metadata) and are loaded into memory at query time. Concurrent deletes and query execution within the owning process are safe because each query snapshots the tombstone file at start — a concurrent delete writes a new file that only subsequent queries will see.
+
+**Full delete semantics.** The complete design for DELETE statement semantics — cheap-class predicate taxonomy, `ALLOW SCAN` opt-in, scan-time filtering order, concurrent-delete serialization, cross-shard crash atomicity, and compaction-time reclamation ordering — is in [storage/deletes.md](storage/deletes.md). This section defines only the on-disk schema.
 
 ### 7.6 Query Snapshots and Compaction
 
