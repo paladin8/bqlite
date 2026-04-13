@@ -382,6 +382,32 @@ impl Database {
             .snapshot_for_query(table_name, time_range, shard_id)
     }
 
+    /// Load a frozen tombstone snapshot for the given `(window_id,
+    /// shard_id)` pairs.
+    ///
+    /// Called once at query bind time alongside the manifest snapshot
+    /// to establish complete visibility state for a query. See
+    /// `docs/design/storage/deletes.md` SS6.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if `table_name` is not registered
+    ///   in the manifest.
+    /// - [`BqliteError::Io`] or [`BqliteError::Execution`] if a
+    ///   tombstone file is present but corrupt.
+    pub fn load_tombstone_snapshot(
+        &self,
+        table_name: &str,
+        targets: &[(u32, u16)],
+    ) -> Result<crate::tombstone::TombstoneSnapshot> {
+        if !self.manifest.tables.contains_key(table_name) {
+            return Err(BqliteError::Execution(format!(
+                "load_tombstone_snapshot: unknown table '{table_name}'"
+            )));
+        }
+        crate::tombstone::load_tombstone_snapshot(&self.root, table_name, targets)
+    }
+
     /// Atomically reserve a fresh `batch_id` for an ingest call on
     /// `table_name`.
     ///
@@ -1606,6 +1632,44 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].segment_id, 3);
+    }
+
+    // ── Tombstone snapshot integration ──────────────────────────────────
+
+    #[test]
+    fn load_tombstone_snapshot_unknown_table_errors() {
+        let scratch = Scratch::new("tomb-unknown");
+        let db = Database::create(scratch.path()).expect("create");
+        let err = db.load_tombstone_snapshot("nope", &[(0, 0)]).unwrap_err();
+        assert!(matches!(err, BqliteError::Execution(_)));
+    }
+
+    #[test]
+    fn load_tombstone_snapshot_empty_when_no_files() {
+        let scratch = Scratch::new("tomb-empty");
+        let db = create_db_with_events(scratch.path());
+        let snap = db.load_tombstone_snapshot("events", &[(0, 0)]).unwrap();
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn load_tombstone_snapshot_reads_written_tombstones() {
+        let scratch = Scratch::new("tomb-roundtrip");
+        let db = create_db_with_events(scratch.path());
+
+        // Write a tombstone file directly to the expected shard path.
+        let path = crate::tombstone::tombstone_file_path(scratch.path(), "events", 1, 0);
+        let tf = crate::tombstone::TombstoneFile::for_rows([42, 99]);
+        crate::tombstone::write_tombstone_atomic(&path, &tf).unwrap();
+
+        let snap = db
+            .load_tombstone_snapshot("events", &[(1, 0), (1, 1)])
+            .unwrap();
+        assert!(!snap.is_empty());
+        let loaded = snap.get(1, 0).expect("shard 0 has tombstones");
+        assert!(loaded.row_deletes.contains(&42));
+        assert!(loaded.row_deletes.contains(&99));
+        assert!(snap.get(1, 1).is_none());
     }
 
     #[test]
