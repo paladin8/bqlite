@@ -17,6 +17,13 @@
 //! Four additional Wave 3 pipeline variants: `SequenceMatch`, `Aggregate`,
 //! `Sort`, `Distinct`. Their physical descriptors are produced by TASK-318;
 //! these arms prevent panics when an `EXPLAIN` wraps a Wave 3 query.
+//!
+//! ## Wave 4 scope (TASK-424)
+//!
+//! Six additional Wave 4 pipeline variants: `Sessionize`, `EventSelect`,
+//! `Attribute`, `SubqueryFilter`, `Sample`, `MergeSources`. Durations are
+//! formatted via `format_nanos`; `EventSelectKind` via
+//! `format_event_select_kind`. `MergeSources` renders child scan nodes.
 
 use bqlite_ast::expr::{BinaryOp, CompareOp, UnaryOp};
 use bqlite_core::{AggFunction, PropertyValue};
@@ -89,6 +96,60 @@ pub enum ExplainNode {
         /// Hard cap on distinct row count.
         max_groups: usize,
         input: Box<ExplainNode>,
+    },
+
+    // ── Wave 4 variants ────────────────────────────────────────────────────
+    /// Wave 4: session assignment operator.
+    Sessionize {
+        /// Gap threshold in nanoseconds formatted as human-readable duration.
+        gap: String,
+        /// Explicit end-event types (empty = gap-only mode).
+        end_events: Vec<String>,
+        input: Box<ExplainNode>,
+    },
+    /// Wave 4: per-entity event sub-selection (FIRST/LAST/NTH).
+    EventSelect {
+        /// Human-readable selection mode (`"FIRST"`, `"LAST"`, `"NTH(3)"`).
+        kind: String,
+        /// Eligible event types.
+        event_types: Vec<String>,
+        /// Whether a per-event predicate is applied.
+        has_predicate: bool,
+        input: Box<ExplainNode>,
+    },
+    /// Wave 4: multi-touch attribution operator.
+    Attribute {
+        /// Conversion event types.
+        conversion_events: Vec<String>,
+        /// Touchpoint event types.
+        touchpoint_events: Vec<String>,
+        /// Lookback window formatted as human-readable duration.
+        window: String,
+        input: Box<ExplainNode>,
+    },
+    /// Wave 4: cohort-based entity filtering.
+    SubqueryFilter {
+        /// Number of LHS columns in the IN check.
+        column_count: usize,
+        input: Box<ExplainNode>,
+        subquery: Box<ExplainNode>,
+    },
+    /// Wave 4: deterministic entity-level sampling.
+    Sample {
+        /// Fraction of entities to keep.
+        fraction: f64,
+        /// Resolved sampling seed.
+        seed: i64,
+        input: Box<ExplainNode>,
+    },
+    /// Wave 4: N-ary entity-aligned source merge.
+    MergeSources {
+        /// Table names being merged, in JOIN-clause order.
+        tables: Vec<String>,
+        /// Merge sort order formatted as column names with direction.
+        order: Vec<String>,
+        /// Child scan nodes, one per joined table.
+        inputs: Vec<ExplainNode>,
     },
 }
 
@@ -180,6 +241,47 @@ pub fn build_explain_node(plan: &PhysicalPlan) -> ExplainNode {
         PhysicalPlan::Distinct(dist) => ExplainNode::Distinct {
             max_groups: dist.max_groups,
             input: Box::new(build_explain_node(&dist.input)),
+        },
+        // ── Wave 4 variants ────────────────────────────────────────────────
+        PhysicalPlan::Sessionize(sess) => ExplainNode::Sessionize {
+            gap: format_nanos(sess.gap_ns),
+            end_events: sess.end_events.clone(),
+            input: Box::new(build_explain_node(&sess.input)),
+        },
+        PhysicalPlan::EventSelect(es) => ExplainNode::EventSelect {
+            kind: format_event_select_kind(&es.kind),
+            event_types: es.event_types.clone(),
+            has_predicate: es.predicate.is_some(),
+            input: Box::new(build_explain_node(&es.input)),
+        },
+        PhysicalPlan::Attribute(attr) => ExplainNode::Attribute {
+            conversion_events: attr.conversion_events.clone(),
+            touchpoint_events: attr.touchpoint_events.clone(),
+            window: format_nanos(attr.window_ns),
+            input: Box::new(build_explain_node(&attr.input)),
+        },
+        PhysicalPlan::SubqueryFilter(sqf) => ExplainNode::SubqueryFilter {
+            column_count: sqf.lhs_columns.len(),
+            input: Box::new(build_explain_node(&sqf.input)),
+            subquery: Box::new(build_explain_node(&sqf.subquery)),
+        },
+        PhysicalPlan::Sample(sample) => ExplainNode::Sample {
+            fraction: sample.fraction,
+            seed: sample.seed,
+            input: Box::new(build_explain_node(&sample.input)),
+        },
+        PhysicalPlan::MergeSources(merge) => ExplainNode::MergeSources {
+            tables: merge.table_id_map.clone(),
+            order: merge
+                .order
+                .iter()
+                .map(|(col, dir)| format!("{col} {}", format_sort_dir(dir)))
+                .collect(),
+            inputs: merge
+                .tables
+                .iter()
+                .map(|t| build_explain_node(&PhysicalPlan::Scan(t.clone())))
+                .collect(),
         },
         other => panic!("build_explain_node: not a query plan node — {other:?}"),
     }
@@ -297,6 +399,88 @@ fn write_node(node: &ExplainNode, indent: usize, buf: &mut String) {
             buf.push_str(&format!("{pad}Distinct\n"));
             buf.push_str(&format!("{pad}  max_groups : {max_groups}\n"));
             write_node(input, indent + 1, buf);
+        }
+        // ── Wave 4 variants ────────────────────────────────────────────────
+        ExplainNode::Sessionize {
+            gap,
+            end_events,
+            input,
+        } => {
+            buf.push_str(&format!("{pad}Sessionize\n"));
+            buf.push_str(&format!("{pad}  gap        : {gap}\n"));
+            if end_events.is_empty() {
+                buf.push_str(&format!("{pad}  end_events : none\n"));
+            } else {
+                buf.push_str(&format!("{pad}  end_events : {}\n", end_events.join(", ")));
+            }
+            write_node(input, indent + 1, buf);
+        }
+        ExplainNode::EventSelect {
+            kind,
+            event_types,
+            has_predicate,
+            input,
+        } => {
+            buf.push_str(&format!("{pad}EventSelect\n"));
+            buf.push_str(&format!("{pad}  kind       : {kind}\n"));
+            buf.push_str(&format!("{pad}  events     : {}\n", event_types.join(", ")));
+            buf.push_str(&format!("{pad}  predicate  : {has_predicate}\n"));
+            write_node(input, indent + 1, buf);
+        }
+        ExplainNode::Attribute {
+            conversion_events,
+            touchpoint_events,
+            window,
+            input,
+        } => {
+            buf.push_str(&format!("{pad}Attribute\n"));
+            buf.push_str(&format!(
+                "{pad}  conversion : {}\n",
+                conversion_events.join(", ")
+            ));
+            buf.push_str(&format!(
+                "{pad}  touchpoints: {}\n",
+                touchpoint_events.join(", ")
+            ));
+            buf.push_str(&format!("{pad}  window     : {window}\n"));
+            write_node(input, indent + 1, buf);
+        }
+        ExplainNode::SubqueryFilter {
+            column_count,
+            input,
+            subquery,
+        } => {
+            buf.push_str(&format!("{pad}SubqueryFilter\n"));
+            buf.push_str(&format!("{pad}  columns    : {column_count}\n"));
+            buf.push_str(&format!("{pad}  subquery:\n"));
+            write_node(subquery, indent + 2, buf);
+            write_node(input, indent + 1, buf);
+        }
+        ExplainNode::Sample {
+            fraction,
+            seed,
+            input,
+        } => {
+            buf.push_str(&format!("{pad}Sample\n"));
+            buf.push_str(&format!("{pad}  fraction   : {fraction}\n"));
+            buf.push_str(&format!("{pad}  seed       : {seed}\n"));
+            write_node(input, indent + 1, buf);
+        }
+        ExplainNode::MergeSources {
+            tables,
+            order,
+            inputs,
+        } => {
+            buf.push_str(&format!("{pad}MergeSources\n"));
+            buf.push_str(&format!("{pad}  tables     : {}\n", tables.join(", ")));
+            if order.is_empty() {
+                buf.push_str(&format!("{pad}  order      : default\n"));
+            } else {
+                buf.push_str(&format!("{pad}  order      : {}\n", order.join(", ")));
+            }
+            for input in inputs {
+                write_node(input, indent + 1, buf);
+            }
         }
     }
 }
@@ -477,6 +661,41 @@ fn format_match_strategy(strategy: &crate::compile::MatchStrategy) -> String {
     }
 }
 
+/// Format a nanosecond duration as a human-readable string.
+///
+/// Uses the largest whole unit that fits: days, hours, minutes, seconds,
+/// milliseconds, or raw nanoseconds.
+fn format_nanos(ns: i64) -> String {
+    const NS_PER_MS: i64 = 1_000_000;
+    const NS_PER_SEC: i64 = 1_000_000_000;
+    const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
+    const NS_PER_HOUR: i64 = 60 * NS_PER_MIN;
+    const NS_PER_DAY: i64 = 24 * NS_PER_HOUR;
+
+    if ns > 0 && ns % NS_PER_DAY == 0 {
+        format!("{}d", ns / NS_PER_DAY)
+    } else if ns > 0 && ns % NS_PER_HOUR == 0 {
+        format!("{}h", ns / NS_PER_HOUR)
+    } else if ns > 0 && ns % NS_PER_MIN == 0 {
+        format!("{}m", ns / NS_PER_MIN)
+    } else if ns > 0 && ns % NS_PER_SEC == 0 {
+        format!("{}s", ns / NS_PER_SEC)
+    } else if ns > 0 && ns % NS_PER_MS == 0 {
+        format!("{}ms", ns / NS_PER_MS)
+    } else {
+        format!("{ns}ns")
+    }
+}
+
+/// Format an [`EventSelectKind`] for EXPLAIN output.
+fn format_event_select_kind(kind: &crate::logical::EventSelectKind) -> String {
+    match kind {
+        crate::logical::EventSelectKind::First => "FIRST".to_string(),
+        crate::logical::EventSelectKind::Last => "LAST".to_string(),
+        crate::logical::EventSelectKind::Nth(n) => format!("NTH({n})"),
+    }
+}
+
 fn format_compiled_agg(agg: &crate::physical::CompiledAgg) -> String {
     let func_name = format_agg_function(agg.function);
     let arg_str = match &agg.arg {
@@ -527,6 +746,7 @@ mod tests {
     use bqlite_core::{Catalog, Result};
 
     use super::*;
+    use crate::physical::ScanPhysical;
     use crate::plan;
 
     // ── Test catalog ─────────────────────────────────────────────────────────
@@ -1004,5 +1224,285 @@ mod tests {
             text.contains('['),
             "EXPLAIN output must show resolved ns range; got:\n{text}"
         );
+    }
+
+    // ── Wave 4 EXPLAIN tests ──────────────────────────────────────────────
+
+    fn scan_node() -> ExplainNode {
+        ExplainNode::Scan {
+            table: "events".into(),
+            time_range: "none".into(),
+            predicates: vec![],
+            columns: vec!["entity_id".into(), "ts".into()],
+        }
+    }
+
+    #[test]
+    fn format_sessionize_gap_only() {
+        let node = ExplainNode::Sessionize {
+            gap: "30m".into(),
+            end_events: vec![],
+            input: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(text.contains("Sessionize"), "missing Sessionize: {text}");
+        assert!(text.contains("gap        : 30m"), "missing gap: {text}");
+        assert!(
+            text.contains("end_events : none"),
+            "gap-only should show none: {text}"
+        );
+        assert!(text.contains("Scan(events)"), "missing child scan: {text}");
+    }
+
+    #[test]
+    fn format_sessionize_with_end_events() {
+        let node = ExplainNode::Sessionize {
+            gap: "1h".into(),
+            end_events: vec!["logout".into(), "timeout".into()],
+            input: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(
+            text.contains("end_events : logout, timeout"),
+            "missing end events: {text}"
+        );
+    }
+
+    #[test]
+    fn format_event_select_first() {
+        let node = ExplainNode::EventSelect {
+            kind: "FIRST".into(),
+            event_types: vec!["purchase".into()],
+            has_predicate: false,
+            input: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(text.contains("EventSelect"), "missing EventSelect: {text}");
+        assert!(text.contains("kind       : FIRST"), "missing kind: {text}");
+        assert!(
+            text.contains("events     : purchase"),
+            "missing events: {text}"
+        );
+        assert!(
+            text.contains("predicate  : false"),
+            "missing predicate flag: {text}"
+        );
+    }
+
+    #[test]
+    fn format_event_select_nth_with_predicate() {
+        let node = ExplainNode::EventSelect {
+            kind: "NTH(3)".into(),
+            event_types: vec!["click".into(), "tap".into()],
+            has_predicate: true,
+            input: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(text.contains("NTH(3)"), "missing NTH(3): {text}");
+        assert!(
+            text.contains("events     : click, tap"),
+            "missing events: {text}"
+        );
+        assert!(
+            text.contains("predicate  : true"),
+            "should show predicate: {text}"
+        );
+    }
+
+    #[test]
+    fn format_attribute() {
+        let node = ExplainNode::Attribute {
+            conversion_events: vec!["purchase".into()],
+            touchpoint_events: vec!["ad_click".into(), "email_open".into()],
+            window: "30d".into(),
+            input: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(text.contains("Attribute"), "missing Attribute: {text}");
+        assert!(
+            text.contains("conversion : purchase"),
+            "missing conversion: {text}"
+        );
+        assert!(
+            text.contains("touchpoints: ad_click, email_open"),
+            "missing touchpoints: {text}"
+        );
+        assert!(text.contains("window     : 30d"), "missing window: {text}");
+    }
+
+    #[test]
+    fn format_subquery_filter() {
+        let node = ExplainNode::SubqueryFilter {
+            column_count: 1,
+            input: Box::new(scan_node()),
+            subquery: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(
+            text.contains("SubqueryFilter"),
+            "missing SubqueryFilter: {text}"
+        );
+        assert!(
+            text.contains("columns    : 1"),
+            "missing column count: {text}"
+        );
+        assert!(text.contains("subquery:"), "missing subquery label: {text}");
+        // Should have two Scan nodes: one for subquery, one for input.
+        assert_eq!(
+            text.matches("Scan(events)").count(),
+            2,
+            "should have two scans: {text}"
+        );
+    }
+
+    #[test]
+    fn format_sample() {
+        let node = ExplainNode::Sample {
+            fraction: 0.1,
+            seed: 42,
+            input: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(text.contains("Sample"), "missing Sample: {text}");
+        assert!(
+            text.contains("fraction   : 0.1"),
+            "missing fraction: {text}"
+        );
+        assert!(text.contains("seed       : 42"), "missing seed: {text}");
+    }
+
+    #[test]
+    fn format_merge_sources() {
+        let node = ExplainNode::MergeSources {
+            tables: vec!["events".into(), "clicks".into()],
+            order: vec!["entity_id ASC".into(), "ts ASC".into()],
+            inputs: vec![scan_node(), scan_node()],
+        };
+        let text = format_explain(&node);
+        assert!(
+            text.contains("MergeSources"),
+            "missing MergeSources: {text}"
+        );
+        assert!(
+            text.contains("tables     : events, clicks"),
+            "missing tables: {text}"
+        );
+        assert!(
+            text.contains("order      : entity_id ASC, ts ASC"),
+            "missing order: {text}"
+        );
+    }
+
+    #[test]
+    fn format_nanos_durations() {
+        use super::format_nanos;
+        assert_eq!(format_nanos(86_400_000_000_000), "1d");
+        assert_eq!(format_nanos(3_600_000_000_000), "1h");
+        assert_eq!(format_nanos(1_800_000_000_000), "30m");
+        assert_eq!(format_nanos(1_000_000_000), "1s");
+        assert_eq!(format_nanos(500_000_000), "500ms");
+        assert_eq!(format_nanos(12345), "12345ns");
+    }
+
+    #[test]
+    fn build_explain_sessionize() {
+        use crate::physical::{ScanPhysical, SessionizePhysical};
+        let scan = ScanPhysical {
+            table: "events".into(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: events_schema_os(),
+            entity_key_col: "entity_id".into(),
+            timestamp_col: "ts".into(),
+        };
+        let sess = SessionizePhysical {
+            gap_ns: 1_800_000_000_000,
+            end_events: vec!["logout".into()],
+            demand: crate::demand::DemandSet::default(),
+            forwarded_columns: vec![],
+            fused_aggregate: None,
+            input: Box::new(PhysicalPlan::Scan(scan)),
+            output_schema: events_schema_os(),
+        };
+        let node = build_explain_node(&PhysicalPlan::Sessionize(sess));
+        let text = format_explain(&node);
+        assert!(text.contains("Sessionize"), "missing: {text}");
+        assert!(text.contains("30m"), "gap should be 30m: {text}");
+        assert!(text.contains("logout"), "missing end event: {text}");
+    }
+
+    fn events_schema_os() -> bqlite_core::OperatorSchema {
+        bqlite_core::OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn build_explain_sample() {
+        let scan = ScanPhysical {
+            table: "events".into(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: events_schema_os(),
+            entity_key_col: "entity_id".into(),
+            timestamp_col: "ts".into(),
+        };
+        let sample = crate::physical::SamplePhysical {
+            fraction: 0.25,
+            seed: 42,
+            input: Box::new(PhysicalPlan::Scan(scan)),
+            output_schema: events_schema_os(),
+        };
+        let node = build_explain_node(&PhysicalPlan::Sample(sample));
+        let text = format_explain(&node);
+        assert!(text.contains("Sample"), "missing: {text}");
+        assert!(text.contains("0.25"), "missing fraction: {text}");
+        assert!(text.contains("42"), "missing seed: {text}");
+    }
+
+    #[test]
+    fn build_explain_merge_sources() {
+        use crate::logical::SortDirection;
+        let scan1 = ScanPhysical {
+            table: "events".into(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: events_schema_os(),
+            entity_key_col: "entity_id".into(),
+            timestamp_col: "ts".into(),
+        };
+        let scan2 = ScanPhysical {
+            table: "clicks".into(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: events_schema_os(),
+            entity_key_col: "entity_id".into(),
+            timestamp_col: "ts".into(),
+        };
+        let merge = crate::physical::MergeSourcesPhysical {
+            tables: vec![scan1, scan2],
+            order: vec![
+                ("entity_id".into(), SortDirection::Asc),
+                ("ts".into(), SortDirection::Asc),
+            ],
+            table_id_map: vec!["events".into(), "clicks".into()],
+            output_schema: events_schema_os(),
+        };
+        let node = build_explain_node(&PhysicalPlan::MergeSources(merge));
+        let text = format_explain(&node);
+        assert!(text.contains("MergeSources"), "missing: {text}");
+        assert!(text.contains("events, clicks"), "missing tables: {text}");
+        assert!(text.contains("entity_id ASC"), "missing order: {text}");
     }
 }
