@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-422",
   "claimed_at": "2026-04-13T03:48:58Z",
+  "completed_at": "2026-04-13T05:12:00Z",
   "branch": "task/TASK-422",
   "description": "Parser ATTRIBUTE stage"
 }
