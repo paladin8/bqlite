@@ -49,6 +49,7 @@ pub mod constant;
 pub mod delta;
 pub mod dictionary;
 pub mod double_delta;
+pub mod frequency;
 pub mod fsst;
 pub mod lz4;
 pub mod plain;

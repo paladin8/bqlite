@@ -306,12 +306,11 @@ fn encode_with(encoding: EncodingType, array: &dyn Array) -> Result<EncodedChunk
         EncodingType::DoubleDelta => DoubleDelta.encode(array),
         // v2 encodings — implementations land in TASK-415 through TASK-418.
         // The selector never picks these; this arm exists only for exhaustiveness.
-        EncodingType::Fsst
-        | EncodingType::For
-        | EncodingType::PFor
-        | EncodingType::Alp => Err(BqliteError::Execution(format!(
-            "v2 encoding {encoding:?} encode not yet implemented"
-        ))),
+        EncodingType::Fsst | EncodingType::For | EncodingType::PFor | EncodingType::Alp => {
+            Err(BqliteError::Execution(format!(
+                "v2 encoding {encoding:?} encode not yet implemented"
+            )))
+        }
     }
 }
 
