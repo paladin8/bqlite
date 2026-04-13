@@ -614,13 +614,20 @@ SESSIONIZE groups events into sessions based on inactivity gaps:
 
 -- With explicit end event
 | SESSIONIZE(gap: 30m, end: logout)
+
+-- With multiple explicit end events
+| SESSIONIZE(gap: 30m, end: (logout, timeout, session_end))
 ```
 
 **Parameters:**
 - `gap: <duration>` — maximum inactivity between events in a session. Required.
-- `end: <event_type>` — explicit session-terminating event. Optional. When set, sessions end at the first occurrence of the event type even if the gap has not elapsed.
+- `end: <event_type>` or `end: (<event_type>, ...)` — explicit session-terminating event(s). Optional. When set, a matching event ends the current session even if the gap has not elapsed.
 
 Output: passes through all input columns and adds `session_id` (Int) and `session_duration` (Int, nanos). See type-system.md Section 6.3.
+
+At exactly `delta == gap`, two adjacent events remain in the same session; a new session opens only when the inactivity gap is strictly greater than `gap`. An `end:` event belongs to the session it closes rather than starting the next one.
+
+`session_id` starts at `1` for each entity and is not globally unique. `COUNT_DISTINCT(session_id)` without `GROUP BY entity_id` therefore almost never means what a user wants.
 
 ### 8.1 Sessions as MATCH Context
 
@@ -830,11 +837,13 @@ Per-entity event selection:
 events | FIRST(purchase)               -- first purchase per entity
 events | LAST(page_view)               -- last page view per entity
 events | NTH(page_view, 3)             -- third page view per entity
+events | FIRST((login, sso_login))     -- first matching event from a list
+events LAST 30d | FIRST(signup, lookback: 90d)
 ```
 
 Output: one row per entity with the selected event's full columns. Entities with no matching event are omitted. See type-system.md Section 6.7.
 
-The event argument is an event type identifier. A WHERE clause may be attached to filter which events are candidates for selection:
+The event argument may be either a single event type identifier or a parenthesized list of event types. A WHERE clause may be attached to filter which events are candidates for selection:
 
 ```bql
 events | FIRST(purchase WHERE amount > 100)            -- first high-value purchase per entity
@@ -844,22 +853,28 @@ events | NTH(purchase WHERE amount > 100, 3)           -- third high-value purch
 
 All three operators (FIRST, LAST, NTH) accept an optional WHERE clause. The predicate is applied per-event before the position selection, so `NTH(e WHERE p, 3)` returns the third event that satisfies `p`, not the third event overall if it happens to satisfy `p`.
 
+`FIRST` and `NTH` also accept an optional `lookback: <duration>` parameter. This widens the scan backward from the outer time range's start so the operator can pick a qualifying event that occurred before the nominal range. `LAST` does not accept `lookback:`.
+
+If an entity has fewer than `n` qualifying events for `NTH`, it emits no row. When multiple qualifying events share the same timestamp, bqlite breaks ties deterministically by `__seq_id`.
+
 ### 14.2 SAMPLE
 
 Random sampling of entities:
 
 ```bql
 events | SAMPLE(fraction: 0.1)         -- 10% random sample of entities
-events | SAMPLE(count: 10000)          -- fixed sample size
+events | SAMPLE(fraction: 1.0)         -- pass-through
 ```
 
-**Parameters:** exactly one of `fraction:` (Float in [0, 1]) or `count:` (Int).
+**Parameters:** `fraction:` (Float in `[0.0, 1.0]`) plus optional `seed: <int>`.
 
 Output: passes through input schema unchanged. SAMPLE is a scan-level operator that filters entities early — it's pushed down to the storage layer to avoid reading segments for non-sampled entities (type-system.md Section 6.11).
 
 Sampling is entity-level, not event-level. A sampled entity's full event stream is included; non-sampled entities contribute zero events.
 
-**Determinism.** SAMPLE uses a hash of the entity ID, making results deterministic across runs with the same seed. An optional `seed: <int>` parameter fixes the seed for reproducibility; without it, the seed is derived from the database identity so repeat queries on the same database produce the same sample.
+**Determinism.** SAMPLE hashes the canonical byte representation of the entity ID with `xxHash64`, making results deterministic across runs with the same seed. An optional `seed: <int>` parameter fixes the seed for reproducibility; without it, the seed is derived from the database identity so repeat queries on the same database produce the same sample indefinitely.
+
+SAMPLE's population is the source table's entity set, not "whatever rows survive upstream stateless filters." A query like `events | WHERE p | SAMPLE(fraction: 0.1)` selects the same entity set as `events | SAMPLE(fraction: 0.1) | WHERE p`; the only difference is which sampled entities still have rows after the filter.
 
 ### 14.3 ATTRIBUTE
 
@@ -872,13 +887,20 @@ events | ATTRIBUTE(
     window: 30d,
     touchpoint_key: channel
 )
+
+events | ATTRIBUTE(
+    conversion: (purchase, subscription),
+    touchpoints: (ad_click, email_open),
+    window: 30d,
+    touchpoint_key: channel
+)
 ```
 
 **Parameters:**
-- `conversion: <event_type>` — the conversion-defining event. Required.
-- `touchpoints: <event_type>` — the touchpoint event type whose occurrences are credited to conversions. Required.
+- `conversion: <event_type>` or `(<event_type>, ...)` — the conversion-defining event type(s). Required.
+- `touchpoints: <event_type>` or `(<event_type>, ...)` — the touchpoint event type(s) whose occurrences are credited to conversions. Required.
 - `window: <duration>` — the lookback window before each conversion in which touchpoints count. Required.
-- `touchpoint_key: <expr>` — an expression evaluated against the touchpoint event's schema that produces a `String`. The result appears as the `touchpoint_key` output column. Required. Use `CAST(… AS STRING)` if the source column isn't already a string. The expression cannot reference conversion properties — it is evaluated purely in the touchpoint's context.
+- `touchpoint_key: <expr>` — any scalar expression that resolves against the source table schema and produces a `String`. The result appears as the `touchpoint_key` output column. Required. Use `CAST(… AS STRING)` if the source expression isn't already a string. The expression cannot reference conversion properties — it is evaluated purely in the touchpoint row's context.
 
 **Output schema.** One row per `(entity_id, conversion, matched-touchpoint)`. See type-system.md Section 6.14.
 
@@ -888,13 +910,17 @@ events | ATTRIBUTE(
 | `conversion_ts` | Timestamp | no | Conversion event's timestamp |
 | *conversion properties* | (resolved from source) | follows source | Accessed as `<conversion_event_type>.<column>` downstream; demand-driven |
 | `touchpoint_ts` | Timestamp | yes | Timestamp of the matched touchpoint. NULL when no touchpoint qualified. |
-| `touchpoint_key` | String | yes | Result of the `touchpoint_key` expression. NULL when no touchpoint qualified. |
+| `touchpoint_key` | String | yes | Result of the `touchpoint_key` expression. NULL when no touchpoint qualified, or when a qualifying touchpoint's key expression evaluates to NULL. |
 
 **Auto-unnest semantics.** ATTRIBUTE emits flat rows, not a list column. A conversion with N qualifying touchpoints produces N rows. This makes attribution aggregation straightforward: `STATS attributions = COUNT(*) GROUP BY touchpoint_key` directly gives you per-channel counts without an intermediate list materialization step.
 
 **Un-attributed conversions (LEFT-UNNEST).** A conversion with zero qualifying touchpoints still emits **one row**, with `touchpoint_ts = NULL` and `touchpoint_key = NULL`. This preserves un-attributed conversions so the user can count them (`STATS unattributed = SUM(CAST(touchpoint_ts IS NULL AS INT))`). For INNER-join semantics — drop un-attributed conversions entirely — append `| WHERE touchpoint_ts IS NOT NULL`.
 
-**Conversion property access.** Forwarded conversion properties are accessed downstream with the conversion event type as a prefix, parallel to MATCH's bare-step property access (Section 5.2). For `conversion: purchase`, downstream writes `purchase.amount`. Conversion property forwarding is demand-driven: only referenced properties are retained. If the conversion event type shares its name with a column on the source table, the planner raises `TypeError::NameCollision`.
+If a qualifying touchpoint exists but `touchpoint_key` evaluates to NULL, the row is still emitted with a non-null `touchpoint_ts` and a null `touchpoint_key`. This is intentionally distinct from the LEFT-UNNEST row.
+
+**Scan widening.** The planner automatically widens the scan backward by `window` so conversions near the start of the outer range can still see qualifying touchpoints from the lookback zone. Users do not need to widen the source range manually.
+
+**Conversion property access.** Forwarded conversion properties are accessed downstream with the conversion event type as a prefix, parallel to MATCH's bare-step property access (Section 5.2). For `conversion: purchase`, downstream writes `purchase.amount`; when `conversion:` is a list, any listed event type may be used as the prefix. Conversion property forwarding is demand-driven: only referenced properties are retained. If a conversion event type shares its name with a column on the source table, the planner raises `TypeError::NameCollision`.
 
 ```bql
 -- Last-touch attribution by channel
@@ -1051,11 +1077,12 @@ events | WHERE entity_id IN churned | MATCH FIRST SEQUENCE(support_ticket THEN c
 
 ### 18.1 Alias Semantics
 
-- **Session-scoped.** Aliases live for the duration of a REPL session or a multi-statement query submission. They do not persist across sessions.
-- **Lazy evaluation.** An alias is not executed when defined. It is executed when referenced. Multiple references in a single session may be evaluated once and cached, or re-evaluated per reference, at the planner's discretion (TASK-006 cost model).
+- **Submission-scoped in the engine.** Aliases live for one query submission / `execute` call. The engine itself is alias-stateless across submissions. A REPL may offer a longer-lived UX by prepending previously defined aliases into later submissions, but that is a CLI-layer convenience rather than an engine contract.
+- **Lazy evaluation with per-submission caching.** An alias is not executed when defined. It is executed when referenced. Multiple references in the same submission execute exactly once and reuse the same materialized result.
 - **Composable.** Aliases may reference other aliases. The planner resolves the dependency graph.
 - **No cycles.** Circular references are a planner error.
 - **Lexically scoped naming.** An alias name must be a valid identifier and must not shadow a keyword or table name. Shadowing other aliases is permitted — the most recent definition wins.
+- **Top-down order.** An alias must be defined before it is referenced within the submission.
 
 ### 18.2 Alias Resolution in IN
 
@@ -1063,7 +1090,7 @@ Per Section 17.3, a bare identifier on the right side of `IN` is **always** an a
 
 ### 18.3 Aliases vs CTEs
 
-Aliases play the role CTEs play in SQL, but they are top-level definitions rather than embedded `WITH` clauses. This keeps the pipeline the main visual element of a query and makes alias reuse across multiple queries (in a REPL session) natural.
+Aliases play the role CTEs play in SQL, but they are top-level definitions rather than embedded `WITH` clauses. This keeps the pipeline the main visual element of a query. REPL-style reuse across multiple submissions is a CLI-layer convenience built on top of the engine's submission-scoped alias model.
 
 Persistent aliases — named views, materialized results — are a v2 feature and explicitly out of scope for v1.
 
@@ -1215,11 +1242,14 @@ DELETE FROM events WHERE __seq_id IN (123, 456, 789)
 
 -- Delete a bad ingest batch
 DELETE FROM events WHERE __batch_id = 42
+
+-- Full-scan delete requires explicit opt-in
+DELETE FROM events WHERE user_id != 'bot' ALLOW SCAN
 ```
 
-DELETE supports a WHERE clause over indexed columns (entity key, timestamp, `__seq_id`, `__batch_id`). Arbitrary-predicate DELETE is supported but may require a full scan to materialize the row set for tombstoning; the planner warns when this happens.
+DELETE supports a cheap class of predicates over the entity key, timestamp, `__seq_id`, and `__batch_id`. Arbitrary-predicate DELETE is rejected by default; users must append `ALLOW SCAN` to opt into a full-scan delete that materializes matching `__seq_id`s before writing tombstones.
 
-Deletes are implemented as tombstones at the storage layer (storage-format.md on tombstones). They are visible immediately to new queries but do not rewrite segments until compaction.
+DELETE returns an exact `rows_affected` count. Deletes are implemented as tombstones at the storage layer (storage-format.md on tombstones). They are visible immediately to new queries but do not rewrite segments until compaction. Re-running the same DELETE is idempotent over the tombstone set, although an `ALLOW SCAN` delete may affect additional newly-ingested matching rows if data arrived between runs.
 
 ### 20.3 No UPDATE
 
@@ -1475,11 +1505,13 @@ FUNNEL and RETENTION appear as entity ops in the category table, but the planner
 | MATCH | WHERE, SELECT, LET, STATS, ORDER BY, LIMIT |
 | FUNNEL | (terminal after desugaring — produces aggregated rows; follows STATS rules) |
 | RETENTION | (terminal after desugaring — produces aggregated rows; follows STATS rules) |
-| SESSIONIZE | WHERE, SELECT, LET, MATCH, STATS |
+| SESSIONIZE | WHERE, SELECT, LET, MATCH, FIRST/LAST/NTH, ATTRIBUTE, STATS |
 | FIRST/LAST/NTH | WHERE, SELECT, LET, STATS, ORDER BY, LIMIT |
 | ATTRIBUTE | WHERE, SELECT, LET, STATS, ORDER BY, LIMIT |
 | STATS | WHERE, SELECT, LET, ORDER BY, LIMIT, PIVOT |
 | PIVOT | WHERE, SELECT, LET, ORDER BY, LIMIT |
+
+`SESSIONIZE | FIRST/LAST/NTH` and `SESSIONIZE | ATTRIBUTE` remain entity-level compositions in v1 — SESSIONIZE does not implicitly make those downstream operators session-scoped.
 | ORDER BY | WHERE, SELECT, LET, LIMIT |
 | LIMIT | WHERE, SELECT, LET, ORDER BY |
 
@@ -1558,6 +1590,8 @@ unqualified_step := (identifier ":")? step_event (WHERE predicate)?
 step_event       := event_ref
                   | "(" event_ref (OR event_ref)+ ")"
 event_ref        := (name ".")? name                    -- table.event_type in multi-table queries
+event_ref_list   := event_ref
+                  | "(" event_ref ("," event_ref)* ")"
 exclusion        := event_ref
                   | "(" event_ref (OR event_ref)+ ")"
 repetition       := "*" | "+"
@@ -1578,7 +1612,7 @@ retention_args   := "entry" ":" event_ref "," "activity" ":" event_ref ","
 
 -- SESSIONIZE
 sessionize_op    := SESSIONIZE "(" session_params ")"
-session_params   := "gap" ":" duration ("," "end" ":" event_ref)?
+session_params   := "gap" ":" duration ("," "end" ":" event_ref_list)?
 
 -- STATS (aggregate expressions must have an `alias =` assignment — see Section 7.1)
 stats_op         := STATS agg_list (GROUP BY group_list)?
@@ -1592,16 +1626,17 @@ group_item       := name                                 -- bare column referenc
                   | expr AS identifier                   -- computed group key, name required
 
 -- FIRST / LAST / NTH
-first_last_op    := (FIRST | LAST) "(" event_ref (WHERE predicate)? ")"
-nth_op           := NTH "(" event_ref (WHERE predicate)? "," integer ")"
+first_last_op    := FIRST "(" event_ref_list (WHERE predicate)? ("," "lookback" ":" duration)? ")"
+                  | LAST "(" event_ref_list (WHERE predicate)? ")"
+nth_op           := NTH "(" event_ref_list (WHERE predicate)? "," integer
+                              ("," "lookback" ":" duration)? ")"
 
 -- SAMPLE
-sample_op        := SAMPLE "(" sample_param ("," "seed" ":" integer)? ")"
-sample_param     := "fraction" ":" number | "count" ":" integer
+sample_op        := SAMPLE "(" "fraction" ":" number ("," "seed" ":" integer)? ")"
 
 -- ATTRIBUTE
-attribute_op     := ATTRIBUTE "(" "conversion" ":" event_ref ","
-                                  "touchpoints" ":" event_ref ","
+attribute_op     := ATTRIBUTE "(" "conversion" ":" event_ref_list ","
+                                  "touchpoints" ":" event_ref_list ","
                                   "window" ":" duration ","
                                   "touchpoint_key" ":" expr ")"
 
@@ -1674,7 +1709,7 @@ literal_tuple    := "(" literal ("," literal)* ")"
 insert_option    := identifier ":" literal
                   | MAP ":" "(" column_mapping ("," column_mapping)* ")"
 column_mapping   := identifier AS identifier
-delete_stmt      := DELETE FROM name WHERE predicate
+delete_stmt      := DELETE FROM name WHERE predicate (ALLOW SCAN)?
 
 -- DDL
 create_table     := CREATE TABLE name "(" column_def ("," column_def)* ")"

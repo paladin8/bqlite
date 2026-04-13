@@ -400,6 +400,8 @@ events | NTH(page_view, 3)
 
 The output has exactly one row per entity (entities with no matching event are omitted). This means sub-selection results compose naturally with other operators: pipe into STATS for aggregation, into WHERE for filtering on properties of the selected event, or use in an IN clause as a cohort.
 
+When `FIRST` or `NTH` uses `lookback: <duration>`, the selected event may fall outside the query's nominal outer time range because the planner widens the scan backward before the operator runs. Same-timestamp ties are broken deterministically by `__seq_id`.
+
 ### 6.8 Window functions (OVER)
 
 Window functions compute values across the entity's ordered event stream without collapsing rows. They pass through all input columns and add computed columns.
@@ -484,7 +486,7 @@ Pivot columns are nullable because not every group may have a value for every pi
 
 ### 6.11 SAMPLE
 
-Random sampling of entities. Reduces the entity set to a fraction or fixed count before processing.
+Random sampling of entities. Reduces the entity set to a fraction before processing.
 
 ```sql
 -- 10% random sample of entities
@@ -492,8 +494,6 @@ events
   | SAMPLE(fraction: 0.1)
   | MATCH FIRST SEQUENCE(signup THEN purchase) WITHIN 7d
 
--- Fixed sample size
-events | SAMPLE(count: 10000)
 ```
 
 Output schema: passes through input schema unchanged. SAMPLE is a scan-level operator — it filters entities early to avoid processing the full dataset.
@@ -516,15 +516,15 @@ Finds touchpoint events preceding each conversion within a time window. See quer
 |---|---|---|---|---|
 | `entity_id` | String or Int (matches entity key) | no | Always | Entity identifier |
 | `conversion_ts` | Timestamp | no | Always | Conversion event's timestamp |
-| *conversion properties* | (resolved from source schema) | follows source | When downstream references `<conversion_event_type>.<column>` | Demand-driven forwarded conversion properties |
+| *conversion properties* | (resolved from source schema) | follows source | When downstream references `<conversion_event_type>.<column>` for any event type named in `conversion:` | Demand-driven forwarded conversion properties |
 | `touchpoint_ts` | Timestamp | **yes** | Always | Touchpoint timestamp; `NULL` when no touchpoint qualified for this conversion |
-| `touchpoint_key` | String | **yes** | Always | Result of the `touchpoint_key` expression; `NULL` when no touchpoint qualified |
+| `touchpoint_key` | String | **yes** | Always | Result of the `touchpoint_key` expression; `NULL` when no touchpoint qualified, or when a qualifying touchpoint's key evaluates to `NULL` |
 
-**`touchpoint_key` typing.** The `touchpoint_key` expression in the ATTRIBUTE parameters must evaluate to `String`. Any other type is a plan-time error; use `CAST(expr AS STRING)` to forward non-string columns. The expression is type-checked against the touchpoint event type's schema only — it cannot reference conversion properties or columns from other event types.
+**`touchpoint_key` typing.** The `touchpoint_key` expression in the ATTRIBUTE parameters must evaluate to `String`. Any other type is a plan-time error; use `CAST(expr AS STRING)` to forward non-string columns. The expression is type-checked against the source schema, but evaluated only on rows whose `event_type` is in the `touchpoints:` list. It cannot reference conversion properties.
 
-**Conversion property forwarding.** Properties of the conversion event are accessed downstream using the conversion event type as a prefix — for `conversion: purchase`, downstream writes `purchase.amount`. This mirrors MATCH's bare-step property access (Section 6.1). Only referenced properties are materialized. If the conversion event type's name collides with a column name on the source table, the planner raises `TypeError::NameCollision` (Section 12).
+**Conversion property forwarding.** Properties of the conversion event are accessed downstream using the conversion event type as a prefix — for `conversion: purchase`, downstream writes `purchase.amount`; for `conversion: (purchase, subscription)`, either `purchase.amount` or `subscription.amount` is valid. This mirrors MATCH's bare-step property access (Section 6.1). Only referenced properties are materialized. If a conversion event type's name collides with a column name on the source table, the planner raises `TypeError::NameCollision` (Section 12).
 
-**LEFT-UNNEST semantics.** Conversions with no qualifying touchpoints still emit one row, with `touchpoint_ts = NULL` and `touchpoint_key = NULL`. This preserves un-attributed conversions so they can be counted. Use `WHERE touchpoint_ts IS NOT NULL` downstream to drop them for INNER-join semantics.
+**LEFT-UNNEST semantics.** Conversions with no qualifying touchpoints still emit one row, with `touchpoint_ts = NULL` and `touchpoint_key = NULL`. This preserves un-attributed conversions so they can be counted. A qualifying touchpoint whose key evaluates to `NULL` still emits a row with non-null `touchpoint_ts` and null `touchpoint_key`. Use `WHERE touchpoint_ts IS NOT NULL` downstream to drop only the un-attributed LEFT-UNNEST rows.
 
 **Row cardinality.** For an entity with K conversions and, on average, N qualifying touchpoints per conversion (within `window`), the operator emits `K * max(N, 1)` rows. The `max(N, 1)` accounts for the LEFT-UNNEST row emitted for un-attributed conversions.
 

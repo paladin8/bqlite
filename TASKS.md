@@ -1028,34 +1028,34 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 **Description**: Registers the surviving codecs with the selector, wires their metadata into reader/writer paths, and proves mixed-version read/write compatibility end-to-end. This is the task that turns the per-codec modules into a real Wave 4 storage format rather than a set of isolated experiments.
 
 ### TASK-420: [EASY][IMPL] Parser RETENTION + SESSIONIZE stages
-**Output**: crates/bqlite-parser/src/pipeline.rs
+**Output**: crates/bqlite-parser/src/pipeline.rs, crates/bqlite-ast/src/operator.rs
 **Depends on**: TASK-405
-**Description**: Adds the two pipeline productions already modeled by the AST but still rejected by the parser: terminal `RETENTION(...)` sugar and `SESSIONIZE(gap: ..., end: ...)`. Unit tests cover parameter ordering, duplicate-key diagnostics, terminal-operator restrictions for RETENTION, and the parser-level surface for downstream `WITHIN SESSION` queries.
+**Description**: Adds terminal `RETENTION(...)` sugar and `SESSIONIZE(gap: ..., end: ...)` to the pipeline parser, including the small AST shape update needed for `SESSIONIZE end:` to accept either a single event ref or a parenthesized event list. Unit tests cover parameter ordering, duplicate-key diagnostics, duplicate names inside `end:` lists, terminal-operator restrictions for RETENTION, and the parser-level surface for downstream `WITHIN SESSION` queries.
 
 ### TASK-421: [EASY][IMPL] Parser FIRST/LAST/NTH + SAMPLE stages
-**Output**: crates/bqlite-parser/src/pipeline.rs
+**Output**: crates/bqlite-parser/src/pipeline.rs, crates/bqlite-ast/src/operator.rs
 **Depends on**: TASK-411
-**Description**: Adds `FIRST(event [WHERE ...])`, `LAST(...)`, `NTH(event, n [WHERE ...])`, and `SAMPLE(fraction: ... | count: ..., seed: ...)` to the pipeline parser. Tests cover the per-operator arity rules, `NTH` argument order, exactly-one-of `fraction` / `count`, and preservation of the AST variants already shipped in `bqlite-ast`.
+**Description**: Adds `FIRST(event_or_list [WHERE ...] [, lookback: ...])`, `LAST(event_or_list [WHERE ...])`, `NTH(event_or_list [WHERE ...], n [, lookback: ...])`, and fraction-only `SAMPLE(fraction: ..., seed: ...)` to the pipeline parser. Includes the small AST updates for EventSelect event-type lists, optional `lookback`, and removal of the `SampleSpec::Count` variant. Tests cover the per-operator arity rules, `NTH(event WHERE ..., n)` argument order, positive-`n` validation, LAST rejecting `lookback`, duplicate names within event lists, fraction boundary validation, and preservation of the updated AST variants.
 
 ### TASK-422: [EASY][IMPL] Parser ATTRIBUTE stage
-**Output**: crates/bqlite-parser/src/pipeline.rs
+**Output**: crates/bqlite-parser/src/pipeline.rs, crates/bqlite-ast/src/operator.rs
 **Depends on**: TASK-406
-**Description**: Adds `ATTRIBUTE(conversion: ..., touchpoints: ..., window: ..., touchpoint_key: ...)` to the parser, including duplicate/missing key diagnostics and expression parsing for `touchpoint_key`. No planner work here — the task is purely about surface syntax and span-accurate diagnostics.
+**Description**: Adds `ATTRIBUTE(conversion: ..., touchpoints: ..., window: ..., touchpoint_key: ...)` to the parser, including the small AST update needed for `conversion:` and `touchpoints:` to accept either a single event ref or a parenthesized event list. Covers duplicate/missing key diagnostics, duplicate names within each list, overlap between the two lists, and expression parsing for `touchpoint_key`. No planner work here — the task is purely about surface syntax and span-accurate diagnostics.
 
 ### TASK-423: [EASY][IMPL] Parser alias definitions
 **Output**: crates/bqlite-parser/src/parser.rs
 **Depends on**: TASK-407
-**Description**: Extends the top-level parser from `pipeline` to `(alias_def)* pipeline` so reusable aliases can precede a query. Covers the `alias = pipeline` production, duplicate-name diagnostics, and span-accurate errors. Planner/runtime semantics are downstream; `IN QUERY` / bare `IN alias` are TASK-451; source `JOIN` is TASK-452.
+**Description**: Extends the top-level parser from `pipeline` to `(alias_def)* pipeline` so reusable aliases can precede a query. Covers the `alias = pipeline` production and span-accurate errors while preserving the language rule that alias shadowing is allowed and resolves last-wins rather than producing a duplicate-name diagnostic. Planner/runtime semantics are downstream; `IN QUERY` / bare `IN alias` are TASK-451; source `JOIN` is TASK-452.
 
-### TASK-424: [EASY][IMPL] Logical + physical plan variants for Wave 4 query nodes
+### TASK-424: [HARD][IMPL] Logical + physical plan variants for Wave 4 query nodes
 **Output**: crates/bqlite-planner/src/{logical.rs,physical.rs,explain.rs}
 **Depends on**: TASK-405, TASK-406, TASK-407, TASK-411
-**Description**: Adds the Wave 4 query-side plan variants promised by `logical-plan-nodes.md`: `Sessionize`, `EventSelect`, `Sample`, `SubqueryFilter`, and `Attribute`, plus their physical mirrors and EXPLAIN rendering. `Delete` remains owned by TASK-433 so the delete/tombstone work stays grouped with storage semantics.
+**Description**: Adds the Wave 4 query-side plan variants promised by `logical-plan-nodes.md`: richer `Sessionize`, `EventSelect`, `Sample`, `SubqueryFilter`, and `Attribute` nodes, plus the `MergeSources` physical node for entity-aligned JOINs, `__source_table_id` / table-id-map schema plumbing, and EXPLAIN rendering. `Delete` remains owned by TASK-453 so the delete/tombstone work stays grouped with storage semantics.
 
 ### TASK-425: [HARD][IMPL] AST → logical lowering + logical → physical lowering for Wave 4
 **Output**: crates/bqlite-planner/src/{logical.rs,physical.rs,expr.rs}
 **Depends on**: TASK-420, TASK-421, TASK-422, TASK-423, TASK-451, TASK-452, TASK-424
-**Description**: Extends the planner to lower the new Wave 4 query nodes, resolve aliases recursively, type-check `touchpoint_key` / forwarded conversion-property references, validate table-qualified references in joined-source queries, and emit the corresponding physical descriptors. Also threads scan-range extension for ATTRIBUTE windows and the metadata the joined-source runtime needs for entity-aligned merge execution.
+**Description**: Extends the planner to lower the new Wave 4 query nodes, bind aliases in source order with cycle detection, type-check `touchpoint_key` / forwarded conversion-property references, validate table-qualified references in joined-source queries, and emit the corresponding physical descriptors. Also threads scan-range extension for ATTRIBUTE windows and EventSelect `lookback` (uniformly across joined tables), materializes cohort subqueries before the main pipeline runs, and carries the metadata the joined-source runtime needs for entity-aligned merge execution.
 
 ### TASK-426: [EASY][IMPL] RETENTION desugaring pass
 **Output**: crates/bqlite-planner/src/opt/desugar_retention.rs
@@ -1075,12 +1075,12 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 ### TASK-429: [EASY][IMPL] EventSelectOperator
 **Output**: crates/bqlite-operators/src/event_select.rs
 **Depends on**: TASK-411, TASK-424, TASK-427
-**Description**: Implements `FIRST`, `LAST`, and `NTH` as one entity operator parameterized by `EventSelectKind`, including optional per-event predicates, forwarded property demand, omission of entities with no qualifying event, and exact handling of the "third qualifying event" semantics for `NTH(... WHERE ...)`.
+**Description**: Implements `FIRST`, `LAST`, and `NTH` as one entity operator parameterized by `EventSelectKind`, including event-type lists, optional per-event predicates, same-`ts` tie-breaking by `__seq_id`, forwarded property demand, omission of entities with no qualifying event, and exact handling of the "third qualifying event" semantics for `NTH(... WHERE ...)`.
 
 ### TASK-430: [HARD][IMPL] SAMPLE pushdown path
 **Output**: crates/bqlite-planner/src/physical.rs, crates/bqlite-operators/src/scan.rs, crates/bqlite-storage/src/segment/reader.rs
 **Depends on**: TASK-411, TASK-425
-**Description**: Makes `SAMPLE` real and cheap by pushing deterministic entity sampling all the way into the single-table scan path, so unsampled entities never reach the merge/read hot loop. Covers explicit seed handling, default seed derivation from the database UUID, and sample-spec threading through the physical plan. Joined-source SAMPLE correctness is extended by TASK-436.
+**Description**: Makes fraction-only `SAMPLE` real and cheap by pushing deterministic entity sampling all the way into the scan path, so unsampled entities never reach the merge/read hot loop. Covers explicit seed handling, default seed derivation from the database UUID, xxHash64-based entity hashing over the canonical entity-id bytes, pushdown through stateless WHERE / SELECT / LET chains, and sample-spec threading through the physical plan. Joined-source SAMPLE correctness is extended by TASK-436.
 
 ### TASK-431: [HARD][IMPL] AttributeOperator
 **Output**: crates/bqlite-operators/src/attribute.rs
@@ -1093,9 +1093,9 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 **Description**: Adds the concrete tombstone-file API described by the delete design: atomic read/write helpers, shard/window targeting, query-start snapshot loading, and typed helpers for row / batch / entity / time-range deletes. This is the storage-layer foundation both DELETE execution and tombstone-aware scans depend on.
 
 ### TASK-433: [EASY][IMPL] DELETE statement parser
-**Output**: crates/bqlite-parser/src/dml.rs
+**Output**: crates/bqlite-parser/src/dml.rs, crates/bqlite-ast/src/statement.rs
 **Depends on**: TASK-404
-**Description**: Parses `DELETE FROM ... WHERE ...` into the DELETE AST node the logical plan consumes. Covers predicate expression parsing, span-accurate diagnostics for unsupported shapes, and the table-reference surface. Planner lowering and engine execution are TASK-453.
+**Description**: Parses `DELETE FROM ... WHERE ... [ALLOW SCAN]` into the DELETE AST node the logical plan consumes, including the small AST update that records the `ALLOW SCAN` opt-in flag. Covers predicate expression parsing, the `ALLOW SCAN` suffix, span-accurate diagnostics for unsupported shapes, rejection of `JOIN` after `DELETE FROM <table>`, and the table-reference surface. Planner lowering and engine execution are TASK-453.
 
 ### TASK-434: [HARD][IMPL] Tombstone-aware scan + merge path
 **Output**: crates/bqlite-operators/src/scan.rs, crates/bqlite-storage/src/segment/merge.rs
@@ -1120,17 +1120,17 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 ### TASK-438: [EASY][IMPL] Engine bind step extension for Wave 4 query nodes
 **Output**: crates/bqlite-engine/src/bind.rs
 **Depends on**: TASK-424, TASK-425, TASK-428, TASK-429, TASK-430, TASK-431, TASK-436, TASK-437
-**Description**: Extends the bind step to materialize runtime trees for `SessionizePhysical`, `EventSelectPhysical`, `SamplePhysical`, `SubqueryFilterPhysical`, `AttributePhysical`, and joined-source scans. `DELETE` remains out of scope for this task because TASK-433 executes it as a statement-level engine path rather than a bound query pipeline.
+**Description**: Extends the bind step to materialize runtime trees for `SessionizePhysical`, `EventSelectPhysical`, `SamplePhysical`, `SubqueryFilterPhysical`, `AttributePhysical`, and joined-source scans. `DELETE` remains out of scope for this task because TASK-453 executes it as a statement-level engine path rather than a bound query pipeline.
 
 ### TASK-439: [HARD][IMPL] Advanced analytics integration tests
 **Output**: tests/integration/advanced_analytics/
 **Depends on**: TASK-426, TASK-428, TASK-429, TASK-430, TASK-431, TASK-436, TASK-437, TASK-438
-**Description**: End-to-end integration matrix for the new query primitives: session boundary edge cases, `WITHIN SESSION`, RETENTION bracket semantics (including cumulative mode), FIRST/LAST/NTH with candidate predicates, deterministic SAMPLE behavior, joined-source queries, cohort semi-joins, ATTRIBUTE left-unnest semantics, and exact downstream aggregate results on realistic fixtures.
+**Description**: End-to-end integration matrix for the new query primitives: session boundary edge cases, `WITHIN SESSION`, RETENTION bracket semantics (including cumulative mode), FIRST/LAST/NTH with candidate predicates, event-type lists, and `lookback:` widening, deterministic fraction-only SAMPLE behavior, joined-source queries, cohort semi-joins, ATTRIBUTE left-unnest semantics, and exact downstream aggregate results on realistic fixtures.
 
 ### TASK-440: [HARD][IMPL] Delete + compaction integration tests
 **Output**: tests/integration/deletes/
 **Depends on**: TASK-408, TASK-433, TASK-453, TASK-434, TASK-435
-**Description**: Integration suite for live-delete correctness: delete-by-entity, delete-by-batch, delete-by-`__seq_id`, time-range delete, query-snapshot visibility during concurrent tombstone updates, and physical reclamation after compaction. This is the correctness evidence the wave acceptance and quality audit lean on for the storage side.
+**Description**: Integration suite for live-delete correctness: delete-by-entity, delete-by-batch, delete-by-`__seq_id`, time-range delete, rejection of non-cheap predicates without `ALLOW SCAN`, exact `rows_affected` accounting, query-snapshot visibility during concurrent tombstone updates, and physical reclamation after compaction. This is the correctness evidence the wave acceptance and quality audit lean on for the storage side.
 
 ### TASK-441: [HARD][IMPL] Advanced analytics benchmark suite
 **Output**: benches/wave4/
@@ -1155,7 +1155,7 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 ### TASK-445: [EASY][IMPL] EventSelect + SAMPLE semantic audit
 **Output**: docs/reviews/wave4-event-select-sample-audit.md
 **Depends on**: TASK-429, TASK-430, TASK-436, TASK-438, TASK-439
-**Description**: Targeted reading pass on `FIRST` / `LAST` / `NTH` and deterministic `SAMPLE`: do the semantics make sense and match the design note? Walk candidate-predicate ordering, omission of entities with no qualifying event, NTH indexing, projection/forwarding correctness, sample determinism across repeated runs, explicit-seed vs database-UUID-derived seed behavior, count-vs-fraction semantics, and pushdown correctness on single-table and joined-source scans. Record a promise-vs-evidence matrix; drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
+**Description**: Targeted reading pass on `FIRST` / `LAST` / `NTH` and deterministic `SAMPLE`: do the semantics make sense and match the design note? Walk event-type lists, candidate-predicate ordering, omission of entities with no qualifying event, NTH indexing, `lookback:` widening, projection/forwarding correctness, sample determinism across repeated runs, explicit-seed vs database-UUID-derived seed behavior, fraction-only semantics, and pushdown correctness on single-table and joined-source scans. Record a promise-vs-evidence matrix; drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
 
 ### TASK-446: [EASY][IMPL] ATTRIBUTE semantic audit
 **Output**: docs/reviews/wave4-attribute-audit.md
@@ -1170,7 +1170,7 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 ### TASK-448: [EASY][IMPL] Delete, tombstone, and compaction semantic audit
 **Output**: docs/reviews/wave4-delete-tombstone-audit.md
 **Depends on**: TASK-433, TASK-453, TASK-434, TASK-435, TASK-440
-**Description**: Targeted reading pass on live-delete semantics: do they make sense and match the design? Walk immediate visibility of deletes, query-start snapshot isolation, planner routing of cheap delete predicate classes, scan-time tombstone application ordering relative to pushdown/post-filter, compaction-time reclamation, and mixed workloads where deletes interact with joined-source reads, cohorts, or long-running scans. Record a promise-vs-evidence matrix; drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
+**Description**: Targeted reading pass on live-delete semantics: do they make sense and match the design? Walk immediate visibility of deletes, query-start snapshot isolation, planner routing of cheap delete predicate classes, `ALLOW SCAN` opt-in for full-scan shapes, exact `rows_affected` behavior, scan-time tombstone application ordering relative to pushdown/post-filter, compaction-time reclamation, and mixed workloads where deletes interact with joined-source reads, cohorts, or long-running scans. Record a promise-vs-evidence matrix; drift and missing coverage are filed as follow-up tasks (rolled up in TASK-455), not fixed here.
 
 ### TASK-449: [EASY][IMPL] Parquet ingest path
 **Output**: crates/bqlite-storage/src/ingest/parquet.rs, crates/bqlite-engine/src/ingest.rs
@@ -1194,8 +1194,8 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 
 ### TASK-453: [HARD][IMPL] DELETE planner + engine tombstone writer
 **Output**: crates/bqlite-planner/src/logical.rs, crates/bqlite-engine/src/query.rs
-**Depends on**: TASK-404, TASK-432, TASK-433
-**Description**: Lowers the parsed DELETE statement onto the delete execution plan, routes cheap predicate classes directly to tombstone updates, warns on full-scan delete shapes, and returns the empty output schema promised by the logical-plan catalog. Owns the statement-level delete plan node because the feature is inseparable from tombstone semantics.
+**Depends on**: TASK-404, TASK-432, TASK-433, TASK-434
+**Description**: Lowers the parsed DELETE statement onto the delete execution plan, routes cheap predicate classes directly to tombstone updates, rejects non-cheap shapes unless `ALLOW SCAN` is present, reuses the tombstone-aware scan path for full-scan deletes, returns exact `rows_affected`, and owns the per-shard tombstone-write serialization / idempotent retry contract from the delete design. Owns the statement-level delete plan node because the feature is inseparable from tombstone semantics.
 
 ### TASK-454: [EASY][IMPL] CompactString adoption in matcher variable binding + Wave 4 hot paths
 **Output**: crates/bqlite-operators/src/matcher/ (and other identified hot paths)

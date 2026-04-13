@@ -110,7 +110,7 @@ pub enum Statement {
 Notes:
 - `AlterTable` in v1 is limited to `ADD COLUMN` (type-system.md §5.3 and query-language.md §20.4). There is no column removal, rename, or type change.
 - `EXPLAIN` wraps a pipeline only, never a DDL or DML statement.
-- `DefineAlias` binds a name to a pipeline in the session scope. Aliases are lazily evaluated at use time (query-language.md §18.1).
+- `DefineAlias` binds a name to a pipeline within a single submission. Aliases are lazily evaluated at use time and cached per submission (query-language.md §18.1).
 
 ### 3.3 Pipeline as Linear Sequence
 
@@ -314,7 +314,7 @@ Alias bodies and subqueries inside `IN QUERY (...)` are planned via recursive en
 
 ### 4.8 Alias Resolution
 
-When an alias is used as a subquery (`entity_id IN alias_name`) or inlined into a pipeline, the planner retrieves the alias body and plans it once per use site. There is no planner-level deduplication. Aliases are a readability mechanism, not a caching one.
+Aliases are bound top-down within a submission: a reference may only target an alias defined earlier in the same submission. When an alias is used as a subquery (`entity_id IN alias_name`) or inlined into a pipeline, the planner retrieves the alias body, normalizes it into the same internal cohort representation used for `IN QUERY (...)`, and materializes it at most once per submission. Multiple references reuse the same cached result.
 
 The planner detects alias cycles (`alias A references alias B references A`) during resolution and raises `TypeError::AliasCycle { path: "A -> B -> A" }` (type-system.md §12). Depth is bounded to prevent pathological nesting.
 
@@ -420,32 +420,35 @@ pub enum LogicalPlan {
     },
     Sessionize {
         gap: i64,                           // nanoseconds
-        end_event: Option<String>,
+        end_events: Vec<String>,
         forwarded_columns: Vec<ColumnId>,   // filled by demand analysis — see §8.3
         fused_downstream: Option<FusedDownstream>,
         input: Box<LogicalPlan>,
     },
     EventSelect {
         kind: EventSelectKind,              // FIRST | LAST | NTH(n)
-        event_type: String,
+        event_types: Vec<String>,
         predicate: Option<TypedExpr>,
+        lookback: Option<i64>,              // nanoseconds
         forwarded_columns: Vec<ColumnId>,
         fused_downstream: Option<FusedDownstream>,
         input: Box<LogicalPlan>,
     },
     Sample {
-        spec: SampleSpec,
+        fraction: f64,
+        seed: Option<i64>,
         input: Box<LogicalPlan>,
     },
     Attribute {
-        conversion_event: String,
-        touchpoint_event: String,
+        conversion_events: Vec<String>,
+        touchpoint_events: Vec<String>,
         window: i64,
         /// Type-checked touchpoint-key expression. Resolves against the
-        /// touchpoint event's schema; must produce String.
+        /// source schema and is evaluated in the touchpoint row's
+        /// context; must produce String.
         touchpoint_key: TypedExpr,
         /// Conversion-side forwarded properties, populated by demand analysis.
-        /// Accessed downstream as `<conversion_event>.<column>`.
+        /// Accessed downstream as `<conversion_event_type>.<column>`.
         forwarded_conversion_columns: Vec<ColumnId>,
         fused_downstream: Option<FusedDownstream>,
         input: Box<LogicalPlan>,
@@ -1042,7 +1045,7 @@ pub struct SequenceMatchPhysical {
 
 pub struct SessionizePhysical {
     pub gap: i64,
-    pub end_event: Option<String>,
+    pub end_events: Vec<String>,
     pub demand: DemandSet,
     pub forwarded_columns: Vec<ColumnId>,
     pub fused_aggregate: Option<FusableAggregate>,
@@ -1050,18 +1053,26 @@ pub struct SessionizePhysical {
 
 pub struct EventSelectPhysical {
     pub kind: EventSelectKind,
-    pub event_type: String,
+    pub event_types: Vec<String>,
     pub predicate: Option<CompiledExpr>,
+    pub lookback: Option<i64>,
     pub forwarded_columns: Vec<ColumnId>,
     pub fused_aggregate: Option<FusableAggregate>,
 }
 
+pub struct SamplePhysical {
+    pub fraction: f64,
+    pub seed: Option<i64>,
+}
+
 pub struct AttributePhysical {
-    pub conversion_event: String,
-    pub touchpoint_event: String,
+    pub conversion_events: Vec<String>,
+    pub touchpoint_events: Vec<String>,
     pub window: i64,
     /// Compiled touchpoint_key expression — evaluated per qualifying touchpoint,
-    /// result is a String stored in the deque entry.
+    /// result is a String stored in the deque entry. The expression is
+    /// resolved against the source schema and runs in the touchpoint
+    /// row's context.
     pub touchpoint_key: CompiledExpr,
     /// Conversion-side demanded properties (forwarded onto every emitted row).
     pub forwarded_conversion_columns: Vec<ColumnId>,
@@ -1149,12 +1160,14 @@ pub enum ExplainNode {
     },
     Sessionize {
         gap: String,
+        end: Vec<String>,
         forwarded: Vec<String>,
         fused_agg: Option<Vec<String>>,
         input: Box<ExplainNode>,
     },
-    EventSelect { /* ... */ },
-    Attribute { /* ... */ },
+    EventSelect { /* kind, event_types, predicate, lookback, ... */ },
+    Sample { /* fraction, seed, input */ },
+    Attribute { /* conversion_events, touchpoint_events, window, ... */ },
     Aggregate {
         functions: Vec<String>,
         group_by: Vec<String>,
@@ -1374,11 +1387,11 @@ ATTRIBUTE is specified in query-language.md §14.3 (surface syntax), type-system
 
 The planner's responsibilities for ATTRIBUTE:
 
-- **Type-check the `touchpoint_key` expression** against the touchpoint event type's schema. The expression must evaluate to `String`; any other type is a `TypeError::TypeMismatch`. The expression cannot reference conversion properties — the planner raises `TypeError::ColumnNotFound` if the expression references a column not on the touchpoint event's schema.
-- **Conversion-side demand collection.** Walk downstream and record which conversion properties are referenced (as `<conversion_event>.<column>` expressions). Store them in `forwarded_conversion_columns`. These are retained on the operator's per-entity state at the moment each conversion is consumed and attached to every emitted row for that conversion.
-- **Scan predicate extraction.** ATTRIBUTE implies the scan must produce events of types `conversion_event` and `touchpoint_event`. Add `event_type IN (conversion_event, touchpoint_event)` to the scan predicates during Pass 3.
+- **Type-check the `touchpoint_key` expression** against the source schema. The expression must evaluate to `String`; any other type is a `TypeError::TypeMismatch`. The expression is evaluated only on rows whose `event_type` is in the `touchpoints:` list, and it cannot reference conversion properties.
+- **Conversion-side demand collection.** Walk downstream and record which conversion properties are referenced (as `<conversion_event_type>.<column>` expressions for event types named in `conversion:`). Store them in `forwarded_conversion_columns`. These are retained on the operator's per-entity state at the moment each conversion is consumed and attached to every emitted row for that conversion.
+- **Scan predicate extraction.** ATTRIBUTE implies the scan must produce events whose `event_type` is in either the `conversion:` list or the `touchpoints:` list. Add `event_type IN (conversion_events ∪ touchpoint_events)` to the scan predicates during Pass 3.
 - **Scan column extraction.** Add every column referenced by the `touchpoint_key` expression to the scan's projected columns. Do the same for each forwarded conversion property.
-- **Scan time range extension.** Extend the scan's upper bound by the ATTRIBUTE `window` duration so touchpoints preceding a conversion near the user's stated range end are visible.
+- **Scan time range extension.** Widen the scan's lower bound backward by the ATTRIBUTE `window` duration so touchpoints preceding a conversion near the user's stated range start are visible.
 - **Fusion with downstream aggregate.** The fusion detection pass (§6.9) looks for `Attribute → Aggregate` (or `Attribute → Filter → Aggregate`) chains and fuses them into a single `AttributePhysical` with per-touchpoint accumulation. Because ATTRIBUTE's output is flat and `GROUP BY touchpoint_key` is a common pattern, this is the primary fusion target. See §7.4.4.
 - **No UNNEST.** BQL has no separate UNNEST operator. ATTRIBUTE is the only operator that emits "one row per sub-element", and it does so intrinsically — there is no list column to explode downstream. This eliminates an entire class of plan shapes the optimizer would otherwise need to recognize, and removes the `List(Struct)` / `List(Map)` type-system workaround the earlier design required.
 

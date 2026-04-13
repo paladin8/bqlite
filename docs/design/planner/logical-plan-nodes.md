@@ -582,24 +582,28 @@ owning wave's design notes.
 
 ### 5.2 Wave 4 — Advanced Analytics
 
-- `Sessionize { gap, end_event, forwarded_columns, fused_downstream,
+- `Sessionize { gap, end_events, forwarded_columns, fused_downstream,
   input, output_schema }` — planner-pipeline.md §5.2. AST source:
   `PipelineStage::Sessionize`. Design: TASK-405.
-- `EventSelect { kind, event_type, predicate, forwarded_columns,
+- `EventSelect { kind, event_types, predicate, lookback,
+  forwarded_columns,
   fused_downstream, input, output_schema }` — planner-pipeline.md
   §5.2. AST source: `PipelineStage::FirstLastNth`.
-- `Attribute { conversion_event, touchpoint_event, window,
+- `Attribute { conversion_events, touchpoint_events, window,
   touchpoint_key, forwarded_conversion_columns, fused_downstream,
   input, output_schema }` — planner-pipeline.md §5.2. AST source:
   `PipelineStage::Attribute`. Design: TASK-406.
 - `SubqueryFilter { column, subquery, input, output_schema }` —
   planner-pipeline.md §5.1. AST source: `WHERE col IN QUERY <alias>`
   and `WHERE col IN (<subquery>)`. Design: TASK-407 (cohorts).
-- `Delete { table, predicate, output_schema (empty) }` — AST source:
-  `Statement::Delete`. Pairs with Wave 4's tombstone work
-  (TASK-404). Wave 2 rejects `DELETE` at the parser boundary, not at
-  lowering — query-language.md §20.2 defers it to Wave 4.
-- `Sample { spec, input, output_schema }` — planner-pipeline.md §5.2.
+- `Delete { table, predicate, allow_scan, statement_result: rows_affected }` —
+  AST source: `Statement::Delete`. DELETE is a statement-level plan
+  node rather than a pipeline row producer; it reports exact
+  `rows_affected` metadata instead of an output row schema. Pairs with
+  Wave 4's tombstone work (TASK-404). Wave 2 rejects `DELETE` at the
+  parser boundary, not at lowering — query-language.md §20.2 defers it
+  to Wave 4.
+- `Sample { fraction, seed, input, output_schema }` — planner-pipeline.md §5.2.
   AST source: `PipelineStage::Sample`.
 
 ### 5.3 Later waves

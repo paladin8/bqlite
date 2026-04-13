@@ -282,7 +282,7 @@ Deletes are tracked via **tombstone files** per shard. Tombstones are *data*, no
 | Row-level | `__seq_id` | Delete specific events |
 | Batch-level | `__batch_id` | Undo a bad ingest |
 | Entity-level | `entity_id` | GDPR right-to-erasure, remove all events for an entity |
-| Time-range | `max_ts` | Drop everything before a given timestamp (retention cutoff) |
+| Time-range | `min_ts` / `max_ts` + inclusivity flags | Drop everything in a bounded or one-sided timestamp range |
 
 Each shard has one tombstone file at `<window>/<shard>/tombstones.json`. The contents:
 
@@ -299,15 +299,24 @@ pub struct TombstoneFile {
     /// Batch-level deletes: specific batch IDs.
     pub batch_deletes: HashSet<u64>,
 
-    /// Time-range delete: all events with ts < this value are dropped.
-    pub time_range_delete: Option<i64>,
+    /// Time-range delete: all events whose timestamps fall within the
+    /// configured bounds are dropped.
+    pub time_range_delete: Option<TimeRangeDelete>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TimeRangeDelete {
+    pub min_ts: Option<i64>,
+    pub min_inclusive: bool,
+    pub max_ts: Option<i64>,
+    pub max_inclusive: bool,
 }
 ```
 
 Tombstone lifecycle:
 
 1. A delete operation writes a new tombstone file (not append — write + rename for atomicity, same pattern as manifest updates). Each tombstone file is a complete snapshot of the shard's active tombstones.
-2. During reads, the scan layer loads the tombstone file for each `(window, shard)` at scan setup (snapshotted alongside the manifest). The checks are all `HashSet` lookups (`entity_id`, `__seq_id`, `__batch_id`) plus one comparison (`ts < time_range_delete`), applied after column filtering but before rows reach operators.
+2. During reads, the engine snapshots the tombstone file for each `(window, shard)` once per query at bind time, alongside the manifest snapshot, and shares that snapshot across every scan in the query. The checks are all `HashSet` lookups (`entity_id`, `__seq_id`, `__batch_id`) plus bounded timestamp comparisons, applied after column filtering but before rows reach operators.
 3. During compaction, tombstoned rows are physically removed from the output segment.
 4. After compaction completes for a `(window, shard)` and the output segment no longer contains any tombstoned rows, those tombstones are removed from the tombstone file. Since compaction merges *all* segments within a `(window, shard)`, a single compaction pass resolves every tombstone for that scope — there are no older segments still containing the deleted rows.
 
@@ -317,7 +326,7 @@ Tombstone lifecycle:
 - If tombstones lived in a (table-wide) manifest, a re-inserted entity after a delete would still be suppressed — the wrong semantics for tombstone-as-data.
 - Per-shard files keep delete writes local: a delete to shard 3 does not block ingest on shards 0–2, 4–31.
 
-Tombstone files are small (`__seq_id`, `__batch_id`, entity ID values, and one timestamp) and are loaded into memory at query time. Concurrent deletes and query execution within the owning process are safe because each query snapshots the tombstone file at start — a concurrent delete writes a new file that only subsequent queries will see.
+Tombstone files are small (`__seq_id`, `__batch_id`, entity ID values, and bounded timestamp metadata) and are loaded into memory at query time. Concurrent deletes and query execution within the owning process are safe because each query snapshots the tombstone file at start — a concurrent delete writes a new file that only subsequent queries will see.
 
 ### 7.6 Query Snapshots and Compaction
 
