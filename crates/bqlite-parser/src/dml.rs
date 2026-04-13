@@ -1,9 +1,9 @@
 //! DML (Data Manipulation Language) productions.
 //!
-//! Design: `docs/design/query-language.md` §20.1 (INSERT) and §26
-//! (`insert_stmt` / `insert_body` / `insert_option` grammar). TASK-237
-//! defined the `InsertBody::From::map` AST field that this module
-//! populates.
+//! Design: `docs/design/query-language.md` §20.1 (INSERT), §20.2
+//! (DELETE), §26 grammar rules. TASK-237 defined the
+//! `InsertBody::From::map` AST field that this module populates.
+//! TASK-433 adds the DELETE parser.
 //!
 //! ## Productions landed here
 //!
@@ -15,10 +15,10 @@
 //!   literal-tuple form (TASK-238). Positional only, no column list,
 //!   literals only — matches the AST's `Vec<Vec<Literal>>` shape and
 //!   the §20.1 v1 restriction.
-//!
-//! ## Not landed here
-//!
-//! - `DELETE FROM ... WHERE ...` — Wave 4 (tombstones).
+//! - `DELETE FROM <table> WHERE <predicate> [ALLOW SCAN]` (TASK-433).
+//!   The parser accepts any predicate expression; cheap-class taxonomy
+//!   checking (storage/deletes.md §3) is deferred to the planner. The
+//!   optional `ALLOW SCAN` suffix sets `DeleteStmt::allow_scan`.
 //!
 //! ## Grammar conformance
 //!
@@ -38,7 +38,9 @@
 
 #![allow(dead_code)] // The dispatcher routes to this module from parser.rs.
 
-use bqlite_ast::{ColumnMapping, InsertBody, InsertOption, InsertStmt, Literal, Name, Statement};
+use bqlite_ast::{
+    ColumnMapping, DeleteStmt, InsertBody, InsertOption, InsertStmt, Literal, Name, Span, Statement,
+};
 
 use crate::error::{Expected, NameRole, ParseError};
 use crate::lex::{token_span, Keyword, TokenKind};
@@ -357,6 +359,113 @@ fn parse_column_mapping(p: &mut Parser) -> Result<ColumnMapping, ParseError> {
         target,
         span,
     })
+}
+
+// ----------------------------------------------------------------------
+// DELETE
+// ----------------------------------------------------------------------
+
+/// Parse a `DELETE FROM <table> WHERE <predicate> [ALLOW SCAN]` statement.
+///
+/// Grammar (query-language.md §26):
+/// ```text
+/// delete_stmt := DELETE FROM name WHERE predicate (ALLOW SCAN)?
+/// ```
+///
+/// The predicate is mandatory — unbounded deletes are rejected at parse time.
+/// `JOIN` after `DELETE FROM <table>` is rejected with a diagnostic. Any
+/// predicate expression is accepted; cheap-class taxonomy checking is a
+/// planner concern (storage/deletes.md §3, §15).
+///
+/// `ALLOW SCAN` is a two-word opt-in suffix, **not** reserved keywords —
+/// both words lex as identifiers and are matched case-insensitively.
+pub(crate) fn parse_delete(p: &mut Parser) -> Result<Statement, ParseError> {
+    let delete_tok = p.expect_kw(Keyword::Delete)?;
+    let start_span = token_span(&delete_tok);
+    p.expect_kw(Keyword::From)?;
+    let table = p.expect_name(NameRole::TableName)?;
+
+    // JOIN is not valid after `DELETE FROM <table>`. Reject it early with
+    // a targeted diagnostic so users don't see the generic "expected WHERE".
+    if matches!(p.peek_kind(), TokenKind::Kw(Keyword::Join)) {
+        return Err(p.error_unexpected(
+            Expected::Keyword("WHERE"),
+            Some(
+                "`DELETE FROM <table>` does not support JOIN; \
+                 filter via a WHERE predicate over entity or system columns instead",
+            ),
+        ));
+    }
+
+    // WHERE clause is mandatory — unbounded deletes are rejected at parse time
+    // per query-language.md §20.2.
+    p.expect_kw(Keyword::Where)?;
+
+    // Parse the full predicate expression. The parser accepts any expression;
+    // the cheap-class taxonomy check (storage/deletes.md §3) is a planner
+    // responsibility. The expression terminates before ALLOW (an identifier
+    // that is not a keyword, so it is not consumed by the AND/OR loops).
+    //
+    // Edge case: if `allow` appears as a column reference inside the
+    // predicate (e.g. `WHERE col = allow SCAN`), the expression parser
+    // consumes `allow` as an Expr::Column, leaving `scan` unconsumed.
+    // `parse_allow_scan` then sees `scan` as the first token, does not
+    // match "allow", and returns `(false, None)`. `expect_eof` rejects
+    // the trailing `scan` — a safe failure, though less helpful than the
+    // dedicated ALLOW SCAN diagnostic. This is an inherent tension when
+    // ALLOW SCAN is two non-reserved identifiers rather than keywords.
+    let predicate = crate::expr::parse_expression(p)?;
+
+    // Optional `ALLOW SCAN` suffix (case-insensitive plain identifiers).
+    let (allow_scan, allow_scan_end) = parse_allow_scan(p)?;
+
+    let end_span = allow_scan_end.unwrap_or(predicate.span);
+    let span = start_span.merged(end_span);
+
+    Ok(Statement::Delete(DeleteStmt {
+        table,
+        predicate,
+        allow_scan,
+        span,
+    }))
+}
+
+/// Try to consume an `ALLOW SCAN` suffix (case-insensitive identifiers).
+///
+/// Returns `(true, Some(scan_span))` if both words were consumed.
+/// Returns `(false, None)` if the current token is not `ALLOW`.
+/// Returns an error if `ALLOW` is present but `SCAN` does not follow —
+/// this guards against typos like `ALLOW FULL` or lone `ALLOW`.
+fn parse_allow_scan(p: &mut Parser) -> Result<(bool, Option<Span>), ParseError> {
+    // ALLOW and SCAN are not reserved keywords; they lex as Ident tokens.
+    // Match case-insensitively so `allow scan`, `ALLOW SCAN`, and mixed
+    // case are all accepted.
+    let is_allow = matches!(p.peek_kind(), TokenKind::Ident(s) if s.eq_ignore_ascii_case("allow"));
+    if !is_allow {
+        return Ok((false, None));
+    }
+
+    // ALLOW is present — the next token must be SCAN. We use peek_at(1)
+    // before consuming ALLOW so the error (if any) can point at the
+    // unexpected token, not at ALLOW itself.
+    let is_scan =
+        matches!(&p.peek_at(1).kind, TokenKind::Ident(s) if s.eq_ignore_ascii_case("scan"));
+    if !is_scan {
+        // Consume ALLOW so the error cursor lands on the problematic token
+        // that follows it.
+        p.bump();
+        return Err(p.error_unexpected(
+            Expected::Keyword("SCAN"),
+            Some(
+                "`ALLOW` must be followed by `SCAN` \
+                 (write `ALLOW SCAN` to opt into a full-scan DELETE)",
+            ),
+        ));
+    }
+
+    p.bump(); // consume ALLOW
+    let scan_tok = p.bump(); // consume SCAN
+    Ok((true, Some(token_span(&scan_tok))))
 }
 
 // ----------------------------------------------------------------------
@@ -961,5 +1070,288 @@ mod tests {
         assert_eq!(mappings.len(), 2);
         assert_eq!(mappings[0].source.text, "uid");
         assert_eq!(mappings[1].source.text, "uid");
+    }
+
+    // ================================================================
+    // DELETE tests (TASK-433)
+    // ================================================================
+
+    /// Extract a `&DeleteStmt` from `Statement::Delete`, panicking otherwise.
+    fn delete_of(stmt: &Statement) -> &bqlite_ast::DeleteStmt {
+        match stmt {
+            Statement::Delete(d) => d,
+            other => panic!("expected Statement::Delete, got {other:?}"),
+        }
+    }
+
+    // --- happy path: basic predicates ---
+
+    #[test]
+    fn delete_entity_equality_predicate() {
+        // The canonical entity-level cheap-class delete.
+        let stmt = parse_ok("DELETE FROM events WHERE user_id = 'alice'");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "events");
+        assert!(!d.allow_scan);
+    }
+
+    #[test]
+    fn delete_time_range_predicate() {
+        // Time-range cheap-class delete.
+        let stmt = parse_ok("DELETE FROM events WHERE ts < '2024-01-01'");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "events");
+        assert!(!d.allow_scan);
+    }
+
+    #[test]
+    fn delete_batch_id_predicate() {
+        // Batch-level cheap-class delete.
+        let stmt = parse_ok("DELETE FROM events WHERE __batch_id = 42");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "events");
+        assert!(!d.allow_scan);
+    }
+
+    #[test]
+    fn delete_seq_id_equality_predicate() {
+        // Row-level cheap-class delete by single __seq_id.
+        let stmt = parse_ok("DELETE FROM events WHERE __seq_id = 123");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "events");
+        assert!(!d.allow_scan);
+    }
+
+    #[test]
+    fn delete_compound_and_predicate() {
+        // AND conjunctions are accepted (cheap-class taxonomy is a planner concern).
+        let stmt = parse_ok("DELETE FROM events WHERE user_id = 'alice' AND ts < '2024-01-01'");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "events");
+        assert!(!d.allow_scan);
+    }
+
+    #[test]
+    fn delete_is_null_predicate() {
+        // IS NULL predicates are accepted at parse time.
+        let stmt = parse_ok("DELETE FROM events WHERE amount IS NULL");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "events");
+        assert!(!d.allow_scan);
+    }
+
+    // --- happy path: ALLOW SCAN ---
+
+    #[test]
+    fn delete_with_allow_scan_uppercase() {
+        // Full-scan delete with uppercase ALLOW SCAN suffix.
+        let stmt = parse_ok("DELETE FROM events WHERE user_id != 'bot' ALLOW SCAN");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "events");
+        assert!(d.allow_scan);
+    }
+
+    #[test]
+    fn delete_with_allow_scan_lowercase() {
+        // `allow scan` in lowercase is accepted (identifiers are
+        // case-insensitive for this two-word suffix).
+        let stmt = parse_ok("DELETE FROM events WHERE user_id != 'bot' allow scan");
+        let d = delete_of(&stmt);
+        assert!(d.allow_scan);
+    }
+
+    #[test]
+    fn delete_with_allow_scan_mixed_case() {
+        // Mixed case is also accepted.
+        let stmt = parse_ok("DELETE FROM events WHERE user_id != 'bot' Allow Scan");
+        let d = delete_of(&stmt);
+        assert!(d.allow_scan);
+    }
+
+    #[test]
+    fn delete_with_allow_scan_and_semicolon() {
+        // Trailing `;` is accepted after ALLOW SCAN.
+        let stmt = parse_ok("DELETE FROM events WHERE user_id != 'bot' ALLOW SCAN;");
+        let d = delete_of(&stmt);
+        assert!(d.allow_scan);
+    }
+
+    // --- happy path: misc surface ---
+
+    #[test]
+    fn delete_table_with_backtick_name() {
+        // Backtick-quoted table names are accepted.
+        let stmt = parse_ok("DELETE FROM `weird table` WHERE id = 1");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "weird table");
+        assert!(!d.allow_scan);
+    }
+
+    #[test]
+    fn delete_with_trailing_semicolon() {
+        // The framework accepts an optional trailing `;`.
+        let stmt = parse_ok("DELETE FROM events WHERE id = 1;");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "events");
+    }
+
+    #[test]
+    fn delete_keywords_case_insensitive() {
+        // DELETE/FROM/WHERE keywords are case-insensitive.
+        let stmt = parse_ok("delete from events where user_id = 'alice'");
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.text, "events");
+        assert!(!d.allow_scan);
+    }
+
+    // --- span coverage ---
+
+    #[test]
+    fn delete_span_covers_entire_statement_no_allow_scan() {
+        let src = "DELETE FROM events WHERE user_id = 'alice'";
+        let stmt = parse_ok(src);
+        let d = delete_of(&stmt);
+        assert_eq!(d.span.start, 0);
+        assert_eq!(d.span.end, src.len());
+    }
+
+    #[test]
+    fn delete_span_covers_entire_statement_with_allow_scan() {
+        let src = "DELETE FROM events WHERE user_id != 'bot' ALLOW SCAN";
+        let stmt = parse_ok(src);
+        let d = delete_of(&stmt);
+        assert_eq!(d.span.start, 0);
+        assert_eq!(d.span.end, src.len());
+    }
+
+    #[test]
+    fn delete_table_span_is_accurate() {
+        // "DELETE FROM " is 12 bytes; "events" starts at offset 12.
+        let src = "DELETE FROM events WHERE id = 1";
+        let stmt = parse_ok(src);
+        let d = delete_of(&stmt);
+        assert_eq!(d.table.span.start, 12);
+        assert_eq!(d.table.span.end, 18); // "events" is 6 bytes
+    }
+
+    // --- error paths ---
+
+    #[test]
+    fn delete_missing_from_errors() {
+        // `DELETE events` — the dispatcher sees `DELETE` and routes to
+        // `parse_delete`, which then expects `FROM` but finds `events`.
+        // Any parse error is correct; the key is that we don't silently succeed.
+        match crate::parse("DELETE events WHERE id = 1") {
+            Err(_) => {} // any parse error is acceptable here
+            Ok(stmts) => panic!("expected error on missing FROM, got {stmts:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_missing_table_name_after_from_errors() {
+        // FROM is present but the table name is missing — expect `Expected::Name`.
+        match crate::parse("DELETE FROM") {
+            Err(ParseError::UnexpectedEof { expected, .. }) => {
+                assert_eq!(expected, Expected::Name);
+            }
+            other => panic!("expected UnexpectedEof/Name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_join_after_table_errors() {
+        // JOIN is not valid after `DELETE FROM <table>`.
+        match crate::parse("DELETE FROM events JOIN other WHERE id = 1") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("WHERE"));
+                assert!(
+                    detail.unwrap_or("").contains("JOIN"),
+                    "detail should mention JOIN"
+                );
+            }
+            other => panic!("expected Unexpected/WHERE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_missing_where_errors() {
+        // WHERE is mandatory; an unbounded delete is rejected at parse time.
+        match crate::parse("DELETE FROM events") {
+            Err(ParseError::UnexpectedEof { expected, .. })
+            | Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Keyword("WHERE"));
+            }
+            other => panic!("expected error for missing WHERE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_where_without_predicate_errors() {
+        // `DELETE FROM events WHERE` with nothing after WHERE.
+        match crate::parse("DELETE FROM events WHERE") {
+            Err(ParseError::UnexpectedEof { .. }) | Err(ParseError::Unexpected { .. }) => {}
+            other => panic!("expected parse error on empty predicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_allow_without_scan_errors() {
+        // `ALLOW` not followed by `SCAN` is a parse error.
+        match crate::parse("DELETE FROM events WHERE id = 1 ALLOW") {
+            Err(ParseError::UnexpectedEof {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("SCAN"));
+                assert!(
+                    detail.unwrap_or("").contains("SCAN"),
+                    "detail should mention SCAN"
+                );
+            }
+            other => panic!("expected UnexpectedEof/SCAN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_allow_wrong_word_after_errors() {
+        // `ALLOW FULL` is not valid — only `ALLOW SCAN` is accepted.
+        match crate::parse("DELETE FROM events WHERE id = 1 ALLOW FULL") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("SCAN"));
+                assert!(
+                    detail.unwrap_or("").contains("SCAN"),
+                    "detail should mention SCAN"
+                );
+            }
+            other => panic!("expected Unexpected/SCAN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_table_reserved_keyword_errors() {
+        // A reserved keyword in the table-name slot produces ReservedKeyword.
+        match crate::parse("DELETE FROM WHERE id = 1") {
+            Err(ParseError::ReservedKeyword { keyword, role, .. }) => {
+                assert_eq!(keyword, "WHERE");
+                assert_eq!(role, NameRole::TableName);
+            }
+            other => panic!("expected ReservedKeyword(WHERE), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_allow_as_column_ref_produces_error_not_silent_success() {
+        // `allow` used as a column reference in the predicate RHS causes
+        // the expression parser to consume it as `Expr::Column`, leaving
+        // `scan` as trailing garbage. The result is a parse error (not a
+        // silent miss of the ALLOW SCAN opt-in). See the comment above
+        // `parse_allow_scan` in `parse_delete` for the full explanation.
+        assert!(
+            crate::parse("DELETE FROM events WHERE col = allow SCAN").is_err(),
+            "expected a parse error when `allow` is a column ref, not a silent success"
+        );
     }
 }

@@ -344,6 +344,7 @@ mod tests {
         let stmt = Statement::Delete(DeleteStmt {
             table: Name::synthetic("events"),
             predicate: Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY),
+            allow_scan: false,
             span: Span::EMPTY,
         });
         match plan(stmt, &catalog, 0) {

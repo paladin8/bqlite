@@ -46,7 +46,8 @@
 //! TASK-222 adds the `INSERT ... FROM '<path>' [WITH (...)]` DML
 //! production via the `dml` module, including the structured
 //! `map: (src AS dst, ...)` column-rename clause. `INSERT ... VALUES`
-//! (TASK-238) and `DELETE` (Wave 4) are deferred.
+//! (TASK-238) is deferred. TASK-433 adds the
+//! `DELETE FROM <table> WHERE <predicate> [ALLOW SCAN]` production.
 //!
 //! Expression features deferred to later tasks: function calls,
 //! `CAST`, `CASE`, `BETWEEN`, `LIKE`, `~=`, `CONTAINS`, `IN` / `NOT

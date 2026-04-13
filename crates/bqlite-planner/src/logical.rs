@@ -3737,6 +3737,7 @@ mod tests {
         let stmt = Statement::Delete(DeleteStmt {
             table: Name::synthetic("t"),
             predicate: lit_true(),
+            allow_scan: false,
             span: Span::EMPTY,
         });
         let err = lower_statement(stmt, &cat).unwrap_err();

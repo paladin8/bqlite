@@ -220,14 +220,22 @@ pub struct ColumnMapping {
     pub span: Span,
 }
 
-/// `DELETE FROM <table> WHERE <predicate>`.
+/// `DELETE FROM <table> WHERE <predicate> [ALLOW SCAN]`.
 ///
 /// The predicate is mandatory — unbounded deletes are rejected at
-/// parse time.
+/// parse time. `allow_scan` records whether the `ALLOW SCAN` suffix
+/// was present; the planner uses this to gate full-scan execution
+/// (storage/deletes.md §4). The parser accepts any predicate expression;
+/// cheap-class taxonomy checking is a planner concern.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeleteStmt {
     pub table: Name,
     pub predicate: Spanned<Expr>,
+    /// Whether the `ALLOW SCAN` suffix was present on the statement.
+    /// When `false`, the planner rejects non-cheap predicates. When
+    /// `true`, the engine performs a full scan and materializes matching
+    /// `__seq_id`s as row-level tombstones (storage/deletes.md §4.1).
+    pub allow_scan: bool,
     pub span: Span,
 }
 
@@ -449,9 +457,41 @@ mod tests {
         let d = DeleteStmt {
             table: Name::synthetic("events"),
             predicate: Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY),
+            allow_scan: false,
             span: Span::EMPTY,
         };
         assert_eq!(d.table.text, "events");
+        assert!(!d.allow_scan);
+    }
+
+    #[test]
+    fn delete_with_allow_scan_flag() {
+        // `allow_scan: true` is carried in the AST as a plain bool.
+        // The planner reads it to decide whether to permit non-cheap
+        // predicates (storage/deletes.md §4).
+        let d = DeleteStmt {
+            table: Name::synthetic("events"),
+            predicate: Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY),
+            allow_scan: true,
+            span: Span::EMPTY,
+        };
+        assert!(d.allow_scan);
+    }
+
+    #[test]
+    fn delete_stmt_serde_round_trip() {
+        // Guards against accidental `#[serde(skip)]` or field-rename
+        // regressions on `DeleteStmt` and its new `allow_scan` field.
+        // Same pattern as `insert_from_map_clause_serde_round_trip`.
+        let stmt = Statement::Delete(DeleteStmt {
+            table: Name::synthetic("events"),
+            predicate: Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY),
+            allow_scan: true,
+            span: Span::EMPTY,
+        });
+        let json = serde_json::to_string(&stmt).expect("serialize");
+        let back: Statement = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(stmt, back);
     }
 
     #[test]
