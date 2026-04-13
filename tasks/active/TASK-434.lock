@@ -1,7 +1,0 @@
-{
-  "agent_id": "agent-4",
-  "task_id": "TASK-434",
-  "claimed_at": "2026-04-13T04:39:53Z",
-  "branch": "task/TASK-434",
-  "description": "Tombstone-aware scan + merge path"
-}
