@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-432",
+  "claimed_at": "2026-04-13T04:13:08Z",
+  "branch": "task/TASK-432",
+  "description": "Tombstone file storage + snapshot loader"
+}
