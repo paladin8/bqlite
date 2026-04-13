@@ -25,8 +25,9 @@
 #![allow(dead_code)] // TASK-221 / TASK-222 productions reach this module later.
 
 use bqlite_ast::{
-    AggItem, BracketSpec, EventRef, Expr, Funnel, GroupItem, MatchMode, MatchPattern, Name,
-    OrderItem, PipelineStage, Retention, SelectItem, SelectItemKind, Sessionize, SortDir,
+    AggItem, Attribute, BracketSpec, EventRef, Expr, Funnel, GroupItem, MatchMode, MatchPattern,
+    Name, OrderItem, PipelineStage, Retention, SelectItem, SelectItemKind, Sessionize, SortDir,
+    Spanned,
 };
 
 use crate::pattern::parse_step_list;
@@ -96,6 +97,9 @@ fn parse_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
         TokenKind::Kw(Keyword::Retention) => parse_retention_stage(p),
         // `SESSIONIZE(gap: …, end: …)` — session assignment (§8, TASK-420).
         TokenKind::Kw(Keyword::Sessionize) => parse_sessionize_stage(p),
+        // `ATTRIBUTE(conversion: …, touchpoints: …, window: …, touchpoint_key: …)` —
+        // attribution operator (§14.3 / §26 line 1638, TASK-422).
+        TokenKind::Kw(Keyword::Attribute) => parse_attribute_stage(p),
 
         // Every other first token is either a later-wave verb that
         // is not yet implemented, or an error. The error message names
@@ -1130,6 +1134,269 @@ fn parse_end_event_list(p: &mut Parser) -> Result<Vec<EventRef>, ParseError> {
         // Single event ref (no parentheses).
         Ok(vec![parse_event_ref(p)?])
     }
+}
+
+// ----------------------------------------------------------------------
+// ATTRIBUTE
+// ----------------------------------------------------------------------
+
+/// `ATTRIBUTE "(" key ":" value "," … ")"` — attribution operator.
+///
+/// Grammar (§14.3 / §26 line 1638):
+/// ```text
+/// attribute_op     := ATTRIBUTE "(" "conversion"     ":" event_ref_list ","
+///                                   "touchpoints"    ":" event_ref_list ","
+///                                   "window"         ":" duration       ","
+///                                   "touchpoint_key" ":" expr           ")"
+/// event_ref_list   := event_ref | "(" event_ref ("," event_ref)* ")"
+/// ```
+///
+/// All four parameters are **required** and may appear in any order.
+/// The grammar above shows the canonical order for documentation; the parser
+/// accepts any permutation so users can write parameters in their preferred order
+/// without memorising a fixed sequence. A trailing comma before `)` is accepted.
+///
+/// **Diagnostics emitted here (all halt-on-first):**
+///
+/// | Condition | Error |
+/// |---|---|
+/// | Missing required parameter | `Expected::Keyword("…")` pointing at `)` |
+/// | Duplicate parameter key | `Expected::Keyword("…")` pointing at duplicate key token |
+/// | Unknown parameter key | `Expected::Keyword("…")` pointing at the unknown key token |
+/// | Duplicate event in `conversion:` list | `Expected::EventRef` pointing at duplicate |
+/// | Duplicate event in `touchpoints:` list | `Expected::EventRef` pointing at duplicate |
+/// | `window:` value is not a duration literal | `Expected::Literal` pointing at the bad token |
+fn parse_attribute_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    let attr_tok = p.expect_kw(Keyword::Attribute)?;
+    let start_span = token_span(&attr_tok);
+
+    p.expect_punct(&TokenKind::LParen, "(")?;
+
+    // Accumulate the four required parameters — each must appear exactly once.
+    let mut conversion: Option<Vec<EventRef>> = None;
+    let mut touchpoints: Option<Vec<EventRef>> = None;
+    let mut window: Option<i64> = None;
+    let mut touchpoint_key: Option<Spanned<Expr>> = None;
+
+    let mut first = true;
+    while !matches!(p.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+        if !first {
+            p.expect_punct(&TokenKind::Comma, ",")?;
+            // Allow trailing comma: stop if `)` follows the comma.
+            if matches!(p.peek_kind(), TokenKind::RParen) {
+                break;
+            }
+        }
+        first = false;
+
+        // Parse the parameter key — must be a bare identifier (not a keyword).
+        let key_tok = p.peek().clone();
+        let key_span = token_span(&key_tok);
+        let (key, _) = p.expect_ident(NameRole::OptionKey)?;
+        p.expect_punct(&TokenKind::Colon, ":")?;
+
+        match key.as_str() {
+            "conversion" => {
+                if conversion.is_some() {
+                    return Err(ParseError::Unexpected {
+                        offset: key_span.start,
+                        line: key_span.line,
+                        column: key_span.column,
+                        expected: Expected::Keyword("conversion"),
+                        found: key,
+                        detail: Some("duplicate `conversion:` parameter in ATTRIBUTE"),
+                    });
+                }
+                let dup_msg = "duplicate event type in ATTRIBUTE `conversion:` list; \
+                               each event type may appear at most once";
+                conversion = Some(parse_attr_event_ref_list(p, dup_msg)?);
+            }
+            "touchpoints" => {
+                if touchpoints.is_some() {
+                    return Err(ParseError::Unexpected {
+                        offset: key_span.start,
+                        line: key_span.line,
+                        column: key_span.column,
+                        expected: Expected::Keyword("touchpoints"),
+                        found: key,
+                        detail: Some("duplicate `touchpoints:` parameter in ATTRIBUTE"),
+                    });
+                }
+                let dup_msg = "duplicate event type in ATTRIBUTE `touchpoints:` list; \
+                               each event type may appear at most once";
+                touchpoints = Some(parse_attr_event_ref_list(p, dup_msg)?);
+            }
+            "window" => {
+                if window.is_some() {
+                    return Err(ParseError::Unexpected {
+                        offset: key_span.start,
+                        line: key_span.line,
+                        column: key_span.column,
+                        expected: Expected::Keyword("window"),
+                        found: key,
+                        detail: Some("duplicate `window:` parameter in ATTRIBUTE"),
+                    });
+                }
+                // The value must be a duration literal (e.g. `30d`).
+                if let TokenKind::Duration(ns) = p.peek().kind {
+                    p.bump();
+                    window = Some(ns);
+                } else {
+                    return Err(p.error_unexpected(
+                        Expected::Literal,
+                        Some(
+                            "ATTRIBUTE `window:` requires a duration literal \
+                             (e.g. 30d, 7d, 1h); found a non-duration token",
+                        ),
+                    ));
+                }
+            }
+            "touchpoint_key" => {
+                if touchpoint_key.is_some() {
+                    return Err(ParseError::Unexpected {
+                        offset: key_span.start,
+                        line: key_span.line,
+                        column: key_span.column,
+                        expected: Expected::Keyword("touchpoint_key"),
+                        found: key,
+                        detail: Some("duplicate `touchpoint_key:` parameter in ATTRIBUTE"),
+                    });
+                }
+                touchpoint_key = Some(parse_expression(p)?);
+            }
+            _ => {
+                return Err(ParseError::Unexpected {
+                    offset: key_span.start,
+                    line: key_span.line,
+                    column: key_span.column,
+                    expected: Expected::Keyword(
+                        "conversion, touchpoints, window, or touchpoint_key",
+                    ),
+                    found: key,
+                    detail: Some(
+                        "unknown ATTRIBUTE parameter; expected one of: \
+                         conversion, touchpoints, window, touchpoint_key",
+                    ),
+                });
+            }
+        }
+    }
+
+    // All four parameters are required — report missing ones before consuming `)`.
+    // At this point the cursor is at `)` (or Eof), so `error_unexpected` points there.
+    if conversion.is_none() {
+        return Err(p.error_unexpected(
+            Expected::Keyword("conversion"),
+            Some("ATTRIBUTE requires a `conversion:` parameter (missing from the argument list)"),
+        ));
+    }
+    if touchpoints.is_none() {
+        return Err(p.error_unexpected(
+            Expected::Keyword("touchpoints"),
+            Some("ATTRIBUTE requires a `touchpoints:` parameter (missing from the argument list)"),
+        ));
+    }
+    if window.is_none() {
+        return Err(p.error_unexpected(
+            Expected::Keyword("window"),
+            Some("ATTRIBUTE requires a `window:` parameter (missing from the argument list)"),
+        ));
+    }
+    if touchpoint_key.is_none() {
+        return Err(p.error_unexpected(
+            Expected::Keyword("touchpoint_key"),
+            Some(
+                "ATTRIBUTE requires a `touchpoint_key:` parameter (missing from the argument list)",
+            ),
+        ));
+    }
+
+    let rparen_tok = p.expect_punct(&TokenKind::RParen, ")")?;
+    let end_span = token_span(&rparen_tok);
+    let span = start_span.merged(end_span);
+
+    // All four are guaranteed Some by the checks above; unwrap is infallible.
+    Ok(PipelineStage::Attribute(Attribute {
+        conversion: conversion.unwrap(),
+        touchpoints: touchpoints.unwrap(),
+        window: window.unwrap(),
+        touchpoint_key: touchpoint_key.unwrap(),
+        span,
+    }))
+}
+
+/// Parse `event_ref | "(" event_ref ("," event_ref)* ")"` for an ATTRIBUTE
+/// `conversion:` or `touchpoints:` value.
+///
+/// `dup_detail` is the `ParseError::Unexpected::detail` string to include
+/// when a duplicate event ref is found within the list.
+///
+/// Returns a `Vec<EventRef>` of length ≥ 1.
+fn parse_attr_event_ref_list(
+    p: &mut Parser,
+    dup_detail: &'static str,
+) -> Result<Vec<EventRef>, ParseError> {
+    if matches!(p.peek_kind(), TokenKind::LParen) {
+        // Parenthesised list: "(" event_ref ("," event_ref)* ")"
+        p.bump(); // consume `(`
+
+        // At least one event ref is required inside the parens.
+        let first = parse_event_ref(p)?;
+        let mut refs = vec![first];
+
+        while matches!(p.peek_kind(), TokenKind::Comma) {
+            p.bump(); // consume `,`
+            refs.push(parse_event_ref(p)?);
+        }
+
+        p.expect_punct(&TokenKind::RParen, ")")?;
+
+        // Validate: no duplicate (table, event) pairs within this list.
+        check_no_duplicate_event_refs(&refs, dup_detail)?;
+
+        Ok(refs)
+    } else {
+        // Single bare event ref — no duplicate check needed (list of length 1).
+        let er = parse_event_ref(p)?;
+        Ok(vec![er])
+    }
+}
+
+/// Validate that no two `EventRef`s in `refs` share the same `(table, event)`
+/// key. Comparison is case-sensitive (identifier semantics per §2.2).
+///
+/// `dup_detail` is the `ParseError::Unexpected::detail` string to use when a
+/// duplicate is found — the caller supplies the parameter-specific message.
+///
+/// On the first duplicate found, returns a `ParseError::Unexpected` pointing at
+/// the duplicate entry's span.
+fn check_no_duplicate_event_refs(
+    refs: &[EventRef],
+    dup_detail: &'static str,
+) -> Result<(), ParseError> {
+    use std::collections::HashSet;
+    // Set of (table_text, event_text) keys seen so far.
+    let mut seen: HashSet<(Option<&str>, &str)> = HashSet::new();
+
+    for er in refs {
+        let key = (
+            er.table.as_ref().map(|t| t.text.as_str()),
+            er.event.text.as_str(),
+        );
+        if !seen.insert(key) {
+            // Point the error at the duplicate EventRef's own span.
+            let dup_span = er.span;
+            return Err(ParseError::Unexpected {
+                offset: dup_span.start,
+                line: dup_span.line,
+                column: dup_span.column,
+                expected: Expected::EventRef,
+                found: er.event.text.clone(),
+                detail: Some(dup_detail),
+            });
+        }
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
@@ -3219,5 +3486,481 @@ mod tests {
             end[1].table.as_ref().map(|t| t.text.as_str()),
             "table qualifiers should differ"
         );
+    }
+
+    // --- ATTRIBUTE --------------------------------------------------------
+
+    /// Extract the `Attribute` from the first stage (must be `Attribute`).
+    fn attribute_of(stmt: &Statement) -> &Attribute {
+        let stages = stages_of(stmt);
+        match &stages[0] {
+            PipelineStage::Attribute(a) => a,
+            other => panic!("expected Attribute stage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_single_event_refs() {
+        // Basic form: single event ref for each of conversion and touchpoints.
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(conversion: purchase, touchpoints: ad_click, \
+             window: 30d, touchpoint_key: channel)",
+        );
+        let attr = attribute_of(&stmt);
+        assert_eq!(attr.conversion.len(), 1);
+        assert_eq!(attr.conversion[0].event.text, "purchase");
+        assert_eq!(attr.touchpoints.len(), 1);
+        assert_eq!(attr.touchpoints[0].event.text, "ad_click");
+        // 30d in nanoseconds: 30 * 24 * 60 * 60 * 1_000_000_000
+        assert_eq!(attr.window, 30 * 24 * 60 * 60 * 1_000_000_000i64);
+        // touchpoint_key must be a non-empty expression (column reference).
+        match &attr.touchpoint_key.node {
+            Expr::Column(name) => assert_eq!(name.text, "channel"),
+            other => panic!("expected Column for touchpoint_key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_multi_event_lists() {
+        // Parenthesised lists for both conversion and touchpoints.
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(\
+             conversion: (purchase, subscription), \
+             touchpoints: (ad_click, email_open), \
+             window: 7d, \
+             touchpoint_key: channel\
+             )",
+        );
+        let attr = attribute_of(&stmt);
+        assert_eq!(attr.conversion.len(), 2);
+        assert_eq!(attr.conversion[0].event.text, "purchase");
+        assert_eq!(attr.conversion[1].event.text, "subscription");
+        assert_eq!(attr.touchpoints.len(), 2);
+        assert_eq!(attr.touchpoints[0].event.text, "ad_click");
+        assert_eq!(attr.touchpoints[1].event.text, "email_open");
+    }
+
+    #[test]
+    fn attribute_single_item_parenthesised_list() {
+        // Parenthesised list with a single event ref is valid.
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(\
+             conversion: (purchase), \
+             touchpoints: (ad_click), \
+             window: 30d, \
+             touchpoint_key: channel\
+             )",
+        );
+        let attr = attribute_of(&stmt);
+        assert_eq!(attr.conversion.len(), 1);
+        assert_eq!(attr.conversion[0].event.text, "purchase");
+        assert_eq!(attr.touchpoints.len(), 1);
+        assert_eq!(attr.touchpoints[0].event.text, "ad_click");
+    }
+
+    #[test]
+    fn attribute_overlap_between_lists_is_allowed() {
+        // The same event type may appear in both conversion and touchpoints
+        // (attribute.md §3: "Lists may overlap").
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(\
+             conversion: login, \
+             touchpoints: login, \
+             window: 7d, \
+             touchpoint_key: channel\
+             )",
+        );
+        let attr = attribute_of(&stmt);
+        assert_eq!(attr.conversion[0].event.text, "login");
+        assert_eq!(attr.touchpoints[0].event.text, "login");
+    }
+
+    #[test]
+    fn attribute_overlap_multi_list_allowed() {
+        // Overlap with multi-event lists is also permitted.
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(\
+             conversion: (purchase, signup), \
+             touchpoints: (ad_click, signup), \
+             window: 30d, \
+             touchpoint_key: source\
+             )",
+        );
+        let attr = attribute_of(&stmt);
+        // signup appears in both lists — not an error.
+        assert_eq!(attr.conversion.len(), 2);
+        assert_eq!(attr.touchpoints.len(), 2);
+    }
+
+    #[test]
+    fn attribute_parameters_any_order() {
+        // Parameters may appear in any order.
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(\
+             window: 14d, \
+             touchpoint_key: campaign, \
+             touchpoints: email_click, \
+             conversion: signup\
+             )",
+        );
+        let attr = attribute_of(&stmt);
+        assert_eq!(attr.conversion[0].event.text, "signup");
+        assert_eq!(attr.touchpoints[0].event.text, "email_click");
+        assert_eq!(attr.window, 14 * 24 * 60 * 60 * 1_000_000_000i64);
+    }
+
+    #[test]
+    fn attribute_trailing_comma_accepted() {
+        // A trailing comma before `)` is syntactically valid.
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(\
+             conversion: purchase, \
+             touchpoints: ad_click, \
+             window: 30d, \
+             touchpoint_key: channel,\
+             )",
+        );
+        let attr = attribute_of(&stmt);
+        assert_eq!(attr.conversion[0].event.text, "purchase");
+    }
+
+    #[test]
+    fn attribute_touchpoint_key_arithmetic_expression() {
+        // `touchpoint_key` accepts any scalar expression supported by the
+        // Wave 2 expression parser — tested here with binary arithmetic.
+        // (Function calls like CONCAT are a later-wave expression feature.)
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(\
+             conversion: purchase, \
+             touchpoints: ad_click, \
+             window: 30d, \
+             touchpoint_key: amount + 1\
+             )",
+        );
+        let attr = attribute_of(&stmt);
+        // Verify the expression is a binary operation, not just a column.
+        match &attr.touchpoint_key.node {
+            Expr::Binary { op, .. } => assert_eq!(*op, bqlite_ast::BinaryOp::Add),
+            other => panic!("expected Binary Add for touchpoint_key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_touchpoint_key_column_reference() {
+        // `touchpoint_key: channel` — bare column reference is the common case.
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(\
+             conversion: purchase, \
+             touchpoints: ad_click, \
+             window: 30d, \
+             touchpoint_key: channel\
+             )",
+        );
+        let attr = attribute_of(&stmt);
+        match &attr.touchpoint_key.node {
+            Expr::Column(name) => assert_eq!(name.text, "channel"),
+            other => panic!("expected Column for touchpoint_key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_qualified_event_refs_accepted() {
+        // Event refs may be table-qualified (e.g. `events.purchase`).
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(\
+             conversion: events.purchase, \
+             touchpoints: events.ad_click, \
+             window: 30d, \
+             touchpoint_key: channel\
+             )",
+        );
+        let attr = attribute_of(&stmt);
+        assert_eq!(attr.conversion[0].table.as_ref().unwrap().text, "events");
+        assert_eq!(attr.conversion[0].event.text, "purchase");
+        assert_eq!(attr.touchpoints[0].table.as_ref().unwrap().text, "events");
+        assert_eq!(attr.touchpoints[0].event.text, "ad_click");
+    }
+
+    #[test]
+    fn attribute_span_covers_keyword_through_rparen() {
+        // The stage span should start at `ATTRIBUTE` and end at `)`.
+        let src = "events | ATTRIBUTE(conversion: purchase, touchpoints: ad_click, window: 30d, touchpoint_key: channel)";
+        let stmt = parse_stmt(src);
+        let attr = attribute_of(&stmt);
+        // The span start should be at the `A` of `ATTRIBUTE`; end at `)`.
+        assert!(
+            attr.span.start < attr.span.end,
+            "span must be non-empty: {:?}",
+            attr.span
+        );
+        let attr_kw_pos = src.find("ATTRIBUTE").unwrap();
+        assert_eq!(
+            attr.span.start, attr_kw_pos,
+            "span.start must point at ATTRIBUTE keyword"
+        );
+        let rparen_pos = src.rfind(')').unwrap();
+        assert_eq!(
+            attr.span.end,
+            rparen_pos + 1,
+            "span.end must be one past `)`"
+        );
+    }
+
+    // --- ATTRIBUTE error cases ------------------------------------------
+
+    #[test]
+    fn attribute_error_empty_conversion_list() {
+        // `conversion: ()` — empty parenthesised list is a parse error;
+        // `parse_event_ref` calls `expect_name` and sees `)`, producing
+        // `Expected::Name` (the role used by `parse_event_ref` internally).
+        match crate::parse(
+            "events | ATTRIBUTE(conversion: (), touchpoints: ad_click, window: 30d, touchpoint_key: channel)",
+        ) {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                // `parse_event_ref` → `expect_name` → Expected::Name on empty list.
+                assert_eq!(expected, Expected::Name);
+            }
+            other => panic!("expected empty-list error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_missing_conversion() {
+        match crate::parse(
+            "events | ATTRIBUTE(touchpoints: ad_click, window: 30d, touchpoint_key: channel)",
+        ) {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("conversion"));
+                assert!(
+                    detail.map(|d| d.contains("conversion")).unwrap_or(false),
+                    "detail should mention conversion"
+                );
+            }
+            other => panic!("expected missing-conversion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_missing_touchpoints() {
+        match crate::parse(
+            "events | ATTRIBUTE(conversion: purchase, window: 30d, touchpoint_key: channel)",
+        ) {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("touchpoints"));
+                assert!(
+                    detail.map(|d| d.contains("touchpoints")).unwrap_or(false),
+                    "detail should mention touchpoints"
+                );
+            }
+            other => panic!("expected missing-touchpoints error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_missing_window() {
+        match crate::parse(
+            "events | ATTRIBUTE(conversion: purchase, touchpoints: ad_click, touchpoint_key: channel)",
+        ) {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("window"));
+                assert!(
+                    detail.map(|d| d.contains("window")).unwrap_or(false),
+                    "detail should mention window"
+                );
+            }
+            other => panic!("expected missing-window error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_missing_touchpoint_key() {
+        match crate::parse(
+            "events | ATTRIBUTE(conversion: purchase, touchpoints: ad_click, window: 30d)",
+        ) {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("touchpoint_key"));
+                assert!(
+                    detail
+                        .map(|d| d.contains("touchpoint_key"))
+                        .unwrap_or(false),
+                    "detail should mention touchpoint_key"
+                );
+            }
+            other => panic!("expected missing-touchpoint_key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_duplicate_conversion_key() {
+        match crate::parse(
+            "events | ATTRIBUTE(\
+             conversion: purchase, \
+             conversion: signup, \
+             touchpoints: ad_click, \
+             window: 30d, \
+             touchpoint_key: channel\
+             )",
+        ) {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("conversion"));
+                assert!(
+                    detail.map(|d| d.contains("duplicate")).unwrap_or(false),
+                    "detail should mention duplicate"
+                );
+            }
+            other => panic!("expected duplicate-conversion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_duplicate_window_key() {
+        match crate::parse(
+            "events | ATTRIBUTE(\
+             conversion: purchase, \
+             touchpoints: ad_click, \
+             window: 30d, \
+             window: 7d, \
+             touchpoint_key: channel\
+             )",
+        ) {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("window"));
+                assert!(
+                    detail.map(|d| d.contains("duplicate")).unwrap_or(false),
+                    "detail should mention duplicate"
+                );
+            }
+            other => panic!("expected duplicate-window error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_unknown_parameter_key() {
+        match crate::parse(
+            "events | ATTRIBUTE(\
+             conversion: purchase, \
+             touchpoints: ad_click, \
+             window: 30d, \
+             touchpoint_key: channel, \
+             model: last_touch\
+             )",
+        ) {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                assert!(
+                    detail
+                        .map(|d| d.contains("unknown ATTRIBUTE parameter"))
+                        .unwrap_or(false),
+                    "detail should mention unknown parameter"
+                );
+            }
+            other => panic!("expected unknown-parameter error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_duplicate_event_in_conversion_list() {
+        // Duplicate within conversion: list is rejected.
+        match crate::parse(
+            "events | ATTRIBUTE(\
+             conversion: (purchase, purchase), \
+             touchpoints: ad_click, \
+             window: 30d, \
+             touchpoint_key: channel\
+             )",
+        ) {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::EventRef);
+                assert!(
+                    detail.map(|d| d.contains("duplicate")).unwrap_or(false),
+                    "detail should mention duplicate"
+                );
+            }
+            other => panic!("expected duplicate-event error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_duplicate_event_in_touchpoints_list() {
+        // Duplicate within touchpoints: list is rejected.
+        match crate::parse(
+            "events | ATTRIBUTE(\
+             conversion: purchase, \
+             touchpoints: (ad_click, ad_click), \
+             window: 30d, \
+             touchpoint_key: channel\
+             )",
+        ) {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::EventRef);
+                assert!(
+                    detail.map(|d| d.contains("duplicate")).unwrap_or(false),
+                    "detail should mention duplicate"
+                );
+            }
+            other => panic!("expected duplicate-event error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_error_window_not_duration() {
+        // `window:` must be a duration literal; an integer is rejected.
+        match crate::parse(
+            "events | ATTRIBUTE(\
+             conversion: purchase, \
+             touchpoints: ad_click, \
+             window: 30, \
+             touchpoint_key: channel\
+             )",
+        ) {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Literal);
+                assert!(
+                    detail.map(|d| d.contains("duration")).unwrap_or(false),
+                    "detail should mention duration"
+                );
+            }
+            other => panic!("expected window-not-duration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_piped_with_stats() {
+        // ATTRIBUTE can be followed by further pipe stages (non-terminal).
+        let stmt = parse_stmt("events | ATTRIBUTE(conversion: purchase, touchpoints: ad_click, window: 30d, touchpoint_key: channel) | STATS n = COUNT(*)");
+        let stages = stages_of(&stmt);
+        assert_eq!(stages.len(), 2);
+        assert!(matches!(stages[0], PipelineStage::Attribute(_)));
+        assert!(matches!(stages[1], PipelineStage::Stats { .. }));
+    }
+
+    #[test]
+    fn attribute_piped_with_where_then_stats() {
+        // ATTRIBUTE | WHERE | STATS composition.
+        let stmt = parse_stmt(
+            "events | ATTRIBUTE(conversion: purchase, touchpoints: ad_click, window: 30d, touchpoint_key: channel) | WHERE touchpoint_ts IS NOT NULL | STATS n = COUNT(*)",
+        );
+        let stages = stages_of(&stmt);
+        assert_eq!(stages.len(), 3);
+        assert!(matches!(stages[0], PipelineStage::Attribute(_)));
+        assert!(matches!(stages[1], PipelineStage::Where { .. }));
+        assert!(matches!(stages[2], PipelineStage::Stats { .. }));
     }
 }

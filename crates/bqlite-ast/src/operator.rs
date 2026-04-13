@@ -278,19 +278,29 @@ pub enum SampleSpec {
 /// The `| ATTRIBUTE` stage — attribution (query-language.md §14.3).
 ///
 /// Four mandatory parameters, matching the grammar at §26 line
-/// 1566–1569: `conversion`, `touchpoints`, `window`, `touchpoint_key`.
+/// 1638–1642: `conversion`, `touchpoints`, `window`, `touchpoint_key`.
 /// The v1 language deliberately omits a `model:` parameter — credit
 /// distribution (first-touch, last-touch, linear, time-decay,
 /// positional) is expressed by follow-on window functions and
 /// aggregates on the flat `(entity, conversion, touchpoint)` rows
 /// emitted by this operator (§14.3, paragraph beginning "Why one key
 /// column, not a list").
+///
+/// Both `conversion` and `touchpoints` accept either a single event
+/// reference or a parenthesised comma-separated list (attribute.md §3,
+/// "List extension"). The `Vec` always has length ≥ 1 when the AST
+/// is produced by the parser.  Duplicate names within each list are
+/// rejected at parse time (TASK-422). Overlap between the two lists
+/// is permitted — the emit-before-add rule (attribute.md §6) handles
+/// the overlap at runtime.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Attribute {
-    /// The conversion event being attributed.
-    pub conversion: EventRef,
-    /// The touchpoint event type credited to conversions.
-    pub touchpoints: EventRef,
+    /// The conversion event type(s) that trigger attribution emission.
+    /// Single event ref or parenthesised list; length ≥ 1.
+    pub conversion: Vec<EventRef>,
+    /// The touchpoint event type(s) eligible for attribution credit.
+    /// Single event ref or parenthesised list; length ≥ 1.
+    pub touchpoints: Vec<EventRef>,
     /// Lookback window in nanoseconds.
     pub window: i64,
     /// Expression evaluated against each touchpoint event to produce
@@ -420,16 +430,16 @@ mod tests {
         assert_eq!(limit_stage.span(), named_span);
 
         let attr_stage = PipelineStage::Attribute(Attribute {
-            conversion: EventRef {
+            conversion: vec![EventRef {
                 table: None,
                 event: Name::synthetic("conv"),
                 span: Span::EMPTY,
-            },
-            touchpoints: EventRef {
+            }],
+            touchpoints: vec![EventRef {
                 table: None,
                 event: Name::synthetic("tp"),
                 span: Span::EMPTY,
-            },
+            }],
             window: 0,
             touchpoint_key: column("k"),
             span: named_span,
@@ -472,23 +482,67 @@ mod tests {
         // `touchpoint_key` is non-optional — §14.3 line 881 says it is
         // required and has no default. A constructed Attribute always
         // carries a real expression.
+        //
+        // Both `conversion` and `touchpoints` are now `Vec<EventRef>`,
+        // accepting a single event ref or a parenthesised list
+        // (attribute.md §3, "List extension", TASK-422).
         let attr = Attribute {
-            conversion: EventRef {
+            conversion: vec![EventRef {
                 table: None,
                 event: Name::synthetic("purchase"),
                 span: Span::EMPTY,
-            },
-            touchpoints: EventRef {
+            }],
+            touchpoints: vec![EventRef {
                 table: None,
                 event: Name::synthetic("ad_click"),
                 span: Span::EMPTY,
-            },
+            }],
             window: 7 * 86_400_000_000_000,
             touchpoint_key: column("channel"),
             span: Span::EMPTY,
         };
-        assert_eq!(attr.conversion.event.text, "purchase");
-        assert_eq!(attr.touchpoints.event.text, "ad_click");
+        assert_eq!(attr.conversion[0].event.text, "purchase");
+        assert_eq!(attr.touchpoints[0].event.text, "ad_click");
+    }
+
+    #[test]
+    fn attribute_accepts_multi_event_lists() {
+        // Both `conversion:` and `touchpoints:` accept a list of ≥ 1 event refs.
+        let attr = Attribute {
+            conversion: vec![
+                EventRef {
+                    table: None,
+                    event: Name::synthetic("purchase"),
+                    span: Span::EMPTY,
+                },
+                EventRef {
+                    table: None,
+                    event: Name::synthetic("subscription"),
+                    span: Span::EMPTY,
+                },
+            ],
+            touchpoints: vec![
+                EventRef {
+                    table: None,
+                    event: Name::synthetic("ad_click"),
+                    span: Span::EMPTY,
+                },
+                EventRef {
+                    table: None,
+                    event: Name::synthetic("email_open"),
+                    span: Span::EMPTY,
+                },
+            ],
+            window: 30 * 86_400_000_000_000,
+            touchpoint_key: column("channel"),
+            span: Span::EMPTY,
+        };
+        assert_eq!(attr.conversion.len(), 2);
+        assert_eq!(attr.touchpoints.len(), 2);
+        assert_eq!(attr.conversion[0].event.text, "purchase");
+        assert_eq!(attr.conversion[1].event.text, "subscription");
+        assert_eq!(attr.touchpoints[0].event.text, "ad_click");
+        assert_eq!(attr.touchpoints[1].event.text, "email_open");
     }
 
     #[test]
