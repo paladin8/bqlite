@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-409",
   "claimed_at": "2026-04-13T02:05:48Z",
+  "completed_at": "2026-04-13T03:12:00Z",
   "branch": "task/TASK-409",
   "description": "DemandCapabilities protocol"
 }
