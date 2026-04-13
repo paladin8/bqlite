@@ -32,6 +32,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use arrow::array::{Array, Int64Array, StringViewArray, TimestampNanosecondArray};
+use arrow::compute::filter_record_batch;
+use arrow::record_batch::RecordBatch;
+
 use bqlite_core::error::{BqliteError, Result};
 use bqlite_core::ScalarValue;
 use serde::{Deserialize, Serialize};
@@ -327,12 +331,227 @@ pub fn load_tombstone_snapshot(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// TombstoneFilter
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Applies tombstone checks to a [`RecordBatch`], removing rows that
+/// match any entry in the associated [`TombstoneFile`].
+///
+/// Filter order follows `deletes.md` SS7.1:
+/// batch → entity → row → time-range. A row is suppressed if **any**
+/// check matches. Short-circuits when the tombstone file is empty.
+pub struct TombstoneFilter<'a> {
+    tombstones: &'a TombstoneFile,
+    entity_key_col: &'a str,
+    ts_col: &'a str,
+}
+
+impl<'a> TombstoneFilter<'a> {
+    /// Build a filter for the given tombstone state.
+    ///
+    /// `entity_key_col` and `ts_col` are the column names in the
+    /// `RecordBatch` to use for entity-level and time-range checks.
+    pub fn new(tombstones: &'a TombstoneFile, entity_key_col: &'a str, ts_col: &'a str) -> Self {
+        Self {
+            tombstones,
+            entity_key_col,
+            ts_col,
+        }
+    }
+
+    /// Filter `batch`, returning a new batch with tombstoned rows removed.
+    ///
+    /// Returns the batch unchanged when tombstones are empty (zero cost).
+    pub fn filter_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if self.tombstones.is_empty() || batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+
+        let num_rows = batch.num_rows();
+        let mut alive = vec![true; num_rows];
+
+        // 1. Batch-level: __batch_id (SS7.1 — cheapest check)
+        self.apply_batch_deletes(&batch, &mut alive)?;
+        // 2. Entity-level
+        self.apply_entity_deletes(&batch, &mut alive)?;
+        // 3. Row-level: __seq_id
+        self.apply_row_deletes(&batch, &mut alive)?;
+        // 4. Time-range
+        self.apply_time_range_deletes(&batch, &mut alive)?;
+
+        // Skip the Arrow filter call when no rows were removed — avoids
+        // copying the entire batch for the common no-match case.
+        if alive.iter().all(|&a| a) {
+            return Ok(batch);
+        }
+
+        let mask = arrow::array::BooleanArray::from(alive);
+        filter_record_batch(&batch, &mask).map_err(|e| {
+            BqliteError::Execution(format!("tombstone filter_record_batch failed: {e}"))
+        })
+    }
+
+    fn apply_batch_deletes(&self, batch: &RecordBatch, alive: &mut [bool]) -> Result<()> {
+        if self.tombstones.batch_deletes.is_empty() {
+            return Ok(());
+        }
+        let col_idx = batch
+            .schema()
+            .index_of(bqlite_core::BATCH_ID_COLUMN)
+            .map_err(|_| {
+                BqliteError::Execution(format!(
+                    "tombstone filter: batch tombstones exist but column '{}' not in batch",
+                    bqlite_core::BATCH_ID_COLUMN
+                ))
+            })?;
+        let col = batch.column(col_idx);
+        let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+            BqliteError::Execution(format!(
+                "tombstone filter: {} column is not Int64Array",
+                bqlite_core::BATCH_ID_COLUMN
+            ))
+        })?;
+        for (i, flag) in alive.iter_mut().enumerate() {
+            if *flag
+                && self
+                    .tombstones
+                    .batch_deletes
+                    .contains(&(arr.value(i) as u64))
+            {
+                *flag = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_entity_deletes(&self, batch: &RecordBatch, alive: &mut [bool]) -> Result<()> {
+        if self.tombstones.entity_deletes.is_empty() {
+            return Ok(());
+        }
+        let col_idx = batch.schema().index_of(self.entity_key_col).map_err(|_| {
+            BqliteError::Execution(format!(
+                "tombstone filter: entity key column '{}' not found in batch",
+                self.entity_key_col
+            ))
+        })?;
+        let col = batch.column(col_idx);
+
+        if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+            // Pre-compute a borrowed &str set from the entity tombstones
+            // to avoid per-row String allocation in the inner loop.
+            let str_set: HashSet<&str> = self
+                .tombstones
+                .entity_deletes
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            for (i, flag) in alive.iter_mut().enumerate() {
+                if *flag && str_set.contains(arr.value(i)) {
+                    *flag = false;
+                }
+            }
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            // Pre-compute an i64 set to avoid ScalarValue construction per row.
+            let int_set: HashSet<i64> = self
+                .tombstones
+                .entity_deletes
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::Int(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            for (i, flag) in alive.iter_mut().enumerate() {
+                if *flag && int_set.contains(&arr.value(i)) {
+                    *flag = false;
+                }
+            }
+        } else {
+            return Err(BqliteError::Execution(format!(
+                "tombstone filter: unsupported entity key column type {:?}",
+                col.data_type()
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_row_deletes(&self, batch: &RecordBatch, alive: &mut [bool]) -> Result<()> {
+        if self.tombstones.row_deletes.is_empty() {
+            return Ok(());
+        }
+        let col_idx = batch
+            .schema()
+            .index_of(bqlite_core::SEQ_ID_COLUMN)
+            .map_err(|_| {
+                BqliteError::Execution(format!(
+                    "tombstone filter: row tombstones exist but column '{}' not in batch",
+                    bqlite_core::SEQ_ID_COLUMN
+                ))
+            })?;
+        let col = batch.column(col_idx);
+        let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+            BqliteError::Execution(format!(
+                "tombstone filter: {} column is not Int64Array",
+                bqlite_core::SEQ_ID_COLUMN
+            ))
+        })?;
+        for (i, flag) in alive.iter_mut().enumerate() {
+            if *flag && self.tombstones.row_deletes.contains(&(arr.value(i) as u64)) {
+                *flag = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_time_range_deletes(&self, batch: &RecordBatch, alive: &mut [bool]) -> Result<()> {
+        if self.tombstones.time_range_deletes.is_empty() {
+            return Ok(());
+        }
+        let col_idx = batch.schema().index_of(self.ts_col).map_err(|_| {
+            BqliteError::Execution(format!(
+                "tombstone filter: timestamp column '{}' not found in batch",
+                self.ts_col
+            ))
+        })?;
+        let col = batch.column(col_idx);
+        let ts_arr = col
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "tombstone filter: timestamp column '{}' is not TimestampNanosecondArray",
+                    self.ts_col
+                ))
+            })?;
+
+        for (i, flag) in alive.iter_mut().enumerate() {
+            if *flag {
+                let ts = ts_arr.value(i);
+                for range in &self.tombstones.time_range_deletes {
+                    if range.contains_timestamp(ts) {
+                        *flag = false;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringViewArray, TimestampNanosecondArray};
 
     use super::*;
 
@@ -757,5 +976,286 @@ mod tests {
         let scratch = Scratch::new("snap-unknown");
         let snap = load_tombstone_snapshot(scratch.path(), "events", &[(1, 0)]).unwrap();
         assert!(snap.get(99, 99).is_none());
+    }
+
+    // ── TombstoneFilter ────────────────────────────────────────────────
+
+    fn make_filter_test_batch(ids: &[&str], tss: &[i64], evts: &[&str]) -> RecordBatch {
+        use arrow::array::{ArrayRef, StringViewArray, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("entity_id", DataType::Utf8View, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("event_type", DataType::Utf8View, false),
+        ]));
+        let id_arr: ArrayRef = Arc::new(StringViewArray::from(ids.to_vec()));
+        let ts_arr: ArrayRef = Arc::new(
+            TimestampNanosecondArray::from(tss.iter().copied().map(Some).collect::<Vec<_>>())
+                .with_timezone("UTC"),
+        );
+        let evt_arr: ArrayRef = Arc::new(StringViewArray::from(evts.to_vec()));
+        RecordBatch::try_new(schema, vec![id_arr, ts_arr, evt_arr]).unwrap()
+    }
+
+    #[test]
+    fn filter_noop_on_empty_tombstones() {
+        let tf = TombstoneFile::default();
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let batch = make_filter_test_batch(&["alice", "bob"], &[100, 200], &["click", "view"]);
+        let result = filter.filter_batch(batch).unwrap();
+        assert_eq!(result.num_rows(), 2);
+    }
+
+    #[test]
+    fn filter_noop_on_empty_batch() {
+        let tf = TombstoneFile::for_entities([ScalarValue::String("alice".into())]);
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let batch = make_filter_test_batch(&[], &[], &[]);
+        let result = filter.filter_batch(batch).unwrap();
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[test]
+    fn filter_entity_deletes_string() {
+        let tf = TombstoneFile::for_entities([ScalarValue::String("alice".into())]);
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let batch = make_filter_test_batch(
+            &["alice", "bob", "alice", "carol"],
+            &[100, 200, 300, 400],
+            &["click", "view", "click", "view"],
+        );
+        let result = filter.filter_batch(batch).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let ids = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), "bob");
+        assert_eq!(ids.value(1), "carol");
+    }
+
+    #[test]
+    fn filter_entity_deletes_int() {
+        use arrow::array::{ArrayRef, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let tss: ArrayRef = Arc::new(
+            TimestampNanosecondArray::from(vec![Some(100), Some(200), Some(300)])
+                .with_timezone("UTC"),
+        );
+        let batch = RecordBatch::try_new(schema, vec![ids, tss]).unwrap();
+
+        let tf = TombstoneFile::for_entities([ScalarValue::Int(2)]);
+        let filter = TombstoneFilter::new(&tf, "user_id", "ts");
+        let result = filter.filter_batch(batch).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 1);
+        assert_eq!(col.value(1), 3);
+    }
+
+    #[test]
+    fn filter_time_range_deletes() {
+        let range = TimeRangeDelete {
+            min_ts: Some(150),
+            min_inclusive: true,
+            max_ts: Some(250),
+            max_inclusive: false,
+        };
+        let tf = TombstoneFile::for_time_range(range);
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let batch = make_filter_test_batch(
+            &["a", "b", "c", "d"],
+            &[100, 150, 200, 300],
+            &["e1", "e2", "e3", "e4"],
+        );
+        let result = filter.filter_batch(batch).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let tss = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(tss.value(0), 100);
+        assert_eq!(tss.value(1), 300);
+    }
+
+    #[test]
+    fn filter_multiple_time_ranges() {
+        let tf = TombstoneFile {
+            time_range_deletes: vec![
+                TimeRangeDelete {
+                    min_ts: None,
+                    min_inclusive: false,
+                    max_ts: Some(100),
+                    max_inclusive: true,
+                },
+                TimeRangeDelete {
+                    min_ts: Some(300),
+                    min_inclusive: false,
+                    max_ts: None,
+                    max_inclusive: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let batch = make_filter_test_batch(
+            &["a", "b", "c", "d"],
+            &[50, 100, 200, 400],
+            &["e1", "e2", "e3", "e4"],
+        );
+        let result = filter.filter_batch(batch).unwrap();
+        assert_eq!(result.num_rows(), 1);
+        let tss = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(tss.value(0), 200);
+    }
+
+    #[test]
+    fn filter_batch_deletes() {
+        use arrow::array::ArrayRef;
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("entity_id", DataType::Utf8View, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("__batch_id", DataType::Int64, false),
+        ]));
+        let ids: ArrayRef = Arc::new(StringViewArray::from(vec!["a", "b", "c"]));
+        let tss: ArrayRef = Arc::new(
+            TimestampNanosecondArray::from(vec![Some(100), Some(200), Some(300)])
+                .with_timezone("UTC"),
+        );
+        let batches: ArrayRef = Arc::new(Int64Array::from(vec![5, 10, 5]));
+        let batch = RecordBatch::try_new(schema, vec![ids, tss, batches]).unwrap();
+
+        let tf = TombstoneFile::for_batches([10]);
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let result = filter.filter_batch(batch).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let batch_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(batch_col.value(0), 5);
+        assert_eq!(batch_col.value(1), 5);
+    }
+
+    #[test]
+    fn filter_row_deletes() {
+        use arrow::array::ArrayRef;
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("entity_id", DataType::Utf8View, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("__seq_id", DataType::Int64, false),
+        ]));
+        let ids: ArrayRef = Arc::new(StringViewArray::from(vec!["a", "b", "c"]));
+        let tss: ArrayRef = Arc::new(
+            TimestampNanosecondArray::from(vec![Some(100), Some(200), Some(300)])
+                .with_timezone("UTC"),
+        );
+        let seqs: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
+        let batch = RecordBatch::try_new(schema, vec![ids, tss, seqs]).unwrap();
+
+        let tf = TombstoneFile::for_rows([20]);
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let result = filter.filter_batch(batch).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let seq_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(seq_col.value(0), 10);
+        assert_eq!(seq_col.value(1), 30);
+    }
+
+    #[test]
+    fn filter_combined_entity_and_time_range() {
+        let tf = TombstoneFile {
+            entity_deletes: HashSet::from([ScalarValue::String("alice".into())]),
+            time_range_deletes: vec![TimeRangeDelete {
+                min_ts: Some(250),
+                min_inclusive: true,
+                max_ts: None,
+                max_inclusive: false,
+            }],
+            ..Default::default()
+        };
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let batch = make_filter_test_batch(
+            &["alice", "bob", "carol", "bob"],
+            &[100, 200, 300, 400],
+            &["e1", "e2", "e3", "e4"],
+        );
+        let result = filter.filter_batch(batch).unwrap();
+        // alice removed by entity; carol(300) and bob(400) removed by time-range
+        assert_eq!(result.num_rows(), 1);
+        let ids = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), "bob");
+    }
+
+    #[test]
+    fn filter_all_rows_removed() {
+        let tf = TombstoneFile::for_entities([ScalarValue::String("a".into())]);
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let batch = make_filter_test_batch(&["a", "a"], &[100, 200], &["e1", "e2"]);
+        let result = filter.filter_batch(batch).unwrap();
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[test]
+    fn filter_missing_seq_id_column_errors_when_needed() {
+        let tf = TombstoneFile::for_rows([1]);
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let batch = make_filter_test_batch(&["a"], &[100], &["e1"]);
+        let err = filter.filter_batch(batch).unwrap_err();
+        assert!(err.to_string().contains("__seq_id"), "got: {err}");
+    }
+
+    #[test]
+    fn filter_missing_batch_id_column_errors_when_needed() {
+        let tf = TombstoneFile::for_batches([1]);
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let batch = make_filter_test_batch(&["a"], &[100], &["e1"]);
+        let err = filter.filter_batch(batch).unwrap_err();
+        assert!(err.to_string().contains("__batch_id"), "got: {err}");
     }
 }

@@ -51,6 +51,7 @@ pub mod ingest;
 pub mod manifest;
 pub mod segment;
 pub mod tombstone;
+pub mod tombstone_scan;
 pub mod writer;
 pub mod zone_map;
 
@@ -69,7 +70,8 @@ pub use manifest::{
 };
 pub use tombstone::{
     load_tombstone_snapshot, read_tombstone_file, tombstone_file_path, write_tombstone_atomic,
-    TimeRangeDelete, TombstoneFile, TombstoneSnapshot, TOMBSTONE_FILE_NAME,
+    TimeRangeDelete, TombstoneFile, TombstoneFilter, TombstoneSnapshot, TOMBSTONE_FILE_NAME,
     TOMBSTONE_TMP_FILE_NAME,
 };
+pub use tombstone_scan::TombstoneScanWrapper;
 pub use writer::{SegmentWriter, WriterConfig, DEFAULT_ROW_GROUP_SIZE};
