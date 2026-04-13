@@ -14,13 +14,15 @@
 //! │   ├── lib.rs             ← this file
 //! │   ├── common.rs          ← integration helpers (TempDb, assert_*)
 //! │   ├── csv.rs             ← deterministic CSV fixture generator (TASK-235)
+//! │   ├── jsonl.rs           ← deterministic JSONL fixture generator (TASK-410)
 //! │   └── strategies.rs      ← shared `proptest` strategies
 //! ├── tests/                 ← Cargo's auto-discovered test binaries
 //! │   ├── prop_property_value.rs
 //! │   ├── prop_time.rs
 //! │   ├── prop_arrow.rs
 //! │   ├── common_smoke.rs
-//! │   └── wave2_acceptance.rs
+//! │   ├── wave2_acceptance.rs
+//! │   └── jsonl_ingest.rs    ← JSONL ingest acceptance tests (TASK-410)
 //! └── suite/                 ← README-only stubs for future Wave 2+ suites
 //! ```
 //!
@@ -43,4 +45,5 @@
 
 pub mod common;
 pub mod csv;
+pub mod jsonl;
 pub mod strategies;

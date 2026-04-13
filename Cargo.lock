@@ -481,6 +481,7 @@ dependencies = [
  "libc",
  "lz4_flex",
  "postcard",
+ "proptest",
  "serde",
  "serde_json",
  "smallvec",

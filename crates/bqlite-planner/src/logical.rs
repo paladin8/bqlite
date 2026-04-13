@@ -335,8 +335,8 @@ pub enum InsertLogicalBody {
 pub struct InsertFromDescriptor {
     /// File path literal from the AST (`'data.csv'` → `"data.csv"`).
     pub path: String,
-    /// Format resolved from `WITH (format: '...')` or inferred from
-    /// the path extension.
+    /// Format resolved from `WITH (format: '...')`. Currently required;
+    /// auto-inference from the path extension is not yet implemented.
     pub format: IngestFormat,
     /// Normalized options from the flat `WITH (...)` list, **excluding**
     /// the `format` key (which moves to `format`) and the `map` key
@@ -353,10 +353,10 @@ pub struct InsertFromDescriptor {
 /// Supported ingest formats (§4.9).
 ///
 /// The enum is full-surface so Wave 4's JSONL / Parquet support
-/// (TASK-410) is a pure engine extension rather than another
-/// planner change. Wave 2 lowering only accepts `Csv`; the other
-/// two variants produce a `Plan` error naming the `format: '...'`
-/// key.
+/// (TASK-410, TASK-449) is a pure engine extension rather than
+/// another planner change. Wave 4 lowering accepts `Csv` and
+/// `JsonL`; `Parquet` is deferred to TASK-449 and produces a `Plan`
+/// error naming the `format: '...'` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IngestFormat {
     Csv,
@@ -1918,8 +1918,8 @@ fn resolve_insert_values(
 /// deferred to engine-time (TASK-233), so the descriptor is
 /// catalog-checked but the file is not opened here.
 ///
-/// Wave 2 only ships `IngestFormat::Csv`; `JsonL` and `Parquet`
-/// are rejected with a forward-compat error that names TASK-410.
+/// Wave 4 ships `IngestFormat::Csv` and `IngestFormat::JsonL`;
+/// `Parquet` is deferred to TASK-449 and is rejected here.
 fn resolve_insert_from(
     path: String,
     options: Vec<bqlite_ast::InsertOption>,
@@ -1955,11 +1955,12 @@ fn resolve_insert_from(
     // Default format = CSV when the option is absent. Inferring from
     // the path extension is a Wave 4 ergonomics improvement.
     let format = format_opt.unwrap_or(IngestFormat::Csv);
-    if format != IngestFormat::Csv {
-        return Err(BqliteError::Plan(format!(
-            "INSERT FROM: `{format:?}` ingest is deferred to Wave 4 (TASK-410); \
-             Wave 2 supports `csv` only"
-        )));
+    if format == IngestFormat::Parquet {
+        return Err(BqliteError::Plan(
+            "INSERT FROM: `parquet` ingest is deferred to Wave 4 (TASK-449); \
+             supported formats are `csv` and `jsonl`"
+                .into(),
+        ));
     }
 
     // Resolve the column map against the target schema. Every
@@ -1997,13 +1998,21 @@ fn resolve_insert_from(
 }
 
 /// Parse a `format: '<name>'` option value into an [`IngestFormat`].
+/// Map a format string from the `WITH (format: '...')` clause to an
+/// [`IngestFormat`] variant.
+///
+/// Accepted values (case-insensitive):
+/// - `"csv"` → [`IngestFormat::Csv`]
+/// - `"jsonl"` or `"json"` → [`IngestFormat::JsonL`]
+/// - `"parquet"` → [`IngestFormat::Parquet`] (deferred to TASK-449)
 fn parse_ingest_format(s: &str) -> Result<IngestFormat> {
     match s.to_ascii_lowercase().as_str() {
         "csv" => Ok(IngestFormat::Csv),
+        // Accept both "jsonl" (canonical) and "json" (common alias).
         "jsonl" | "json" => Ok(IngestFormat::JsonL),
         "parquet" => Ok(IngestFormat::Parquet),
         other => Err(BqliteError::Plan(format!(
-            "INSERT FROM: unknown format `{other}` — supported formats are csv, jsonl, parquet"
+            "INSERT FROM: unknown format `{other}` — supported formats: csv, jsonl (json), parquet"
         ))),
     }
 }
@@ -3408,9 +3417,11 @@ mod tests {
     }
 
     #[test]
-    fn insert_from_rejects_jsonl_in_wave_2() {
+    fn insert_from_accepts_jsonl_in_wave_4() {
+        // TASK-410: JSONL is now accepted; the planner should produce a
+        // valid descriptor with `IngestFormat::JsonL`.
         let cat = InMemoryCatalog::default().with(purchases_schema());
-        let err = lower_statement(
+        let plan = lower_statement(
             insert_from(
                 "purchases",
                 "data.jsonl",
@@ -3419,10 +3430,60 @@ mod tests {
             ),
             &cat,
         )
+        .unwrap();
+        match plan {
+            LogicalPlan::Insert {
+                body: InsertLogicalBody::From(desc),
+                ..
+            } => assert_eq!(desc.format, IngestFormat::JsonL),
+            other => panic!("expected Insert::From, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_from_accepts_json_alias_for_jsonl() {
+        // `"json"` is a documented alias for `"jsonl"` in parse_ingest_format.
+        // Verify the planner accepts it and resolves to JsonL.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let plan = lower_statement(
+            insert_from(
+                "purchases",
+                "data.json",
+                vec![("format", Literal::String("json".into()))],
+                None,
+            ),
+            &cat,
+        )
+        .unwrap();
+        match plan {
+            LogicalPlan::Insert {
+                body: InsertLogicalBody::From(desc),
+                ..
+            } => assert_eq!(desc.format, IngestFormat::JsonL),
+            other => panic!("expected Insert::From, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_from_rejects_parquet_until_task_449() {
+        // TASK-449 lands Parquet; until then the planner must reject it.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statement(
+            insert_from(
+                "purchases",
+                "data.parquet",
+                vec![("format", Literal::String("parquet".into()))],
+                None,
+            ),
+            &cat,
+        )
         .unwrap_err();
         match err {
             BqliteError::Plan(msg) => {
-                assert!(msg.contains("Wave 4") || msg.contains("TASK-410"));
+                assert!(
+                    msg.contains("TASK-449") || msg.contains("parquet"),
+                    "got: {msg}"
+                );
             }
             other => panic!("expected Plan error, got {other:?}"),
         }

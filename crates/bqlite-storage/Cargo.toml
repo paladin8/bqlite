@@ -20,6 +20,9 @@ postcard = { workspace = true }
 csv = { workspace = true }
 bitpacking = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 # `libc` is only pulled in on platforms where the segment reader emits
 # an OS-specific sequential-read hint: `posix_fadvise(2)` on
 # Linux/FreeBSD/Android and Darwin's `fcntl(F_RDADVISE)` on Apple

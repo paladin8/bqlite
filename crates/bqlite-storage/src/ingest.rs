@@ -23,4 +23,5 @@
 //! `push_event` loop.
 
 pub mod csv_reader;
+pub mod json;
 pub mod partitioner;

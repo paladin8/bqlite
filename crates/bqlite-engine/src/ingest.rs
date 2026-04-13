@@ -6,10 +6,12 @@
 //!
 //! Two `InsertBody` variants:
 //!
-//! - **`From`** — opens a CSV file via the streaming
-//!   [`CsvEventReader`], pushes each row into the [`Partitioner`],
-//!   then drains sorted buckets through the [`SegmentWriter`]
-//!   (TASK-233).
+//! - **`From`** — opens a source file, dispatches to the appropriate
+//!   format reader, pushes each row into the [`Partitioner`], then
+//!   drains sorted buckets through the [`SegmentWriter`].
+//!   - CSV: [`CsvEventReader`] (TASK-233)
+//!   - JSONL: [`JsonlEventReader`] (TASK-410)
+//!   - Parquet: deferred to TASK-449
 //! - **`Values`** — converts planner-coerced literal tuples into
 //!   [`Event`] records using the resolved `TableSchema` role indices,
 //!   then feeds them through the same partitioner + writer pipeline
@@ -25,9 +27,10 @@ use bqlite_core::event::{EntityId, Event};
 use bqlite_core::property::PropertyValue;
 use bqlite_core::schema::TableSchema;
 use bqlite_core::time::Timestamp;
-use bqlite_planner::logical::{InsertFromDescriptor, InsertLogicalBody};
+use bqlite_planner::logical::{IngestFormat, InsertFromDescriptor, InsertLogicalBody};
 use bqlite_planner::InsertPhysical;
 use bqlite_storage::ingest::csv_reader::{CsvEventReader, CsvReaderOptions};
+use bqlite_storage::ingest::json::JsonlEventReader;
 use bqlite_storage::ingest::partitioner::Partitioner;
 use bqlite_storage::writer::SegmentWriter;
 use bqlite_storage::Database;
@@ -63,22 +66,19 @@ pub fn execute_insert(plan: &InsertPhysical, db: &mut Database) -> Result<()> {
 }
 
 /// Execute `INSERT INTO <table> FROM '<path>' WITH (...)`.
+///
+/// Dispatches to the format-specific reader (`csv` or `jsonl`),
+/// streams rows into the partitioner, then drains sorted buckets
+/// through the segment writer.
 fn execute_insert_from(
     descriptor: &InsertFromDescriptor,
     table: &bqlite_core::schema::TableSchema,
     db: &mut Database,
 ) -> Result<()> {
-    // 1. Parse CSV reader options from the planner's resolved options.
-    let csv_options = CsvReaderOptions::from_options(&descriptor.options)?;
-
-    // 2. Open the CSV reader and resolve column mapping.
     let path = Path::new(&descriptor.path);
-    let mut csv_reader = CsvEventReader::open(path, table, &descriptor.column_map, &csv_options)?;
 
-    // 3. Allocate a batch_id for this ingest call.
+    // 1. Allocate a batch_id and construct the partitioner.
     let batch_id = db.allocate_batch_id(table.name())?;
-
-    // 4. Construct the partitioner with the database's shard count.
     let shard_count = db.manifest().shard_count;
     let mut partitioner = Partitioner::new(
         shard_count,
@@ -87,23 +87,77 @@ fn execute_insert_from(
         DEFAULT_INGEST_BUDGET_BYTES,
     )?;
 
-    // 5. Stream CSV rows into the partitioner.
-    let mut row_count: u64 = 0;
-    while let Some(event) = csv_reader.next_event()? {
-        partitioner.push_event(event)?;
-        row_count += 1;
-    }
+    // 2. Stream events into the partitioner using the appropriate reader.
+    let row_count = match descriptor.format {
+        IngestFormat::Csv => {
+            let csv_options = CsvReaderOptions::from_options(&descriptor.options)?;
+            let mut reader =
+                CsvEventReader::open(path, table, &descriptor.column_map, &csv_options)?;
+            stream_reader_into_partitioner(&mut reader, &mut partitioner)?
+        }
+        IngestFormat::JsonL => {
+            let mut reader = JsonlEventReader::open(path, table, &descriptor.column_map)?;
+            stream_reader_into_partitioner(&mut reader, &mut partitioner)?
+        }
+        IngestFormat::Parquet => {
+            // The planner rejects Parquet until TASK-449 lands; this
+            // branch is a defensive fallback.
+            return Err(BqliteError::Execution(
+                "INSERT FROM: `parquet` ingest is not yet implemented (TASK-449)".into(),
+            ));
+        }
+    };
 
     if row_count == 0 {
-        // Nothing to write — the CSV had a header but no data rows.
+        // Nothing to write — the source had no data rows.
         return Ok(());
     }
 
-    // 6. Drain sorted buckets through the segment writer.
+    // 3. Drain sorted buckets through the segment writer.
     let mut writer = SegmentWriter::new(db);
     writer.write_partitioner(table.name(), partitioner)?;
 
     Ok(())
+}
+
+/// Drain a pull-based event reader into a [`Partitioner`], returning
+/// the number of events pushed.
+///
+/// The reader must implement `next_event() -> Result<Option<Event>>`.
+/// This helper avoids duplicating the streaming loop for each format.
+fn stream_reader_into_partitioner<R>(reader: &mut R, partitioner: &mut Partitioner) -> Result<u64>
+where
+    R: EventReader,
+{
+    let mut count: u64 = 0;
+    while let Some(event) = reader.next_event()? {
+        partitioner.push_event(event)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Trait alias for the pull-based reader interface shared by
+/// [`CsvEventReader`] and [`JsonlEventReader`].
+///
+/// Both readers expose `next_event() -> Result<Option<Event>>` but
+/// live in separate modules and carry format-specific state. This
+/// private trait lets `stream_reader_into_partitioner` be generic
+/// without a public `EventReader` abstraction in the library surface.
+trait EventReader {
+    fn next_event(&mut self) -> Result<Option<Event>>;
+}
+
+impl<R: std::io::BufRead> EventReader for CsvEventReader<R> {
+    fn next_event(&mut self) -> Result<Option<Event>> {
+        CsvEventReader::next_event(self)
+    }
+}
+
+impl<R: std::io::BufRead> EventReader for JsonlEventReader<R> {
+    fn next_event(&mut self) -> Result<Option<Event>> {
+        JsonlEventReader::next_event(self)
+    }
 }
 
 /// Execute `INSERT INTO <table> VALUES (row), ...`.
@@ -420,6 +474,213 @@ mod tests {
             }
             other => panic!("expected Execution, got {other:?}"),
         }
+    }
+
+    // ── INSERT FROM JSONL: helpers ─────────────────────────────────
+
+    /// Write JSONL text to a temp file and return the path.
+    fn write_jsonl_file(scratch: &Scratch, name: &str, content: &str) -> PathBuf {
+        let path = scratch.path().join(name);
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    fn insert_from_jsonl_plan(
+        table: TableSchema,
+        jsonl_path: &Path,
+        column_map: Vec<(String, String)>,
+    ) -> InsertPhysical {
+        InsertPhysical {
+            table,
+            body: InsertLogicalBody::From(InsertFromDescriptor {
+                path: jsonl_path.to_string_lossy().into_owned(),
+                format: IngestFormat::JsonL,
+                options: Vec::new(),
+                column_map,
+            }),
+            output_schema: empty_schema(),
+        }
+    }
+
+    // ── INSERT FROM JSONL: happy path ──────────────────────────────
+
+    #[test]
+    fn insert_from_jsonl_writes_segments_and_registers_in_manifest() {
+        let scratch = Scratch::new("jsonl-happy");
+        let mut db = create_db_with_events(scratch.path());
+        let jsonl_path = write_jsonl_file(
+            &scratch,
+            "data.jsonl",
+            r#"{"user_id":"alice","ts":1700000000000000000,"event_type":"click","amount":42}
+{"user_id":"bob","ts":1700000000100000000,"event_type":"view","amount":null}
+{"user_id":"charlie","ts":1700000000200000000,"event_type":"purchase","amount":10}
+"#,
+        );
+
+        let schema = events_table_schema(&db);
+        let plan = insert_from_jsonl_plan(schema, &jsonl_path, vec![]);
+        execute_insert(&plan, &mut db).expect("JSONL insert must succeed");
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 3);
+    }
+
+    // ── INSERT FROM JSONL: nested "properties" object ──────────────
+
+    #[test]
+    fn insert_from_jsonl_nested_properties_object() {
+        let scratch = Scratch::new("jsonl-nested");
+        let mut db = create_db_with_events(scratch.path());
+        let jsonl_path = write_jsonl_file(
+            &scratch,
+            "data.jsonl",
+            r#"{"user_id":"alice","ts":1700000000000000000,"event_type":"click","properties":{"amount":99}}
+"#,
+        );
+
+        let schema = events_table_schema(&db);
+        let plan = insert_from_jsonl_plan(schema, &jsonl_path, vec![]);
+        execute_insert(&plan, &mut db).expect("JSONL nested properties must succeed");
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 1);
+    }
+
+    // ── INSERT FROM JSONL: column mapping ─────────────────────────
+
+    #[test]
+    fn insert_from_jsonl_with_column_map() {
+        let scratch = Scratch::new("jsonl-map");
+        let mut db = create_db_with_events(scratch.path());
+        let jsonl_path = write_jsonl_file(
+            &scratch,
+            "data.jsonl",
+            r#"{"uid":"alice","time":1700000000000000000,"evt":"click","val":42}
+"#,
+        );
+
+        let schema = events_table_schema(&db);
+        let plan = insert_from_jsonl_plan(
+            schema,
+            &jsonl_path,
+            vec![
+                ("uid".into(), "user_id".into()),
+                ("time".into(), "ts".into()),
+                ("evt".into(), "event_type".into()),
+                ("val".into(), "amount".into()),
+            ],
+        );
+        execute_insert(&plan, &mut db).expect("JSONL with map must succeed");
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 1);
+    }
+
+    // ── INSERT FROM JSONL: empty file is no-op ─────────────────────
+
+    #[test]
+    fn insert_from_empty_jsonl_is_noop() {
+        let scratch = Scratch::new("jsonl-empty");
+        let mut db = create_db_with_events(scratch.path());
+        let jsonl_path = write_jsonl_file(&scratch, "data.jsonl", "");
+
+        let schema = events_table_schema(&db);
+        let plan = insert_from_jsonl_plan(schema, &jsonl_path, vec![]);
+        execute_insert(&plan, &mut db).expect("empty JSONL must succeed");
+
+        assert!(db.manifest().tables["events"].windows.is_empty());
+    }
+
+    // ── INSERT FROM JSONL: missing file errors ─────────────────────
+
+    #[test]
+    fn insert_from_missing_jsonl_errors() {
+        let scratch = Scratch::new("jsonl-missing");
+        let mut db = create_db_with_events(scratch.path());
+        let jsonl_path = scratch.path().join("nonexistent.jsonl");
+
+        let schema = events_table_schema(&db);
+        let plan = insert_from_jsonl_plan(schema, &jsonl_path, vec![]);
+        let err = execute_insert(&plan, &mut db).expect_err("missing file must error");
+        assert!(matches!(err, BqliteError::Io(_)));
+    }
+
+    // ── INSERT FROM JSONL: type error carries row number ───────────
+
+    #[test]
+    fn insert_from_jsonl_type_error_has_row_number() {
+        let scratch = Scratch::new("jsonl-type-err");
+        let mut db = create_db_with_events(scratch.path());
+        let jsonl_path = write_jsonl_file(
+            &scratch,
+            "data.jsonl",
+            r#"{"user_id":"alice","ts":1700000000000000000,"event_type":"click","amount":42}
+{"user_id":"bob","ts":"not_a_timestamp","event_type":"view"}
+"#,
+        );
+
+        let schema = events_table_schema(&db);
+        let plan = insert_from_jsonl_plan(schema, &jsonl_path, vec![]);
+        let err = execute_insert(&plan, &mut db).expect_err("type error must propagate");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("row 2"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    // ── End-to-end: INSERT FROM JSONL via Engine::query ───────────
+
+    #[test]
+    fn engine_query_insert_from_jsonl_end_to_end() {
+        let scratch = Scratch::new("jsonl-e2e");
+        let mut db = create_db_with_events(scratch.path());
+        let jsonl_path = write_jsonl_file(
+            &scratch,
+            "data.jsonl",
+            r#"{"user_id":"alice","ts":1700000000000000000,"event_type":"click","amount":42}
+{"user_id":"bob","ts":1700000000100000000,"event_type":"view"}
+"#,
+        );
+
+        let engine = crate::Engine::new();
+        let insert_sql = format!(
+            "INSERT INTO events FROM '{}' WITH (format: 'jsonl')",
+            jsonl_path.display()
+        );
+        let result = engine
+            .query(&insert_sql, &mut db)
+            .expect("e2e JSONL insert");
+        assert!(result.is_empty());
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 2);
     }
 
     // ── INSERT VALUES: happy path ──────────────────────────────────
