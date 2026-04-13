@@ -2919,6 +2919,8 @@ mod tests {
             seq_id_range: (0, 3),
             batch_id: 1,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3041,6 +3043,8 @@ mod tests {
             seq_id_range: (0, 4),
             batch_id: 2,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3130,6 +3134,8 @@ mod tests {
             seq_id_range: (0, 3),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3203,6 +3209,8 @@ mod tests {
             seq_id_range: (0, 4),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3276,6 +3284,8 @@ mod tests {
             seq_id_range: (0, 5),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3351,6 +3361,8 @@ mod tests {
             seq_id_range: (0, 39),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3427,6 +3439,8 @@ mod tests {
             seq_id_range: (0, 1),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3513,6 +3527,8 @@ mod tests {
             seq_id_range: (0, 1),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3608,6 +3624,8 @@ mod tests {
             seq_id_range: (0, 1),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3679,6 +3697,8 @@ mod tests {
             seq_id_range: (0, 1),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -3773,6 +3793,8 @@ mod tests {
             seq_id_range: (0, 1),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -4006,6 +4028,8 @@ mod tests {
             seq_id_range: (0, 3),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -4104,6 +4128,8 @@ mod tests {
             seq_id_range: (0, 4),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -4181,6 +4207,8 @@ mod tests {
             seq_id_range: (0, 2),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -4267,6 +4295,8 @@ mod tests {
             seq_id_range: (0, 0),
             batch_id: 1,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         // Serialize to bytes via the writer, then write to a

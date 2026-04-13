@@ -82,8 +82,9 @@ use twox_hash::XxHash64;
 
 use crate::encoding::{compress_lz4, CompressionType, EncodedChunk};
 use crate::segment::layout::{
-    ColumnChunkMeta, FooterV1, RowGroupIndex, SegmentDictRef, CHECKSUM_SEED, FILE_HEADER_LEN,
-    MAGIC, ROW_GROUP_SIZE_DEFAULT, SEGMENT_FORMAT_VERSION,
+    ColumnChunkMeta, FooterV1, FooterV2, FsstSymbolTableRef, RowGroupIndex, SegmentDictRef,
+    CHECKSUM_SEED, FILE_HEADER_LEN, MAGIC, ROW_GROUP_SIZE_DEFAULT, SEGMENT_FORMAT_VERSION,
+    SEGMENT_FORMAT_VERSION_V2,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -179,31 +180,48 @@ pub struct PreparedDictionary {
     pub value_type: BqlType,
 }
 
+/// Pre-built FSST symbol table bytes for one column, ready for the
+/// writer to place in the FSST symbol tables region.
+///
+/// See `segment-format-v2.md` §6 for the on-disk layout.
+#[derive(Debug, Clone)]
+pub struct PreparedFsstSymbolTable {
+    /// Column this symbol table belongs to.
+    pub column_ordinal: u32,
+    /// Serialized symbol table bytes (`segment-format-v2.md` §6.2).
+    pub bytes: Vec<u8>,
+    /// Number of symbols (1..=256).
+    pub symbol_count: u16,
+}
+
 /// Everything the writer needs to emit a segment file.
+///
+/// For v1 segments, set `format_version` to `1` and leave
+/// `fsst_symbol_tables` empty. For v2 segments, set `format_version`
+/// to `2` and populate `fsst_symbol_tables` for any FSST-encoded
+/// columns.
 #[derive(Debug, Clone)]
 pub struct SegmentWriteRequest {
-    /// Segment-schema snapshot (§10.1 `schema` field). Normally this
-    /// matches the current manifest schema; for segments written
-    /// before a later `ALTER TABLE ADD COLUMN`, it is an older
-    /// snapshot that the reader backfills against per §14.
+    /// Segment-schema snapshot (§10.1 `schema` field).
     pub schema: TableSchema,
-    /// Version tag on [`Self::schema`] at write time. Stored in the
-    /// footer's `schema_version` field.
+    /// Version tag on [`Self::schema`] at write time.
     pub schema_version: u32,
     /// Row groups to write, in file order. Must be non-empty.
     pub row_groups: Vec<PreparedRowGroup>,
     /// Segment-level dictionaries, in footer order.
     pub dictionaries: Vec<PreparedDictionary>,
+    /// FSST symbol tables for v2 segments. Empty for v1.
+    pub fsst_symbol_tables: Vec<PreparedFsstSymbolTable>,
     /// Segment creation timestamp (nanoseconds since epoch UTC).
     pub creation_timestamp_ns: i64,
-    /// `__seq_id` range `(min_inclusive, max_inclusive)` covered by
-    /// this segment. Both endpoints must be actual values present in
-    /// the segment (§6.2).
+    /// `__seq_id` range `(min_inclusive, max_inclusive)`.
     pub seq_id_range: (u64, u64),
     /// Ingest batch that produced the segment (§6.2).
     pub batch_id: u64,
     /// Compaction tier. `0` for L0 ingest output in Wave 2.
     pub compaction_level: u8,
+    /// Format version to emit. `1` for v1 (default), `2` for v2.
+    pub format_version: u16,
 }
 
 /// Summary returned after [`write_segment`] completes successfully.
@@ -260,7 +278,7 @@ pub fn encode_segment(request: &SegmentWriteRequest) -> Result<Vec<u8>> {
 
     // § File header (§5)
     buf.extend_from_slice(&MAGIC);
-    buf.extend_from_slice(&SEGMENT_FORMAT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&request.format_version.to_le_bytes());
     debug_assert_eq!(buf.len(), FILE_HEADER_LEN);
 
     // § Row groups (§6, §7)
@@ -337,24 +355,60 @@ pub fn encode_segment(request: &SegmentWriteRequest) -> Result<Vec<u8>> {
         });
     }
 
-    // § Footer body (§10.1)
+    // § FSST symbol tables region (v2 only, segment-format-v2.md §6)
+    let mut fsst_refs: Vec<FsstSymbolTableRef> =
+        Vec::with_capacity(request.fsst_symbol_tables.len());
+    for st in &request.fsst_symbol_tables {
+        let offset = buf.len() as u64;
+        buf.extend_from_slice(&st.bytes);
+        let len = buf.len() as u64 - offset;
+        fsst_refs.push(FsstSymbolTableRef {
+            column_ordinal: st.column_ordinal,
+            byte_offset: offset,
+            byte_length: len,
+            symbol_count: st.symbol_count,
+        });
+    }
+
+    // § Footer body (§10.1 / segment-format-v2.md §7)
     let total_row_count: u64 = request.row_groups.iter().map(|rg| rg.row_count).sum();
-    let footer = FooterV1 {
-        format_version: SEGMENT_FORMAT_VERSION,
-        schema: request.schema.clone(),
-        schema_version: request.schema_version,
-        row_count: total_row_count,
-        row_group_count: request.row_groups.len() as u32,
-        row_group_size_hint: ROW_GROUP_SIZE_DEFAULT,
-        creation_timestamp_ns: request.creation_timestamp_ns,
-        seq_id_range: request.seq_id_range,
-        batch_id: request.batch_id,
-        compaction_level: request.compaction_level,
-        dictionaries: dict_refs,
-        row_groups: row_group_indices,
+    let footer_bytes = if request.format_version == SEGMENT_FORMAT_VERSION_V2 {
+        let footer = FooterV2 {
+            format_version: SEGMENT_FORMAT_VERSION_V2,
+            schema: request.schema.clone(),
+            schema_version: request.schema_version,
+            row_count: total_row_count,
+            row_group_count: request.row_groups.len() as u32,
+            row_group_size_hint: ROW_GROUP_SIZE_DEFAULT,
+            creation_timestamp_ns: request.creation_timestamp_ns,
+            seq_id_range: request.seq_id_range,
+            batch_id: request.batch_id,
+            compaction_level: request.compaction_level,
+            dictionaries: dict_refs,
+            fsst_symbol_tables: fsst_refs,
+            row_groups: row_group_indices,
+        };
+        postcard::to_allocvec(&footer)
+            .map_err(|e| BqliteError::Execution(format!("failed to serialize v2 footer: {e}")))?
+    } else {
+        let footer = FooterV1 {
+            format_version: SEGMENT_FORMAT_VERSION,
+            schema: request.schema.clone(),
+            schema_version: request.schema_version,
+            row_count: total_row_count,
+            row_group_count: request.row_groups.len() as u32,
+            row_group_size_hint: ROW_GROUP_SIZE_DEFAULT,
+            creation_timestamp_ns: request.creation_timestamp_ns,
+            seq_id_range: request.seq_id_range,
+            batch_id: request.batch_id,
+            compaction_level: request.compaction_level,
+            dictionaries: dict_refs,
+            row_groups: row_group_indices,
+        };
+        postcard::to_allocvec(&footer).map_err(|e| {
+            BqliteError::Execution(format!("failed to serialize segment footer: {e}"))
+        })?
     };
-    let footer_bytes = postcard::to_allocvec(&footer)
-        .map_err(|e| BqliteError::Execution(format!("failed to serialize segment footer: {e}")))?;
     let footer_body_length = u32::try_from(footer_bytes.len()).map_err(|_| {
         BqliteError::Execution(format!(
             "segment footer body too large: {} bytes does not fit in u32",
@@ -411,6 +465,22 @@ fn summary_for(request: &SegmentWriteRequest, bytes: &[u8]) -> SegmentWriteSumma
 /// any bytes are emitted. Failing here produces a clean error instead
 /// of an on-disk corruption.
 fn validate_request(request: &SegmentWriteRequest) -> Result<()> {
+    // Format version must be 1 or 2.
+    if request.format_version != SEGMENT_FORMAT_VERSION
+        && request.format_version != SEGMENT_FORMAT_VERSION_V2
+    {
+        return Err(BqliteError::Execution(format!(
+            "unsupported format_version {}: expected 1 or 2",
+            request.format_version
+        )));
+    }
+    // FSST symbol tables are only valid in v2 segments.
+    if request.format_version == SEGMENT_FORMAT_VERSION && !request.fsst_symbol_tables.is_empty() {
+        return Err(BqliteError::Execution(
+            "FSST symbol tables are only supported in format_version >= 2".into(),
+        ));
+    }
+
     if request.row_groups.is_empty() {
         return Err(BqliteError::Execution(
             "segment must contain at least one row group (empty segments are illegal — §6)".into(),
@@ -683,6 +753,8 @@ mod tests {
             seq_id_range: (0, 2),
             batch_id: 7,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         }
     }
 
@@ -927,6 +999,8 @@ mod tests {
             seq_id_range: (0, 63),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -1038,6 +1112,8 @@ mod tests {
             seq_id_range: (0, 2),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
 
         let bytes = encode_segment(&request).unwrap();
@@ -1121,6 +1197,8 @@ mod tests {
             seq_id_range: (0, 0),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
         assert_execution_err(encode_segment(&request), "at least one row group");
     }
@@ -1139,6 +1217,8 @@ mod tests {
             seq_id_range: (0, 0),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
         assert_execution_err(encode_segment(&request), "row_count = 0 is illegal");
     }
@@ -1215,6 +1295,8 @@ mod tests {
             seq_id_range: (0, 0),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
         assert_execution_err(
             encode_segment(&request),
@@ -1296,6 +1378,8 @@ mod tests {
             seq_id_range: (0, 15),
             batch_id: 0,
             compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
         };
         assert_execution_err(encode_segment(&request), "null bitmap length 1");
     }

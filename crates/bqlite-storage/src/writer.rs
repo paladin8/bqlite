@@ -418,6 +418,8 @@ fn prepare_segment(
         seq_id_range,
         batch_id,
         compaction_level: 0,
+        fsst_symbol_tables: vec![],
+        format_version: 1,
     };
 
     Ok(PreparedSegment {
