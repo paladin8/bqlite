@@ -2,6 +2,7 @@
   "agent_id": "agent-4",
   "task_id": "TASK-415",
   "claimed_at": "2026-04-13T02:56:04Z",
+  "completed_at": "2026-04-13T07:15:00Z",
   "branch": "task/TASK-415",
   "description": "FOR encoding"
 }
