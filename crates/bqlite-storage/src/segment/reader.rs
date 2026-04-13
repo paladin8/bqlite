@@ -1007,7 +1007,6 @@ fn dispatch_decode(
         EncodingType::BitPacking => BitPacking.decode_borrowed(chunk, ty),
         EncodingType::Constant => Constant.decode_borrowed(chunk, ty),
         EncodingType::Rle => Rle.decode_borrowed(chunk, ty),
-        EncodingType::DoubleDelta => DoubleDelta.decode_borrowed(chunk, ty),
         EncodingType::For => ForEncoding.decode_borrowed(chunk, ty),
         // v2 encodings — decode implementations land in TASK-416 through TASK-418, TASK-450.
         EncodingType::Fsst
