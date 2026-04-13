@@ -141,21 +141,23 @@ impl EncodingType {
 
     /// Parse a byte into an [`EncodingType`], gated by format version.
     ///
-    /// v1 segments accept `{0, 1, 2, 4, 5, 6}` (Rle added by TASK-413).
-    /// v2 segments additionally accept `{3, 7, 8, 9, 10}`.
-    /// Discriminant 11 (`FreqEncoding`) is reserved but rejected in
-    /// both versions per `segment-format-v2.md` §4.
+    /// v1 segments accept `{0, 1, 2, 3, 4, 5, 6}` (Rle added by
+    /// TASK-413, DoubleDelta added by TASK-414). v2 segments
+    /// additionally accept `{7, 8, 9, 10}`. Discriminant 11
+    /// (`FreqEncoding`) is reserved but rejected in both versions
+    /// per `segment-format-v2.md` §4.
     pub fn from_discriminant_versioned(byte: u8, format_version: u16) -> Result<Self> {
         match byte {
-            // v1 set — always accepted (includes Rle since TASK-413)
+            // v1 set — always accepted (includes Rle since TASK-413,
+            // DoubleDelta since TASK-414)
             0 => Ok(Self::Plain),
             1 => Ok(Self::Dictionary),
             2 => Ok(Self::Delta),
+            3 => Ok(Self::DoubleDelta),
             4 => Ok(Self::BitPacking),
             5 => Ok(Self::Rle),
             6 => Ok(Self::Constant),
             // v2 set — accepted only when format_version >= 2
-            3 if format_version >= 2 => Ok(Self::DoubleDelta),
             7 if format_version >= 2 => Ok(Self::Fsst),
             8 if format_version >= 2 => Ok(Self::For),
             9 if format_version >= 2 => Ok(Self::PFor),
@@ -394,8 +396,8 @@ mod tests {
 
     #[test]
     fn from_discriminant_versioned_v1_rejects_v2_encodings() {
-        // Rle (5) is accepted in v1 since TASK-413
-        for byte in [3u8, 7, 8, 9, 10] {
+        // Rle (5) accepted in v1 since TASK-413, DoubleDelta (3) since TASK-414
+        for byte in [7u8, 8, 9, 10] {
             assert!(
                 EncodingType::from_discriminant_versioned(byte, 1).is_err(),
                 "v1 should reject discriminant {byte}"

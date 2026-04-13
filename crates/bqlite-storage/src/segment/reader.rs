@@ -2692,11 +2692,11 @@ mod tests {
     #[test]
     fn rejects_illegal_encoding_discriminant() {
         // Build a segment whose column-chunk metadata declares an
-        // out-of-set encoding discriminant (`5` is reserved for RLE,
-        // not yet in the known set `{0, 1, 2, 3, 4, 6}`). The column
-        // chunk bytes themselves do not need to parse — the reader
-        // rejects the metadata long before it touches the bytes — so
-        // we stub the row group with three empty Plain chunks and only
+        // out-of-set encoding discriminant (`99` is not a valid
+        // encoding for any format version). The column chunk bytes
+        // themselves do not need to parse — the reader rejects the
+        // metadata long before it touches the bytes — so we stub
+        // the row group with three empty Plain chunks and only
         // override the metadata of the first.
         let one_col_schema = TableSchema::new(
             "t",
@@ -2739,7 +2739,7 @@ mod tests {
                         column_ordinal: 0,
                         byte_offset: rg_off,
                         byte_length: 5,
-                        encoding: 5, // illegal — RLE reserved, not yet in known set
+                        encoding: 99, // illegal — not a valid encoding discriminant
                         compression: 0,
                         row_count: 0,
                         null_count: 1,
