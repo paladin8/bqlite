@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-414",
+  "claimed_at": "2026-04-13T02:48:56Z",
+  "branch": "task/TASK-414",
+  "description": "DoubleDelta encoding"
+}
