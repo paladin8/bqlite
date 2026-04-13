@@ -51,8 +51,8 @@ use bqlite_core::{AggFunction, ColumnDef, OperatorSchema, TableSchema};
 
 use crate::compile::{CompiledNfa, MatchExecutionConfig, MatchStrategy};
 use crate::compiled::CompiledExpr;
-use crate::demand::CompiledFusableAggregate;
-use crate::logical::{InsertLogicalBody, LogicalPlan, ProjectItem, SortDirection};
+use crate::demand::{ColumnId, CompiledFusableAggregate, DemandSet};
+use crate::logical::{EventSelectKind, InsertLogicalBody, LogicalPlan, ProjectItem, SortDirection};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tunables
@@ -138,6 +138,23 @@ pub enum PhysicalPlan {
     Sort(SortPhysical),
     /// Row deduplication via hash-set (streaming). Wave 3.
     Distinct(DistinctPhysical),
+
+    // ── Wave 4 variants ────────────────────────────────────────────────────
+    /// Session assignment operator. Wave 4.
+    Sessionize(SessionizePhysical),
+    /// Per-entity event sub-selection (FIRST/LAST/NTH). Wave 4.
+    EventSelect(EventSelectPhysical),
+    /// Multi-touch attribution operator. Wave 4.
+    Attribute(AttributePhysical),
+    /// Cohort-based entity filtering via hash-set probe. Wave 4.
+    SubqueryFilter(SubqueryFilterPhysical),
+    /// Deterministic entity-level sampling. Wave 4.
+    Sample(SamplePhysical),
+    /// N-ary entity-aligned merge of multiple table scans. Wave 4.
+    ///
+    /// Produced for source expressions with `JOIN` clauses. Single-table
+    /// sources produce an ordinary `Scan` — no wrapping needed.
+    MergeSources(MergeSourcesPhysical),
 }
 
 impl PhysicalPlan {
@@ -165,6 +182,13 @@ impl PhysicalPlan {
             PhysicalPlan::Aggregate(n) => &n.output_schema,
             PhysicalPlan::Sort(n) => &n.output_schema,
             PhysicalPlan::Distinct(n) => &n.output_schema,
+            // Wave 4 variants.
+            PhysicalPlan::Sessionize(n) => &n.output_schema,
+            PhysicalPlan::EventSelect(n) => &n.output_schema,
+            PhysicalPlan::Attribute(n) => &n.output_schema,
+            PhysicalPlan::SubqueryFilter(n) => &n.output_schema,
+            PhysicalPlan::Sample(n) => &n.output_schema,
+            PhysicalPlan::MergeSources(n) => &n.output_schema,
         }
     }
 }
@@ -533,6 +557,196 @@ pub struct DistinctPhysical {
     /// Child plan feeding this distinct operator.
     pub input: Box<PhysicalPlan>,
     /// Identical to `input.output_schema()` — Distinct never changes the schema.
+    pub output_schema: OperatorSchema,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4 physical descriptors
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Physical descriptor for the SESSIONIZE operator. Wave 4.
+///
+/// Produced by TASK-425's physical lowering from
+/// [`crate::logical::LogicalPlan::Sessionize`]. Materialized into a
+/// `SessionizeOperator` (TASK-428) by the engine bind step (TASK-438).
+///
+/// See `docs/design/operators/sessionize.md` §4 for the full spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionizePhysical {
+    /// Minimum inactivity gap (nanoseconds) that triggers a new session.
+    /// Boundary is exclusive: new session iff delta > gap_ns.
+    pub gap_ns: i64,
+    /// Event types that explicitly end a session. Empty = gap-only mode.
+    pub end_events: Vec<String>,
+    /// Demand set from downstream operators.
+    pub demand: DemandSet,
+    /// Columns that downstream operators need forwarded through the
+    /// session buffer.
+    pub forwarded_columns: Vec<ColumnId>,
+    /// Fused aggregate specification. Always `None` in v1 (Wave 5).
+    pub fused_aggregate: Option<CompiledFusableAggregate>,
+    /// Child plan feeding this sessionize operator.
+    pub input: Box<PhysicalPlan>,
+    /// Output schema: input columns + `session_id` + `session_duration`.
+    pub output_schema: OperatorSchema,
+}
+
+/// Physical descriptor for EventSelect (FIRST/LAST/NTH). Wave 4.
+///
+/// Produced by TASK-425's physical lowering from
+/// [`crate::logical::LogicalPlan::EventSelect`]. Materialized into an
+/// `EventSelectOperator` (TASK-429) by the engine bind step (TASK-438).
+///
+/// See `docs/design/operators/event-select-sample.md` Block A for the
+/// full spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventSelectPhysical {
+    /// Selection mode: FIRST, LAST, or NTH(n).
+    pub kind: EventSelectKind,
+    /// Event types eligible for selection. Length >= 1.
+    pub event_types: Vec<String>,
+    /// Optional per-event predicate, compiled from WHERE clause.
+    pub predicate: Option<CompiledExpr>,
+    /// Scan-range backward extension for FIRST/NTH. `None` for LAST.
+    pub lookback: Option<i64>,
+    /// Columns that downstream operators need forwarded through the
+    /// candidate row.
+    pub forwarded_columns: Vec<ColumnId>,
+    /// Fused aggregate specification. Always `None` in v1 (Wave 5).
+    pub fused_aggregate: Option<CompiledFusableAggregate>,
+    /// Child plan feeding this event-select operator.
+    pub input: Box<PhysicalPlan>,
+    /// Output schema: source-table columns (one row per entity).
+    pub output_schema: OperatorSchema,
+}
+
+/// Physical descriptor for the ATTRIBUTE operator. Wave 4.
+///
+/// Produced by TASK-425's physical lowering from
+/// [`crate::logical::LogicalPlan::Attribute`]. Materialized into an
+/// `AttributeOperator` (TASK-431) by the engine bind step (TASK-438).
+///
+/// See `docs/design/operators/attribute.md` for the full spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributePhysical {
+    /// Event type(s) that trigger conversion emission.
+    pub conversion_events: Vec<String>,
+    /// Event type(s) eligible as touchpoints.
+    pub touchpoint_events: Vec<String>,
+    /// Lookback window in nanoseconds.
+    pub window_ns: i64,
+    /// Compiled expression evaluated per qualifying touchpoint; result
+    /// becomes the `touchpoint_key` output column.
+    pub touchpoint_key: CompiledExpr,
+    /// Demand-driven forwarded conversion properties.
+    pub forwarded_conversion_columns: Vec<ColumnId>,
+    /// Fused aggregate specification. Always `None` in v1 (Wave 5).
+    pub fused_aggregate: Option<CompiledFusableAggregate>,
+    /// Original query time range `(start_ns, end_ns)` for scan-extension-
+    /// aware conversion emission filtering. When the planner widens the
+    /// scan backward by `window` (attribute.md §12), only conversions
+    /// whose `conversion_ts` falls within this original range trigger
+    /// emission — touchpoints from the extended zone are deque material
+    /// only. `None` when no time range is specified (unbounded scan).
+    pub conversion_range: Option<(i64, i64)>,
+    /// Child plan feeding this attribute operator.
+    pub input: Box<PhysicalPlan>,
+    /// Output schema: `entity_id`, `conversion_ts`,
+    /// demand-forwarded conversion properties, `touchpoint_ts?`,
+    /// `touchpoint_key?`.
+    pub output_schema: OperatorSchema,
+}
+
+/// Physical descriptor for cohort-based SubqueryFilter. Wave 4.
+///
+/// Produced by TASK-425's physical lowering from
+/// [`crate::logical::LogicalPlan::SubqueryFilter`]. Materialized into a
+/// `SubqueryFilterOperator` (TASK-437) by the engine bind step (TASK-438).
+///
+/// The engine bind step executes the `subquery` plan to materialize a
+/// hash set, then wires the set into the operator. The physical plan
+/// carries the subquery as a child plan (plain data), not the runtime
+/// hash set.
+///
+/// See `docs/design/language/cohorts-aliases-joins.md` §4 for the full
+/// spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubqueryFilterPhysical {
+    /// Compiled LHS column expression(s) for the IN check. Length 1 for
+    /// single-column cohorts; length N for tuple cohorts.
+    pub lhs_columns: Vec<CompiledExpr>,
+    /// Inner pipeline producing the cohort set. Executed at query start
+    /// by the engine bind step.
+    pub subquery: Box<PhysicalPlan>,
+    /// Outer input stream being filtered.
+    pub input: Box<PhysicalPlan>,
+    /// Identical to `input.output_schema()` — filter, not transform.
+    pub output_schema: OperatorSchema,
+}
+
+/// Physical descriptor for deterministic entity-level SAMPLE. Wave 4.
+///
+/// Produced by TASK-425's physical lowering from
+/// [`crate::logical::LogicalPlan::Sample`]. SAMPLE is pushed down to the
+/// scan layer by TASK-430; at the physical plan level it is a standalone
+/// node that the engine bind step may fuse with the scan.
+///
+/// See `docs/design/operators/event-select-sample.md` Block B for the
+/// full spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplePhysical {
+    /// Fraction of entities to keep, in `[0.0, 1.0]`.
+    pub fraction: f64,
+    /// Resolved seed for deterministic sampling. When the logical plan's
+    /// `seed` is `None`, the engine bind step substitutes a database-
+    /// UUID-derived default; at the physical-plan level a seed is always
+    /// present.
+    pub seed: i64,
+    /// Child plan feeding this sample operator.
+    pub input: Box<PhysicalPlan>,
+    /// Identical to `input.output_schema()` — SAMPLE never changes the
+    /// column shape.
+    pub output_schema: OperatorSchema,
+}
+
+/// Default SAMPLE seed used when the user does not provide an explicit
+/// `seed:` parameter. The engine bind step replaces this with the
+/// database-UUID-derived seed; 0 is used as a placeholder at the
+/// planner level.
+pub const DEFAULT_SAMPLE_SEED: i64 = 0;
+
+/// Physical descriptor for N-ary entity-aligned source merge. Wave 4.
+///
+/// Produced by TASK-425's source-resolution step when the source
+/// expression contains one or more `JOIN` clauses. Single-table
+/// source expressions produce an ordinary `Scan` — no wrapping.
+///
+/// The operator performs a k-way merge over N independent entity-sorted
+/// scans (one per joined table), emitting a unified entity-sorted event
+/// stream with a `__source_table_id` discriminator column.
+///
+/// See `docs/design/language/cohorts-aliases-joins.md` §3.7–3.8 for
+/// the full spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeSourcesPhysical {
+    /// One scan descriptor per joined table, in JOIN-clause order.
+    /// Index 0 is the primary table; indices 1..N are the joined tables.
+    pub tables: Vec<ScanPhysical>,
+    /// Merge sort key specification. The canonical order is
+    /// `(entity_id ASC, ts ASC, table_order ASC, __seq_id ASC)` per
+    /// cohorts-aliases-joins.md §3.2. Carried explicitly so EXPLAIN can
+    /// render it and future waves can parameterize it.
+    pub order: Vec<(String, SortDirection)>,
+    /// Table-id → table-name map. `table_id_map[i]` is the catalog name
+    /// of the table whose events carry `__source_table_id == i`.
+    /// Length equals `tables.len()`.
+    pub table_id_map: Vec<String>,
+    /// Output schema: union of all joined tables' declared columns plus
+    /// `__source_table_id: Int NOT NULL`.
+    ///
+    /// Note: the design doc specifies `Int8` for `__source_table_id`,
+    /// but `BqlType` has no `Int8` variant. The planner uses `Int` (i64);
+    /// the operator layer may narrow to `Int8` in the Arrow representation.
     pub output_schema: OperatorSchema,
 }
 
@@ -950,6 +1164,146 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                 output_schema,
             })
         }
+
+        // ── Wave 4 variants ──────────────────────────────────────────────
+        LogicalPlan::Sessionize {
+            gap,
+            end_events,
+            forwarded_columns,
+            fused_downstream,
+            input,
+            output_schema,
+        } => {
+            let fused_aggregate = fused_downstream.map(compile_fused_downstream);
+            let demand = DemandSet {
+                columns: output_schema
+                    .columns()
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect(),
+                forwarded: forwarded_columns.clone(),
+                ..DemandSet::default()
+            };
+            let child = lower_physical(*input, now_ns);
+            PhysicalPlan::Sessionize(SessionizePhysical {
+                gap_ns: gap,
+                end_events,
+                demand,
+                forwarded_columns,
+                fused_aggregate,
+                input: Box::new(child),
+                output_schema,
+            })
+        }
+
+        LogicalPlan::EventSelect {
+            kind,
+            event_types,
+            predicate,
+            lookback,
+            forwarded_columns,
+            fused_downstream,
+            input,
+            output_schema,
+        } => {
+            let compiled_predicate = predicate.as_ref().map(CompiledExpr::from_typed);
+            let fused_aggregate = fused_downstream.map(compile_fused_downstream);
+            let child = lower_physical(*input, now_ns);
+            PhysicalPlan::EventSelect(EventSelectPhysical {
+                kind,
+                event_types,
+                predicate: compiled_predicate,
+                lookback,
+                forwarded_columns,
+                fused_aggregate,
+                input: Box::new(child),
+                output_schema,
+            })
+        }
+
+        LogicalPlan::Attribute {
+            conversion_events,
+            touchpoint_events,
+            window,
+            touchpoint_key,
+            forwarded_conversion_columns,
+            fused_downstream,
+            input,
+            output_schema,
+        } => {
+            let compiled_key = CompiledExpr::from_typed(&touchpoint_key);
+            let fused_aggregate = fused_downstream.map(compile_fused_downstream);
+            let child = lower_physical(*input, now_ns);
+            PhysicalPlan::Attribute(AttributePhysical {
+                conversion_events,
+                touchpoint_events,
+                window_ns: window,
+                touchpoint_key: compiled_key,
+                forwarded_conversion_columns,
+                fused_aggregate,
+                conversion_range: None, // populated by TASK-425 during AST→logical lowering
+                input: Box::new(child),
+                output_schema,
+            })
+        }
+
+        LogicalPlan::SubqueryFilter {
+            columns,
+            subquery,
+            input,
+            output_schema,
+        } => {
+            let compiled_cols: Vec<CompiledExpr> =
+                columns.iter().map(CompiledExpr::from_typed).collect();
+            let compiled_subquery = lower_physical(*subquery, now_ns);
+            let child = lower_physical(*input, now_ns);
+            PhysicalPlan::SubqueryFilter(SubqueryFilterPhysical {
+                lhs_columns: compiled_cols,
+                subquery: Box::new(compiled_subquery),
+                input: Box::new(child),
+                output_schema,
+            })
+        }
+
+        LogicalPlan::Sample {
+            fraction,
+            seed,
+            input,
+            output_schema,
+        } => {
+            let child = lower_physical(*input, now_ns);
+            PhysicalPlan::Sample(SamplePhysical {
+                fraction,
+                seed: seed.unwrap_or(DEFAULT_SAMPLE_SEED),
+                input: Box::new(child),
+                output_schema,
+            })
+        }
+    }
+}
+
+/// Compile a logical `FusedDownstream` into a physical
+/// `CompiledFusableAggregate`. Shared by Wave 4 stateful node lowering.
+fn compile_fused_downstream(fd: crate::logical::FusedDownstream) -> CompiledFusableAggregate {
+    CompiledFusableAggregate {
+        aggregates: fd
+            .aggregate
+            .aggregates
+            .iter()
+            .map(|a| crate::demand::CompiledAggExpr {
+                function: a.function,
+                arg: a.arg.as_ref().map(CompiledExpr::from_typed),
+                output_name: a.output_name.clone(),
+            })
+            .collect(),
+        group_by: fd
+            .aggregate
+            .group_by
+            .iter()
+            .map(|(e, n)| (CompiledExpr::from_typed(e), n.clone()))
+            .collect(),
+        output_schema: fd.aggregate.output_schema.clone(),
+        max_groups: DEFAULT_MAX_GROUPS,
     }
 }
 
@@ -1609,5 +1963,334 @@ mod tests {
         assert!(matches!(*distinct.input, PhysicalPlan::Project(_)));
         assert_eq!(distinct.output_schema.columns().len(), 1);
         assert_eq!(distinct.output_schema.columns()[0].name, "entity_id");
+    }
+
+    // ── Wave 4 variant tests ──────────────────────────────────────────
+
+    use crate::demand::ColumnId;
+    use crate::logical::EventSelectKind;
+
+    fn sessionize_output_schema() -> bqlite_core::OperatorSchema {
+        bqlite_core::OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+            ColumnDef::required("session_id", BqlType::Int),
+            ColumnDef::required("session_duration", BqlType::Int),
+        ])
+        .unwrap()
+    }
+
+    fn event_select_output_schema() -> bqlite_core::OperatorSchema {
+        bqlite_core::OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+        ])
+        .unwrap()
+    }
+
+    fn attribute_output_schema() -> bqlite_core::OperatorSchema {
+        bqlite_core::OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("conversion_ts", BqlType::Timestamp),
+            ColumnDef::nullable("touchpoint_ts", BqlType::Timestamp),
+            ColumnDef::nullable("touchpoint_key", BqlType::String),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn sessionize_logical_output_schema() {
+        let scan = LogicalPlan::scan(events_schema());
+        let os = sessionize_output_schema();
+        let node = LogicalPlan::Sessionize {
+            gap: 1_800_000_000_000, // 30 min in ns
+            end_events: vec!["logout".into()],
+            forwarded_columns: vec![],
+            fused_downstream: None,
+            input: Box::new(scan),
+            output_schema: os.clone(),
+        };
+        assert_eq!(node.output_schema(), &os);
+        assert_eq!(node.output_schema().columns().len(), 5);
+    }
+
+    #[test]
+    fn sessionize_lowering_produces_physical() {
+        let scan = LogicalPlan::scan(events_schema());
+        let os = sessionize_output_schema();
+        let node = LogicalPlan::Sessionize {
+            gap: 1_800_000_000_000,
+            end_events: vec!["logout".into()],
+            forwarded_columns: vec!["amount".into()],
+            fused_downstream: None,
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::Sessionize(sess) = physical else {
+            panic!("expected Sessionize, got {physical:?}");
+        };
+        assert_eq!(sess.gap_ns, 1_800_000_000_000);
+        assert_eq!(sess.end_events, vec!["logout".to_string()]);
+        assert_eq!(
+            sess.forwarded_columns,
+            vec!["amount".to_string()] as Vec<ColumnId>
+        );
+        assert!(sess.fused_aggregate.is_none());
+        assert!(matches!(*sess.input, PhysicalPlan::Scan(_)));
+    }
+
+    #[test]
+    fn event_select_first_lowering() {
+        let scan = LogicalPlan::scan(events_schema());
+        let os = event_select_output_schema();
+        let node = LogicalPlan::EventSelect {
+            kind: EventSelectKind::First,
+            event_types: vec!["purchase".into()],
+            predicate: None,
+            lookback: None,
+            forwarded_columns: vec![],
+            fused_downstream: None,
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::EventSelect(es) = physical else {
+            panic!("expected EventSelect, got {physical:?}");
+        };
+        assert_eq!(es.kind, EventSelectKind::First);
+        assert_eq!(es.event_types, vec!["purchase".to_string()]);
+        assert!(es.predicate.is_none());
+        assert!(es.lookback.is_none());
+    }
+
+    #[test]
+    fn event_select_nth_lowering() {
+        let scan = LogicalPlan::scan(events_schema());
+        let os = event_select_output_schema();
+        let node = LogicalPlan::EventSelect {
+            kind: EventSelectKind::Nth(3),
+            event_types: vec!["click".into(), "tap".into()],
+            predicate: None,
+            lookback: Some(86_400_000_000_000), // 1 day
+            forwarded_columns: vec![],
+            fused_downstream: None,
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::EventSelect(es) = physical else {
+            panic!("expected EventSelect, got {physical:?}");
+        };
+        assert_eq!(es.kind, EventSelectKind::Nth(3));
+        assert_eq!(es.event_types.len(), 2);
+        assert_eq!(es.lookback, Some(86_400_000_000_000));
+    }
+
+    #[test]
+    fn event_select_last_lowering() {
+        let scan = LogicalPlan::scan(events_schema());
+        let os = event_select_output_schema();
+        let node = LogicalPlan::EventSelect {
+            kind: EventSelectKind::Last,
+            event_types: vec!["purchase".into()],
+            predicate: None,
+            lookback: None,
+            forwarded_columns: vec![],
+            fused_downstream: None,
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::EventSelect(es) = physical else {
+            panic!("expected EventSelect, got {physical:?}");
+        };
+        assert_eq!(es.kind, EventSelectKind::Last);
+        assert!(es.lookback.is_none());
+    }
+
+    #[test]
+    fn attribute_lowering() {
+        let scan = LogicalPlan::scan(events_schema());
+        let os = attribute_output_schema();
+        // Build a simple typed expression for touchpoint_key.
+        let key_expr = crate::expr::TypedExpr {
+            kind: crate::expr::TypedExprKind::Column {
+                column_index: 2,
+                name: "event_type".into(),
+            },
+            result_type: BqlType::String,
+            nullable: false,
+            span: Span::EMPTY,
+        };
+        let node = LogicalPlan::Attribute {
+            conversion_events: vec!["purchase".into()],
+            touchpoint_events: vec!["ad_click".into(), "email_open".into()],
+            window: 2_592_000_000_000_000, // 30 days in ns
+            touchpoint_key: key_expr,
+            forwarded_conversion_columns: vec![],
+            fused_downstream: None,
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::Attribute(attr) = physical else {
+            panic!("expected Attribute, got {physical:?}");
+        };
+        assert_eq!(attr.conversion_events, vec!["purchase".to_string()]);
+        assert_eq!(attr.touchpoint_events.len(), 2);
+        assert_eq!(attr.window_ns, 2_592_000_000_000_000);
+        assert!(attr.fused_aggregate.is_none());
+        assert!(attr.conversion_range.is_none());
+    }
+
+    #[test]
+    fn subquery_filter_lowering() {
+        let scan = LogicalPlan::scan(events_schema());
+        let subquery = LogicalPlan::scan(events_schema());
+        let input_schema = scan.output_schema().clone();
+        // Build a column expression for the LHS of the IN check.
+        let col_expr = crate::expr::TypedExpr {
+            kind: crate::expr::TypedExprKind::Column {
+                column_index: 0,
+                name: "entity_id".into(),
+            },
+            result_type: BqlType::String,
+            nullable: false,
+            span: Span::EMPTY,
+        };
+        let node = LogicalPlan::SubqueryFilter {
+            columns: vec![col_expr],
+            subquery: Box::new(subquery),
+            input: Box::new(scan),
+            output_schema: input_schema,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::SubqueryFilter(sqf) = physical else {
+            panic!("expected SubqueryFilter, got {physical:?}");
+        };
+        assert_eq!(sqf.lhs_columns.len(), 1);
+        // SubqueryFilter's output schema is identical to its input's.
+        assert!(matches!(*sqf.input, PhysicalPlan::Scan(_)));
+        assert!(matches!(*sqf.subquery, PhysicalPlan::Scan(_)));
+    }
+
+    #[test]
+    fn sample_lowering_with_explicit_seed() {
+        let scan = LogicalPlan::scan(events_schema());
+        let os = scan.output_schema().clone();
+        let node = LogicalPlan::Sample {
+            fraction: 0.1,
+            seed: Some(42),
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::Sample(sample) = physical else {
+            panic!("expected Sample, got {physical:?}");
+        };
+        assert!((sample.fraction - 0.1).abs() < f64::EPSILON);
+        assert_eq!(sample.seed, 42);
+    }
+
+    #[test]
+    fn sample_lowering_default_seed() {
+        let scan = LogicalPlan::scan(events_schema());
+        let os = scan.output_schema().clone();
+        let node = LogicalPlan::Sample {
+            fraction: 0.5,
+            seed: None,
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::Sample(sample) = physical else {
+            panic!("expected Sample, got {physical:?}");
+        };
+        assert!((sample.fraction - 0.5).abs() < f64::EPSILON);
+        assert_eq!(sample.seed, DEFAULT_SAMPLE_SEED);
+    }
+
+    #[test]
+    fn merge_sources_physical_construction() {
+        let schema = events_schema();
+        let scan1 = ScanPhysical {
+            table: "events".into(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: bqlite_core::OperatorSchema::from_table(&schema),
+            entity_key_col: "entity_id".into(),
+            timestamp_col: "ts".into(),
+        };
+        let scan2 = ScanPhysical {
+            table: "clicks".into(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: bqlite_core::OperatorSchema::from_table(&schema),
+            entity_key_col: "entity_id".into(),
+            timestamp_col: "ts".into(),
+        };
+        // Build a merged output schema with __source_table_id.
+        let merged_schema = bqlite_core::OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+            ColumnDef::nullable("amount", BqlType::Int),
+            ColumnDef::required("__source_table_id", BqlType::Int),
+        ])
+        .unwrap();
+        let merge = MergeSourcesPhysical {
+            tables: vec![scan1, scan2],
+            order: vec![
+                ("entity_id".into(), SortDirection::Asc),
+                ("ts".into(), SortDirection::Asc),
+                ("__source_table_id".into(), SortDirection::Asc),
+            ],
+            table_id_map: vec!["events".into(), "clicks".into()],
+            output_schema: merged_schema.clone(),
+        };
+        let plan = PhysicalPlan::MergeSources(merge);
+        assert_eq!(plan.output_schema(), &merged_schema);
+        // Verify the __source_table_id column is present.
+        assert!(plan.output_schema().column("__source_table_id").is_some());
+    }
+
+    #[test]
+    fn wave4_physical_output_schemas_match_input() {
+        // Sample and SubqueryFilter preserve input schema.
+        let scan = LogicalPlan::scan(events_schema());
+        let scan_schema = scan.output_schema().clone();
+
+        let sample = LogicalPlan::Sample {
+            fraction: 0.2,
+            seed: None,
+            input: Box::new(scan.clone()),
+            output_schema: scan_schema.clone(),
+        };
+        assert_eq!(sample.output_schema(), &scan_schema);
+
+        let subquery = LogicalPlan::scan(events_schema());
+        let col_expr = crate::expr::TypedExpr {
+            kind: crate::expr::TypedExprKind::Column {
+                column_index: 0,
+                name: "entity_id".into(),
+            },
+            result_type: BqlType::String,
+            nullable: false,
+            span: Span::EMPTY,
+        };
+        let sqf = LogicalPlan::SubqueryFilter {
+            columns: vec![col_expr],
+            subquery: Box::new(subquery),
+            input: Box::new(scan),
+            output_schema: scan_schema.clone(),
+        };
+        assert_eq!(sqf.output_schema(), &scan_schema);
     }
 }

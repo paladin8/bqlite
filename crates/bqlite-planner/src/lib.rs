@@ -84,16 +84,18 @@ pub use demand::{
 pub use explain::{build_explain_node, format_explain, format_expr, ExplainNode};
 pub use expr::{FunctionRegistry, ScalarFunctionSig, TypedExpr, TypedExprKind};
 pub use logical::{
-    lower_statement, FusedDownstream, IngestFormat, InsertFromDescriptor, InsertLogicalBody,
-    LogicalPlan, MatchWindowSpec, ProjectItem, SequencePattern, SortDirection, TypedAggExpr,
+    lower_statement, EventSelectKind, FusedDownstream, IngestFormat, InsertFromDescriptor,
+    InsertLogicalBody, LogicalPlan, MatchWindowSpec, ProjectItem, SequencePattern, SortDirection,
+    TypedAggExpr,
 };
 pub use physical::{
-    lower_physical, AggregatePhysical, AlterTableAddColumnPhysical, CompiledAgg,
-    CreateTablePhysical, DescribePhysical, DistinctPhysical, DropTablePhysical, ExplainPhysical,
-    FilterPhysical, InsertPhysical, LimitPhysical, PhysicalPlan, ProjectPhysical,
-    ProjectPhysicalItem, ScanPhysical, SequenceMatchPhysical, SortPhysical,
-    DEFAULT_FILTER_TILE_SIZE, DEFAULT_MAX_GROUPS, DEFAULT_SORT_MAX_ROWS, MAX_FILTER_TILE_SIZE,
-    MIN_FILTER_TILE_SIZE,
+    lower_physical, AggregatePhysical, AlterTableAddColumnPhysical, AttributePhysical, CompiledAgg,
+    CreateTablePhysical, DescribePhysical, DistinctPhysical, DropTablePhysical,
+    EventSelectPhysical, ExplainPhysical, FilterPhysical, InsertPhysical, LimitPhysical,
+    MergeSourcesPhysical, PhysicalPlan, ProjectPhysical, ProjectPhysicalItem, SamplePhysical,
+    ScanPhysical, SequenceMatchPhysical, SessionizePhysical, SortPhysical, SubqueryFilterPhysical,
+    DEFAULT_FILTER_TILE_SIZE, DEFAULT_MAX_GROUPS, DEFAULT_SAMPLE_SEED, DEFAULT_SORT_MAX_ROWS,
+    MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

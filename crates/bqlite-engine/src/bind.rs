@@ -580,6 +580,20 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
                 insert.output_schema.clone(),
             )))
         }
+
+        // ── Wave 4 stubs ─────────────────────────────────────────
+        // These arms will be implemented by TASK-438 (engine bind
+        // extension for Wave 4 query nodes). For now, they return
+        // unsupported errors so the crate compiles and downstream
+        // tasks can land their variants independently.
+        PhysicalPlan::Sessionize(_)
+        | PhysicalPlan::EventSelect(_)
+        | PhysicalPlan::Attribute(_)
+        | PhysicalPlan::SubqueryFilter(_)
+        | PhysicalPlan::Sample(_)
+        | PhysicalPlan::MergeSources(_) => Err(BqliteError::Execution(
+            "Wave 4 operator binding is not yet implemented (TASK-438)".into(),
+        )),
     }
 }
 

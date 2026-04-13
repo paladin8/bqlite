@@ -53,7 +53,7 @@ use bqlite_core::{
     TableSchema, Timestamp,
 };
 
-use crate::demand::{FusableAggregate, StepPropertyRef};
+use crate::demand::{ColumnId, FusableAggregate, StepPropertyRef};
 use crate::expr::{FunctionRegistry, TypedExpr};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -292,6 +292,138 @@ pub enum LogicalPlan {
         /// Identical to `input.output_schema()`.
         output_schema: OperatorSchema,
     },
+
+    // ── Wave 4 variants ────────────────────────────────────────────────────
+    /// `| SESSIONIZE gap: <dur> [end: <events>]` — session assignment.
+    /// Wave 4.
+    ///
+    /// Annotates each input event with `session_id` and `session_duration`
+    /// columns, grouping events into sessions based on inactivity gaps and
+    /// optional explicit end events.
+    ///
+    /// See `docs/design/operators/sessionize.md` and
+    /// `docs/design/planner/logical-plan-nodes.md` §5.2.
+    Sessionize {
+        /// Minimum inactivity gap (nanoseconds) that triggers a new session.
+        /// Boundary is exclusive: new session iff delta > gap.
+        gap: i64,
+        /// Event types that explicitly end a session. Empty = gap-only mode.
+        end_events: Vec<String>,
+        /// Columns that downstream operators need forwarded through the
+        /// session buffer. Populated by demand analysis.
+        forwarded_columns: Vec<ColumnId>,
+        /// Fused downstream aggregate specification (Wave 5).
+        /// Always `None` in v1.
+        fused_downstream: Option<FusedDownstream>,
+        /// Child plan feeding this sessionize operator.
+        input: Box<LogicalPlan>,
+        /// Output schema: input columns + `session_id: Int64 NOT NULL` +
+        /// `session_duration: Int64 NOT NULL`.
+        output_schema: OperatorSchema,
+    },
+
+    /// `| FIRST / LAST / NTH` — per-entity event sub-selection. Wave 4.
+    ///
+    /// Selects a single qualifying event per entity based on position
+    /// (first, last, or nth). Parameterized by `EventSelectKind` to
+    /// distinguish the three selection modes.
+    ///
+    /// See `docs/design/operators/event-select-sample.md` Block A and
+    /// `docs/design/planner/logical-plan-nodes.md` §5.2.
+    EventSelect {
+        /// Selection mode: FIRST, LAST, or NTH(n).
+        kind: EventSelectKind,
+        /// Event types eligible for selection. Length >= 1.
+        event_types: Vec<String>,
+        /// Optional per-event predicate (from WHERE clause), type-checked
+        /// against the input schema. Applied before position selection.
+        predicate: Option<TypedExpr>,
+        /// Scan-range backward extension for FIRST/NTH. `None` for LAST.
+        lookback: Option<i64>,
+        /// Columns that downstream operators need forwarded through the
+        /// candidate row. Populated by demand analysis.
+        forwarded_columns: Vec<ColumnId>,
+        /// Fused downstream aggregate specification (Wave 5).
+        /// Always `None` in v1.
+        fused_downstream: Option<FusedDownstream>,
+        /// Child plan feeding this event-select operator.
+        input: Box<LogicalPlan>,
+        /// Output schema: source-table columns (one row per entity).
+        output_schema: OperatorSchema,
+    },
+
+    /// `| ATTRIBUTE conversion: <e> touchpoints: <e> window: <d>
+    ///   touchpoint_key: <expr>` — multi-touch attribution. Wave 4.
+    ///
+    /// Finds touchpoint events preceding each conversion event within a
+    /// time window and auto-unnests them into flat rows — one row per
+    /// `(entity, conversion, matched-touchpoint)` triple.
+    ///
+    /// See `docs/design/operators/attribute.md` and
+    /// `docs/design/planner/logical-plan-nodes.md` §5.2.
+    Attribute {
+        /// Event type(s) that trigger conversion emission.
+        conversion_events: Vec<String>,
+        /// Event type(s) eligible as touchpoints.
+        touchpoint_events: Vec<String>,
+        /// Lookback window in nanoseconds.
+        window: i64,
+        /// Expression evaluated per qualifying touchpoint; result becomes
+        /// the `touchpoint_key` output column. Typed to `String`.
+        touchpoint_key: TypedExpr,
+        /// Demand-driven forwarded conversion properties.
+        forwarded_conversion_columns: Vec<ColumnId>,
+        /// Fused downstream aggregate specification (Wave 5).
+        /// Always `None` in v1.
+        fused_downstream: Option<FusedDownstream>,
+        /// Child plan feeding this attribute operator.
+        input: Box<LogicalPlan>,
+        /// Output schema: `entity_id`, `conversion_ts`,
+        /// demand-forwarded conversion properties, `touchpoint_ts?`,
+        /// `touchpoint_key?`.
+        output_schema: OperatorSchema,
+    },
+
+    /// `WHERE col IN QUERY <alias>` / `WHERE col IN (<subquery>)` —
+    /// cohort-based entity filtering. Wave 4.
+    ///
+    /// Materializes the subquery into a hash set and probes the outer
+    /// stream row-by-row. Output schema is identical to the outer input
+    /// (filter, not transform).
+    ///
+    /// See `docs/design/language/cohorts-aliases-joins.md` §4 and
+    /// `docs/design/planner/logical-plan-nodes.md` §5.2.
+    SubqueryFilter {
+        /// LHS column expression(s) for the IN check. Length 1 for
+        /// single-column cohorts; length N for tuple cohorts.
+        columns: Vec<TypedExpr>,
+        /// Inner pipeline producing the cohort set.
+        subquery: Box<LogicalPlan>,
+        /// Outer input stream being filtered.
+        input: Box<LogicalPlan>,
+        /// Identical to `input.output_schema()`.
+        output_schema: OperatorSchema,
+    },
+
+    /// `| SAMPLE fraction: <f> [seed: <s>]` — deterministic entity-level
+    /// sampling. Wave 4.
+    ///
+    /// Keeps roughly `fraction` of entities using a deterministic hash of
+    /// `entity_id`. Output schema is identical to the input schema.
+    ///
+    /// See `docs/design/operators/event-select-sample.md` Block B and
+    /// `docs/design/planner/logical-plan-nodes.md` §5.2.
+    Sample {
+        /// Fraction of entities to keep, in `[0.0, 1.0]`.
+        fraction: f64,
+        /// Optional explicit RNG seed for reproducible sampling.
+        /// `None` → engine uses a database-UUID-derived default seed.
+        seed: Option<i64>,
+        /// Child plan feeding this sample operator.
+        input: Box<LogicalPlan>,
+        /// Identical to `input.output_schema()`.
+        output_schema: OperatorSchema,
+    },
 }
 
 /// A single output item in a `LogicalPlan::Project`.
@@ -457,6 +589,29 @@ pub enum SortDirection {
     Desc,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4 logical plan support types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Selection mode for `LogicalPlan::EventSelect`.
+///
+/// Planner-level mirror of the AST's `EventSelectKind`. The AST uses
+/// `Nth(u64)` because the parser doesn't validate the range; the
+/// planner narrows to `u32` during AST→logical lowering (TASK-425)
+/// after validating `n >= 1`.
+///
+/// See `docs/design/operators/event-select-sample.md` §4.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventSelectKind {
+    /// Select the first qualifying event per entity.
+    First,
+    /// Select the last qualifying event per entity.
+    Last,
+    /// Select the nth qualifying event per entity (1-indexed).
+    /// Invariant: `n >= 1`, enforced at plan construction time.
+    Nth(u32),
+}
+
 impl LogicalPlan {
     /// The cached output schema for this plan node.
     ///
@@ -479,7 +634,13 @@ impl LogicalPlan {
             | LogicalPlan::SequenceMatch { output_schema, .. }
             | LogicalPlan::Aggregate { output_schema, .. }
             | LogicalPlan::Sort { output_schema, .. }
-            | LogicalPlan::Distinct { output_schema, .. } => output_schema,
+            | LogicalPlan::Distinct { output_schema, .. }
+            // Wave 4 variants.
+            | LogicalPlan::Sessionize { output_schema, .. }
+            | LogicalPlan::EventSelect { output_schema, .. }
+            | LogicalPlan::Attribute { output_schema, .. }
+            | LogicalPlan::SubqueryFilter { output_schema, .. }
+            | LogicalPlan::Sample { output_schema, .. } => output_schema,
         }
     }
 
