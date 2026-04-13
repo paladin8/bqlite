@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-418",
   "claimed_at": "2026-04-13T03:29:56Z",
+  "completed_at": "2026-04-13T04:15:00Z",
   "branch": "task/TASK-418",
   "description": "Frequency encoding"
 }
