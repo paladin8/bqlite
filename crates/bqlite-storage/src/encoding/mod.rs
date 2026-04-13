@@ -48,6 +48,7 @@ pub mod bitpacking;
 pub mod constant;
 pub mod delta;
 pub mod dictionary;
+pub mod fsst;
 pub mod lz4;
 pub mod plain;
 pub mod rle;
@@ -57,6 +58,7 @@ pub use bitpacking::BitPacking;
 pub use constant::Constant;
 pub use delta::Delta;
 pub use dictionary::Dictionary;
+pub use fsst::Fsst;
 pub use lz4::{compress_lz4, decompress_lz4, CompressionType};
 pub use plain::Plain;
 pub use rle::Rle;
@@ -66,8 +68,9 @@ pub use selector::{decode_cost, select_encoding, select_encoding_type, SelectedE
 ///
 /// Values match the `EncodingType` enum documented in
 /// `storage-format.md` §10.2. v1 readers recognize exactly the five
-/// v1 variants plus the Wave 4 `Rle` variant added by TASK-413. Any
-/// other discriminant in a segment file is treated as corruption.
+/// v1 variants plus the Wave 4 `Rle` (TASK-413) and `Fsst` (TASK-416)
+/// variants. Any other discriminant in a segment file is treated as
+/// corruption.
 /// Later waves extend this enum by adding variants (and bumping the
 /// segment format version); existing discriminants never change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,7 +113,7 @@ impl EncodingType {
 
     /// Parse a byte read out of a segment file back into an
     /// [`EncodingType`]. Unknown discriminants — including any
-    /// reserved-for-later-waves value (`3`, `7`, `8` ..) — produce
+    /// reserved-for-later-waves value (`3`, `8`, `9` ..) — produce
     /// [`BqliteError::Execution`] so the reader can surface a
     /// corruption error without panicking.
     ///
@@ -351,6 +354,7 @@ mod tests {
         assert_eq!(EncodingType::BitPacking.discriminant(), 4);
         assert_eq!(EncodingType::Rle.discriminant(), 5);
         assert_eq!(EncodingType::Constant.discriminant(), 6);
+        assert_eq!(EncodingType::Fsst.discriminant(), 7);
     }
 
     #[test]

@@ -478,6 +478,7 @@ dependencies = [
  "bitpacking",
  "bqlite-core",
  "csv",
+ "fsst-rs",
  "libc",
  "lz4_flex",
  "postcard",
@@ -874,6 +875,15 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "fsst-rs"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bf53d7c403a2b76873d4d66ba7d79c54bde2784cdaba6083f223d6e33270708"
+dependencies = [
+ "rustc-hash",
+]
 
 [[package]]
 name = "getrandom"
@@ -1571,6 +1581,12 @@ name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustc_version"

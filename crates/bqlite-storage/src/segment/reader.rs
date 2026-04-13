@@ -787,8 +787,8 @@ fn decode_column_chunk(
                 &write_time_col.bql_type,
             )?
         }
-        // NOTE: When TASK-416 lands FSST, Fsst will need its own
-        // match arm here (like Dictionary above) to access the
+        // NOTE: When TASK-419 wires the v2 reader, FSST will need its
+        // own match arm here (like Dictionary above) to access the
         // segment-level FSST symbol tables.
         EncodingType::Plain
         | EncodingType::Delta

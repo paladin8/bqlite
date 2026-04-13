@@ -19,6 +19,7 @@ lz4_flex = { workspace = true }
 postcard = { workspace = true }
 csv = { workspace = true }
 bitpacking = { workspace = true }
+fsst-rs = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
