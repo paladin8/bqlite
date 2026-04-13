@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-429",
+  "claimed_at": "2026-04-13T05:08:11Z",
+  "branch": "task/TASK-429",
+  "description": "EventSelectOperator"
+}
