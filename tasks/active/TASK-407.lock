@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-407",
+  "claimed_at": "2026-04-13T02:05:34Z",
+  "branch": "task/TASK-407",
+  "description": "Cohort materialization, alias binding, and entity joins"
+}
