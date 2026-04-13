@@ -63,7 +63,7 @@ use bqlite_core::{BqlType, Result};
 
 use super::{
     compress_lz4, require_dense, BitPacking, CompressionType, Constant, Delta, Dictionary,
-    EncodedChunk, Encoding, EncodingType, Plain,
+    EncodedChunk, Encoding, EncodingType, Plain, Rle,
 };
 
 /// LZ4 minimum compression threshold per `storage-format.md` §10.7
@@ -175,6 +175,15 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
     // resolved in Phase 2). Plain is included so it serves as the
     // universal fallback — every primitive type has at least Plain in
     // the candidate set, so `best` is always populated for primitives.
+    //
+    // Note: Rle is intentionally omitted here. Its registration —
+    // including the §3.7 average-run-length guard from
+    // `docs/design/storage/advanced-encodings.md` (only select RLE when
+    // `run_count < row_count / 2`) — is owned by TASK-419, which wires
+    // all Wave 4 surviving codecs into the selector together. Rle is
+    // already wired into `decode_cost`, `encode_with`,
+    // `parse_encoding_params_len`, and `dispatch_decode` so TASK-419
+    // only needs to append `&Rle` here and implement the guard.
     let candidates: &[&dyn Encoding] = &[&Plain, &Dictionary, &Delta, &BitPacking];
     let mut best: Option<(EncodingType, usize, u8)> = None;
     for enc in candidates {
@@ -219,9 +228,10 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
 /// |------------|------|-------------------------------------------|
 /// | Constant   | 0    | broadcast a single value into an array    |
 /// | Plain      | 1    | memcpy / fixed-stride read                 |
-/// | BitPacking | 2    | bit-pack unpack into i64                   |
-/// | Delta      | 3    | bit-pack unpack + cumulative sum           |
-/// | Dictionary | 4    | bit-pack unpack + per-row dict lookup      |
+/// | Rle        | 2    | sequential run broadcast (cache-friendly)  |
+/// | BitPacking | 3    | bit-pack unpack into i64                   |
+/// | Delta      | 4    | bit-pack unpack + cumulative sum           |
+/// | Dictionary | 5    | bit-pack unpack + per-row dict lookup      |
 ///
 /// These are *relative* costs used only as tiebreakers — the absolute
 /// values have no meaning beyond the ordering. The selector ranks by
@@ -231,9 +241,10 @@ pub const fn decode_cost(enc: EncodingType) -> u8 {
     match enc {
         EncodingType::Constant => 0,
         EncodingType::Plain => 1,
-        EncodingType::BitPacking => 2,
-        EncodingType::Delta => 3,
-        EncodingType::Dictionary => 4,
+        EncodingType::Rle => 2,
+        EncodingType::BitPacking => 3,
+        EncodingType::Delta => 4,
+        EncodingType::Dictionary => 5,
     }
 }
 
@@ -265,7 +276,7 @@ fn pick_compression(chunk: &EncodedChunk) -> (CompressionType, Vec<u8>) {
 /// Dispatch to a specific encoding's `encode` method by discriminant.
 ///
 /// Used by `select_encoding` after the heuristic picks a winner. The
-/// match is exhaustive over the v1 encoding set so adding a new
+/// match is exhaustive over the known encoding set so adding a new
 /// encoding (Wave 4+) requires updating this function and the
 /// `decode_cost` table together.
 fn encode_with(encoding: EncodingType, array: &dyn Array) -> Result<EncodedChunk> {
@@ -275,6 +286,7 @@ fn encode_with(encoding: EncodingType, array: &dyn Array) -> Result<EncodedChunk
         EncodingType::Dictionary => Dictionary.encode(array),
         EncodingType::Delta => Delta.encode(array),
         EncodingType::BitPacking => BitPacking.encode(array),
+        EncodingType::Rle => Rle.encode(array),
     }
 }
 
@@ -369,7 +381,7 @@ mod tests {
     use bqlite_core::BqliteError;
     use std::sync::Arc;
 
-    use super::super::{decompress_lz4, EncodingType};
+    use super::super::{decompress_lz4, EncodingType, Rle};
 
     /// Drive `select_encoding` and verify the chosen encoding's
     /// decode of the (possibly LZ4-decompressed) on-disk payload
@@ -397,6 +409,7 @@ mod tests {
             EncodingType::Dictionary => Dictionary.decode(&selected.chunk, &ty),
             EncodingType::Delta => Delta.decode(&selected.chunk, &ty),
             EncodingType::BitPacking => BitPacking.decode(&selected.chunk, &ty),
+            EncodingType::Rle => Rle.decode(&selected.chunk, &ty),
         }
         .expect("decode must succeed");
         assert_eq!(
@@ -543,9 +556,10 @@ mod tests {
 
     #[test]
     fn alternating_bool_picks_plain() {
-        // Bool has Plain + Constant in the v1 set. Alternating bools
-        // are not uniform, so Constant is out, and Plain is the only
-        // remaining candidate.
+        // Bool has Plain + Constant in the current candidate set (Rle
+        // is deferred to TASK-419). Alternating bools are not uniform,
+        // so Constant is out, and Plain is the only remaining
+        // registered candidate.
         let values: Vec<bool> = (0..50).map(|i| i % 2 == 0).collect();
         let array: ArrayRef = Arc::new(BooleanArray::from(values));
         let chosen = select_and_round_trip(array, BqlType::Bool);
@@ -662,8 +676,10 @@ mod tests {
     fn decode_cost_orders_encodings_correctly() {
         // The cost table is the tiebreaker; assert the relative order
         // matches the documented "fastest decode wins" rule.
+        // Full ordering: Constant < Plain < Rle < BitPacking < Delta < Dictionary.
         assert!(decode_cost(EncodingType::Constant) < decode_cost(EncodingType::Plain));
-        assert!(decode_cost(EncodingType::Plain) < decode_cost(EncodingType::BitPacking));
+        assert!(decode_cost(EncodingType::Plain) < decode_cost(EncodingType::Rle));
+        assert!(decode_cost(EncodingType::Rle) < decode_cost(EncodingType::BitPacking));
         assert!(decode_cost(EncodingType::BitPacking) < decode_cost(EncodingType::Delta));
         assert!(decode_cost(EncodingType::Delta) < decode_cost(EncodingType::Dictionary));
     }

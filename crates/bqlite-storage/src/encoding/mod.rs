@@ -50,6 +50,7 @@ pub mod delta;
 pub mod dictionary;
 pub mod lz4;
 pub mod plain;
+pub mod rle;
 pub mod selector;
 
 pub use bitpacking::BitPacking;
@@ -58,16 +59,17 @@ pub use delta::Delta;
 pub use dictionary::Dictionary;
 pub use lz4::{compress_lz4, decompress_lz4, CompressionType};
 pub use plain::Plain;
+pub use rle::Rle;
 pub use selector::{decode_cost, select_encoding, select_encoding_type, SelectedEncoding};
 
 /// On-disk encoding discriminant per `segment-format-v1.md` §9.
 ///
 /// Values match the `EncodingType` enum documented in
 /// `storage-format.md` §10.2. v1 readers recognize exactly the five
-/// variants below; any other discriminant in a segment file is
-/// treated as corruption. Later waves extend this enum by adding
-/// variants (and bumping the segment format version); existing
-/// discriminants never change.
+/// v1 variants plus the Wave 4 `Rle` variant added by TASK-413. Any
+/// other discriminant in a segment file is treated as corruption.
+/// Later waves extend this enum by adding variants (and bumping the
+/// segment format version); existing discriminants never change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum EncodingType {
@@ -75,11 +77,13 @@ pub enum EncodingType {
     Plain = 0,
     /// Sorted distinct values + bit-packed ordinal codes. §9.2.
     Dictionary = 1,
-    /// Reserved for TASK-208.
+    /// First-value + zigzag bit-packed residuals. §9.3.
     Delta = 2,
-    /// Reserved for TASK-209.
+    /// Bit-packed offsets from a min-value frame of reference. §9.4.
     BitPacking = 4,
-    /// Reserved for TASK-210.
+    /// Run-length encoding: (run_ends, values) pairs. Wave 4 / TASK-413.
+    Rle = 5,
+    /// Zero-payload single-value encoding. §9.5.
     Constant = 6,
 }
 
@@ -91,7 +95,7 @@ impl EncodingType {
 
     /// Parse a byte read out of a segment file back into an
     /// [`EncodingType`]. Unknown discriminants — including any
-    /// reserved-for-later-waves value (`3`, `5`, `7` ..) — produce
+    /// reserved-for-later-waves value (`3`, `7`, `8` ..) — produce
     /// [`BqliteError::Execution`] so the reader can surface a
     /// corruption error without panicking.
     pub fn from_discriminant(byte: u8) -> Result<Self> {
@@ -100,6 +104,7 @@ impl EncodingType {
             1 => Ok(Self::Dictionary),
             2 => Ok(Self::Delta),
             4 => Ok(Self::BitPacking),
+            5 => Ok(Self::Rle),
             6 => Ok(Self::Constant),
             other => Err(BqliteError::Execution(format!(
                 "unknown encoding discriminant {other} — segment written by an incompatible version"
@@ -273,6 +278,7 @@ mod tests {
             EncodingType::Dictionary,
             EncodingType::Delta,
             EncodingType::BitPacking,
+            EncodingType::Rle,
             EncodingType::Constant,
         ] {
             let byte = variant.discriminant();
@@ -284,18 +290,21 @@ mod tests {
     #[test]
     fn encoding_type_discriminants_match_segment_format_v1_spec() {
         // Values pinned to `segment-format-v1.md` §9 and
-        // `storage-format.md` §10.2 so that later-wave encodings
-        // (Rle = 5, Fsst = 7, ...) can be added without renumbering.
+        // `storage-format.md` §10.2 and `advanced-encodings.md` §3
+        // so that later-wave encodings (Fsst = 7, ...) can be added
+        // without renumbering.
         assert_eq!(EncodingType::Plain.discriminant(), 0);
         assert_eq!(EncodingType::Dictionary.discriminant(), 1);
         assert_eq!(EncodingType::Delta.discriminant(), 2);
         assert_eq!(EncodingType::BitPacking.discriminant(), 4);
+        assert_eq!(EncodingType::Rle.discriminant(), 5);
         assert_eq!(EncodingType::Constant.discriminant(), 6);
     }
 
     #[test]
     fn unknown_discriminant_is_a_typed_execution_error() {
-        for byte in [3u8, 5, 7, 8, 255] {
+        // Bytes 3, 7, 8, 255 are still unassigned. Byte 5 is now Rle.
+        for byte in [3u8, 7, 8, 255] {
             let err = EncodingType::from_discriminant(byte).unwrap_err();
             match err {
                 BqliteError::Execution(msg) => {

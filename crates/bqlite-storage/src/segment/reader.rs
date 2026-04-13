@@ -66,7 +66,7 @@ use crate::encoding::dictionary::{
 };
 use crate::encoding::{
     decompress_lz4, BitPacking, BorrowedEncodedChunk, Constant, Delta, Encoding, EncodingType,
-    Plain,
+    Plain, Rle,
 };
 use crate::segment::layout::{
     ColumnChunkMeta, CompressionType, FooterV1, CHECKSUM_LEN, CHECKSUM_SEED, FILE_HEADER_LEN,
@@ -790,7 +790,8 @@ fn decode_column_chunk(
         EncodingType::Plain
         | EncodingType::Delta
         | EncodingType::BitPacking
-        | EncodingType::Constant => {
+        | EncodingType::Constant
+        | EncodingType::Rle => {
             let chunk = BorrowedEncodedChunk {
                 encoding,
                 params: on_disk_params,
@@ -842,6 +843,8 @@ fn parse_encoding_params_len(
         EncodingType::Delta => Ok(9),
         // `min_value: i64 LE` + `bit_width: u8`.
         EncodingType::BitPacking => Ok(9),
+        // `run_count: u32 LE`.
+        EncodingType::Rle => Ok(4),
         EncodingType::Constant => {
             if after_discriminant.is_empty() {
                 return Err("Constant encoding missing value_kind byte".to_string());
@@ -962,6 +965,7 @@ fn dispatch_decode(
         EncodingType::Delta => Delta.decode_borrowed(chunk, ty),
         EncodingType::BitPacking => BitPacking.decode_borrowed(chunk, ty),
         EncodingType::Constant => Constant.decode_borrowed(chunk, ty),
+        EncodingType::Rle => Rle.decode_borrowed(chunk, ty),
     }
 }
 
