@@ -44,6 +44,7 @@
 use arrow::array::{Array, ArrayRef};
 use bqlite_core::{BqlType, BqliteError, Result};
 
+pub mod alp;
 pub mod bitpacking;
 pub mod constant;
 pub mod delta;
@@ -57,6 +58,7 @@ pub mod plain;
 pub mod rle;
 pub mod selector;
 
+pub use alp::Alp;
 pub use bitpacking::BitPacking;
 pub use constant::Constant;
 pub use delta::Delta;

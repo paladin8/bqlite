@@ -65,7 +65,7 @@ use crate::encoding::dictionary::{
     payload_byte_count as dictionary_payload_byte_count, unpack_codes,
 };
 use crate::encoding::{
-    decompress_lz4, BitPacking, BorrowedEncodedChunk, Constant, Delta, DoubleDelta, Encoding,
+    decompress_lz4, Alp, BitPacking, BorrowedEncodedChunk, Constant, Delta, DoubleDelta, Encoding,
     EncodingType, ForEncoding, Plain, Rle,
 };
 use crate::segment::layout::{
@@ -1008,11 +1008,10 @@ fn dispatch_decode(
         EncodingType::Constant => Constant.decode_borrowed(chunk, ty),
         EncodingType::Rle => Rle.decode_borrowed(chunk, ty),
         EncodingType::For => ForEncoding.decode_borrowed(chunk, ty),
-        // v2 encodings — decode implementations land in TASK-416 through TASK-418, TASK-450.
-        EncodingType::Fsst
-        | EncodingType::PFor
-        | EncodingType::Alp => Err(BqliteError::Execution(format!(
-            "v2 encoding {encoding:?} decode not yet implemented (TASK-416–TASK-418)"
+        EncodingType::Alp => Alp.decode_borrowed(chunk, ty),
+        // v2 encodings — decode implementations land in TASK-450.
+        EncodingType::Fsst | EncodingType::PFor => Err(BqliteError::Execution(format!(
+            "v2 encoding {encoding:?} decode not yet implemented (TASK-450)"
         ))),
     }
 }

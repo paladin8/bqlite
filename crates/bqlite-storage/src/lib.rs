@@ -58,7 +58,7 @@ pub use database::{
     empty_segment_reader, Database, LOCK_FILE_NAME, MANIFEST_FILE_NAME, MANIFEST_TMP_FILE_NAME,
 };
 pub use encoding::{
-    select_encoding, select_encoding_type, BitPacking, CompressionType, Constant, Delta,
+    select_encoding, select_encoding_type, Alp, BitPacking, CompressionType, Constant, Delta,
     Dictionary, DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Fsst, Plain, Rle,
     SelectedEncoding,
 };

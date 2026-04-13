@@ -62,7 +62,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use bqlite_core::{BqlType, BqliteError, Result};
 
 use super::{
-    compress_lz4, require_dense, BitPacking, CompressionType, Constant, Delta, Dictionary,
+    compress_lz4, require_dense, Alp, BitPacking, CompressionType, Constant, Delta, Dictionary,
     DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Plain, Rle,
 };
 
@@ -305,11 +305,12 @@ fn encode_with(encoding: EncodingType, array: &dyn Array) -> Result<EncodedChunk
         EncodingType::Rle => Rle.encode(array),
         EncodingType::DoubleDelta => DoubleDelta.encode(array),
         EncodingType::For => ForEncoding.encode(array),
-        // v2 encodings — implementations land in TASK-416 through TASK-418, TASK-450.
+        EncodingType::Alp => Alp.encode(array),
+        // v2 encodings — implementations land in TASK-450.
         // The selector never picks these; this arm exists only for exhaustiveness.
-        EncodingType::Fsst | EncodingType::PFor | EncodingType::Alp => Err(BqliteError::Execution(
-            format!("v2 encoding {encoding:?} encode not yet implemented"),
-        )),
+        EncodingType::Fsst | EncodingType::PFor => Err(BqliteError::Execution(format!(
+            "v2 encoding {encoding:?} encode not yet implemented"
+        ))),
     }
 }
 
