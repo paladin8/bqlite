@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-404",
+  "claimed_at": "2026-04-13T02:06:28Z",
+  "branch": "task/TASK-404",
+  "description": "Tombstone and delete semantics"
+}
