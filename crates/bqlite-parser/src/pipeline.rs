@@ -25,9 +25,9 @@
 #![allow(dead_code)] // TASK-221 / TASK-222 productions reach this module later.
 
 use bqlite_ast::{
-    AggItem, Attribute, BracketSpec, EventRef, Expr, Funnel, GroupItem, MatchMode, MatchPattern,
-    Name, OrderItem, PipelineStage, Retention, SelectItem, SelectItemKind, Sessionize, SortDir,
-    Spanned,
+    AggItem, Attribute, BracketSpec, EventRef, EventSelect, EventSelectKind, Expr, Funnel,
+    GroupItem, MatchMode, MatchPattern, Name, OrderItem, PipelineStage, Retention, Sample,
+    SelectItem, SelectItemKind, Sessionize, SortDir, Spanned,
 };
 
 use crate::pattern::parse_step_list;
@@ -97,6 +97,12 @@ fn parse_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
         TokenKind::Kw(Keyword::Retention) => parse_retention_stage(p),
         // `SESSIONIZE(gap: …, end: …)` — session assignment (§8, TASK-420).
         TokenKind::Kw(Keyword::Sessionize) => parse_sessionize_stage(p),
+        // `FIRST(…)` / `LAST(…)` — per-entity event selection (§14.1, TASK-421).
+        TokenKind::Kw(Keyword::First) | TokenKind::Kw(Keyword::Last) => parse_first_last_stage(p),
+        // `NTH(…)` — nth per-entity event (§14.1, TASK-421).
+        TokenKind::Kw(Keyword::Nth) => parse_nth_stage(p),
+        // `SAMPLE(fraction: …)` — entity sampling (§14.2, TASK-421).
+        TokenKind::Kw(Keyword::Sample) => parse_sample_stage(p),
         // `ATTRIBUTE(conversion: …, touchpoints: …, window: …, touchpoint_key: …)` —
         // attribution operator (§14.3 / §26 line 1638, TASK-422).
         TokenKind::Kw(Keyword::Attribute) => parse_attribute_stage(p),
@@ -1135,6 +1141,407 @@ fn parse_end_event_list(p: &mut Parser) -> Result<Vec<EventRef>, ParseError> {
         Ok(vec![parse_event_ref(p)?])
     }
 }
+
+// FIRST / LAST / NTH
+// ----------------------------------------------------------------------
+
+/// Parse the `event_ref_list` production used by FIRST, LAST, NTH, and
+/// related operators (query-language.md §26):
+///
+/// ```text
+/// event_ref_list := event_ref
+///                 | "(" event_ref ("," event_ref)* ")"
+/// ```
+///
+/// The single-arg form `FIRST(purchase)` produces a one-element `Vec`.
+/// The parenthesized list form `FIRST((login, sso_login))` produces a
+/// longer one. Duplicate event names within a list are rejected here
+/// (event-select-sample.md §5.1).
+///
+/// # Error cases
+/// - Empty list `()` → `Expected::EventRef`
+/// - Duplicate event name `(a, a)` → `Expected::EventRef` with detail
+fn parse_event_ref_list(p: &mut Parser) -> Result<Vec<EventRef>, ParseError> {
+    if matches!(p.peek_kind(), TokenKind::LParen) {
+        let lparen_tok = p.bump(); // consume "("
+        let lparen_span = token_span(&lparen_tok);
+
+        // Empty list `()` is not allowed — at least one event ref is required.
+        if matches!(p.peek_kind(), TokenKind::RParen) {
+            return Err(ParseError::Unexpected {
+                offset: lparen_span.start,
+                line: lparen_span.line,
+                column: lparen_span.column,
+                expected: Expected::EventRef,
+                found: "()".to_string(),
+                detail: Some("event list cannot be empty; provide at least one event type"),
+            });
+        }
+
+        let mut events = Vec::new();
+        events.push(parse_event_ref(p)?);
+
+        while matches!(p.peek_kind(), TokenKind::Comma) {
+            p.bump(); // consume ","
+
+            // Guard: if next token is `)` that's a trailing comma error.
+            if matches!(p.peek_kind(), TokenKind::RParen) {
+                return Err(
+                    p.error_unexpected(Expected::EventRef, Some("trailing comma in event list"))
+                );
+            }
+
+            let er = parse_event_ref(p)?;
+            // Duplicate-check on the full (table, event) pair (O(n²) for small lists).
+            // Two refs are duplicates only when both the table qualifier AND the
+            // event name are identical. `events.login` and `purchases.login` are
+            // different qualified refs and are not duplicates (mirrors SESSIONIZE
+            // `parse_end_event_list` behaviour).
+            let er_table = er.table.as_ref().map(|t| t.text.as_str());
+            let dup = events.iter().any(|prev: &EventRef| {
+                prev.event.text == er.event.text
+                    && prev.table.as_ref().map(|t| t.text.as_str()) == er_table
+            });
+            if dup {
+                return Err(ParseError::Unexpected {
+                    offset: er.span.start,
+                    line: er.span.line,
+                    column: er.span.column,
+                    expected: Expected::EventRef,
+                    found: er.event.text.clone(),
+                    detail: Some(
+                        "duplicate event type in list; each event type may appear only once",
+                    ),
+                });
+            }
+            events.push(er);
+        }
+
+        p.expect_punct(&TokenKind::RParen, ")")?;
+        Ok(events)
+    } else {
+        // Single unparenthesized event ref: `FIRST(purchase)`.
+        Ok(vec![parse_event_ref(p)?])
+    }
+}
+
+/// `FIRST "(" event_ref_list (WHERE predicate)? ("," "lookback" ":" duration)? ")"`
+/// `LAST  "(" event_ref_list (WHERE predicate)? ")"`
+///
+/// Grammar (query-language.md §26):
+/// ```text
+/// first_last_op := FIRST "(" event_ref_list (WHERE predicate)?
+///                             ("," "lookback" ":" duration)? ")"
+///               | LAST "(" event_ref_list (WHERE predicate)? ")"
+/// ```
+///
+/// # Error cases
+/// - `LAST(…, lookback: …)` — LAST does not accept `lookback:` (§14.1)
+/// - Unknown key after `,` — explicit detail pointing at the unknown key
+/// - `lookback:` on NTH is handled by `parse_nth_stage`
+fn parse_first_last_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    // Consume the leading FIRST or LAST keyword.
+    let is_first = matches!(p.peek_kind(), TokenKind::Kw(Keyword::First));
+    let kw_tok = if is_first {
+        p.expect_kw(Keyword::First)?
+    } else {
+        p.expect_kw(Keyword::Last)?
+    };
+    let kind = if is_first {
+        EventSelectKind::First
+    } else {
+        EventSelectKind::Last
+    };
+    let start_span = token_span(&kw_tok);
+
+    p.expect_punct(&TokenKind::LParen, "(")?;
+
+    // event_ref_list (single or parenthesized list).
+    let events = parse_event_ref_list(p)?;
+
+    // Optional WHERE predicate.
+    let predicate = if p.try_kw(Keyword::Where).is_some() {
+        Some(parse_expression(p)?)
+    } else {
+        None
+    };
+
+    // Optional `, lookback: <duration>` — only valid for FIRST.
+    let lookback = if matches!(p.peek_kind(), TokenKind::Comma) {
+        // Consume the comma speculatively; we'll error if the key is wrong or
+        // if it's a `lookback:` on LAST.
+        p.bump(); // consume ","
+        let key_name = p.expect_name(NameRole::ColumnName)?;
+        if key_name.text != "lookback" {
+            // Unknown key — the error detail depends on which operator we're in.
+            let detail = if kind == EventSelectKind::First {
+                "only `lookback: <duration>` is accepted as a trailing parameter in FIRST"
+            } else {
+                "LAST does not accept any trailing parameters (query-language.md §14.1)"
+            };
+            return Err(ParseError::Unexpected {
+                offset: key_name.span.start,
+                line: key_name.span.line,
+                column: key_name.span.column,
+                expected: Expected::Keyword("lookback"),
+                found: key_name.text.clone(),
+                detail: Some(detail),
+            });
+        }
+
+        // `lookback:` is not valid on LAST — reject before consuming `:` so
+        // the error position correctly identifies the `lookback` identifier.
+        if kind == EventSelectKind::Last {
+            return Err(ParseError::Unexpected {
+                offset: key_name.span.start,
+                line: key_name.span.line,
+                column: key_name.span.column,
+                expected: Expected::Punct(")"),
+                found: "lookback".to_string(),
+                detail: Some(
+                    "LAST does not accept `lookback:` — use FIRST or NTH for backward-extended \
+                     scan ranges (query-language.md §14.1)",
+                ),
+            });
+        }
+
+        p.expect_punct(&TokenKind::Colon, ":")?;
+
+        // Consume the duration literal.
+        if let TokenKind::Duration(ns) = p.peek().kind {
+            let _ = p.bump();
+            Some(ns)
+        } else {
+            return Err(p.error_unexpected(
+                Expected::Literal,
+                Some("expected a duration literal (e.g. `90d`) after `lookback:`"),
+            ));
+        }
+    } else {
+        None
+    };
+
+    let rparen_tok = p.expect_punct(&TokenKind::RParen, ")")?;
+    let rparen_span = token_span(&rparen_tok);
+    let span = start_span.merged(rparen_span);
+
+    Ok(PipelineStage::EventSelect(EventSelect {
+        kind,
+        events,
+        predicate,
+        lookback,
+        span,
+    }))
+}
+
+/// `NTH "(" event_ref_list (WHERE predicate)? "," integer
+///          ("," "lookback" ":" duration)? ")"`
+///
+/// Grammar (query-language.md §26):
+/// ```text
+/// nth_op := NTH "(" event_ref_list (WHERE predicate)? "," integer
+///                    ("," "lookback" ":" duration)? ")"
+/// ```
+///
+/// The positional `integer` argument (1-indexed, >= 1) always follows the
+/// event list (and optional WHERE). The parser rejects `n == 0`.
+///
+/// # Error cases
+/// - Missing `,` before `n` → `Expected::Punct(",")`
+/// - `n == 0` → explicit detail
+/// - Negative or non-integer `n` → `Expected::Integer`
+/// - Unknown key after second `,` → explicit detail
+fn parse_nth_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    let nth_tok = p.expect_kw(Keyword::Nth)?;
+    let start_span = token_span(&nth_tok);
+
+    p.expect_punct(&TokenKind::LParen, "(")?;
+
+    // event_ref_list (single or parenthesized list).
+    let events = parse_event_ref_list(p)?;
+
+    // Optional WHERE predicate.
+    let predicate = if p.try_kw(Keyword::Where).is_some() {
+        Some(parse_expression(p)?)
+    } else {
+        None
+    };
+
+    // Required comma before the positional `n`.
+    p.expect_punct(&TokenKind::Comma, ",")?;
+
+    // Positional integer `n` — must be >= 1.
+    // The lexer only produces non-negative `Int` tokens, so `n_raw < 0` is
+    // unreachable from source text; the `<= 0` guard is a defensive
+    // belt-and-suspenders check that also covers the `n_raw == 0` case.
+    // The upper bound rejects values > u32::MAX to prevent silent truncation
+    // (e.g. 4294967296i64 as u32 == 0, which would bypass the n>=1 invariant).
+    let (n_raw, n_span) = p.expect_int()?;
+    if n_raw <= 0 || n_raw > u32::MAX as i64 {
+        return Err(ParseError::Unexpected {
+            offset: n_span.start,
+            line: n_span.line,
+            column: n_span.column,
+            expected: Expected::Integer,
+            found: n_raw.to_string(),
+            detail: Some(
+                "NTH position `n` must be >= 1; the first qualifying event is NTH(..., 1)",
+            ),
+        });
+    }
+    // Safe cast: n_raw is in 1..=u32::MAX at this point.
+    let n = n_raw as u32;
+
+    // Optional `, lookback: <duration>`.
+    let lookback = if matches!(p.peek_kind(), TokenKind::Comma) {
+        p.bump(); // consume ","
+        let key_name = p.expect_name(NameRole::ColumnName)?;
+        if key_name.text != "lookback" {
+            return Err(ParseError::Unexpected {
+                offset: key_name.span.start,
+                line: key_name.span.line,
+                column: key_name.span.column,
+                expected: Expected::Keyword("lookback"),
+                found: key_name.text.clone(),
+                detail: Some(
+                    "only `lookback: <duration>` is accepted as the third argument to NTH",
+                ),
+            });
+        }
+        p.expect_punct(&TokenKind::Colon, ":")?;
+        if let TokenKind::Duration(ns) = p.peek().kind {
+            let _ = p.bump();
+            Some(ns)
+        } else {
+            return Err(p.error_unexpected(
+                Expected::Literal,
+                Some("expected a duration literal (e.g. `90d`) after `lookback:`"),
+            ));
+        }
+    } else {
+        None
+    };
+
+    let rparen_tok = p.expect_punct(&TokenKind::RParen, ")")?;
+    let rparen_span = token_span(&rparen_tok);
+    let span = start_span.merged(rparen_span);
+
+    Ok(PipelineStage::EventSelect(EventSelect {
+        kind: EventSelectKind::Nth(n),
+        events,
+        predicate,
+        lookback,
+        span,
+    }))
+}
+
+// ----------------------------------------------------------------------
+// SAMPLE
+// ----------------------------------------------------------------------
+
+/// `SAMPLE "(" "fraction" ":" number ("," "seed" ":" integer)? ")"`
+///
+/// Grammar (query-language.md §26):
+/// ```text
+/// sample_op := SAMPLE "(" "fraction" ":" number
+///                         ("," "seed" ":" integer)? ")"
+/// ```
+///
+/// Only `fraction:` (a float in `[0.0, 1.0]`) is accepted — the
+/// `count:` parameter has been removed from the v1 surface
+/// (event-select-sample.md §15.2). `fraction:` values outside `[0.0, 1.0]`
+/// are rejected at parse time (§15.1).
+///
+/// # Error cases
+/// - First key is not `fraction` → `Expected::Keyword("fraction")`
+/// - `fraction:` value is outside `[0.0, 1.0]` → explicit detail
+/// - Second key is not `seed` → `Expected::Keyword("seed")`
+fn parse_sample_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    let sample_tok = p.expect_kw(Keyword::Sample)?;
+    let start_span = token_span(&sample_tok);
+
+    p.expect_punct(&TokenKind::LParen, "(")?;
+
+    // `fraction` key.
+    let frac_name = p.expect_name(NameRole::ColumnName)?;
+    if frac_name.text != "fraction" {
+        return Err(ParseError::Unexpected {
+            offset: frac_name.span.start,
+            line: frac_name.span.line,
+            column: frac_name.span.column,
+            expected: Expected::Keyword("fraction"),
+            found: frac_name.text.clone(),
+            detail: Some(
+                "SAMPLE requires `fraction: <float>` as its first parameter; \
+                 the `count:` parameter is not supported in v1",
+            ),
+        });
+    }
+    p.expect_punct(&TokenKind::Colon, ":")?;
+
+    // `fraction:` value — must be a float literal in `[0.0, 1.0]`.
+    let (fraction, frac_span) = if let TokenKind::Number(v) = p.peek().kind {
+        let tok = p.bump();
+        (v, token_span(&tok))
+    } else if let TokenKind::Int(v) = p.peek().kind {
+        // Accept bare integers `0` and `1` as valid fractions.
+        let tok = p.bump();
+        (v as f64, token_span(&tok))
+    } else {
+        return Err(p.error_unexpected(
+            Expected::Literal,
+            Some("expected a float literal (e.g. `0.1`) after `fraction:`"),
+        ));
+    };
+
+    if !(0.0..=1.0).contains(&fraction) {
+        return Err(ParseError::Unexpected {
+            offset: frac_span.start,
+            line: frac_span.line,
+            column: frac_span.column,
+            expected: Expected::Literal,
+            found: fraction.to_string(),
+            detail: Some(
+                "`fraction:` must be in [0.0, 1.0]; use 0.0 for empty output, 1.0 for pass-through",
+            ),
+        });
+    }
+
+    // Optional `, seed: <integer>`.
+    let seed = if matches!(p.peek_kind(), TokenKind::Comma) {
+        p.bump(); // consume ","
+        let key_name = p.expect_name(NameRole::ColumnName)?;
+        if key_name.text != "seed" {
+            return Err(ParseError::Unexpected {
+                offset: key_name.span.start,
+                line: key_name.span.line,
+                column: key_name.span.column,
+                expected: Expected::Keyword("seed"),
+                found: key_name.text.clone(),
+                detail: Some(
+                    "only `seed: <integer>` is accepted as the second parameter to SAMPLE",
+                ),
+            });
+        }
+        p.expect_punct(&TokenKind::Colon, ":")?;
+        let (seed_val, _) = p.expect_int()?;
+        Some(seed_val)
+    } else {
+        None
+    };
+
+    let rparen_tok = p.expect_punct(&TokenKind::RParen, ")")?;
+    let rparen_span = token_span(&rparen_tok);
+    let span = start_span.merged(rparen_span);
+
+    Ok(PipelineStage::Sample(Sample {
+        fraction,
+        seed,
+        span,
+    }))
+}
+
+// ----------------------------------------------------------------------
 
 // ----------------------------------------------------------------------
 // ATTRIBUTE
@@ -3970,5 +4377,410 @@ mod tests {
         assert!(matches!(stages[0], PipelineStage::Attribute(_)));
         assert!(matches!(stages[1], PipelineStage::Where { .. }));
         assert!(matches!(stages[2], PipelineStage::Stats { .. }));
+    }
+
+    // --- FIRST / LAST / NTH ------------------------------------------
+
+    fn event_select_of(stmt: &Statement) -> &bqlite_ast::EventSelect {
+        let stages = stages_of(stmt);
+        assert_eq!(stages.len(), 1);
+        match &stages[0] {
+            PipelineStage::EventSelect(e) => e,
+            other => panic!("expected EventSelect, got {other:?}"),
+        }
+    }
+
+    fn sample_of(stmt: &Statement) -> &bqlite_ast::Sample {
+        let stages = stages_of(stmt);
+        assert_eq!(stages.len(), 1);
+        match &stages[0] {
+            PipelineStage::Sample(s) => s,
+            other => panic!("expected Sample, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_single_event() {
+        // `events | FIRST(purchase)` — one event type, no WHERE.
+        let stmt = parse_stmt("events | FIRST(purchase)");
+        let es = event_select_of(&stmt);
+        assert_eq!(es.kind, EventSelectKind::First);
+        assert_eq!(es.events.len(), 1);
+        assert_eq!(es.events[0].event.text, "purchase");
+        assert!(es.predicate.is_none());
+        assert!(es.lookback.is_none());
+    }
+
+    #[test]
+    fn last_single_event() {
+        // `events | LAST(page_view)` — LAST with one event type.
+        let stmt = parse_stmt("events | LAST(page_view)");
+        let es = event_select_of(&stmt);
+        assert_eq!(es.kind, EventSelectKind::Last);
+        assert_eq!(es.events.len(), 1);
+        assert_eq!(es.events[0].event.text, "page_view");
+        assert!(es.lookback.is_none());
+    }
+
+    #[test]
+    fn nth_basic_argument_order() {
+        // `events | NTH(page_view, 3)` — event then n.
+        let stmt = parse_stmt("events | NTH(page_view, 3)");
+        let es = event_select_of(&stmt);
+        assert_eq!(es.kind, EventSelectKind::Nth(3));
+        assert_eq!(es.events.len(), 1);
+        assert_eq!(es.events[0].event.text, "page_view");
+        assert!(es.predicate.is_none());
+        assert!(es.lookback.is_none());
+    }
+
+    #[test]
+    fn event_select_with_where_predicate() {
+        // `FIRST(purchase WHERE amount > 100)` — predicate on the event.
+        let stmt = parse_stmt("events | FIRST(purchase WHERE amount > 100)");
+        let es = event_select_of(&stmt);
+        assert!(es.predicate.is_some());
+    }
+
+    #[test]
+    fn nth_where_then_n() {
+        // `NTH(purchase WHERE amount > 100, 3)` — WHERE before `n`.
+        let stmt = parse_stmt("events | NTH(purchase WHERE amount > 100, 3)");
+        let es = event_select_of(&stmt);
+        assert_eq!(es.kind, EventSelectKind::Nth(3));
+        assert!(es.predicate.is_some());
+    }
+
+    #[test]
+    fn first_with_lookback() {
+        // `FIRST(signup, lookback: 90d)` — with lookback parameter.
+        let stmt = parse_stmt("events | FIRST(signup, lookback: 90d)");
+        let es = event_select_of(&stmt);
+        assert_eq!(es.kind, EventSelectKind::First);
+        // 90 days in nanoseconds.
+        assert_eq!(es.lookback, Some(90 * 24 * 3_600_000_000_000_i64));
+    }
+
+    #[test]
+    fn nth_with_lookback() {
+        // `NTH(purchase, 3, lookback: 90d)` — NTH with lookback.
+        let stmt = parse_stmt("events | NTH(purchase, 3, lookback: 90d)");
+        let es = event_select_of(&stmt);
+        assert_eq!(es.kind, EventSelectKind::Nth(3));
+        assert_eq!(es.lookback, Some(90 * 24 * 3_600_000_000_000_i64));
+    }
+
+    #[test]
+    fn nth_where_with_lookback() {
+        // `NTH(purchase WHERE amount > 0, 3, lookback: 365d)` — all three.
+        let stmt = parse_stmt("events | NTH(purchase WHERE amount > 0, 3, lookback: 365d)");
+        let es = event_select_of(&stmt);
+        assert_eq!(es.kind, EventSelectKind::Nth(3));
+        assert!(es.predicate.is_some());
+        assert!(es.lookback.is_some());
+    }
+
+    #[test]
+    fn event_list_form_first() {
+        // `FIRST((login, sso_login))` — two-event parenthesized list.
+        let stmt = parse_stmt("events | FIRST((login, sso_login))");
+        let es = event_select_of(&stmt);
+        assert_eq!(es.events.len(), 2);
+        assert_eq!(es.events[0].event.text, "login");
+        assert_eq!(es.events[1].event.text, "sso_login");
+    }
+
+    #[test]
+    fn event_list_three_elements() {
+        // `LAST((a, b, c))` — three-element event list.
+        let stmt = parse_stmt("events | LAST((a, b, c))");
+        let es = event_select_of(&stmt);
+        assert_eq!(es.events.len(), 3);
+    }
+
+    #[test]
+    fn nth_zero_is_rejected() {
+        // `NTH(event, 0)` — zero is not a valid position.
+        match crate::parse("events | NTH(click, 0)") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Integer);
+                assert!(
+                    detail.map(|d| d.contains("1")).unwrap_or(false),
+                    "detail should mention that n must be >= 1"
+                );
+            }
+            other => panic!("expected Integer error for NTH n=0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nth_above_u32_max_is_rejected() {
+        // `NTH(event, 4294967296)` — 2^32 as u32 == 0, which would bypass the n>=1 invariant.
+        match crate::parse("events | NTH(click, 4294967296)") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Integer);
+            }
+            other => panic!("expected Integer error for NTH n > u32::MAX, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_rejects_lookback() {
+        // `LAST(…, lookback: 7d)` — LAST must not accept lookback.
+        match crate::parse("events | LAST(purchase, lookback: 7d)") {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                assert!(
+                    detail.map(|d| d.contains("LAST")).unwrap_or(false),
+                    "error should mention LAST"
+                );
+            }
+            other => panic!("expected Unexpected error for LAST with lookback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_event_names_in_list_rejected() {
+        // `FIRST((signup, signup))` — duplicate event type is a parse error.
+        match crate::parse("events | FIRST((signup, signup))") {
+            Err(ParseError::Unexpected { found, detail, .. }) => {
+                assert_eq!(found, "signup");
+                assert!(
+                    detail.map(|d| d.contains("duplicate")).unwrap_or(false),
+                    "detail should mention duplicate"
+                );
+            }
+            other => panic!("expected duplicate-name error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_table_qualified_refs_not_duplicate() {
+        // `FIRST((events.login, purchases.login))` — same bare name, different table
+        // qualifiers: NOT a duplicate. Mirrors sessionize_cross_table_qualified_end_refs_not_duplicate.
+        let stmt = parse_stmt("events | FIRST((events.login, purchases.login))");
+        let es = event_select_of(&stmt);
+        assert_eq!(
+            es.events.len(),
+            2,
+            "cross-table refs should not be treated as duplicates"
+        );
+        assert_eq!(es.events[0].event.text, "login");
+        assert_eq!(es.events[1].event.text, "login");
+        assert_ne!(
+            es.events[0].table.as_ref().map(|t| t.text.as_str()),
+            es.events[1].table.as_ref().map(|t| t.text.as_str()),
+        );
+    }
+
+    #[test]
+    fn first_span_starts_at_keyword() {
+        // Stage span must begin at `F` of `FIRST` and end at `)`.
+        let src = "events | FIRST(purchase)";
+        let stmt = parse_stmt(src);
+        match &stages_of(&stmt)[0] {
+            PipelineStage::EventSelect(es) => {
+                let kw_start = src.find("FIRST").unwrap();
+                let rparen_end = src.rfind(')').unwrap() + 1;
+                assert_eq!(es.span.start, kw_start);
+                assert_eq!(es.span.end, rparen_end);
+            }
+            other => panic!("expected EventSelect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nth_missing_positional_n_errors() {
+        // `NTH(purchase)` — missing the required `n` argument.
+        match crate::parse("events | NTH(purchase)") {
+            Err(ParseError::Unexpected { .. }) | Err(ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected error for NTH without n, got {other:?}"),
+        }
+    }
+
+    // --- SAMPLE -------------------------------------------------------
+
+    #[test]
+    fn sample_basic_fraction() {
+        // `SAMPLE(fraction: 0.1)` — basic 10% sample.
+        let stmt = parse_stmt("events | SAMPLE(fraction: 0.1)");
+        let s = sample_of(&stmt);
+        assert!((s.fraction - 0.1).abs() < f64::EPSILON);
+        assert!(s.seed.is_none());
+    }
+
+    #[test]
+    fn sample_fraction_with_seed() {
+        // `SAMPLE(fraction: 0.5, seed: 42)` — with explicit seed.
+        let stmt = parse_stmt("events | SAMPLE(fraction: 0.5, seed: 42)");
+        let s = sample_of(&stmt);
+        assert!((s.fraction - 0.5).abs() < f64::EPSILON);
+        assert_eq!(s.seed, Some(42));
+    }
+
+    #[test]
+    fn sample_fraction_zero_and_one_are_valid() {
+        // `fraction: 0.0` and `fraction: 1.0` are both legal boundary values.
+        let stmt0 = parse_stmt("events | SAMPLE(fraction: 0.0)");
+        let s0 = sample_of(&stmt0);
+        assert_eq!(s0.fraction, 0.0);
+        let stmt1 = parse_stmt("events | SAMPLE(fraction: 1.0)");
+        let s1 = sample_of(&stmt1);
+        assert_eq!(s1.fraction, 1.0);
+    }
+
+    #[test]
+    fn sample_fraction_integer_zero_and_one_are_valid() {
+        // Bare integer `0` and `1` are accepted as valid fractions.
+        let stmt0 = parse_stmt("events | SAMPLE(fraction: 0)");
+        let s0 = sample_of(&stmt0);
+        assert_eq!(s0.fraction, 0.0);
+        let stmt1 = parse_stmt("events | SAMPLE(fraction: 1)");
+        let s1 = sample_of(&stmt1);
+        assert_eq!(s1.fraction, 1.0);
+    }
+
+    #[test]
+    fn sample_fraction_above_one_is_rejected() {
+        // `fraction: 1.5` is outside [0.0, 1.0].
+        match crate::parse("events | SAMPLE(fraction: 1.5)") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Literal);
+                assert!(
+                    detail.map(|d| d.contains("1.0")).unwrap_or(false),
+                    "detail should mention 1.0"
+                );
+            }
+            other => panic!("expected fraction-out-of-range error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_fraction_negative_is_rejected() {
+        // Negative fraction: the lexer won't produce a negative Number directly.
+        // The `-` is a separate unary-minus expression; the parser will hit
+        // an unexpected `-` where it expects a float literal.
+        match crate::parse("events | SAMPLE(fraction: -0.1)") {
+            Err(ParseError::Unexpected { .. }) | Err(ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected error for negative fraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_count_parameter_is_rejected() {
+        // `SAMPLE(count: 100)` — count: is not in the v1 surface.
+        // `COUNT` is a reserved keyword so `expect_name` produces a
+        // `ReservedKeyword` error rather than `Unexpected`. Either error
+        // variant is acceptable — the point is the parse fails.
+        match crate::parse("events | SAMPLE(count: 100)") {
+            Err(ParseError::ReservedKeyword { .. })
+            | Err(ParseError::Unexpected { .. })
+            | Err(ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected error for SAMPLE(count:…), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_span_starts_at_keyword() {
+        // Stage span must begin at `S` of `SAMPLE` and end at `)`.
+        let src = "events | SAMPLE(fraction: 0.25)";
+        let stmt = parse_stmt(src);
+        match &stages_of(&stmt)[0] {
+            PipelineStage::Sample(s) => {
+                let kw_start = src.find("SAMPLE").unwrap();
+                let rparen_end = src.rfind(')').unwrap() + 1;
+                assert_eq!(s.span.start, kw_start);
+                assert_eq!(s.span.end, rparen_end);
+            }
+            other => panic!("expected Sample, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_followed_by_stats_is_valid() {
+        // FIRST is not a terminal stage — it may be followed by STATS.
+        let stmt = parse_stmt("events | FIRST(signup) | STATS n = COUNT(*)");
+        let stages = stages_of(&stmt);
+        assert_eq!(stages.len(), 2);
+        assert!(matches!(stages[0], PipelineStage::EventSelect(_)));
+        assert!(matches!(stages[1], PipelineStage::Stats { .. }));
+    }
+
+    #[test]
+    fn event_list_empty_parens_errors() {
+        // `FIRST(())` — empty event list must be rejected.
+        match crate::parse("events | FIRST(())") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::EventRef);
+            }
+            other => panic!("expected EventRef error for empty event list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_with_unknown_trailing_key_errors() {
+        // `LAST(e, foo: 1d)` — LAST does not accept any trailing parameters.
+        match crate::parse("events | LAST(purchase, foo: 7d)") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("lookback"));
+                assert!(
+                    detail.map(|d| d.contains("LAST")).unwrap_or(false),
+                    "error detail should mention LAST, not FIRST"
+                );
+            }
+            other => panic!("expected error for LAST with unknown key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_rejects_lookback_points_at_keyword() {
+        // `LAST(purchase, lookback: 7d)` — error must mention LAST and the
+        // offset must point at the `lookback` identifier, not the duration.
+        let src = "events | LAST(purchase, lookback: 7d)";
+        match crate::parse(src) {
+            Err(ParseError::Unexpected { offset, detail, .. }) => {
+                // The error offset should point at the start of "lookback".
+                let lookback_pos = src.find("lookback").unwrap();
+                assert_eq!(offset, lookback_pos, "error should point at `lookback`");
+                assert!(
+                    detail.map(|d| d.contains("LAST")).unwrap_or(false),
+                    "error detail should mention LAST"
+                );
+            }
+            other => panic!("expected Unexpected error for LAST + lookback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nth_with_unknown_trailing_key_errors() {
+        // `NTH(e, 3, foo: 1d)` — only `lookback:` is accepted as third arg.
+        match crate::parse("events | NTH(click, 3, foo: 7d)") {
+            Err(ParseError::Unexpected {
+                expected, detail, ..
+            }) => {
+                assert_eq!(expected, Expected::Keyword("lookback"));
+                assert!(
+                    detail.map(|d| d.contains("lookback")).unwrap_or(false),
+                    "error detail should mention `lookback`"
+                );
+            }
+            other => {
+                panic!("expected error for NTH with unknown trailing key, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn sample_without_fraction_key_errors() {
+        // `SAMPLE(0.5)` — positional float without `fraction:` key must be rejected.
+        match crate::parse("events | SAMPLE(0.5)") {
+            Err(ParseError::Unexpected { .. }) | Err(ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected error for SAMPLE without fraction key, got {other:?}"),
+        }
     }
 }

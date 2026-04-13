@@ -68,7 +68,7 @@ pub use expr::{
 };
 pub use operator::{
     AggItem, Attribute, EventSelect, EventSelectKind, Funnel, GroupItem, PipelineStage, Retention,
-    Sample, SampleSpec, SelectItem, SelectItemKind, Sessionize,
+    Sample, SelectItem, SelectItemKind, Sessionize,
 };
 pub use pattern::{
     BracketSpec, EventRef, Exclusion, MatchMode, MatchPattern, MatchWindow, Repetition, Step,

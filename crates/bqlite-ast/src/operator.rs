@@ -98,7 +98,8 @@ pub enum PipelineStage {
     /// per-entity event sub-selection (query-language.md §14.1).
     EventSelect(EventSelect),
 
-    /// `| SAMPLE <spec>` — random row sampling (query-language.md §14.3).
+    /// `| SAMPLE(fraction: …)` — deterministic entity sampling
+    /// (query-language.md §14.2).
     Sample(Sample),
 
     /// `| ATTRIBUTE conversion: <e> touchpoints: <e> window: <d>` —
@@ -241,10 +242,18 @@ pub struct Sessionize {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventSelect {
     pub kind: EventSelectKind,
-    /// Event type(s) the selector applies to.
-    pub event: EventRef,
-    /// Optional predicate scoping which events qualify.
+    /// Event type(s) the selector applies to. One or more `EventRef`s;
+    /// the single-arg form `FIRST(purchase)` produces a one-element vec and
+    /// the parenthesized list form `FIRST((login, sso_login))` produces a
+    /// longer one. Duplicate names are rejected at parse time.
+    pub events: Vec<EventRef>,
+    /// Optional predicate scoping which events qualify (the `WHERE` clause).
+    /// Applied per-event before position selection.
     pub predicate: Option<Spanned<Expr>>,
+    /// Scan-range backward extension in nanoseconds, from `lookback: <dur>`.
+    /// Only `FIRST` and `NTH` accept this parameter; the parser rejects it
+    /// on `LAST` (query-language.md §14.1).
+    pub lookback: Option<i64>,
     pub span: Span,
 }
 
@@ -253,26 +262,24 @@ pub struct EventSelect {
 pub enum EventSelectKind {
     First,
     Last,
-    /// `NTH(n)` — 1-indexed position of the target event for each entity.
-    Nth(u64),
+    /// `NTH(n)` — 1-indexed, >= 1. The parser rejects `n == 0`. Using `u32`
+    /// matches the physical descriptor shape in `event-select-sample.md §4`
+    /// and bounds the max position to ~4 billion events, well beyond any
+    /// practical per-entity event count.
+    Nth(u32),
 }
 
-/// The `| SAMPLE` stage — random row sampling (query-language.md §14.3).
+/// The `| SAMPLE` stage — deterministic entity-level sampling
+/// (query-language.md §14.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
-    pub spec: SampleSpec,
-    /// Optional explicit RNG seed for reproducible sampling.
+    /// Fraction of entities to include, in `[0.0, 1.0]` (inclusive both
+    /// ends). Values outside this range are rejected at parse time.
+    pub fraction: f64,
+    /// Optional explicit RNG seed for reproducible sampling. Without it the
+    /// seed is derived from the database identity (query-language.md §30.9).
     pub seed: Option<i64>,
     pub span: Span,
-}
-
-/// What to sample.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum SampleSpec {
-    /// `FRACTION 0.1` — keep roughly this fraction of rows in `[0.0, 1.0]`.
-    Fraction(f64),
-    /// `COUNT 1000` — keep at most this many rows.
-    Count(u64),
 }
 
 /// The `| ATTRIBUTE` stage — attribution (query-language.md §14.3).
@@ -451,30 +458,93 @@ mod tests {
     fn event_select_nth_carries_position() {
         let sel = EventSelect {
             kind: EventSelectKind::Nth(3),
-            event: EventRef {
+            events: vec![EventRef {
                 table: None,
                 event: Name::synthetic("click"),
                 span: Span::EMPTY,
-            },
+            }],
             predicate: None,
+            lookback: None,
             span: Span::EMPTY,
         };
         assert_eq!(sel.kind, EventSelectKind::Nth(3));
+        assert_eq!(sel.events.len(), 1);
+        assert_eq!(sel.events[0].event.text, "click");
     }
 
     #[test]
-    fn sample_fraction_vs_count_distinct() {
-        let f = SampleSpec::Fraction(0.1);
-        let c = SampleSpec::Count(100);
-        // Smoke test that both variants can be constructed and matched.
-        match f {
-            SampleSpec::Fraction(v) => assert_eq!(v, 0.1),
-            _ => panic!("expected Fraction"),
-        }
-        match c {
-            SampleSpec::Count(n) => assert_eq!(n, 100),
-            _ => panic!("expected Count"),
-        }
+    fn event_select_multi_event_list() {
+        // FIRST((login, sso_login)) — two-element event list.
+        let sel = EventSelect {
+            kind: EventSelectKind::First,
+            events: vec![
+                EventRef {
+                    table: None,
+                    event: Name::synthetic("login"),
+                    span: Span::EMPTY,
+                },
+                EventRef {
+                    table: None,
+                    event: Name::synthetic("sso_login"),
+                    span: Span::EMPTY,
+                },
+            ],
+            predicate: None,
+            lookback: None,
+            span: Span::EMPTY,
+        };
+        assert_eq!(sel.events.len(), 2);
+        assert_eq!(sel.events[0].event.text, "login");
+        assert_eq!(sel.events[1].event.text, "sso_login");
+    }
+
+    #[test]
+    fn event_select_lookback_optional() {
+        // FIRST only — lookback is Some; LAST — lookback is None.
+        let with_lb = EventSelect {
+            kind: EventSelectKind::First,
+            events: vec![EventRef {
+                table: None,
+                event: Name::synthetic("signup"),
+                span: Span::EMPTY,
+            }],
+            predicate: None,
+            lookback: Some(90 * 86_400_000_000_000_i64),
+            span: Span::EMPTY,
+        };
+        assert_eq!(with_lb.lookback, Some(90 * 86_400_000_000_000_i64));
+
+        let without_lb = EventSelect {
+            kind: EventSelectKind::Last,
+            events: vec![EventRef {
+                table: None,
+                event: Name::synthetic("page_view"),
+                span: Span::EMPTY,
+            }],
+            predicate: None,
+            lookback: None,
+            span: Span::EMPTY,
+        };
+        assert_eq!(without_lb.lookback, None);
+    }
+
+    #[test]
+    fn sample_fraction_only() {
+        // `count:` is removed; only `fraction:` is valid in v1.
+        let s = Sample {
+            fraction: 0.1,
+            seed: None,
+            span: Span::EMPTY,
+        };
+        assert_eq!(s.fraction, 0.1);
+        assert_eq!(s.seed, None);
+
+        let s_with_seed = Sample {
+            fraction: 0.5,
+            seed: Some(42),
+            span: Span::EMPTY,
+        };
+        assert_eq!(s_with_seed.seed, Some(42));
     }
 
     #[test]
