@@ -65,8 +65,8 @@ use crate::encoding::dictionary::{
     payload_byte_count as dictionary_payload_byte_count, unpack_codes,
 };
 use crate::encoding::{
-    decompress_lz4, BitPacking, BorrowedEncodedChunk, Constant, Delta, Encoding, EncodingType,
-    Plain, Rle,
+    decompress_lz4, BitPacking, BorrowedEncodedChunk, Constant, Delta, DoubleDelta, Encoding,
+    EncodingType, Plain, Rle,
 };
 use crate::segment::layout::{
     ColumnChunkMeta, CompressionType, FooterV1, CHECKSUM_LEN, CHECKSUM_SEED, FILE_HEADER_LEN,
@@ -792,6 +792,7 @@ fn decode_column_chunk(
         // segment-level FSST symbol tables.
         EncodingType::Plain
         | EncodingType::Delta
+        | EncodingType::DoubleDelta
         | EncodingType::BitPacking
         | EncodingType::Constant
         | EncodingType::Rle
@@ -849,6 +850,8 @@ fn parse_encoding_params_len(
         EncodingType::Dictionary => Ok(5),
         // `base_value: i64 LE` + `residual_bit_width: u8`.
         EncodingType::Delta => Ok(9),
+        // `base_value: i64 LE` + `first_delta: i64 LE` + `dd_bit_width: u8`.
+        EncodingType::DoubleDelta => Ok(17),
         // `min_value: i64 LE` + `bit_width: u8`.
         EncodingType::BitPacking => Ok(9),
         // `run_count: u32 LE`.
@@ -982,6 +985,7 @@ fn dispatch_decode(
                 .into(),
         )),
         EncodingType::Delta => Delta.decode_borrowed(chunk, ty),
+        EncodingType::DoubleDelta => DoubleDelta.decode_borrowed(chunk, ty),
         EncodingType::BitPacking => BitPacking.decode_borrowed(chunk, ty),
         EncodingType::Constant => Constant.decode_borrowed(chunk, ty),
         EncodingType::Rle => Rle.decode_borrowed(chunk, ty),
@@ -1422,11 +1426,14 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
                 )));
             }
             // Rule 10 continued: legal encoding discriminant.
+            // Allowed set: v1 encodings {0,1,2,4,6} + Wave 4 v2
+            // extensions {3} (DoubleDelta). Unknown discriminants are
+            // still a corruption error.
             match meta.encoding {
-                0 | 1 | 2 | 4 | 6 => (),
+                0 | 1 | 2 | 3 | 4 | 6 => (),
                 other => {
                     return Err(BqliteError::Corruption(format!(
-                        "row group {i} column {c} encoding {other} is not in the v1 set {{0,1,2,4,6}}"
+                        "row group {i} column {c} encoding {other} is not in the known set {{0,1,2,3,4,6}}"
                     )));
                 }
             }
@@ -2646,12 +2653,12 @@ mod tests {
     #[test]
     fn rejects_illegal_encoding_discriminant() {
         // Build a segment whose column-chunk metadata declares an
-        // out-of-set encoding discriminant (`3` is reserved, not in
-        // `{0, 1, 2, 4, 6}`). The column chunk bytes themselves do
-        // not need to parse — the reader rejects the metadata long
-        // before it touches the bytes — so we stub the row group
-        // with three empty Plain chunks and only override the
-        // metadata of the first.
+        // out-of-set encoding discriminant (`5` is reserved for RLE,
+        // not yet in the known set `{0, 1, 2, 3, 4, 6}`). The column
+        // chunk bytes themselves do not need to parse — the reader
+        // rejects the metadata long before it touches the bytes — so
+        // we stub the row group with three empty Plain chunks and only
+        // override the metadata of the first.
         let one_col_schema = TableSchema::new(
             "t",
             vec![
@@ -2693,7 +2700,7 @@ mod tests {
                         column_ordinal: 0,
                         byte_offset: rg_off,
                         byte_length: 5,
-                        encoding: 3, // illegal
+                        encoding: 5, // illegal — RLE reserved, not yet in known set
                         compression: 0,
                         row_count: 0,
                         null_count: 1,

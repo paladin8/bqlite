@@ -63,7 +63,7 @@ use bqlite_core::{BqlType, BqliteError, Result};
 
 use super::{
     compress_lz4, require_dense, BitPacking, CompressionType, Constant, Delta, Dictionary,
-    EncodedChunk, Encoding, EncodingType, Plain, Rle,
+    DoubleDelta, EncodedChunk, Encoding, EncodingType, Plain, Rle,
 };
 
 /// LZ4 minimum compression threshold per `storage-format.md` §10.7
@@ -171,10 +171,11 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
     // Phase 3: rank applicable encodings by estimated payload size.
     // Tie-break by decode cost (lower is better).
     //
-    // The candidate list is the v1 encoding set minus Constant (already
-    // resolved in Phase 2). Plain is included so it serves as the
-    // universal fallback — every primitive type has at least Plain in
-    // the candidate set, so `best` is always populated for primitives.
+    // The candidate list is the v1 encoding set plus Wave 4 DoubleDelta
+    // minus Constant (already resolved in Phase 2). Plain is included so
+    // it serves as the universal fallback — every primitive type has at
+    // least Plain in the candidate set, so `best` is always populated for
+    // primitives.
     //
     // Note: Rle is intentionally omitted here. Its registration —
     // including the §3.7 average-run-length guard from
@@ -184,7 +185,7 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
     // already wired into `decode_cost`, `encode_with`,
     // `parse_encoding_params_len`, and `dispatch_decode` so TASK-419
     // only needs to append `&Rle` here and implement the guard.
-    let candidates: &[&dyn Encoding] = &[&Plain, &Dictionary, &Delta, &BitPacking];
+    let candidates: &[&dyn Encoding] = &[&Plain, &Dictionary, &Delta, &DoubleDelta, &BitPacking];
     let mut best: Option<(EncodingType, usize, u8)> = None;
     for enc in candidates {
         if !enc.applicable_to(ty) {
@@ -243,6 +244,10 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
 /// values have no meaning beyond the ordering. The selector ranks by
 /// payload size first, so this only applies to candidates whose
 /// estimated size is identical.
+///
+/// DoubleDelta (cost 6) is slower than Delta (cost 3) due to the
+/// extra prefix-sum pass, per `advanced-encodings.md` §10.3, but is
+/// still preferred over Delta when its payload is smaller.
 pub const fn decode_cost(enc: EncodingType) -> u8 {
     match enc {
         EncodingType::Constant => 0,
@@ -298,14 +303,14 @@ fn encode_with(encoding: EncodingType, array: &dyn Array) -> Result<EncodedChunk
         EncodingType::Delta => Delta.encode(array),
         EncodingType::BitPacking => BitPacking.encode(array),
         EncodingType::Rle => Rle.encode(array),
-        // v2 encodings — implementations land in TASK-414 through TASK-418, TASK-450.
+        EncodingType::DoubleDelta => DoubleDelta.encode(array),
+        // v2 encodings — implementations land in TASK-415 through TASK-418.
         // The selector never picks these; this arm exists only for exhaustiveness.
-        EncodingType::DoubleDelta
-        | EncodingType::Fsst
+        EncodingType::Fsst
         | EncodingType::For
         | EncodingType::PFor
         | EncodingType::Alp => Err(BqliteError::Execution(format!(
-            "v2 encoding {encoding:?} encode not yet implemented (TASK-414–TASK-418)"
+            "v2 encoding {encoding:?} encode not yet implemented"
         ))),
     }
 }
@@ -430,6 +435,7 @@ mod tests {
             EncodingType::Delta => Delta.decode(&selected.chunk, &ty),
             EncodingType::BitPacking => BitPacking.decode(&selected.chunk, &ty),
             EncodingType::Rle => Rle.decode(&selected.chunk, &ty),
+            EncodingType::DoubleDelta => DoubleDelta.decode(&selected.chunk, &ty),
             other => panic!("selector should never pick unimplemented encoding {other:?}"),
         }
         .expect("decode must succeed");
@@ -703,29 +709,45 @@ mod tests {
         assert!(decode_cost(EncodingType::Rle) < decode_cost(EncodingType::BitPacking));
         assert!(decode_cost(EncodingType::BitPacking) < decode_cost(EncodingType::Delta));
         assert!(decode_cost(EncodingType::Delta) < decode_cost(EncodingType::Dictionary));
+        assert!(decode_cost(EncodingType::Dictionary) < decode_cost(EncodingType::DoubleDelta));
     }
 
     #[test]
     fn tiebreaker_picks_lower_decode_cost_at_equal_size() {
-        // A two-element ascending int run is the simplest case where
-        // multiple encodings collide on payload size:
+        // A three-element ascending int run where three encodings
+        // collide on payload size (each padded to 8 bytes):
         //
-        // - Plain:      16 bytes (2 × i64 LE)
-        // - BitPacking: padded to 8 bytes (1 bit/value × 2 values padded)
-        // - Delta:      padded to 8 bytes (1 bit residual × 1 padded)
+        // - Plain:       24 bytes (3 × i64 LE)
+        // - BitPacking:  8 bytes padded (2 bits/value × 3 values padded)
+        // - Delta:       8 bytes padded (2-bit residuals × 2 residuals padded)
+        // - DoubleDelta: 8 bytes padded (1 dd value at 1-bit width padded)
         //
-        // BitPacking and Delta both produce 8-byte payloads but their
-        // decode costs differ (BitPacking < Delta). The selector
-        // should pick BitPacking via the tiebreaker.
-        let array: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2]));
+        // All three compact encodings produce 8-byte payloads. The
+        // selector picks BitPacking (decode cost 2), beating Delta
+        // (cost 3) and DoubleDelta (cost 6).
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![0_i64, 1, 2]));
         let chosen = select_encoding_type(array.as_ref(), &BqlType::Int).unwrap();
-        // Constant doesn't apply (non-uniform), Plain is 16 bytes,
-        // BitPacking and Delta tie at 8 bytes — BitPacking wins on cost.
         assert_eq!(
             chosen,
             EncodingType::BitPacking,
-            "BitPacking and Delta tie on size at this input; tiebreaker \
-             must select BitPacking (lower decode cost)"
+            "BitPacking, Delta, and DoubleDelta tie on size; BitPacking \
+             must win via lowest decode cost"
+        );
+    }
+
+    #[test]
+    fn double_delta_wins_two_element_input() {
+        // For a 2-element array, DoubleDelta stores both values in params
+        // (base_value + first_delta) with a 0-byte payload. This beats
+        // Delta (8-byte padded payload for 1 residual) and BitPacking
+        // (8-byte padded payload for 2 values at 1 bit each).
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2]));
+        let chosen = select_encoding_type(array.as_ref(), &BqlType::Int).unwrap();
+        assert_eq!(
+            chosen,
+            EncodingType::DoubleDelta,
+            "DoubleDelta must win on 2-element input: 0-byte payload beats \
+             Delta and BitPacking which both produce 8-byte padded payloads"
         );
     }
 

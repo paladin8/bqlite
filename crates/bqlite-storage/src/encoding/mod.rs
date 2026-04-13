@@ -48,6 +48,7 @@ pub mod bitpacking;
 pub mod constant;
 pub mod delta;
 pub mod dictionary;
+pub mod double_delta;
 pub mod fsst;
 pub mod lz4;
 pub mod plain;
@@ -58,13 +59,15 @@ pub use bitpacking::BitPacking;
 pub use constant::Constant;
 pub use delta::Delta;
 pub use dictionary::Dictionary;
+pub use double_delta::DoubleDelta;
 pub use fsst::Fsst;
 pub use lz4::{compress_lz4, decompress_lz4, CompressionType};
 pub use plain::Plain;
 pub use rle::Rle;
 pub use selector::{decode_cost, select_encoding, select_encoding_type, SelectedEncoding};
 
-/// On-disk encoding discriminant per `segment-format-v1.md` §9.
+/// On-disk encoding discriminant per `segment-format-v1.md` §9 and
+/// `segment-format-v2.md`.
 ///
 /// Values match the `EncodingType` enum documented in
 /// `storage-format.md` §10.2. v1 readers recognize exactly the five
@@ -125,6 +128,7 @@ impl EncodingType {
             0 => Ok(Self::Plain),
             1 => Ok(Self::Dictionary),
             2 => Ok(Self::Delta),
+            3 => Ok(Self::DoubleDelta),
             4 => Ok(Self::BitPacking),
             5 => Ok(Self::Rle),
             6 => Ok(Self::Constant),
@@ -327,10 +331,10 @@ mod tests {
             EncodingType::Plain,
             EncodingType::Dictionary,
             EncodingType::Delta,
+            EncodingType::DoubleDelta,
             EncodingType::BitPacking,
             EncodingType::Rle,
             EncodingType::Constant,
-            EncodingType::DoubleDelta,
             EncodingType::Fsst,
             EncodingType::For,
             EncodingType::PFor,
@@ -351,6 +355,7 @@ mod tests {
         assert_eq!(EncodingType::Plain.discriminant(), 0);
         assert_eq!(EncodingType::Dictionary.discriminant(), 1);
         assert_eq!(EncodingType::Delta.discriminant(), 2);
+        assert_eq!(EncodingType::DoubleDelta.discriminant(), 3);
         assert_eq!(EncodingType::BitPacking.discriminant(), 4);
         assert_eq!(EncodingType::Rle.discriminant(), 5);
         assert_eq!(EncodingType::Constant.discriminant(), 6);
@@ -372,7 +377,7 @@ mod tests {
     fn unknown_discriminant_is_a_typed_execution_error() {
         // v2-only discriminants (3, 7, 8, 9, 10) are rejected by
         // from_discriminant. Byte 5 (Rle) is accepted since TASK-413.
-        for byte in [3u8, 7, 8, 9, 10, 11, 255] {
+        for byte in [7u8, 8, 9, 10, 11, 255] {
             let err = EncodingType::from_discriminant(byte).unwrap_err();
             match err {
                 BqliteError::Execution(msg) => {

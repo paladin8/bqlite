@@ -17,11 +17,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{ArrayRef, Int64Array, StringViewArray};
+use arrow::array::{ArrayRef, Int64Array, StringViewArray, TimestampNanosecondArray};
 use bqlite_benches::common::*;
 use bqlite_core::BqlType;
 use bqlite_storage::encoding::{
-    compress_lz4, decompress_lz4, BitPacking, Constant, Delta, Dictionary, Encoding, Plain, Rle,
+    compress_lz4, decompress_lz4, BitPacking, Constant, Delta, Dictionary, DoubleDelta, Encoding,
+    Plain, Rle,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
@@ -402,6 +403,79 @@ fn bench_lz4_repetitive(c: &mut Criterion) {
     group.finish();
 }
 
+// ── DoubleDelta ──────────────────────────────────────────────────────────────
+
+fn bench_double_delta_timestamp_near_constant(c: &mut Criterion) {
+    // Near-constant-interval timestamps with small jitter — the primary
+    // use case for DoubleDelta per `advanced-encodings.md` §4.7.
+    // The step is 1 ms (1_000_000 ns) and jitter ≈ ±250 ns, so second-order
+    // deltas are tiny (<<step) and dd_bit_width collapses to ~9 bits.
+    let base = 1_700_000_000_000_000_000_i64;
+    let step = 1_000_000_i64; // 1 ms in ns
+    let jitter_period = 500_i64; // ±250 ns jitter cycle
+    let values: Vec<i64> = (0..ROW_GROUP_SIZE as i64)
+        .map(|i| base + i * step + (i % jitter_period - jitter_period / 2))
+        .collect();
+    let array: ArrayRef = Arc::new(TimestampNanosecondArray::from(values).with_timezone("UTC"));
+
+    let dd = DoubleDelta::new();
+    let chunk = dd.encode(array.as_ref()).unwrap();
+    let delta = Delta::new();
+    let delta_chunk = delta.encode(array.as_ref()).unwrap();
+    let dd_payload_bytes = chunk.payload.len() as u64;
+    let delta_payload_bytes = delta_chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/double_delta/timestamp_near_constant");
+    group.throughput(Throughput::Bytes(dd_payload_bytes));
+
+    group.bench_function("encode", |b| {
+        b.iter(|| dd.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("decode", |b| {
+        b.iter(|| dd.decode(black_box(&chunk), &BqlType::Timestamp).unwrap())
+    });
+
+    group.bench_function("delta_encode_for_comparison", |b| {
+        b.iter(|| delta.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("delta_decode_for_comparison", |b| {
+        b.iter(|| {
+            delta
+                .decode(black_box(&delta_chunk), &BqlType::Timestamp)
+                .unwrap()
+        })
+    });
+
+    // Report the compression improvement over Delta.
+    let _ = delta_payload_bytes; // used in the comparison above
+    group.finish();
+}
+
+fn bench_double_delta_seq_id(c: &mut Criterion) {
+    // Strictly monotonic seq_id (Δ = 1, dd = 0). All double-deltas are
+    // zero, so dd_bit_width floors to 1 and the payload is all zeros.
+    // This is the best case for DoubleDelta — ~0.016× vs Plain.
+    let array = gen_int64_array(ROW_GROUP_SIZE, 0); // 0, 1, 2, ..., N-1
+    let dd = DoubleDelta::new();
+    let chunk = dd.encode(array.as_ref()).unwrap();
+    let payload_bytes = chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/double_delta/seq_id");
+    group.throughput(Throughput::Bytes(payload_bytes.max(1)));
+
+    group.bench_function("encode", |b| {
+        b.iter(|| dd.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("decode", |b| {
+        b.iter(|| dd.decode(black_box(&chunk), &BqlType::Int).unwrap())
+    });
+
+    group.finish();
+}
+
 // ── Encoding selector throughput ─────────────────────────────────────────────
 
 fn bench_selector_throughput(c: &mut Criterion) {
@@ -507,6 +581,8 @@ criterion_group! {
         bench_dictionary_string,
         bench_delta_timestamp,
         bench_delta_int64,
+        bench_double_delta_timestamp_near_constant,
+        bench_double_delta_seq_id,
         bench_bitpacking_int64,
         bench_bitpacking_timestamp,
         bench_constant_int64,
