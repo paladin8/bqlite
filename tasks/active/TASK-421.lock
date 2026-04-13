@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-421",
+  "claimed_at": "2026-04-13T04:30:57Z",
+  "branch": "task/TASK-421",
+  "description": "Parser FIRST/LAST/NTH + SAMPLE stages"
+}
