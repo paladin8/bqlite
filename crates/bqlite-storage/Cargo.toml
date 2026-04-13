@@ -20,7 +20,7 @@ postcard = { workspace = true }
 csv = { workspace = true }
 parquet = { workspace = true }
 bitpacking = { workspace = true }
-fsst-rs = { workspace = true }
+fsst = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

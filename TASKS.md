@@ -1180,7 +1180,7 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 ### TASK-450: [HARD][IMPL] PFOR encoding
 **Output**: crates/bqlite-storage/src/encoding/pfor.rs
 **Depends on**: TASK-401, TASK-415
-**Description**: Patched frame-of-reference integer codec built on the FOR scaffolding from TASK-415. Covers patch-list layout, sparse-outlier handling, decode hot loop including patch application, and property tests for overflow and the worst-case all-patched fallback. Retire with a note linking to TASK-401 evidence if the research task records a no-go.
+**Description**: Patched frame-of-reference integer codec built on the FOR scaffolding from TASK-415. Covers patch-list layout, sparse-outlier handling, decode hot loop including patch application, and property tests for overflow and the worst-case all-patched fallback. Retire with a note linking to TASK-401 evidence if the research task records a no-go. Use the fastpfor crate instead of implementing manually.
 
 ### TASK-451: [EASY][IMPL] Parser `IN QUERY` and bare `IN alias` expressions
 **Output**: crates/bqlite-parser/src/expr.rs

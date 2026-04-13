@@ -34,8 +34,8 @@ bqlite-ffi = { path = "crates/bqlite-ffi" }
 
 # External dependencies
 ahash = "0.8"
-arrow = "54"
-parquet = { version = "54", features = ["arrow", "snap", "brotli", "lz4", "zstd"] }
+arrow = "57"
+parquet = { version = "57", features = ["arrow", "snap", "brotli", "lz4", "zstd"] }
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -62,6 +62,6 @@ compact_str = "0.9"
 # Pinned exactly because BitPacking's on-disk bytes depend on
 # `bitpacking`'s `BitPacker4x` block layout staying stable.
 bitpacking = { version = "=0.9.3", default-features = false, features = ["bitpacker4x"] }
-# Pinned exactly because FSST's on-disk symbol tables and compressed
-# payloads depend on `fsst-rs`'s encoding staying wire-compatible.
-fsst-rs = "=0.5.10"
+# Pinned exactly because FSST's serialized symbol tables and compressed
+# payloads depend on the crate's wire format staying compatible.
+fsst = "=4.0.0"

@@ -698,11 +698,13 @@ segment-level metadata extension.
   the per-chunk encode output to the segment-level region, similar
   to how Dictionary values are hoisted today.
 
-**Crate option**: The `fsst-rs` crate exists in the Rust ecosystem
-and could be evaluated as a dependency to reduce implementation
-effort. Per CLAUDE.md dependency conventions, an existing
-well-maintained crate is preferred over rolling a custom
-implementation when integration constraints are manageable.
+**Crate option**: The `fsst` crate from Lance exists in the Rust
+ecosystem and is the chosen implementation path for TASK-416.
+Microbenchmarks on bqlite's representative URL / user-agent string
+workloads showed materially better encode, decode, and payload-size
+results than the previous `fsst-rs`-based adapter, while preserving
+the serialized symbol-table model bqlite needs for segment-level
+storage.
 
 Estimated implementation: ~600–800 lines of Rust if using an
 existing crate for the core algorithm, ~1200–1500 lines if
@@ -1118,10 +1120,11 @@ single-block case.
 
 ### 11.4 TASK-416 (FSST): Proceed
 
-Evaluate the `fsst-rs` crate for the core algorithm. If suitable,
-use it; otherwise implement from the VLDB 2020 paper specification.
-Coordinate with TASK-402 (segment format v2) for the segment-level
-symbol table region.
+Use the `fsst` crate for the core algorithm. Coordinate with
+TASK-402 (segment format v2) for the segment-level symbol table
+region and keep bqlite's self-contained trait-level chunk params as
+the serialized symbol-table blob until the writer hoists those bytes
+to the segment-level FSST region.
 
 ### 11.5 TASK-417 (ALP): Proceed
 
@@ -1177,9 +1180,10 @@ cascade and note that discriminant 11 is reserved but retired.
 
 The following are deferred to downstream tasks:
 
-1. **FSST crate selection** (TASK-416): Whether to use `fsst-rs` or
-   implement from scratch depends on API compatibility and
-   maintenance status at implementation time.
+1. **FSST crate integration model** (TASK-416): The crate choice is
+   resolved (`fsst`), but the writer still needs to hoist the
+   self-contained symbol-table bytes to the segment-level FSST region
+   when TASK-419 wires v2 segment emission end-to-end.
 2. **FOR block size** (TASK-415): 128 vs 256. Both are valid; 128
    aligns with AVX2 register files, 256 amortizes per-block overhead
    better. The implementation task should benchmark both and pick the

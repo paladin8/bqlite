@@ -1014,10 +1014,11 @@ Deferred without blocking v2 merges:
    `block_size` field is already in the params block). The selector
    would need to choose between 128 and 256 based on the data.
 
-3. **FSST crate selection.** Whether TASK-416 uses `fsst-rs` or a
-   from-scratch implementation depends on API compatibility and
-   maintenance status at implementation time. The on-disk format is
-   independent of the implementation choice.
+3. **FSST crate integration.** TASK-416 uses the `fsst` crate for the
+   core algorithm. The remaining work is writer/read-path
+   integration: hoisting the self-contained symbol-table bytes out of
+   trait-level chunks into the segment-level FSST region while
+   preserving the v2 on-disk contract.
 
 4. **Nested type encodings.** v1 supports `List` and `Map` only via
    Plain encoding. v2 does not add specialized encodings for nested

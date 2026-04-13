@@ -500,13 +500,14 @@ mod tests {
     fn reverse_rejects_unsupported_types() {
         use ::arrow::datatypes::{UnionFields, UnionMode};
 
-        let union_fields = UnionFields::new(
+        let union_fields = UnionFields::try_new(
             vec![0_i8, 1],
             vec![
                 Field::new("a", DataType::Int32, false),
                 Field::new("b", DataType::Utf8, false),
             ],
-        );
+        )
+        .expect("valid union fields");
 
         let cases: Vec<DataType> = vec![
             DataType::Null,

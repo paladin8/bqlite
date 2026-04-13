@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{ArrayRef, Int64Array, StringViewArray, TimestampNanosecondArray};
+use arrow::array::{Array, ArrayRef, Int64Array, StringViewArray, TimestampNanosecondArray};
 use bqlite_benches::common::*;
 use bqlite_core::BqlType;
 use bqlite_storage::encoding::{
@@ -29,6 +29,9 @@ use bqlite_storage::encoding::{
     ForEncoding, Fsst, Plain, Rle,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use fsst::fsst::{
+    compress as fsst_compress, decompress as fsst_decompress, FSST_SYMBOL_TABLE_SIZE,
+};
 
 /// Default row-group size — the unit of encoding work.
 const ROW_GROUP_SIZE: usize = 65_536;
@@ -514,6 +517,149 @@ fn gen_user_agent_array(n: usize) -> ArrayRef {
     Arc::new(StringViewArray::from(values))
 }
 
+#[derive(Clone)]
+struct RawFsstChunk {
+    symbol_table: [u8; FSST_SYMBOL_TABLE_SIZE],
+    payload: Vec<u8>,
+    row_count: usize,
+    decoded_bytes: usize,
+}
+
+fn string_view_offsets_and_bytes(array: &ArrayRef) -> (Vec<i32>, Vec<u8>) {
+    let view = array
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("FSST benchmark datasets are StringViewArray");
+
+    let mut offsets = Vec::with_capacity(view.len() + 1);
+    let mut values = Vec::new();
+    offsets.push(0);
+    for i in 0..view.len() {
+        let bytes = view.value(i).as_bytes();
+        values.extend_from_slice(bytes);
+        offsets.push(
+            i32::try_from(values.len()).expect("FSST benchmark input fits in i32 offset space"),
+        );
+    }
+    (offsets, values)
+}
+
+fn encode_with_raw_fsst(values: &[u8], offsets: &[i32]) -> std::io::Result<RawFsstChunk> {
+    let mut symbol_table = [0u8; FSST_SYMBOL_TABLE_SIZE];
+    let mut compressed_values = vec![0u8; values.len()];
+    let mut compressed_offsets = vec![0i32; offsets.len()];
+
+    fsst_compress(
+        &mut symbol_table,
+        values,
+        offsets,
+        &mut compressed_values,
+        &mut compressed_offsets,
+    )?;
+
+    if compressed_offsets.len() != offsets.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "lance fsst returned {} offsets for {} strings",
+                compressed_offsets.len(),
+                offsets.len().saturating_sub(1)
+            ),
+        ));
+    }
+
+    let mut payload = Vec::with_capacity(compressed_values.len() + offsets.len() * 2);
+    for window in compressed_offsets.windows(2) {
+        let start = usize::try_from(window[0]).expect("compressed offsets stay non-negative");
+        let end = usize::try_from(window[1]).expect("compressed offsets stay non-negative");
+        let len = end - start;
+        if len > u16::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("compressed string length {len} exceeds bqlite's u16 limit"),
+            ));
+        }
+        payload.extend_from_slice(&(len as u16).to_le_bytes());
+        payload.extend_from_slice(&compressed_values[start..end]);
+    }
+
+    Ok(RawFsstChunk {
+        symbol_table,
+        payload,
+        row_count: offsets.len().saturating_sub(1),
+        decoded_bytes: values.len(),
+    })
+}
+
+fn decode_with_raw_fsst(chunk: &RawFsstChunk) -> std::io::Result<ArrayRef> {
+    let mut compressed_values = Vec::new();
+    let mut compressed_offsets = Vec::with_capacity(chunk.row_count + 1);
+    compressed_offsets.push(0i32);
+
+    let mut offset = 0usize;
+    while offset < chunk.payload.len() {
+        if offset + 2 > chunk.payload.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "missing per-string compressed length prefix",
+            ));
+        }
+        let len =
+            u16::from_le_bytes(chunk.payload[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+
+        if offset + len > chunk.payload.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "payload ended before compressed string bytes",
+            ));
+        }
+
+        compressed_values.extend_from_slice(&chunk.payload[offset..offset + len]);
+        compressed_offsets.push(
+            i32::try_from(compressed_values.len())
+                .expect("compressed payload fits in i32 offset space"),
+        );
+        offset += len;
+    }
+
+    if compressed_offsets.len() != chunk.row_count + 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "decoded {} offsets for {} rows",
+                compressed_offsets.len(),
+                chunk.row_count
+            ),
+        ));
+    }
+
+    let mut decoded_values = vec![0u8; chunk.decoded_bytes.max(compressed_values.len() * 3)];
+    let mut decoded_offsets = vec![0i32; compressed_offsets.len()];
+    fsst_decompress(
+        &chunk.symbol_table,
+        &compressed_values,
+        &compressed_offsets,
+        &mut decoded_values,
+        &mut decoded_offsets,
+    )?;
+
+    let mut strings = Vec::with_capacity(chunk.row_count);
+    for window in decoded_offsets.windows(2) {
+        let start = usize::try_from(window[0]).expect("decoded offsets stay non-negative");
+        let end = usize::try_from(window[1]).expect("decoded offsets stay non-negative");
+        let s = std::str::from_utf8(&decoded_values[start..end]).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("lance fsst produced invalid UTF-8: {err}"),
+            )
+        })?;
+        strings.push(s);
+    }
+
+    Ok(Arc::new(StringViewArray::from(strings)) as ArrayRef)
+}
+
 fn bench_fsst_url_strings(c: &mut Criterion) {
     let array = gen_url_string_array(ROW_GROUP_SIZE);
     let fsst = Fsst::train(array.as_ref()).unwrap();
@@ -560,6 +706,70 @@ fn bench_fsst_user_agents(c: &mut Criterion) {
     });
 
     group.finish();
+}
+
+/// Compare the production FSST wrapper against the raw `fsst` crate
+/// API, including the packing/unpacking adapter work needed to fit
+/// bqlite's current payload shape.
+fn bench_fsst_impl_compare(c: &mut Criterion) {
+    for (dataset_name, array) in [
+        ("url_strings", gen_url_string_array(ROW_GROUP_SIZE)),
+        ("user_agents", gen_user_agent_array(ROW_GROUP_SIZE)),
+    ] {
+        let (offsets, values) = string_view_offsets_and_bytes(&array);
+
+        let wrapper = Fsst::train(array.as_ref()).unwrap();
+        let wrapper_chunk = wrapper.encode(array.as_ref()).unwrap();
+        let raw_chunk = encode_with_raw_fsst(&values, &offsets).unwrap();
+        let wrapper_decoded = wrapper.decode(&wrapper_chunk, &BqlType::String).unwrap();
+        let raw_decoded = decode_with_raw_fsst(&raw_chunk).unwrap();
+
+        assert_eq!(wrapper_decoded.as_ref(), array.as_ref());
+        assert_eq!(raw_decoded.as_ref(), array.as_ref());
+
+        let input_bytes = values.len() as u64;
+        let wrapper_total_bytes = (wrapper_chunk.params.len() + wrapper_chunk.payload.len()) as u64;
+        let raw_total_bytes = (raw_chunk.symbol_table.len() + raw_chunk.payload.len()) as u64;
+
+        let mut group = c.benchmark_group(format!("encoding/fsst_impl_compare/{dataset_name}"));
+        group.throughput(Throughput::Bytes(input_bytes));
+
+        group.bench_function("wrapper_train_plus_encode", |b| {
+            b.iter(|| {
+                let trained = Fsst::train(black_box(array.as_ref())).unwrap();
+                trained.encode(black_box(array.as_ref())).unwrap()
+            })
+        });
+
+        group.bench_function("raw_encode_adapted", |b| {
+            b.iter(|| encode_with_raw_fsst(black_box(&values), black_box(&offsets)).unwrap())
+        });
+
+        group.bench_function("wrapper_decode", |b| {
+            b.iter(|| {
+                wrapper
+                    .decode(black_box(&wrapper_chunk), &BqlType::String)
+                    .unwrap()
+            })
+        });
+
+        group.bench_function("raw_decode_adapted", |b| {
+            b.iter(|| decode_with_raw_fsst(black_box(&raw_chunk)).unwrap())
+        });
+
+        group.finish();
+
+        eprintln!(
+            "  impl-compare/{dataset_name}: wrapper={} bytes (params {} + payload {}), \
+             raw={} bytes (symbol_table {} + payload {})",
+            wrapper_total_bytes,
+            wrapper_chunk.params.len(),
+            wrapper_chunk.payload.len(),
+            raw_total_bytes,
+            raw_chunk.symbol_table.len(),
+            raw_chunk.payload.len()
+        );
+    }
 }
 
 /// Compare FSST against Dictionary + Plain + LZ4 on the same
@@ -904,6 +1114,7 @@ criterion_group! {
         bench_lz4_repetitive,
         bench_fsst_url_strings,
         bench_fsst_user_agents,
+        bench_fsst_impl_compare,
         bench_fsst_vs_baselines,
         bench_selector_throughput,
         bench_encoding_with_metrics,

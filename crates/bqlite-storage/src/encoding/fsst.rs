@@ -1,10 +1,9 @@
 //! FSST (Fast Static Symbol Table) string compression.
 //!
-//! FSST builds a 256-entry symbol table of common substrings (1–8
-//! bytes each) from a sample of the column's strings, then re-encodes
-//! each string by replacing substring occurrences with single-byte
-//! codes. The symbol table is stored once per segment and shared by
-//! all row groups.
+//! FSST builds a symbol table of common substrings and re-encodes each
+//! string by replacing substring occurrences with single-byte codes.
+//! The symbol table is stored once per segment and shared by all row
+//! groups in the future v2 segment layout.
 //!
 //! See `docs/design/storage/advanced-encodings.md` §7 for the go
 //! decision evidence and `segment-format-v2.md` §5.3 for the on-disk
@@ -21,26 +20,32 @@
 //! once at the **segment** level (in the FSST symbol tables region,
 //! `segment-format-v2.md` §6) and the per-row-group column chunk
 //! stores only `symbol_table_id: u32 LE` params plus the compressed
-//! strings payload. That layout is what TASK-419 writes to disk.
+//! strings payload. That layout is what TASK-419 will eventually write
+//! to disk.
 //!
 //! The [`Encoding`] trait operates on **self-contained**
 //! [`EncodedChunk`]s so that round-trip property tests hold without a
 //! separate segment-level store. To honor both constraints, the
-//! trait-level chunk produced by `Fsst` inlines the symbol table into
-//! the `params` block — following the same pattern as Dictionary, which
-//! inlines dictionary values into its params. The segment writer
-//! (TASK-419) will parse each FSST chunk's params, hoist the symbol
-//! table to the segment-level region, and rewrite the on-disk params to
-//! the `symbol_table_id` shape §5.3 mandates.
+//! trait-level chunk produced here inlines the serialized FSST symbol
+//! table directly into `params`. The segment writer can later hoist
+//! those bytes to the segment-level FSST region and rewrite the
+//! per-chunk params to the `symbol_table_id` shape the v2 spec
+//! mandates.
 //!
 //! # Params layout (self-contained form)
 //!
-//! ```text
-//! [symbol_count:    u16 LE]        // number of symbols (0..=255)
-//! for each symbol:
-//!   [sym_len:       u8]            // 1..=8
-//!   [sym_bytes:     [u8; sym_len]] // the symbol's bytes
-//! ```
+//! `params` is the exact fixed-size symbol table blob exported by the
+//! `fsst` crate. It is always `FSST_SYMBOL_TABLE_SIZE` bytes and
+//! carries:
+//!
+//! - the crate's `FSST` magic/version header
+//! - whether the crate elected to enable compression or pass the input
+//!   through unchanged for very small inputs
+//! - the symbol bytes and their lengths
+//!
+//! Keeping the crate-native blob intact avoids losing the
+//! "encoder-switch" flag, which the crate uses to fall back to raw
+//! bytes for small inputs.
 //!
 //! # Payload layout
 //!
@@ -51,21 +56,25 @@
 //! ```
 //!
 //! Each `compressed_bytes` sequence is the FSST-encoded form of the
-//! original string. Byte 0xFF is the escape byte: the following byte
-//! is a literal. All other bytes are symbol table indices.
+//! original string. When the underlying crate chooses its small-input
+//! passthrough path, `compressed_bytes` is simply the raw UTF-8 bytes
+//! for that string; the serialized symbol-table blob in `params`
+//! preserves that choice so decode remains correct.
 //!
-//! # Symbol table construction
+//! # State model
 //!
-//! This module uses the `fsst-rs` crate (a pure-Rust FSST
-//! implementation following the VLDB 2020 paper) for symbol table
-//! construction and string compression/decompression. The crate
-//! provides:
+//! The `fsst` crate exposes a one-shot `compress` / `decompress` API
+//! keyed by a serialized symbol-table blob. It does **not** currently
+//! expose a public "train once, then reuse this symbol table for many
+//! encode calls" surface. Because bqlite's selector does not yet pick
+//! FSST in the production writer path, this wrapper treats [`Fsst`] as
+//! a lightweight adapter: `encode` builds a fresh self-contained chunk
+//! for the provided array, and `decode` uses the authoritative symbol
+//! table bytes carried in that chunk's `params`.
 //!
-//! - `CompressorBuilder` → builds a `Compressor` from training data
-//! - `Compressor::compress` → compresses individual strings
-//! - `Decompressor::decompress` → decompresses individual strings
-//! - `Compressor::rebuild_from(symbols, lens)` → reconstructs from
-//!   serialized symbol table
+//! `train` and `from_params` remain as convenience constructors for
+//! tests and future read-path integration, but decode correctness is
+//! driven by the chunk params, not hidden encoder state.
 //!
 //! # Null handling
 //!
@@ -75,16 +84,17 @@
 //!
 //! # Edge cases
 //!
-//! - `row_count == 0`: legal. `encode` returns an empty chunk (params =
-//!   `[0, 0]` for symbol_count=0, payload = `[]`). `decode` returns
-//!   an empty array.
-//! - All strings empty: legal. The symbol table will be empty or
-//!   near-empty; each compressed string is 0 bytes.
-//! - Strings shorter than any symbol: encoded as escape-preceded
-//!   literal bytes. The compressed form is at most 2× the original.
-//! - No beneficial symbols (FSST payload ≥ Plain payload): the
-//!   selector guard in TASK-419 catches this; `Fsst::encode` itself
-//!   always produces valid output regardless.
+//! - `row_count == 0`: legal. `encode` returns an empty payload and a
+//!   valid serialized symbol-table blob with the crate's passthrough
+//!   flag disabled.
+//! - Very small inputs: legal. The crate falls back to raw bytes below
+//!   its threshold; decode remains correct because the serialized
+//!   symbol-table blob in `params` records that choice.
+//! - All strings empty: legal. Each `compressed_len` is zero.
+//! - Strings shorter than any useful symbol: legal. FSST may emit
+//!   escape-prefixed literals or choose the passthrough path.
+//! - No beneficial symbols: legal. The selector guard in TASK-419
+//!   catches this; `Fsst::encode` itself always produces valid output.
 //!
 //! # Selector guard
 //!
@@ -94,108 +104,41 @@
 //! here. [`Fsst::estimate_size`] returns a conservative upper bound
 //! (2× input size) so the selector can compare accurately.
 
+use std::sync::Arc;
+
 use arrow::array::{Array, ArrayRef, StringArray, StringViewArray, StringViewBuilder};
 use arrow::datatypes::DataType;
 use bqlite_core::{BqlType, BqliteError, Result};
-use std::sync::Arc;
+use fsst::fsst::{
+    compress as fsst_compress, decompress as fsst_decompress, FSST_SYMBOL_TABLE_SIZE,
+};
 
 use super::{require_dense, BorrowedEncodedChunk, EncodedChunk, Encoding, EncodingType};
 
-/// Maximum number of strings sampled for symbol table construction.
-/// Per `advanced-encodings.md` §7.5: sample up to 16,384 strings.
-const SAMPLE_SIZE: usize = 16_384;
-
-/// FSST encoding — string compression via a trained symbol table.
+/// FSST encoding adapter.
 ///
-/// Unlike the other encodings (which are zero-sized marker types),
-/// `Fsst` holds a trained `fsst::Compressor` that provides the symbol
-/// table and compression logic. The compressor is built once from a
-/// sample of the column's strings and reused for all row groups in the
-/// segment.
-///
-/// For decode-only paths (reader), construct via
-/// [`Fsst::from_symbol_table`] using the serialized symbol table
-/// loaded from the segment file.
-#[derive(Clone)]
-pub struct Fsst {
-    compressor: fsst::Compressor,
-}
-
-impl std::fmt::Debug for Fsst {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Fsst")
-            .field("symbol_count", &self.compressor.symbol_table().len())
-            .finish()
-    }
-}
+/// The `fsst` crate's public API is one-shot and chunk-oriented, so
+/// this wrapper carries no mutable compression state of its own.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Fsst;
 
 impl Fsst {
-    /// Build an FSST encoder by training a symbol table on a sample of
-    /// strings from the given array.
-    ///
-    /// The array must be a `StringViewArray` or `StringArray` (the two
-    /// Arrow string representations bqlite uses). Up to [`SAMPLE_SIZE`]
-    /// strings are sampled for training.
+    /// Validate that `array` is a supported String array and that the
+    /// underlying crate can compress it successfully.
     pub fn train(array: &dyn Array) -> Result<Self> {
-        let strings = collect_string_bytes(array)?;
-
-        // Sample up to SAMPLE_SIZE strings for training.
-        let sample: Vec<&[u8]> = if strings.len() <= SAMPLE_SIZE {
-            strings.iter().map(|s| s.as_slice()).collect()
-        } else {
-            // Deterministic evenly-spaced sampling — no RNG needed.
-            let step = strings.len() as f64 / SAMPLE_SIZE as f64;
-            (0..SAMPLE_SIZE)
-                .map(|i| {
-                    let idx = (i as f64 * step) as usize;
-                    strings[idx].as_slice()
-                })
-                .collect()
-        };
-
-        let compressor = fsst::Compressor::train(&sample);
-
-        Ok(Self { compressor })
+        let _ = encode_chunk(array)?;
+        Ok(Self)
     }
 
-    /// Reconstruct an FSST encoder/decoder from a serialized symbol
-    /// table (as stored in the segment file's FSST symbol tables
-    /// region).
-    ///
-    /// `symbols` and `symbol_lens` are the parallel arrays from the
-    /// on-disk format: each symbol is a `fsst::Symbol` (8-byte packed
-    /// value) and its length in bytes (1–8).
-    pub fn from_symbol_table(symbols: &[fsst::Symbol], symbol_lens: &[u8]) -> Self {
-        let compressor = fsst::Compressor::rebuild_from(symbols, symbol_lens);
-        Self { compressor }
+    /// Validate a serialized FSST symbol-table blob.
+    pub fn from_symbol_table(symbol_table: &[u8]) -> Result<Self> {
+        validate_params(symbol_table)?;
+        Ok(Self)
     }
 
-    /// Deserialize an FSST encoder/decoder from the self-contained
-    /// params format used in `EncodedChunk`.
+    /// Validate a self-contained params block.
     pub fn from_params(params: &[u8]) -> Result<Self> {
-        let (symbols, symbol_lens) = parse_params(params)?;
-        Ok(Self::from_symbol_table(&symbols, &symbol_lens))
-    }
-
-    /// Serialize the symbol table into the self-contained params format
-    /// used in `EncodedChunk`.
-    fn serialize_params(&self) -> Vec<u8> {
-        let symbols = self.compressor.symbol_table();
-        let lengths = self.compressor.symbol_lengths();
-        let n = symbols.len();
-
-        // Calculate total size: 2 (symbol_count) + sum(1 + sym_len)
-        let total_sym_bytes: usize = lengths.iter().map(|&l| 1 + l as usize).sum();
-        let mut params = Vec::with_capacity(2 + total_sym_bytes);
-
-        params.extend_from_slice(&(n as u16).to_le_bytes());
-        for i in 0..n {
-            let len = lengths[i];
-            params.push(len);
-            let sym_bytes = &symbols[i].to_u64().to_le_bytes()[..len as usize];
-            params.extend_from_slice(sym_bytes);
-        }
-        params
+        Self::from_symbol_table(params)
     }
 }
 
@@ -211,62 +154,30 @@ impl Encoding for Fsst {
     fn estimate_size(&self, array: &dyn Array) -> Result<usize> {
         // Conservative upper bound: each string contributes at most
         // 2 bytes (compressed_len) + 2 * original_len (worst case:
-        // every byte escaped). In practice FSST compresses 3–5×, so
-        // this is intentionally loose — the selector uses the estimate
-        // only for ranking, not for allocation.
+        // every byte escaped). The `fsst` crate also has a small-input
+        // passthrough mode, which still fits inside this bound.
         let total_string_bytes = total_string_byte_len(array)?;
         let row_count = array.len();
-        // 2 bytes per string for the compressed_len prefix, plus
-        // worst-case 2× expansion of string data.
         Ok(row_count * 2 + total_string_bytes * 2)
     }
 
     fn encode(&self, array: &dyn Array) -> Result<EncodedChunk> {
         require_dense(array, "Fsst")?;
-        let row_count = array.len();
-
-        let params = self.serialize_params();
-
-        // Compress each string directly from the array — no intermediate
-        // Vec<Vec<u8>> materialization needed for the encode path.
-        let mut payload = Vec::new();
-        encode_strings(array, &self.compressor, &mut payload)?;
-
-        Ok(EncodedChunk {
-            encoding: EncodingType::Fsst,
-            params,
-            payload,
-            row_count,
-        })
+        encode_chunk(array)
     }
 
     fn decode(&self, chunk: &EncodedChunk, ty: &BqlType) -> Result<ArrayRef> {
-        // Use the already-built compressor instead of re-parsing params.
-        decode_with_decompressor(
-            &self.compressor.decompressor(),
-            &chunk.payload,
-            chunk.row_count,
-            ty,
-        )
+        decode_from_params(&chunk.params, &chunk.payload, chunk.row_count, ty)
     }
 
     fn decode_borrowed(&self, chunk: BorrowedEncodedChunk<'_>, ty: &BqlType) -> Result<ArrayRef> {
-        decode_with_decompressor(
-            &self.compressor.decompressor(),
-            chunk.payload,
-            chunk.row_count,
-            ty,
-        )
+        decode_from_params(chunk.params, chunk.payload, chunk.row_count, ty)
     }
 }
 
-// ── decode implementation ───────────────────────────────────────────────────
-
-/// Decode an FSST-encoded payload using an already-constructed
-/// decompressor. This is the fast path used when the `Fsst` struct
-/// already holds a trained compressor.
-fn decode_with_decompressor(
-    decompressor: &fsst::Decompressor<'_>,
+/// Decode from a self-contained params block plus payload.
+pub fn decode_from_params(
+    params: &[u8],
     payload: &[u8],
     row_count: usize,
     ty: &BqlType,
@@ -276,41 +187,35 @@ fn decode_with_decompressor(
             "Fsst::decode called with {ty:?} — FSST only supports String"
         )));
     }
-
     if row_count == 0 {
         return Ok(Arc::new(StringViewArray::from(Vec::<&str>::new())) as ArrayRef);
     }
 
+    validate_params(params)?;
+
+    let (compressed_values, compressed_offsets) = unpack_payload(payload, row_count)?;
+    let mut decoded_values = vec![0u8; decoded_size_from_symbol_table(params, &compressed_values)?];
+    let mut decoded_offsets = vec![0i32; compressed_offsets.len()];
+    fsst_decompress(
+        params,
+        &compressed_values,
+        &compressed_offsets,
+        &mut decoded_values,
+        &mut decoded_offsets,
+    )
+    .map_err(|e| BqliteError::Corruption(format!("Fsst::decode: {e}")))?;
+
     let mut builder = StringViewBuilder::with_capacity(row_count);
-    let mut offset = 0;
-
-    for _ in 0..row_count {
-        if offset + 2 > payload.len() {
-            return Err(BqliteError::Corruption(
-                "Fsst::decode: payload too short — missing compressed_len".into(),
-            ));
-        }
-        let compressed_len =
-            u16::from_le_bytes(payload[offset..offset + 2].try_into().unwrap()) as usize;
-        offset += 2;
-
-        if offset + compressed_len > payload.len() {
-            return Err(BqliteError::Corruption(format!(
-                "Fsst::decode: payload too short — need {compressed_len} compressed \
-                 bytes at offset {offset} but only {} remain",
-                payload.len() - offset
-            )));
-        }
-
-        let compressed = &payload[offset..offset + compressed_len];
-        offset += compressed_len;
-
-        let decompressed = decompressor.decompress(compressed);
-        // SAFETY: FSST preserves the original bytes — if the input was
-        // valid UTF-8, the output is valid UTF-8.
-        let s = std::str::from_utf8(&decompressed).map_err(|e| {
+    for window in decoded_offsets.windows(2) {
+        let start = usize::try_from(window[0]).map_err(|_| {
+            BqliteError::Corruption("Fsst::decode: decoded offsets must be non-negative".into())
+        })?;
+        let end = usize::try_from(window[1]).map_err(|_| {
+            BqliteError::Corruption("Fsst::decode: decoded offsets must be non-negative".into())
+        })?;
+        let s = std::str::from_utf8(&decoded_values[start..end]).map_err(|e| {
             BqliteError::Corruption(format!(
-                "Fsst::decode: decompressed bytes are not valid UTF-8: {e}"
+                "Fsst::decode: decoded bytes are not valid UTF-8: {e}"
             ))
         })?;
         builder.append_value(s);
@@ -319,34 +224,38 @@ fn decode_with_decompressor(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-/// Decode by reconstructing the decompressor from the self-contained
-/// params. Used by external callers that only have a chunk (e.g. the
-/// segment reader in TASK-419).
-pub fn decode_from_params(
-    params: &[u8],
-    payload: &[u8],
-    row_count: usize,
-    ty: &BqlType,
-) -> Result<ArrayRef> {
-    let fsst = Fsst::from_params(params)?;
-    let decompressor = fsst.compressor.decompressor();
-    decode_with_decompressor(&decompressor, payload, row_count, ty)
+fn encode_chunk(array: &dyn Array) -> Result<EncodedChunk> {
+    let row_count = array.len();
+    let (values, offsets) = flatten_string_values(array)?;
+    let (params, compressed_values, compressed_offsets) = compress_values(&values, &offsets)?;
+    let payload = pack_payload(&compressed_values, &compressed_offsets)?;
+
+    Ok(EncodedChunk {
+        encoding: EncodingType::Fsst,
+        params,
+        payload,
+        row_count,
+    })
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────
+fn compress_values(values: &[u8], offsets: &[i32]) -> Result<(Vec<u8>, Vec<u8>, Vec<i32>)> {
+    let mut symbol_table = vec![0u8; FSST_SYMBOL_TABLE_SIZE];
+    let mut compressed_values = vec![0u8; values.len()];
+    let mut compressed_offsets = vec![0i32; offsets.len()];
 
-/// Compress each string in the array directly into the payload buffer,
-/// avoiding per-row heap allocations. Each string is written as:
-/// `[compressed_len: u16 LE][compressed_bytes]`.
-///
-/// Returns `BqliteError::Execution` if any compressed string exceeds
-/// the `u16::MAX` (65,535 byte) limit — per `segment-format-v2.md` §5.3
-/// the writer must fall back to Plain for the entire column in that case.
-fn encode_strings(
-    array: &dyn Array,
-    compressor: &fsst::Compressor,
-    payload: &mut Vec<u8>,
-) -> Result<()> {
+    fsst_compress(
+        &mut symbol_table,
+        values,
+        offsets,
+        &mut compressed_values,
+        &mut compressed_offsets,
+    )
+    .map_err(|e| BqliteError::Execution(format!("Fsst::encode: {e}")))?;
+
+    Ok((symbol_table, compressed_values, compressed_offsets))
+}
+
+fn flatten_string_values(array: &dyn Array) -> Result<(Vec<u8>, Vec<i32>)> {
     match array.data_type() {
         DataType::Utf8View => {
             let a = array
@@ -355,10 +264,17 @@ fn encode_strings(
                 .ok_or_else(|| {
                     BqliteError::Execution("Fsst: expected StringViewArray, downcast failed".into())
                 })?;
+
+            let mut offsets = Vec::with_capacity(a.len() + 1);
+            let mut values = Vec::new();
+            offsets.push(0);
             for i in 0..a.len() {
-                compress_one(a.value(i).as_bytes(), compressor, payload)?;
+                values.extend_from_slice(a.value(i).as_bytes());
+                offsets.push(i32::try_from(values.len()).map_err(|_| {
+                    BqliteError::Execution("Fsst: value buffer exceeds i32 offset space".into())
+                })?);
             }
-            Ok(())
+            Ok((values, offsets))
         }
         DataType::Utf8 => {
             let a = array
@@ -367,10 +283,17 @@ fn encode_strings(
                 .ok_or_else(|| {
                     BqliteError::Execution("Fsst: expected StringArray, downcast failed".into())
                 })?;
+
+            let mut offsets = Vec::with_capacity(a.len() + 1);
+            let mut values = Vec::new();
+            offsets.push(0);
             for i in 0..a.len() {
-                compress_one(a.value(i).as_bytes(), compressor, payload)?;
+                values.extend_from_slice(a.value(i).as_bytes());
+                offsets.push(i32::try_from(values.len()).map_err(|_| {
+                    BqliteError::Execution("Fsst: value buffer exceeds i32 offset space".into())
+                })?);
             }
-            Ok(())
+            Ok((values, offsets))
         }
         other => Err(BqliteError::Execution(format!(
             "Fsst: unsupported Arrow type {other:?} — FSST covers Utf8/Utf8View only"
@@ -378,53 +301,123 @@ fn encode_strings(
     }
 }
 
-/// Compress a single string and append `[u16 LE len][compressed bytes]`
-/// to the payload. Returns an error if the compressed output overflows
-/// `u16::MAX`.
-fn compress_one(input: &[u8], compressor: &fsst::Compressor, payload: &mut Vec<u8>) -> Result<()> {
-    let compressed = compressor.compress(input);
-    let len = compressed.len();
-    if len > u16::MAX as usize {
-        return Err(BqliteError::Execution(format!(
-            "Fsst: compressed string is {len} bytes, exceeding the u16 \
-             (65,535 byte) limit — the column must fall back to Plain"
+fn pack_payload(compressed_values: &[u8], compressed_offsets: &[i32]) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(compressed_values.len() + compressed_offsets.len() * 2);
+    for window in compressed_offsets.windows(2) {
+        let start = usize::try_from(window[0]).map_err(|_| {
+            BqliteError::Execution("Fsst: compressed offsets must be non-negative".into())
+        })?;
+        let end = usize::try_from(window[1]).map_err(|_| {
+            BqliteError::Execution("Fsst: compressed offsets must be non-negative".into())
+        })?;
+        let len = end - start;
+        if len > u16::MAX as usize {
+            return Err(BqliteError::Execution(format!(
+                "Fsst: compressed string is {len} bytes, exceeding the u16 \
+                 (65,535 byte) limit — the column must fall back to Plain"
+            )));
+        }
+        payload.extend_from_slice(&(len as u16).to_le_bytes());
+        payload.extend_from_slice(&compressed_values[start..end]);
+    }
+    Ok(payload)
+}
+
+fn unpack_payload(payload: &[u8], row_count: usize) -> Result<(Vec<u8>, Vec<i32>)> {
+    let mut compressed_values = Vec::new();
+    let mut compressed_offsets = Vec::with_capacity(row_count + 1);
+    compressed_offsets.push(0);
+
+    let mut offset = 0usize;
+    for row in 0..row_count {
+        if offset + 2 > payload.len() {
+            return Err(BqliteError::Corruption(format!(
+                "Fsst::decode: payload too short — missing compressed_len for row {row}"
+            )));
+        }
+        let len = u16::from_le_bytes(payload[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+
+        if offset + len > payload.len() {
+            return Err(BqliteError::Corruption(format!(
+                "Fsst::decode: payload too short — row {row} needs {len} bytes at offset \
+                 {offset} but only {} remain",
+                payload.len() - offset
+            )));
+        }
+
+        compressed_values.extend_from_slice(&payload[offset..offset + len]);
+        compressed_offsets.push(i32::try_from(compressed_values.len()).map_err(|_| {
+            BqliteError::Corruption("Fsst::decode: compressed payload exceeds i32 offsets".into())
+        })?);
+        offset += len;
+    }
+
+    if offset != payload.len() {
+        return Err(BqliteError::Corruption(format!(
+            "Fsst::decode: payload has {} trailing bytes",
+            payload.len() - offset
         )));
     }
-    payload.extend_from_slice(&(len as u16).to_le_bytes());
-    payload.extend_from_slice(&compressed);
+
+    Ok((compressed_values, compressed_offsets))
+}
+
+fn validate_params(params: &[u8]) -> Result<()> {
+    if params.len() != FSST_SYMBOL_TABLE_SIZE {
+        return Err(BqliteError::Corruption(format!(
+            "Fsst params must be exactly {FSST_SYMBOL_TABLE_SIZE} bytes, got {}",
+            params.len()
+        )));
+    }
     Ok(())
 }
 
-/// Collect all strings from a String-typed Arrow array into byte slices.
-/// Used only for the training path (which needs all strings up front).
-fn collect_string_bytes(array: &dyn Array) -> Result<Vec<Vec<u8>>> {
-    match array.data_type() {
-        DataType::Utf8View => {
-            let a = array
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .ok_or_else(|| {
-                    BqliteError::Execution("Fsst: expected StringViewArray, downcast failed".into())
-                })?;
-            Ok((0..a.len())
-                .map(|i| a.value(i).as_bytes().to_vec())
-                .collect())
-        }
-        DataType::Utf8 => {
-            let a = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    BqliteError::Execution("Fsst: expected StringArray, downcast failed".into())
-                })?;
-            Ok((0..a.len())
-                .map(|i| a.value(i).as_bytes().to_vec())
-                .collect())
-        }
-        other => Err(BqliteError::Execution(format!(
-            "Fsst: unsupported Arrow type {other:?} — FSST covers Utf8/Utf8View only"
-        ))),
+fn decoded_size_from_symbol_table(params: &[u8], compressed_values: &[u8]) -> Result<usize> {
+    let header = u64::from_ne_bytes(params[..8].try_into().unwrap());
+    let encoder_switch = (header & (1 << 24)) != 0;
+    if !encoder_switch {
+        return Ok(compressed_values.len());
     }
+
+    let symbol_count = (header & 0xFF) as usize;
+    let lens_start = 8 + symbol_count * 8;
+    if lens_start + symbol_count > params.len() {
+        return Err(BqliteError::Corruption(format!(
+            "Fsst params truncated: symbol_count {symbol_count} exceeds params length {}",
+            params.len()
+        )));
+    }
+
+    let mut lens = [0u8; 256];
+    lens[..symbol_count].copy_from_slice(&params[lens_start..lens_start + symbol_count]);
+
+    let mut decoded_size = 0usize;
+    let mut i = 0usize;
+    while i < compressed_values.len() {
+        let code = compressed_values[i];
+        if code == 255 {
+            if i + 1 >= compressed_values.len() {
+                return Err(BqliteError::Corruption(
+                    "Fsst::decode: payload ends with dangling escape byte".into(),
+                ));
+            }
+            decoded_size += 1;
+            i += 2;
+            continue;
+        }
+
+        let len = lens[code as usize] as usize;
+        if len == 0 {
+            return Err(BqliteError::Corruption(format!(
+                "Fsst::decode: code {code} has no symbol length in params"
+            )));
+        }
+        decoded_size += len;
+        i += 1;
+    }
+
+    Ok(decoded_size)
 }
 
 /// Total byte length of all strings in an array (for estimate_size).
@@ -454,46 +447,6 @@ fn total_string_byte_len(array: &dyn Array) -> Result<usize> {
     }
 }
 
-/// Parse the self-contained params into (symbols, symbol_lengths).
-fn parse_params(params: &[u8]) -> Result<(Vec<fsst::Symbol>, Vec<u8>)> {
-    if params.len() < 2 {
-        return Err(BqliteError::Corruption(
-            "Fsst params too short — missing symbol_count".into(),
-        ));
-    }
-    let symbol_count = u16::from_le_bytes(params[..2].try_into().unwrap()) as usize;
-    let mut symbols = Vec::with_capacity(symbol_count);
-    let mut lengths = Vec::with_capacity(symbol_count);
-
-    let mut offset = 2;
-    for i in 0..symbol_count {
-        if offset >= params.len() {
-            return Err(BqliteError::Corruption(format!(
-                "Fsst params truncated at symbol {i}/{symbol_count}"
-            )));
-        }
-        let sym_len = params[offset] as usize;
-        offset += 1;
-        if sym_len == 0 || sym_len > 8 {
-            return Err(BqliteError::Corruption(format!(
-                "Fsst symbol {i} has invalid length {sym_len} (must be 1..=8)"
-            )));
-        }
-        if offset + sym_len > params.len() {
-            return Err(BqliteError::Corruption(format!(
-                "Fsst params truncated at symbol {i} bytes"
-            )));
-        }
-        let mut sym_buf = [0u8; 8];
-        sym_buf[..sym_len].copy_from_slice(&params[offset..offset + sym_len]);
-        symbols.push(fsst::Symbol::from_slice(&sym_buf));
-        lengths.push(sym_len as u8);
-        offset += sym_len;
-    }
-
-    Ok((symbols, lengths))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +459,7 @@ mod tests {
         let chunk = fsst.encode(array.as_ref()).unwrap();
         assert_eq!(chunk.encoding, EncodingType::Fsst);
         assert_eq!(chunk.row_count, 3);
+        assert_eq!(chunk.params.len(), FSST_SYMBOL_TABLE_SIZE);
         let decoded = fsst.decode(&chunk, &BqlType::String).unwrap();
         assert_eq!(decoded.as_ref(), array.as_ref());
     }
@@ -521,32 +475,11 @@ mod tests {
     }
 
     #[test]
-    fn fsst_round_trip_empty_strings() {
-        let strings = vec!["", "", ""];
-        let array: ArrayRef = Arc::new(StringViewArray::from(strings));
-        let fsst = Fsst::train(array.as_ref()).unwrap();
-        let chunk = fsst.encode(array.as_ref()).unwrap();
-        let decoded = fsst.decode(&chunk, &BqlType::String).unwrap();
-        assert_eq!(decoded.as_ref(), array.as_ref());
-    }
-
-    #[test]
-    fn fsst_round_trip_single_string() {
-        let strings = vec!["a single string"];
-        let array: ArrayRef = Arc::new(StringViewArray::from(strings));
-        let fsst = Fsst::train(array.as_ref()).unwrap();
-        let chunk = fsst.encode(array.as_ref()).unwrap();
-        let decoded = fsst.decode(&chunk, &BqlType::String).unwrap();
-        assert_eq!(decoded.as_ref(), array.as_ref());
-    }
-
-    #[test]
     fn fsst_round_trip_utf8_array() {
         let strings = vec!["foo", "bar", "baz"];
         let array: ArrayRef = Arc::new(StringArray::from(strings));
         let fsst = Fsst::train(array.as_ref()).unwrap();
         let chunk = fsst.encode(array.as_ref()).unwrap();
-        // Decode always produces StringViewArray per bqlite convention.
         let decoded = fsst.decode(&chunk, &BqlType::String).unwrap();
         let decoded_view = decoded.as_any().downcast_ref::<StringViewArray>().unwrap();
         assert_eq!(decoded_view.value(0), "foo");
@@ -555,24 +488,34 @@ mod tests {
     }
 
     #[test]
-    fn fsst_params_serialization_round_trip() {
-        let strings = vec!["https://example.com/page1", "https://example.com/page2"];
+    fn fsst_cross_decode_from_params() {
+        let strings = vec![
+            "user_agent: Mozilla/5.0",
+            "user_agent: Chrome/120",
+            "user_agent: Safari/17",
+        ];
+        let array: ArrayRef = Arc::new(StringViewArray::from(strings));
+        let encoder = Fsst::train(array.as_ref()).unwrap();
+        let chunk = encoder.encode(array.as_ref()).unwrap();
+
+        let decoder = Fsst::from_params(&chunk.params).unwrap();
+        let decoded = decoder.decode(&chunk, &BqlType::String).unwrap();
+        assert_eq!(decoded.as_ref(), array.as_ref());
+    }
+
+    #[test]
+    fn fsst_small_input_round_trips() {
+        let strings = vec!["a", "bb", "ccc", "dddd"];
         let array: ArrayRef = Arc::new(StringViewArray::from(strings));
         let fsst = Fsst::train(array.as_ref()).unwrap();
-        let params = fsst.serialize_params();
-        let reconstructed = Fsst::from_params(&params).unwrap();
-
-        // Verify the reconstructed encoder produces the same output.
-        let chunk1 = fsst.encode(array.as_ref()).unwrap();
-        let chunk2 = reconstructed.encode(array.as_ref()).unwrap();
-        assert_eq!(chunk1.payload, chunk2.payload);
+        let chunk = fsst.encode(array.as_ref()).unwrap();
+        let decoded = fsst.decode(&chunk, &BqlType::String).unwrap();
+        assert_eq!(decoded.as_ref(), array.as_ref());
     }
 
     #[test]
     fn fsst_applicable_to_string_only() {
-        let strings = vec!["a"];
-        let array: ArrayRef = Arc::new(StringViewArray::from(strings));
-        let fsst = Fsst::train(array.as_ref()).unwrap();
+        let fsst = Fsst;
         assert!(fsst.applicable_to(&BqlType::String));
         assert!(!fsst.applicable_to(&BqlType::Int));
         assert!(!fsst.applicable_to(&BqlType::Float));
@@ -596,21 +539,13 @@ mod tests {
     }
 
     #[test]
-    fn fsst_cross_decode_from_params() {
-        // Encode with one Fsst instance, decode by reconstructing from
-        // the chunk's params — simulates what the segment reader does.
-        let strings = vec![
-            "user_agent: Mozilla/5.0",
-            "user_agent: Chrome/120",
-            "user_agent: Safari/17",
-        ];
-        let array: ArrayRef = Arc::new(StringViewArray::from(strings));
-        let encoder = Fsst::train(array.as_ref()).unwrap();
-        let chunk = encoder.encode(array.as_ref()).unwrap();
-
-        // Reconstruct decoder from params only (no access to original Fsst).
-        let decoder = Fsst::from_params(&chunk.params).unwrap();
-        let decoded = decoder.decode(&chunk, &BqlType::String).unwrap();
-        assert_eq!(decoded.as_ref(), array.as_ref());
+    fn fsst_from_params_rejects_bad_length() {
+        let err = Fsst::from_params(&[1, 2, 3]).unwrap_err();
+        match err {
+            BqliteError::Corruption(msg) => {
+                assert!(msg.contains("exactly"));
+            }
+            other => panic!("expected Corruption error, got {other:?}"),
+        }
     }
 }
