@@ -69,8 +69,9 @@ use crate::encoding::{
     EncodingType, Plain, Rle,
 };
 use crate::segment::layout::{
-    ColumnChunkMeta, CompressionType, FooterV1, CHECKSUM_LEN, CHECKSUM_SEED, FILE_HEADER_LEN,
-    FOOTER_SUFFIX_LEN, MAGIC, SEGMENT_FORMAT_VERSION, TRAILER_LEN,
+    ColumnChunkMeta, CompressionType, FooterV1, FooterV2, SegmentFooter, CHECKSUM_LEN,
+    CHECKSUM_SEED, FILE_HEADER_LEN, FOOTER_SUFFIX_LEN, MAGIC, SEGMENT_FORMAT_VERSION_V1,
+    SEGMENT_FORMAT_VERSION_V2, TRAILER_LEN,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,14 +105,14 @@ impl DictionaryValues {
     }
 }
 
-/// Reader over a single v1 segment file.
+/// Reader over a v1 or v2 segment file.
 ///
 /// Constructed by reading a segment file from disk ([`Self::open`])
 /// or from an in-memory byte buffer ([`Self::from_bytes`]). The
-/// constructor runs every validation rule listed in
-/// `segment-format-v1.md` §15 — a `SegmentFileReader` value is
-/// therefore a proof that the underlying bytes are a well-formed
-/// v1 segment.
+/// constructor runs every §15 validation rule (plus v2 additions
+/// from `segment-format-v2.md` §11) — a `SegmentFileReader` value
+/// is therefore a proof that the underlying bytes are a well-formed
+/// segment.
 ///
 /// Cloning a `SegmentFileReader` is cheap: the backing bytes, the
 /// parsed footer, and the loaded dictionaries all live behind
@@ -123,19 +124,18 @@ pub struct SegmentFileReader {
     /// bytes directly out of this buffer via absolute offsets from
     /// [`crate::segment::layout::ColumnChunkMeta`].
     bytes: Arc<[u8]>,
-    /// Parsed footer body. The reader guarantees this struct has
-    /// passed every §15 validation rule.
-    footer: Arc<FooterV1>,
-    /// Segment-level dictionaries, indexed by
-    /// [`crate::segment::layout::FooterV1::dictionaries`] position.
-    /// Loaded eagerly on open per §11.
+    /// Parsed footer body (v1 or v2). The reader guarantees this
+    /// struct has passed every validation rule.
+    footer: Arc<SegmentFooter>,
+    /// Segment-level dictionaries, indexed by footer dictionaries
+    /// position. Loaded eagerly on open per §11.
     dictionaries: Arc<[DictionaryValues]>,
     /// Current manifest schema the reader should project rows
     /// against, passed in by the caller. This is the target schema
     /// for name-based lookups during row-group decode (§14 schema
     /// evolution) — it may differ from the segment's write-time
-    /// schema in [`FooterV1::schema`] when a column has been added
-    /// via `ALTER TABLE ADD COLUMN` since the segment was written.
+    /// schema when a column has been added via `ALTER TABLE ADD
+    /// COLUMN` since the segment was written.
     current_schema: Arc<TableSchema>,
 }
 
@@ -194,7 +194,7 @@ impl SegmentFileReader {
     /// pre-shared schema (TASK-247). Avoids wrapping the schema in
     /// a new `Arc` when the caller already holds one.
     pub fn from_bytes_shared(bytes: Vec<u8>, current_schema: Arc<TableSchema>) -> Result<Self> {
-        validate_header(&bytes)?;
+        let format_version = validate_header(&bytes)?;
         let footer_body_length = parse_trailer(&bytes)?;
         validate_framing_lengths(bytes.len(), footer_body_length)?;
 
@@ -202,13 +202,34 @@ impl SegmentFileReader {
         let footer_body_end = bytes.len() - CHECKSUM_LEN - TRAILER_LEN;
         let footer_body_bytes = &bytes[footer_body_start..footer_body_end];
 
-        let footer: FooterV1 = postcard::from_bytes(footer_body_bytes).map_err(|e| {
-            BqliteError::Corruption(format!(
-                "segment footer body failed to deserialize (postcard): {e}"
-            ))
-        })?;
+        // Dispatch footer deserialization based on file header version.
+        let footer: SegmentFooter = match format_version {
+            SEGMENT_FORMAT_VERSION_V1 => {
+                let v1: FooterV1 = postcard::from_bytes(footer_body_bytes).map_err(|e| {
+                    BqliteError::Corruption(format!(
+                        "v1 segment footer body failed to deserialize (postcard): {e}"
+                    ))
+                })?;
+                SegmentFooter::V1(v1)
+            }
+            SEGMENT_FORMAT_VERSION_V2 => {
+                let v2: FooterV2 = postcard::from_bytes(footer_body_bytes).map_err(|e| {
+                    BqliteError::Corruption(format!(
+                        "v2 segment footer body failed to deserialize (postcard): {e}"
+                    ))
+                })?;
+                SegmentFooter::V2(v2)
+            }
+            // validate_header already rejects unknown versions, but
+            // be explicit.
+            _ => {
+                return Err(BqliteError::Corruption(format!(
+                    "unsupported segment format version {format_version}"
+                )));
+            }
+        };
 
-        validate_footer(&footer, footer_body_start)?;
+        validate_footer(&footer, footer_body_start, format_version)?;
         verify_checksum(&bytes)?;
 
         let dictionaries = load_dictionaries(&bytes, &footer)?;
@@ -221,9 +242,9 @@ impl SegmentFileReader {
         })
     }
 
-    /// The parsed footer body. Guaranteed to have passed every
-    /// §15 validation rule.
-    pub fn footer(&self) -> &FooterV1 {
+    /// The parsed footer body (v1 or v2). Guaranteed to have passed
+    /// every validation rule.
+    pub fn footer(&self) -> &SegmentFooter {
         &self.footer
     }
 
@@ -232,7 +253,7 @@ impl SegmentFileReader {
     /// projecting against schema evolution should use
     /// [`Self::current_schema`] instead.
     pub fn write_time_schema(&self) -> &TableSchema {
-        &self.footer.schema
+        self.footer.schema()
     }
 
     /// The current manifest schema the reader was opened with.
@@ -250,12 +271,12 @@ impl SegmentFileReader {
     /// Number of row groups in this segment. Equal to
     /// `self.footer().row_groups.len()`.
     pub fn row_group_count(&self) -> usize {
-        self.footer.row_groups.len()
+        self.footer.row_groups().len()
     }
 
     /// Total row count across every row group in the segment.
     pub fn row_count(&self) -> u64 {
-        self.footer.row_count
+        self.footer.row_count()
     }
 
     /// The underlying byte buffer. Crate-private; used by the
@@ -296,7 +317,7 @@ impl SegmentFileReader {
         projection: &ColumnProjection,
         predicate: Option<Arc<dyn Predicate>>,
     ) -> Result<SegmentFileScan> {
-        let plan = build_scan_plan(&self.current_schema, &self.footer.schema, projection)?;
+        let plan = build_scan_plan(&self.current_schema, self.footer.schema(), projection)?;
         Ok(SegmentFileScan {
             bytes: self.bytes.clone(),
             footer: self.footer.clone(),
@@ -313,11 +334,11 @@ impl std::fmt::Debug for SegmentFileReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SegmentFileReader")
             .field("file_size", &self.bytes.len())
-            .field("format_version", &self.footer.format_version)
-            .field("row_count", &self.footer.row_count)
-            .field("row_group_count", &self.footer.row_group_count)
+            .field("format_version", &self.footer.format_version())
+            .field("row_count", &self.footer.row_count())
+            .field("row_group_count", &self.footer.row_group_count())
             .field("dictionaries", &self.dictionaries.len())
-            .field("schema", &self.footer.schema.name())
+            .field("schema", &self.footer.schema().name())
             .finish()
     }
 }
@@ -336,13 +357,13 @@ impl std::fmt::Debug for SegmentFileReader {
 ///
 /// # Resource sharing
 ///
-/// Clones the reader's `Arc<[u8]>`, `Arc<FooterV1>`, and
+/// Clones the reader's `Arc<[u8]>`, `Arc<SegmentFooter>`, and
 /// `Arc<[DictionaryValues]>`. A `SegmentFileScan` is therefore cheap
 /// to create — the only per-scan allocations are the [`ScanPlan`]
 /// and the predicate pointer.
 pub struct SegmentFileScan {
     bytes: Arc<[u8]>,
-    footer: Arc<FooterV1>,
+    footer: Arc<SegmentFooter>,
     dictionaries: Arc<[DictionaryValues]>,
     plan: ScanPlan,
     predicate: Option<Arc<dyn Predicate>>,
@@ -500,21 +521,21 @@ fn build_scan_plan(
 
 impl SegmentScan for SegmentFileScan {
     fn row_group_count(&self) -> usize {
-        self.footer.row_groups.len()
+        self.footer.row_groups().len()
     }
 
     fn row_group_zone_maps(&self, idx: usize) -> Result<HashMap<String, ZoneMap>> {
-        let rg = self.footer.row_groups.get(idx).ok_or_else(|| {
+        let rg = self.footer.row_groups().get(idx).ok_or_else(|| {
             BqliteError::Execution(format!(
                 "segment reader: row group index {idx} out of range (total {})",
-                self.footer.row_groups.len()
+                self.footer.row_groups().len()
             ))
         })?;
         let mut map = HashMap::with_capacity(rg.columns.len());
         for meta in &rg.columns {
             let name = self
                 .footer
-                .schema
+                .schema()
                 .columns()
                 .get(meta.column_ordinal as usize)
                 .map(|c| c.name.clone());
@@ -538,7 +559,7 @@ impl SegmentScan for SegmentFileScan {
             return Ok(None);
         }
         loop {
-            if self.next_idx >= self.footer.row_groups.len() {
+            if self.next_idx >= self.footer.row_groups().len() {
                 self.exhausted = true;
                 return Ok(None);
             }
@@ -565,11 +586,11 @@ impl SegmentScan for SegmentFileScan {
                     .as_any()
                     .downcast_ref::<bqlite_core::storage::ScanPredicate>()
                 {
-                    let rg = &self.footer.row_groups[idx];
+                    let rg = &self.footer.row_groups()[idx];
                     if !crate::zone_map::accepts_row_group_inline(
                         sp,
                         rg,
-                        self.footer.schema.columns(),
+                        self.footer.schema().columns(),
                     ) {
                         continue;
                     }
@@ -590,7 +611,7 @@ impl SegmentFileScan {
     /// Decode row group `idx` to a [`RecordBatch`], honoring the
     /// scan's projection plan.
     fn decode_row_group(&self, idx: usize) -> Result<RecordBatch> {
-        let rg = &self.footer.row_groups[idx];
+        let rg = &self.footer.row_groups()[idx];
         let row_count = rg.row_count as usize;
 
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.plan.entries.len());
@@ -1223,7 +1244,9 @@ fn backfill_all_null(ty: &BqlType, row_count: usize) -> Result<ArrayRef> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// §15 rules 1, 2, 3 — file size minimum, header magic, format version.
-fn validate_header(bytes: &[u8]) -> Result<()> {
+///
+/// Returns the format version (`1` or `2`) on success.
+fn validate_header(bytes: &[u8]) -> Result<u16> {
     if bytes.len() < FILE_HEADER_LEN + FOOTER_SUFFIX_LEN {
         return Err(BqliteError::Corruption(format!(
             "segment file too short: {} bytes (minimum {} bytes for header + checksum + trailer)",
@@ -1239,12 +1262,12 @@ fn validate_header(bytes: &[u8]) -> Result<()> {
         )));
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().expect("slice length checked above"));
-    if version != SEGMENT_FORMAT_VERSION {
+    if version != SEGMENT_FORMAT_VERSION_V1 && version != SEGMENT_FORMAT_VERSION_V2 {
         return Err(BqliteError::Corruption(format!(
-            "segment file format version mismatch: expected {SEGMENT_FORMAT_VERSION}, got {version}"
+            "segment file format version unsupported: expected 1 or 2, got {version}"
         )));
     }
-    Ok(())
+    Ok(version)
 }
 
 /// §15 rule 4 — trailer magic; §15 rule 5 — `footer_body_length` extract.
@@ -1299,25 +1322,44 @@ fn validate_framing_lengths(file_size: usize, footer_body_length: usize) -> Resu
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// §15 rules 7–11 — footer internal consistency + byte-range bounds.
-fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
-    // Rule 7: format_version.
-    if footer.format_version != SEGMENT_FORMAT_VERSION {
+///
+/// `header_version` is the format version read from the file header
+/// by [`validate_header`] — it must match `footer.format_version()`.
+///
+/// v2-specific FSST validation (§11 rules 13–15) is deferred to
+/// TASK-416 when the FSST encoding implementation lands. Rule 15
+/// (reject discriminant 11) is implicitly satisfied by the
+/// `from_discriminant_versioned` call in the encoding check below.
+fn validate_footer(
+    footer: &SegmentFooter,
+    footer_body_start: usize,
+    header_version: u16,
+) -> Result<()> {
+    let format_version = footer.format_version();
+
+    // Rule 7: format_version is recognized and matches the header.
+    if format_version != SEGMENT_FORMAT_VERSION_V1 && format_version != SEGMENT_FORMAT_VERSION_V2 {
         return Err(BqliteError::Corruption(format!(
-            "segment footer format_version mismatch: expected {SEGMENT_FORMAT_VERSION}, \
-             got {}",
-            footer.format_version
+            "segment footer format_version unsupported: expected 1 or 2, \
+             got {format_version}",
+        )));
+    }
+    if format_version != header_version {
+        return Err(BqliteError::Corruption(format!(
+            "segment footer format_version {format_version} does not match \
+             file header version {header_version}",
         )));
     }
 
     // Rule 8: row_group_count == row_groups.len() and sum of row counts.
-    if footer.row_group_count as usize != footer.row_groups.len() {
+    if footer.row_group_count() as usize != footer.row_groups().len() {
         return Err(BqliteError::Corruption(format!(
             "segment footer row_group_count = {} but row_groups has {} entries",
-            footer.row_group_count,
-            footer.row_groups.len(),
+            footer.row_group_count(),
+            footer.row_groups().len(),
         )));
     }
-    if footer.row_groups.is_empty() {
+    if footer.row_groups().is_empty() {
         return Err(BqliteError::Corruption(
             "segment footer has zero row groups — an empty segment is illegal \
              per segment-format-v1.md §6"
@@ -1325,16 +1367,16 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
         ));
     }
     let sum: Option<u64> = footer
-        .row_groups
+        .row_groups()
         .iter()
         .map(|rg| rg.row_count)
         .try_fold(0u64, u64::checked_add);
     match sum {
-        Some(s) if s == footer.row_count => (),
+        Some(s) if s == footer.row_count() => (),
         Some(s) => {
             return Err(BqliteError::Corruption(format!(
                 "segment footer row_count = {} but row groups sum to {s}",
-                footer.row_count
+                footer.row_count()
             )));
         }
         None => {
@@ -1349,7 +1391,7 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
     // its start is the first dictionary's byte_offset when there are
     // dictionaries, or `footer_body_start` otherwise.
     let row_groups_end_max = footer
-        .dictionaries
+        .dictionaries()
         .iter()
         .map(|d| d.byte_offset)
         .min()
@@ -1359,7 +1401,7 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
     // Rule 9: per-row-group byte ranges fit inside the row-groups
     // region [FILE_HEADER_LEN, row_groups_end_max).
     let mut expected_offset = FILE_HEADER_LEN as u64;
-    for (i, rg) in footer.row_groups.iter().enumerate() {
+    for (i, rg) in footer.row_groups().iter().enumerate() {
         if rg.row_count == 0 {
             return Err(BqliteError::Corruption(format!(
                 "row group {i} has row_count = 0; empty row groups are illegal (§6)"
@@ -1386,7 +1428,7 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
 
         // Rule 10: per-column-chunk byte ranges fit inside the row
         // group + legal encoding/compression discriminants.
-        let schema_col_count = footer.schema.columns().len();
+        let schema_col_count = footer.schema().columns().len();
         if rg.columns.len() != schema_col_count {
             return Err(BqliteError::Corruption(format!(
                 "row group {i} has {} column chunks but schema has {schema_col_count} columns",
@@ -1421,22 +1463,18 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
                     meta.byte_offset
                 )));
             }
-            // Rule 10 continued: legal encoding discriminant.
-            // Allowed set: v1 encodings {0,1,2,4,6} + Wave 4 v2
-            // extensions {3} (DoubleDelta). Unknown discriminants are
-            // still a corruption error.
-            match meta.encoding {
-                0 | 1 | 2 | 3 | 4 | 6 => (),
-                other => {
-                    return Err(BqliteError::Corruption(format!(
-                        "row group {i} column {c} encoding {other} is not in the known set {{0,1,2,3,4,6}}"
-                    )));
-                }
+            // Rule 10 continued: legal encoding discriminant for
+            // this format version.
+            if EncodingType::from_discriminant_versioned(meta.encoding, format_version).is_err() {
+                return Err(BqliteError::Corruption(format!(
+                    "row group {i} column {c} encoding {} is not valid for format version {format_version}",
+                    meta.encoding,
+                )));
             }
             // Rule 10 continued: legal compression discriminant.
             if CompressionType::from_discriminant(meta.compression).is_err() {
                 return Err(BqliteError::Corruption(format!(
-                    "row group {i} column {c} compression {} is not in the v1 set {{0,1}}",
+                    "row group {i} column {c} compression {} is not in the valid set {{0,1}}",
                     meta.compression
                 )));
             }
@@ -1459,7 +1497,7 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
 
     // Rule 11: per-dictionary byte ranges fit inside the
     // segment-dictionaries region, column_ordinal fits the schema.
-    let schema_col_count = footer.schema.columns().len();
+    let schema_col_count = footer.schema().columns().len();
     let dict_region_start = expected_offset as usize;
     let dict_region_end = footer_body_start;
     if dict_region_end < dict_region_start {
@@ -1467,7 +1505,7 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
             "footer body start {footer_body_start} is before the end of the row groups region {dict_region_start}"
         )));
     }
-    for (i, dict) in footer.dictionaries.iter().enumerate() {
+    for (i, dict) in footer.dictionaries().iter().enumerate() {
         if (dict.column_ordinal as usize) >= schema_col_count {
             return Err(BqliteError::Corruption(format!(
                 "dictionary {i} column_ordinal {} is out of schema bounds (< {schema_col_count})",
@@ -1501,7 +1539,7 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
     // Row-group-size-hint sanity: v1 writers always emit the default
     // row-group size. Accept any positive value so later waves can
     // vary it without breaking the reader, but reject zero.
-    if footer.row_group_size_hint == 0 {
+    if footer.row_group_size_hint() == 0 {
         return Err(BqliteError::Corruption(
             "segment footer row_group_size_hint = 0 (must be positive)".to_string(),
         ));
@@ -1509,21 +1547,23 @@ fn validate_footer(footer: &FooterV1, footer_body_start: usize) -> Result<()> {
     // Soft sanity check: every row group's count ≤ row_group_size_hint
     // except possibly the last. This catches a corrupt writer that
     // emits over-sized row groups.
-    let n = footer.row_groups.len();
-    for (i, rg) in footer.row_groups.iter().enumerate() {
+    let n = footer.row_groups().len();
+    for (i, rg) in footer.row_groups().iter().enumerate() {
         let is_last = i + 1 == n;
-        if !is_last && rg.row_count > footer.row_group_size_hint as u64 {
+        if !is_last && rg.row_count > footer.row_group_size_hint() as u64 {
             return Err(BqliteError::Corruption(format!(
                 "non-final row group {i} row_count {} exceeds row_group_size_hint {}",
-                rg.row_count, footer.row_group_size_hint
+                rg.row_count,
+                footer.row_group_size_hint()
             )));
         }
     }
     // seq_id_range monotonic.
-    if footer.seq_id_range.0 > footer.seq_id_range.1 {
+    if footer.seq_id_range().0 > footer.seq_id_range().1 {
         return Err(BqliteError::Corruption(format!(
             "segment footer seq_id_range = ({}, {}): min exceeds max",
-            footer.seq_id_range.0, footer.seq_id_range.1
+            footer.seq_id_range().0,
+            footer.seq_id_range().1
         )));
     }
 
@@ -1574,9 +1614,9 @@ fn verify_checksum(bytes: &[u8]) -> Result<()> {
 /// We decode them directly into owned Rust vectors so the row-group
 /// decoder in the next checkpoint can look up dictionary values by
 /// code without touching the file buffer.
-fn load_dictionaries(bytes: &[u8], footer: &FooterV1) -> Result<Vec<DictionaryValues>> {
-    let mut out = Vec::with_capacity(footer.dictionaries.len());
-    for (i, dict_ref) in footer.dictionaries.iter().enumerate() {
+fn load_dictionaries(bytes: &[u8], footer: &SegmentFooter) -> Result<Vec<DictionaryValues>> {
+    let mut out = Vec::with_capacity(footer.dictionaries().len());
+    for (i, dict_ref) in footer.dictionaries().iter().enumerate() {
         let start = dict_ref.byte_offset as usize;
         let end = start + dict_ref.byte_length as usize;
         // Already validated by `validate_footer` — re-check here
@@ -1725,6 +1765,7 @@ pub(crate) mod test_fixture {
     //! §4 layout defines. No encoding selection, no writer logic.
 
     use super::*;
+    use crate::segment::layout::SEGMENT_FORMAT_VERSION;
 
     /// Assemble a complete v1 segment from a pre-built footer and
     /// pre-laid-out row group / dictionary bytes.
@@ -1815,7 +1856,9 @@ mod tests {
     use super::test_fixture::*;
     use super::*;
     use crate::encoding::EncodedChunk;
-    use crate::segment::layout::{ColumnChunkMeta, RowGroupIndex, SegmentDictRef};
+    use crate::segment::layout::{
+        ColumnChunkMeta, RowGroupIndex, SegmentDictRef, SEGMENT_FORMAT_VERSION,
+    };
     use bqlite_core::{ColumnDef, PropertyValue, TableSchema};
 
     fn simple_int_schema() -> TableSchema {
@@ -2001,8 +2044,8 @@ mod tests {
     #[test]
     fn rejects_unknown_format_version() {
         let (mut bytes, schema) = build_minimal_segment(simple_int_schema(), &[1, 2, 3]);
-        // Flip version bytes to 2.
-        bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
+        // Flip version bytes to 99 (truly unknown).
+        bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
         match SegmentFileReader::from_bytes(bytes, schema).unwrap_err() {
             BqliteError::Corruption(msg) => {
                 assert!(msg.contains("format version"), "got: {msg}")
@@ -2076,7 +2119,7 @@ mod tests {
         let schema = simple_int_schema();
         let (bytes, schema_clone) = build_minimal_segment(schema, &[10, 20, 30]);
         let reader = SegmentFileReader::from_bytes(bytes, schema_clone).expect("open succeeds");
-        assert_eq!(reader.footer().row_count, 3);
+        assert_eq!(reader.footer().row_count(), 3);
         assert_eq!(reader.row_group_count(), 1);
         assert_eq!(reader.write_time_schema().name(), "events");
         assert!(reader.dictionaries().is_empty());
@@ -2099,7 +2142,7 @@ mod tests {
         let (bytes, schema_clone) = build_minimal_segment(schema, &[1, 2, 3]);
         let a = SegmentFileReader::from_bytes(bytes, schema_clone).unwrap();
         let b = a.clone();
-        assert_eq!(a.footer().row_count, b.footer().row_count);
+        assert_eq!(a.footer().row_count(), b.footer().row_count());
         assert!(Arc::ptr_eq(a.bytes(), b.bytes()));
     }
 
