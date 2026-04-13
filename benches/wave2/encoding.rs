@@ -21,7 +21,7 @@ use arrow::array::{ArrayRef, Int64Array, StringViewArray};
 use bqlite_benches::common::*;
 use bqlite_core::BqlType;
 use bqlite_storage::encoding::{
-    compress_lz4, decompress_lz4, BitPacking, Constant, Delta, Dictionary, Encoding, Plain,
+    compress_lz4, decompress_lz4, BitPacking, Constant, Delta, Dictionary, Encoding, Plain, Rle,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
@@ -279,6 +279,83 @@ fn bench_constant_string(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Rle ──────────────────────────────────────────────────────────────────────
+
+fn bench_rle_int64_long_runs(c: &mut Criterion) {
+    // 256 distinct values each repeated 256 times — long-run sweet spot.
+    // Compresses 65,536 i64 rows (512 KiB) to 256 runs (≈8 KiB payload).
+    let values: Vec<i64> = (0..ROW_GROUP_SIZE as i64)
+        .map(|i| i / 256) // 256 identical values per run
+        .collect();
+    let array: ArrayRef = Arc::new(Int64Array::from(values));
+    let rle = Rle::new();
+    let chunk = rle.encode(array.as_ref()).unwrap();
+    let payload_bytes = chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/rle/int64_long_runs");
+    group.throughput(Throughput::Bytes(payload_bytes));
+
+    group.bench_function("encode", |b| {
+        b.iter(|| rle.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("decode", |b| {
+        b.iter(|| rle.decode(black_box(&chunk), &BqlType::Int).unwrap())
+    });
+
+    group.finish();
+}
+
+fn bench_rle_string_long_runs(c: &mut Criterion) {
+    // 20 distinct event types each appearing in runs of ~3,277 rows.
+    // Simulates a sorted partition where all events of one type appear
+    // before the next — the canonical RLE workload for string columns.
+    let labels: Vec<String> = (0..20).map(|i| format!("event_{i}")).collect();
+    let values: Vec<String> = (0..ROW_GROUP_SIZE)
+        .map(|i| labels[(i * 20) / ROW_GROUP_SIZE].clone())
+        .collect();
+    let array: ArrayRef = Arc::new(StringViewArray::from(values));
+    let rle = Rle::new();
+    let chunk = rle.encode(array.as_ref()).unwrap();
+    let payload_bytes = chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/rle/string_long_runs");
+    group.throughput(Throughput::Bytes(payload_bytes));
+
+    group.bench_function("encode", |b| {
+        b.iter(|| rle.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("decode", |b| {
+        b.iter(|| rle.decode(black_box(&chunk), &BqlType::String).unwrap())
+    });
+
+    group.finish();
+}
+
+fn bench_rle_bool_constant(c: &mut Criterion) {
+    // All-true bool column: single run of 65,536 rows → 1-run chunk.
+    // Measures the RLE encode/decode floor when compression is maximal.
+    let values: Vec<bool> = vec![true; ROW_GROUP_SIZE];
+    let array: ArrayRef = Arc::new(arrow::array::BooleanArray::from(values));
+    let rle = Rle::new();
+    let chunk = rle.encode(array.as_ref()).unwrap();
+    let payload_bytes = (chunk.params.len() + chunk.payload.len()) as u64;
+
+    let mut group = c.benchmark_group("encoding/rle/bool_constant");
+    group.throughput(Throughput::Bytes(payload_bytes.max(1)));
+
+    group.bench_function("encode", |b| {
+        b.iter(|| rle.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("decode", |b| {
+        b.iter(|| rle.decode(black_box(&chunk), &BqlType::Bool).unwrap())
+    });
+
+    group.finish();
+}
+
 // ── LZ4 wrapper ──────────────────────────────────────────────────────────────
 
 fn bench_lz4_compress(c: &mut Criterion) {
@@ -434,6 +511,9 @@ criterion_group! {
         bench_bitpacking_timestamp,
         bench_constant_int64,
         bench_constant_string,
+        bench_rle_int64_long_runs,
+        bench_rle_string_long_runs,
+        bench_rle_bool_constant,
         bench_lz4_compress,
         bench_lz4_repetitive,
         bench_selector_throughput,
