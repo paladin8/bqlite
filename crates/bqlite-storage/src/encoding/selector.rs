@@ -59,7 +59,7 @@ use arrow::array::{
     TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use bqlite_core::{BqlType, Result};
+use bqlite_core::{BqlType, BqliteError, Result};
 
 use super::{
     compress_lz4, require_dense, BitPacking, CompressionType, Constant, Delta, Dictionary,
@@ -222,16 +222,22 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
 
 /// Decode-cost tiebreaker. Lower is faster.
 ///
-/// Approximate ordering by hot-path complexity:
+/// Approximate ordering by hot-path complexity
+/// (per `segment-format-v2.md` §10.2):
 ///
-/// | Encoding   | Cost | Decode hot path                           |
-/// |------------|------|-------------------------------------------|
-/// | Constant   | 0    | broadcast a single value into an array    |
-/// | Plain      | 1    | memcpy / fixed-stride read                 |
-/// | Rle        | 2    | sequential run broadcast (cache-friendly)  |
-/// | BitPacking | 3    | bit-pack unpack into i64                   |
-/// | Delta      | 4    | bit-pack unpack + cumulative sum           |
-/// | Dictionary | 5    | bit-pack unpack + per-row dict lookup      |
+/// | Encoding    | Cost | Decode hot path                                |
+/// |-------------|------|------------------------------------------------|
+/// | Constant    | 0    | broadcast single value                         |
+/// | Plain       | 1    | memcpy / fixed-stride read                     |
+/// | Rle         | 2    | broadcast per run (or zero-copy RunEndEncoded)  |
+/// | BitPacking  | 3    | bit-unpack into i64                            |
+/// | For         | 4    | per-block bit-unpack + base add                |
+/// | Delta       | 5    | bit-unpack + cumulative sum                    |
+/// | DoubleDelta | 6    | bit-unpack + 2x cumulative sum                 |
+/// | PFor        | 7    | per-block bit-unpack + base add + patch scatter |
+/// | Dictionary  | 8    | bit-unpack + per-row dict lookup               |
+/// | Alp         | 9    | FOR-unpack mantissas + f64 mul + patch scatter  |
+/// | Fsst        | 10   | per-byte symbol lookup                         |
 ///
 /// These are *relative* costs used only as tiebreakers — the absolute
 /// values have no meaning beyond the ordering. The selector ranks by
@@ -243,8 +249,13 @@ pub const fn decode_cost(enc: EncodingType) -> u8 {
         EncodingType::Plain => 1,
         EncodingType::Rle => 2,
         EncodingType::BitPacking => 3,
-        EncodingType::Delta => 4,
-        EncodingType::Dictionary => 5,
+        EncodingType::For => 4,
+        EncodingType::Delta => 5,
+        EncodingType::DoubleDelta => 6,
+        EncodingType::PFor => 7,
+        EncodingType::Dictionary => 8,
+        EncodingType::Alp => 9,
+        EncodingType::Fsst => 10,
     }
 }
 
@@ -287,6 +298,15 @@ fn encode_with(encoding: EncodingType, array: &dyn Array) -> Result<EncodedChunk
         EncodingType::Delta => Delta.encode(array),
         EncodingType::BitPacking => BitPacking.encode(array),
         EncodingType::Rle => Rle.encode(array),
+        // v2 encodings — implementations land in TASK-414 through TASK-418, TASK-450.
+        // The selector never picks these; this arm exists only for exhaustiveness.
+        EncodingType::DoubleDelta
+        | EncodingType::Fsst
+        | EncodingType::For
+        | EncodingType::PFor
+        | EncodingType::Alp => Err(BqliteError::Execution(format!(
+            "v2 encoding {encoding:?} encode not yet implemented (TASK-414–TASK-418)"
+        ))),
     }
 }
 
@@ -410,6 +430,7 @@ mod tests {
             EncodingType::Delta => Delta.decode(&selected.chunk, &ty),
             EncodingType::BitPacking => BitPacking.decode(&selected.chunk, &ty),
             EncodingType::Rle => Rle.decode(&selected.chunk, &ty),
+            other => panic!("selector should never pick unimplemented encoding {other:?}"),
         }
         .expect("decode must succeed");
         assert_eq!(

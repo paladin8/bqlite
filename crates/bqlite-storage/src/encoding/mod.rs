@@ -73,6 +73,7 @@ pub use selector::{decode_cost, select_encoding, select_encoding_type, SelectedE
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum EncodingType {
+    // v1 (unchanged)
     /// Uncompressed primitive layout. §9.1.
     Plain = 0,
     /// Sorted distinct values + bit-packed ordinal codes. §9.2.
@@ -85,6 +86,20 @@ pub enum EncodingType {
     Rle = 5,
     /// Zero-payload single-value encoding. §9.5.
     Constant = 6,
+
+    // v2 (new in Wave 4, per segment-format-v2.md §4)
+    /// Second-order delta encoding for near-constant-interval columns.
+    DoubleDelta = 3,
+    /// Fast Static Symbol Table compression for high-cardinality strings.
+    Fsst = 7,
+    /// Frame-of-Reference encoding with per-block minimums.
+    For = 8,
+    /// Patched Frame-of-Reference with outlier exception list.
+    PFor = 9,
+    /// Adaptive Lossless floating-Point compression.
+    Alp = 10,
+    // Reserved: FreqEncoding = 11 (no-go per TASK-401 §9, discriminant
+    //           reserved for future variable-width coding scheme)
 }
 
 impl EncodingType {
@@ -98,6 +113,10 @@ impl EncodingType {
     /// reserved-for-later-waves value (`3`, `7`, `8` ..) — produce
     /// [`BqliteError::Execution`] so the reader can surface a
     /// corruption error without panicking.
+    ///
+    /// This method enforces the v1 encoding set only. For
+    /// version-aware parsing that also accepts v2 discriminants,
+    /// use [`Self::from_discriminant_versioned`].
     pub fn from_discriminant(byte: u8) -> Result<Self> {
         match byte {
             0 => Ok(Self::Plain),
@@ -108,6 +127,34 @@ impl EncodingType {
             6 => Ok(Self::Constant),
             other => Err(BqliteError::Execution(format!(
                 "unknown encoding discriminant {other} — segment written by an incompatible version"
+            ))),
+        }
+    }
+
+    /// Parse a byte into an [`EncodingType`], gated by format version.
+    ///
+    /// v1 segments accept `{0, 1, 2, 4, 5, 6}` (Rle added by TASK-413).
+    /// v2 segments additionally accept `{3, 7, 8, 9, 10}`.
+    /// Discriminant 11 (`FreqEncoding`) is reserved but rejected in
+    /// both versions per `segment-format-v2.md` §4.
+    pub fn from_discriminant_versioned(byte: u8, format_version: u16) -> Result<Self> {
+        match byte {
+            // v1 set — always accepted (includes Rle since TASK-413)
+            0 => Ok(Self::Plain),
+            1 => Ok(Self::Dictionary),
+            2 => Ok(Self::Delta),
+            4 => Ok(Self::BitPacking),
+            5 => Ok(Self::Rle),
+            6 => Ok(Self::Constant),
+            // v2 set — accepted only when format_version >= 2
+            3 if format_version >= 2 => Ok(Self::DoubleDelta),
+            7 if format_version >= 2 => Ok(Self::Fsst),
+            8 if format_version >= 2 => Ok(Self::For),
+            9 if format_version >= 2 => Ok(Self::PFor),
+            10 if format_version >= 2 => Ok(Self::Alp),
+            other => Err(BqliteError::Execution(format!(
+                "unknown encoding discriminant {other} for format version {format_version} \
+                 — segment written by an incompatible version"
             ))),
         }
     }
@@ -280,9 +327,14 @@ mod tests {
             EncodingType::BitPacking,
             EncodingType::Rle,
             EncodingType::Constant,
+            EncodingType::DoubleDelta,
+            EncodingType::Fsst,
+            EncodingType::For,
+            EncodingType::PFor,
+            EncodingType::Alp,
         ] {
             let byte = variant.discriminant();
-            let parsed = EncodingType::from_discriminant(byte).unwrap();
+            let parsed = EncodingType::from_discriminant_versioned(byte, 2).unwrap();
             assert_eq!(parsed, variant);
         }
     }
@@ -302,9 +354,21 @@ mod tests {
     }
 
     #[test]
+    fn encoding_type_discriminants_match_segment_format_v2_spec() {
+        // Values pinned to `segment-format-v2.md` §4.
+        assert_eq!(EncodingType::DoubleDelta.discriminant(), 3);
+        assert_eq!(EncodingType::Rle.discriminant(), 5);
+        assert_eq!(EncodingType::Fsst.discriminant(), 7);
+        assert_eq!(EncodingType::For.discriminant(), 8);
+        assert_eq!(EncodingType::PFor.discriminant(), 9);
+        assert_eq!(EncodingType::Alp.discriminant(), 10);
+    }
+
+    #[test]
     fn unknown_discriminant_is_a_typed_execution_error() {
-        // Bytes 3, 7, 8, 255 are still unassigned. Byte 5 is now Rle.
-        for byte in [3u8, 7, 8, 255] {
+        // v2-only discriminants (3, 7, 8, 9, 10) are rejected by
+        // from_discriminant. Byte 5 (Rle) is accepted since TASK-413.
+        for byte in [3u8, 7, 8, 9, 10, 11, 255] {
             let err = EncodingType::from_discriminant(byte).unwrap_err();
             match err {
                 BqliteError::Execution(msg) => {
@@ -316,5 +380,45 @@ mod tests {
                 other => panic!("expected Execution error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn from_discriminant_versioned_v1_rejects_v2_encodings() {
+        // Rle (5) is accepted in v1 since TASK-413
+        for byte in [3u8, 7, 8, 9, 10] {
+            assert!(
+                EncodingType::from_discriminant_versioned(byte, 1).is_err(),
+                "v1 should reject discriminant {byte}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_discriminant_versioned_v2_accepts_all_valid() {
+        let v2_pairs = [
+            (0, EncodingType::Plain),
+            (1, EncodingType::Dictionary),
+            (2, EncodingType::Delta),
+            (3, EncodingType::DoubleDelta),
+            (4, EncodingType::BitPacking),
+            (5, EncodingType::Rle),
+            (6, EncodingType::Constant),
+            (7, EncodingType::Fsst),
+            (8, EncodingType::For),
+            (9, EncodingType::PFor),
+            (10, EncodingType::Alp),
+        ];
+        for (byte, expected) in v2_pairs {
+            assert_eq!(
+                EncodingType::from_discriminant_versioned(byte, 2).unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn from_discriminant_versioned_rejects_reserved_11() {
+        assert!(EncodingType::from_discriminant_versioned(11, 1).is_err());
+        assert!(EncodingType::from_discriminant_versioned(11, 2).is_err());
     }
 }

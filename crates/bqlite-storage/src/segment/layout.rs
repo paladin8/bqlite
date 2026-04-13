@@ -56,6 +56,17 @@ pub const MAGIC: [u8; 4] = *b"BQLT";
 /// other value as [`bqlite_core::BqliteError`] corruption.
 pub const SEGMENT_FORMAT_VERSION: u16 = 1;
 
+/// Alias for the v1 format version, for clarity when both versions
+/// are in scope. The original [`SEGMENT_FORMAT_VERSION`] name is
+/// retained so existing code that refers to it (which always means
+/// "the v1 constant") is unambiguous.
+pub const SEGMENT_FORMAT_VERSION_V1: u16 = 1;
+
+/// On-disk format version for v2 segments. v2 extends v1 with six
+/// new encoding discriminants and the FSST symbol tables region.
+/// See `docs/design/storage/segment-format-v2.md` §3.
+pub const SEGMENT_FORMAT_VERSION_V2: u16 = 2;
+
 /// Default row-group size in rows. v1 writers always emit exactly this
 /// many rows per row group, with one exception documented in §6: the
 /// **last** row group in a segment may be short when the input does
@@ -265,6 +276,192 @@ pub struct SegmentDictRef {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// v2 layout types (segment-format-v2.md §6 – §8)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reference to a segment-level FSST symbol table
+/// (`segment-format-v2.md` §6.4).
+///
+/// One entry per FSST-encoded column. Each entry locates the symbol
+/// table bytes inside the FSST symbol tables region (between the
+/// segment dictionaries region and the footer body).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsstSymbolTableRef {
+    /// The column this symbol table is for. A column has at most
+    /// one FSST symbol table per segment.
+    pub column_ordinal: u32,
+
+    /// Absolute byte offset of the symbol table in the segment
+    /// file. Points into the FSST symbol tables region.
+    pub byte_offset: u64,
+    /// Byte length of the symbol table data.
+    pub byte_length: u64,
+
+    /// Number of symbols in the table (1..=256).
+    pub symbol_count: u16,
+}
+
+/// The v2 segment footer body — a strict superset of [`FooterV1`]
+/// with one new field (`fsst_symbol_tables`). See
+/// `segment-format-v2.md` §7.
+///
+/// FooterV2 is a separate struct rather than an extension of FooterV1
+/// because FooterV1's postcard serialization is the v1 on-disk
+/// contract — adding a field would change serialized bytes and break
+/// v1 reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FooterV2 {
+    /// Must equal [`SEGMENT_FORMAT_VERSION_V2`] (2).
+    pub format_version: u16,
+
+    /// Full segment schema at write time.
+    pub schema: TableSchema,
+
+    /// Schema version the segment was written against.
+    pub schema_version: u32,
+
+    /// Total rows across all row groups.
+    pub row_count: u64,
+
+    /// Number of row groups.
+    pub row_group_count: u32,
+
+    /// Row-group size hint.
+    pub row_group_size_hint: u32,
+
+    /// Creation timestamp in nanoseconds since epoch UTC.
+    pub creation_timestamp_ns: i64,
+
+    /// Sequence-ID range (min_inclusive, max_inclusive).
+    pub seq_id_range: (u64, u64),
+
+    /// Batch ID.
+    pub batch_id: u64,
+
+    /// Compaction tier.
+    pub compaction_level: u8,
+
+    /// Segment-level dictionaries — identical to FooterV1.
+    pub dictionaries: Vec<SegmentDictRef>,
+
+    /// Segment-level FSST symbol tables — NEW in v2.
+    /// One entry per FSST-encoded column. Empty when no column
+    /// uses FSST encoding.
+    pub fsst_symbol_tables: Vec<FsstSymbolTableRef>,
+
+    /// Per-row-group index — identical structure to FooterV1.
+    /// `ColumnChunkMeta.encoding` may now contain v2 discriminants.
+    pub row_groups: Vec<RowGroupIndex>,
+}
+
+/// Version-dispatched segment footer. The reader parses the file
+/// header version and deserializes the footer body as the
+/// corresponding variant. Accessor methods delegate to the active
+/// variant so callers do not need to match.
+///
+/// See `segment-format-v2.md` §8.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentFooter {
+    V1(FooterV1),
+    V2(FooterV2),
+}
+
+impl SegmentFooter {
+    pub fn format_version(&self) -> u16 {
+        match self {
+            Self::V1(f) => f.format_version,
+            Self::V2(f) => f.format_version,
+        }
+    }
+
+    pub fn schema(&self) -> &TableSchema {
+        match self {
+            Self::V1(f) => &f.schema,
+            Self::V2(f) => &f.schema,
+        }
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        match self {
+            Self::V1(f) => f.schema_version,
+            Self::V2(f) => f.schema_version,
+        }
+    }
+
+    pub fn row_count(&self) -> u64 {
+        match self {
+            Self::V1(f) => f.row_count,
+            Self::V2(f) => f.row_count,
+        }
+    }
+
+    pub fn row_group_count(&self) -> u32 {
+        match self {
+            Self::V1(f) => f.row_group_count,
+            Self::V2(f) => f.row_group_count,
+        }
+    }
+
+    pub fn row_group_size_hint(&self) -> u32 {
+        match self {
+            Self::V1(f) => f.row_group_size_hint,
+            Self::V2(f) => f.row_group_size_hint,
+        }
+    }
+
+    pub fn creation_timestamp_ns(&self) -> i64 {
+        match self {
+            Self::V1(f) => f.creation_timestamp_ns,
+            Self::V2(f) => f.creation_timestamp_ns,
+        }
+    }
+
+    pub fn seq_id_range(&self) -> (u64, u64) {
+        match self {
+            Self::V1(f) => f.seq_id_range,
+            Self::V2(f) => f.seq_id_range,
+        }
+    }
+
+    pub fn batch_id(&self) -> u64 {
+        match self {
+            Self::V1(f) => f.batch_id,
+            Self::V2(f) => f.batch_id,
+        }
+    }
+
+    pub fn compaction_level(&self) -> u8 {
+        match self {
+            Self::V1(f) => f.compaction_level,
+            Self::V2(f) => f.compaction_level,
+        }
+    }
+
+    pub fn dictionaries(&self) -> &[SegmentDictRef] {
+        match self {
+            Self::V1(f) => &f.dictionaries,
+            Self::V2(f) => &f.dictionaries,
+        }
+    }
+
+    pub fn row_groups(&self) -> &[RowGroupIndex] {
+        match self {
+            Self::V1(f) => &f.row_groups,
+            Self::V2(f) => &f.row_groups,
+        }
+    }
+
+    /// FSST symbol table refs. Returns an empty slice for V1
+    /// segments (which have no FSST region).
+    pub fn fsst_symbol_tables(&self) -> &[FsstSymbolTableRef] {
+        match self {
+            Self::V1(_) => &[],
+            Self::V2(f) => &f.fsst_symbol_tables,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests — round-trip on every nested record
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -399,5 +596,136 @@ mod tests {
     fn footer_format_version_matches_constant() {
         let footer = sample_footer();
         assert_eq!(footer.format_version, SEGMENT_FORMAT_VERSION);
+    }
+
+    // ── v2 tests ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn v2_constants_match_spec() {
+        assert_eq!(SEGMENT_FORMAT_VERSION_V1, 1);
+        assert_eq!(SEGMENT_FORMAT_VERSION_V2, 2);
+        assert_eq!(SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION_V1);
+    }
+
+    fn sample_footer_v2() -> FooterV2 {
+        FooterV2 {
+            format_version: SEGMENT_FORMAT_VERSION_V2,
+            schema: sample_schema(),
+            schema_version: 0,
+            row_count: 3,
+            row_group_count: 1,
+            row_group_size_hint: ROW_GROUP_SIZE_DEFAULT,
+            creation_timestamp_ns: 1_700_000_000_000_000_000,
+            seq_id_range: (0, 2),
+            batch_id: 42,
+            compaction_level: 0,
+            dictionaries: vec![SegmentDictRef {
+                column_ordinal: 2,
+                byte_offset: 256,
+                byte_length: 64,
+                cardinality: 3,
+                value_type: BqlType::String,
+            }],
+            fsst_symbol_tables: vec![FsstSymbolTableRef {
+                column_ordinal: 0,
+                byte_offset: 320,
+                byte_length: 128,
+                symbol_count: 42,
+            }],
+            row_groups: vec![RowGroupIndex {
+                byte_offset: FILE_HEADER_LEN as u64,
+                byte_length: 240,
+                row_count: 3,
+                columns: vec![ColumnChunkMeta {
+                    column_ordinal: 0,
+                    byte_offset: FILE_HEADER_LEN as u64,
+                    byte_length: 48,
+                    encoding: 6,
+                    compression: CompressionType::None.discriminant(),
+                    row_count: 3,
+                    null_count: 0,
+                    zone_min: Some(PropertyValue::String("u1".into())),
+                    zone_max: Some(PropertyValue::String("u1".into())),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn footer_v2_round_trips_through_postcard() {
+        let footer = sample_footer_v2();
+        let bytes = postcard::to_allocvec(&footer).unwrap();
+        let back: FooterV2 = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, footer);
+    }
+
+    #[test]
+    fn footer_v2_round_trip_is_deterministic() {
+        let footer = sample_footer_v2();
+        let a = postcard::to_allocvec(&footer).unwrap();
+        let b = postcard::to_allocvec(&footer).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn footer_v1_and_v2_serialize_differently() {
+        // FooterV2 has the fsst_symbol_tables field, so even with
+        // the same base data the serialized bytes differ.
+        let v1 = sample_footer();
+        let v2 = sample_footer_v2();
+        let v1_bytes = postcard::to_allocvec(&v1).unwrap();
+        let v2_bytes = postcard::to_allocvec(&v2).unwrap();
+        assert_ne!(v1_bytes, v2_bytes);
+    }
+
+    #[test]
+    fn segment_footer_accessors_delegate_v1() {
+        let v1 = sample_footer();
+        let sf = SegmentFooter::V1(v1.clone());
+        assert_eq!(sf.format_version(), v1.format_version);
+        assert_eq!(sf.schema(), &v1.schema);
+        assert_eq!(sf.schema_version(), v1.schema_version);
+        assert_eq!(sf.row_count(), v1.row_count);
+        assert_eq!(sf.row_group_count(), v1.row_group_count);
+        assert_eq!(sf.row_group_size_hint(), v1.row_group_size_hint);
+        assert_eq!(sf.creation_timestamp_ns(), v1.creation_timestamp_ns);
+        assert_eq!(sf.seq_id_range(), v1.seq_id_range);
+        assert_eq!(sf.batch_id(), v1.batch_id);
+        assert_eq!(sf.compaction_level(), v1.compaction_level);
+        assert_eq!(sf.dictionaries(), &v1.dictionaries[..]);
+        assert_eq!(sf.row_groups(), &v1.row_groups[..]);
+        assert!(sf.fsst_symbol_tables().is_empty());
+    }
+
+    #[test]
+    fn segment_footer_accessors_delegate_v2() {
+        let v2 = sample_footer_v2();
+        let sf = SegmentFooter::V2(v2.clone());
+        assert_eq!(sf.format_version(), v2.format_version);
+        assert_eq!(sf.schema(), &v2.schema);
+        assert_eq!(sf.schema_version(), v2.schema_version);
+        assert_eq!(sf.row_count(), v2.row_count);
+        assert_eq!(sf.row_group_count(), v2.row_group_count);
+        assert_eq!(sf.row_group_size_hint(), v2.row_group_size_hint);
+        assert_eq!(sf.creation_timestamp_ns(), v2.creation_timestamp_ns);
+        assert_eq!(sf.seq_id_range(), v2.seq_id_range);
+        assert_eq!(sf.batch_id(), v2.batch_id);
+        assert_eq!(sf.compaction_level(), v2.compaction_level);
+        assert_eq!(sf.dictionaries(), &v2.dictionaries[..]);
+        assert_eq!(sf.row_groups(), &v2.row_groups[..]);
+        assert_eq!(sf.fsst_symbol_tables(), &v2.fsst_symbol_tables[..]);
+    }
+
+    #[test]
+    fn fsst_symbol_table_ref_round_trips_through_postcard() {
+        let r = FsstSymbolTableRef {
+            column_ordinal: 3,
+            byte_offset: 1024,
+            byte_length: 256,
+            symbol_count: 128,
+        };
+        let bytes = postcard::to_allocvec(&r).unwrap();
+        let back: FsstSymbolTableRef = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, r);
     }
 }

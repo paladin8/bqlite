@@ -787,11 +787,19 @@ fn decode_column_chunk(
                 &write_time_col.bql_type,
             )?
         }
+        // NOTE: When TASK-416 lands FSST, Fsst will need its own
+        // match arm here (like Dictionary above) to access the
+        // segment-level FSST symbol tables.
         EncodingType::Plain
         | EncodingType::Delta
         | EncodingType::BitPacking
         | EncodingType::Constant
-        | EncodingType::Rle => {
+        | EncodingType::Rle
+        | EncodingType::DoubleDelta
+        | EncodingType::Fsst
+        | EncodingType::For
+        | EncodingType::PFor
+        | EncodingType::Alp => {
             let chunk = BorrowedEncodedChunk {
                 encoding,
                 params: on_disk_params,
@@ -882,6 +890,17 @@ fn parse_encoding_params_len(
             };
             Ok(1 + literal_len)
         }
+        // v2 encoding params sizes per segment-format-v2.md §5.
+        // base_value(8) + first_delta(8) + dd_bit_width(1)
+        EncodingType::DoubleDelta => Ok(17),
+        // symbol_table_id(4)
+        EncodingType::Fsst => Ok(4),
+        // block_size(2) + block_count(4)
+        EncodingType::For => Ok(6),
+        // block_size(2) + block_count(4)
+        EncodingType::PFor => Ok(6),
+        // exponent(1) + factor(8) + patch_count(4) + for_block_size(2) + for_block_count(4)
+        EncodingType::Alp => Ok(19),
     }
 }
 
@@ -966,6 +985,14 @@ fn dispatch_decode(
         EncodingType::BitPacking => BitPacking.decode_borrowed(chunk, ty),
         EncodingType::Constant => Constant.decode_borrowed(chunk, ty),
         EncodingType::Rle => Rle.decode_borrowed(chunk, ty),
+        // v2 encodings — decode implementations land in TASK-414 through TASK-418, TASK-450.
+        EncodingType::DoubleDelta
+        | EncodingType::Fsst
+        | EncodingType::For
+        | EncodingType::PFor
+        | EncodingType::Alp => Err(BqliteError::Execution(format!(
+            "v2 encoding {encoding:?} decode not yet implemented (TASK-414–TASK-418)"
+        ))),
     }
 }
 
