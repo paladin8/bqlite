@@ -513,11 +513,18 @@ The set is computed once at construction:
 ```rust
 fn supported_demands(&self) -> DemandCapabilities {
     DemandCapabilities {
-        supports_column_forwarding: true,
-        supports_aggregation_fusion: false,  // v1: no fusion (Section 12)
+        supports_step_reached: false,
+        supports_match_count: false,
+        supports_full_detail: false,
+        supports_aggregation_fusion: false,           // v1: no fusion (Section 12)
+        supports_step_property_forwarding: false,
+        supports_forwarded_columns: true,             // generic column forwarding (§10)
+        supports_eager_group_emit: false,             // reserved for Wave 5
     }
 }
 ```
+
+See `docs/design/planner/demand-protocol.md` §6.3 for the canonical capability table.
 
 ---
 

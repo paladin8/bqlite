@@ -751,4 +751,4 @@ Entities with zero events after scan-level filtering are skipped without initial
 - **Pattern compiler pipeline**: AST -> NFA graph -> classification -> optimization. Owned by TASK-311.
 - **Variable binding implementation**: Track creation/lookup, binding extraction, check semantics. Owned by TASK-306.
 - **Logical lowering**: How the planner lowers `PipelineStage::Match` into a `SequenceMatchPhysical`. Owned by TASK-309.
-- **`DemandCapabilities` real protocol**: The Wave 1 scaffold returns `DemandCapabilities::None`. The full protocol that populates the struct above is a Wave 4+ design task, with TASK-302 specifying the interim strategy-selection approach.
+- **`DemandCapabilities` protocol**: Landed by TASK-427. The real 7-field struct and `check_demand_satisfied` matching live in `bqlite-planner::demand`. See `demand-protocol.md` for the spec.

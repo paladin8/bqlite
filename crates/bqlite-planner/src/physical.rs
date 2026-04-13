@@ -51,7 +51,7 @@ use bqlite_core::{AggFunction, ColumnDef, OperatorSchema, TableSchema};
 
 use crate::compile::{CompiledNfa, MatchExecutionConfig, MatchStrategy};
 use crate::compiled::CompiledExpr;
-use crate::demand::{ColumnId, CompiledFusableAggregate, DemandSet};
+use crate::demand::{ColumnId, CompiledFusableAggregate, DemandCapabilities, DemandSet};
 use crate::logical::{EventSelectKind, InsertLogicalBody, LogicalPlan, ProjectItem, SortDirection};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -465,6 +465,21 @@ pub struct SequenceMatchPhysical {
     pub output_schema: OperatorSchema,
 }
 
+impl SequenceMatchPhysical {
+    /// Planner-side capability declaration. Must match
+    /// `SequenceMatchOperator::supported_demands()` — enforced by
+    /// contract tests in `bqlite-operators`.
+    pub const DEMAND_CAPS: DemandCapabilities = DemandCapabilities {
+        supports_step_reached: true,
+        supports_match_count: true,
+        supports_full_detail: true,
+        supports_aggregation_fusion: true,
+        supports_step_property_forwarding: true,
+        supports_forwarded_columns: false,
+        supports_eager_group_emit: false,
+    };
+}
+
 // Manual PartialEq because CompiledNfa derives Debug+Clone but not PartialEq.
 // `compiled_nfa` is intentionally excluded: structural NFA equality is not
 // required for plan-equivalence tests (two compilations of the same pattern
@@ -591,6 +606,20 @@ pub struct SessionizePhysical {
     pub output_schema: OperatorSchema,
 }
 
+impl SessionizePhysical {
+    /// Planner-side capability declaration. Must match the runtime
+    /// `SessionizeOperator::supported_demands()` — enforced by contract tests.
+    pub const DEMAND_CAPS: DemandCapabilities = DemandCapabilities {
+        supports_step_reached: false,
+        supports_match_count: false,
+        supports_full_detail: false,
+        supports_aggregation_fusion: false,
+        supports_step_property_forwarding: false,
+        supports_forwarded_columns: true,
+        supports_eager_group_emit: false,
+    };
+}
+
 /// Physical descriptor for EventSelect (FIRST/LAST/NTH). Wave 4.
 ///
 /// Produced by TASK-425's physical lowering from
@@ -618,6 +647,20 @@ pub struct EventSelectPhysical {
     pub input: Box<PhysicalPlan>,
     /// Output schema: source-table columns (one row per entity).
     pub output_schema: OperatorSchema,
+}
+
+impl EventSelectPhysical {
+    /// Planner-side capability declaration. Must match the runtime
+    /// `EventSelectOperator::supported_demands()` — enforced by contract tests.
+    pub const DEMAND_CAPS: DemandCapabilities = DemandCapabilities {
+        supports_step_reached: false,
+        supports_match_count: false,
+        supports_full_detail: false,
+        supports_aggregation_fusion: false,
+        supports_step_property_forwarding: false,
+        supports_forwarded_columns: true,
+        supports_eager_group_emit: false,
+    };
 }
 
 /// Physical descriptor for the ATTRIBUTE operator. Wave 4.
@@ -655,6 +698,20 @@ pub struct AttributePhysical {
     /// demand-forwarded conversion properties, `touchpoint_ts?`,
     /// `touchpoint_key?`.
     pub output_schema: OperatorSchema,
+}
+
+impl AttributePhysical {
+    /// Planner-side capability declaration. Must match the runtime
+    /// `AttributeOperator::supported_demands()` — enforced by contract tests.
+    pub const DEMAND_CAPS: DemandCapabilities = DemandCapabilities {
+        supports_step_reached: false,
+        supports_match_count: false,
+        supports_full_detail: false,
+        supports_aggregation_fusion: false,
+        supports_step_property_forwarding: false,
+        supports_forwarded_columns: true,
+        supports_eager_group_emit: false,
+    };
 }
 
 /// Physical descriptor for cohort-based SubqueryFilter. Wave 4.

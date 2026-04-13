@@ -1095,7 +1095,7 @@ Each worker maintains its own `QueryMetrics` in its `WorkerContext` (Section 3.3
 | `DictFilterBitset` | `bqlite-storage` | Scan-time precomputed dictionary filter |
 | `TypedKernel` | `bqlite-operators` | Monomorphized vectorized kernels |
 | `OperatorError` | `bqlite-operators` | Operator-facing execution failures |
-| `DemandSet` / `DemandCapabilities` | `bqlite-planner` | Plan-time demand propagation. **Wave 1 scaffold note:** TASK-110 shipped `DemandCapabilities` in `bqlite-core` instead so that both `bqlite-operators` and `bqlite-planner` can reference it without adding a new crate edge while the real protocol is still in design. The final home is still `bqlite-planner`; the scaffold relocates when the Wave 4+ demand-protocol `[DESIGN]` task lands. See `crates/bqlite-core/src/demand.rs` for the module-level note. |
+| `DemandSet` / `DemandCapabilities` | `bqlite-planner` | Plan-time demand propagation — `DemandSet` (planner-side) and `DemandCapabilities` (operator-side) per `demand-protocol.md` §4. TASK-427 relocated `DemandCapabilities` from its Wave 1 scaffold home in `bqlite-core` to `bqlite-planner::demand`, replacing the placeholder enum with a 7-field bool struct. |
 | Parser orchestration (`Engine::query(text, db)`) | `bqlite-engine` | TASK-118 added `bqlite-parser` as a direct dep of `bqlite-engine` so the engine owns the single text-in, rows-out surface the CLI and future Python bindings call. See architecture.md "Dependency Direction" and CLAUDE.md for the updated graph (`bqlite-engine → parser, planner, operators, storage, core`). |
 | `ExecutionError` | `bqlite-engine` | Query-facing wrapper around operator failures and timeouts |
 | `QueryContext` / `QueryMetrics` | `bqlite-engine` | Execution-time state and metrics |

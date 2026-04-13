@@ -462,11 +462,18 @@ The set is computed once at construction:
 ```rust
 fn supported_demands(&self) -> DemandCapabilities {
     DemandCapabilities {
-        supports_column_forwarding: true,
-        supports_aggregation_fusion: false,  // v1: no fusion (§10)
+        supports_step_reached: false,
+        supports_match_count: false,
+        supports_full_detail: false,
+        supports_aggregation_fusion: false,           // v1: no fusion (§10)
+        supports_step_property_forwarding: false,
+        supports_forwarded_columns: true,             // generic column forwarding (§9)
+        supports_eager_group_emit: false,             // reserved for Wave 5
     }
 }
 ```
+
+See `docs/design/planner/demand-protocol.md` §6.3 for the canonical capability table.
 
 ---
 
@@ -729,7 +736,7 @@ This respects the dependency direction: `bqlite-operators -> bqlite-planner` (fo
 
 - **TASK-420 (parser)**: `session_params` grammar accepts single `event_ref` and parenthesized list. AST carries `Vec<EventRef>` (length >= 1). Duplicate-name diagnostic within the list.
 - **TASK-424 (planner)**: Logical node carries `gap`, `end_events: Vec<String>`, `forwarded_columns` (demand-driven), output schema per §6.
-- **TASK-427 (DemandCapabilities)**: SESSIONIZE advertises `supports_column_forwarding: true`, `supports_aggregation_fusion: false`.
+- **TASK-427 (DemandCapabilities)**: SESSIONIZE advertises `supports_forwarded_columns: true`; all other bits `false` (demand-protocol.md §6.3).
 - **TASK-428 (SessionizeOperator)**: Owns the per-entity buffer, gap rule (§5.1), end-event rule (§5.2, §5.3), duration computation (§6.3), per-entity event cap with diagnostic + entity skip (§11), entity-boundary flush (§5.5). Must thread the per-query diagnostic channel.
 - **Wave 5 fusion task**: Add the two fusion candidates from §10.1 to the fusion-opportunities list.
 
@@ -738,6 +745,6 @@ This respects the dependency direction: `bqlite-operators -> bqlite-planner` (fo
 ## 18. Open Questions Deferred to Other Tasks
 
 - **Logical lowering rules**: How the planner lowers `PipelineStage::Sessionize` into a `Sessionize` logical node and then to `SessionizePhysical`. Owned by TASK-425.
-- **`DemandCapabilities` real protocol**: The Wave 1 scaffold returns `DemandCapabilities::None`. The full protocol is a Wave 4 task (TASK-427).
+- **`DemandCapabilities` protocol**: Landed by TASK-427. See `demand-protocol.md` for the real struct shape and matching algorithm.
 - **Spill-to-disk for session buffers**: Deferred to Wave 5 (TASK-502). V1 uses the event cap as the only defense.
 - **Cross-stateful-operator fusion**: `SESSIONIZE -> MATCH -> STATS` fuses MATCH with STATS but not SESSIONIZE with MATCH. Cross-operator fusion is a potential v2 enhancement (planner-pipeline.md §7.7).

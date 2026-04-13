@@ -43,9 +43,6 @@ pub use arrow::{
     table_schema_to_arrow,
 };
 
-pub mod demand;
-pub use demand::{DemandCapabilities, DemandPropagation};
-
 pub mod storage;
 pub use storage::{
     ColumnProjection, DictRewrite, DictionaryIndex, Predicate, RangeOp, ScanConjunct,

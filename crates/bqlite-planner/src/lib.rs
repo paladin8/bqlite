@@ -78,8 +78,9 @@ pub use compiled::{
     FunctionKernel, InSetKernel, LogicalKernel, UnaryKernel,
 };
 pub use demand::{
-    ColumnId, CompiledAggExpr, CompiledFusableAggregate, DemandSet, FusableAggExpr,
-    FusableAggregate, StepPropertyRef,
+    check_demand_satisfied, ColumnId, CompiledAggExpr, CompiledFusableAggregate,
+    DemandCapabilities, DemandPropagation, DemandSet, FusableAggExpr, FusableAggregate,
+    StepPropertyRef,
 };
 pub use explain::{build_explain_node, format_explain, format_expr, ExplainNode};
 pub use expr::{FunctionRegistry, ScalarFunctionSig, TypedExpr, TypedExprKind};

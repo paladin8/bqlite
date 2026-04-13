@@ -784,9 +784,13 @@ fn supported_demands(&self) -> DemandCapabilities {
         supports_full_detail: true,
         supports_aggregation_fusion: true,
         supports_step_property_forwarding: true,   // per-(step, column) forwarding
+        supports_forwarded_columns: false,         // MATCH-specific, not generic forwarding
+        supports_eager_group_emit: false,          // reserved for Wave 5
     }
 }
 ```
+
+See `docs/design/planner/demand-protocol.md` §2–§3 for the canonical field list and §6 for the `const DEMAND_CAPS` planner-side declaration that must stay in sync.
 
 For general NFA patterns, `step_reached` is computed using the `state_to_step` mapping (Section 3.2): each NFA state maps to a logical step number based on the shortest path from the start state. For branching patterns (A THEN (B OR C) THEN D), both B and C states map to step 2, and D maps to step 3.
 

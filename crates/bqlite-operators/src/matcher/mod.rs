@@ -32,7 +32,7 @@ use arrow::record_batch::RecordBatch;
 
 use bqlite_core::{BqlType, ColumnDef, EntityId, OperatorSchema, TimeRange};
 use bqlite_planner::compile::{CompiledNfa, MatchStrategy};
-use bqlite_planner::demand::CompiledFusableAggregate;
+use bqlite_planner::demand::{CompiledFusableAggregate, DemandCapabilities};
 use bqlite_planner::physical::SequenceMatchPhysical;
 use bqlite_planner::PhysicalPlan;
 
@@ -400,6 +400,18 @@ impl EntityOperator for SequenceMatchOperator {
 
     fn required_columns(&self) -> &[String] {
         &self.required_column_names
+    }
+
+    fn supported_demands(&self) -> DemandCapabilities {
+        DemandCapabilities {
+            supports_step_reached: true,
+            supports_match_count: true,
+            supports_full_detail: true,
+            supports_aggregation_fusion: true,
+            supports_step_property_forwarding: true,
+            supports_forwarded_columns: false,
+            supports_eager_group_emit: false,
+        }
     }
 }
 

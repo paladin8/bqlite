@@ -991,7 +991,7 @@ pub struct StepPropertyRef {
 }
 ```
 
-**Relationship to `DemandCapabilities` in sequence-matching.md §13.5.** Sequence-matching.md uses a distinct type named `DemandCapabilities` returned by `supported_demands()` — that is the **operator side** of the protocol, advertising which demand shapes the operator supports (step counts, match details, aggregation fusion, step property forwarding). `DemandSet` in this document is the **planner side** — what the downstream needs. The two are dual: the planner constructs a `DemandSet` during the backward pass, then matches it against the operator's `DemandCapabilities` to select a strategy. Sequence-matching.md §13.5 documents this distinction explicitly.
+**Relationship to `DemandCapabilities` (demand-protocol.md §2–§3).** Both `DemandSet` (planner-side) and `DemandCapabilities` (operator-side) now live in `bqlite-planner::demand`. `DemandCapabilities` is a plain struct with 7 boolean fields, each advertising a single orthogonal capability that a stateful operator may or may not support. The planner constructs a `DemandSet` during the backward pass, then matches it against the operator's `DemandCapabilities` (via `const DEMAND_CAPS` on physical descriptors) to select a strategy and validate that every demand can be satisfied. See `demand-protocol.md` for the full matching algorithm and unmet-demand error policy.
 
 ### 9.4 Strategy Selection for MATCH
 
@@ -1433,6 +1433,8 @@ The following open questions from TASK-006 and the design notes are resolved:
 | Desugaring (FUNNEL, RETENTION, LET) | `bqlite-planner` | Runs during lowering                                      |
 | Optimizer passes 1–7                | `bqlite-planner` | Rule-based structural rewrites                            |
 | `DemandSet`                          | `bqlite-planner` | Downstream-needs value carried through backward pass      |
+| `DemandCapabilities`                 | `bqlite-planner` | Operator-side capability advertisement (demand-protocol.md §2–§3) |
+| `DemandPropagation`                  | `bqlite-planner` | Object-safe trait for capability queries (demand-protocol.md §5) |
 | Physical planner                    | `bqlite-planner` | Strategy selection, fused operator emission               |
 | `PhysicalOperator` trait             | `bqlite-operators` | Operators implement this; see execution-model.md §15     |
 | Physical operator implementations    | `bqlite-operators` | Per execution-model.md §4                                 |
