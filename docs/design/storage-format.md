@@ -227,9 +227,9 @@ Each `(window, shard)` compacts independently. This means compaction is embarras
 
 **Strategy: size-tiered.** Compaction is size-tiered within each `(window, shard)`. This is the cheapest correct strategy and, because bqlite is a query-performance-first engine, there is no separate "cold-window" compaction policy — every window is compacted for read performance, not for storage footprint.
 
-**Scheduling:** Compaction runs as a dedicated background process that activates when query and ingest load is light. It can also be triggered explicitly via API or CLI.
+**Scheduling:** A dedicated `CompactionScheduler` thread pool (default `max(1, num_cores / 4)` workers) dequeues eligible jobs from a priority queue (highest L0 count first, ties broken by total L0 size). A synchronous `Database::compact_now(table)` API is also available for tests and CLI. See [compaction-concurrency.md](storage/compaction-concurrency.md) §3 for the full scheduler model and concurrency gating.
 
-**Trigger:** When the number of L0 segments in a `(window, shard)` exceeds a threshold (default: 4), or the total size of L0 segments exceeds a limit (default: 256 MB).
+**Trigger:** When the number of L0 segments in a `(window, shard)` exceeds a threshold (default: 4), or the total size of L0 segments exceeds a limit (default: 256 MB). Both thresholds are configurable.
 
 **Process:**
 
@@ -260,18 +260,21 @@ Compaction is an opportunity to re-analyze column distributions and pick optimal
 
 ### 7.4 Atomicity
 
-The manifest is the source of truth for which segments are live. Compaction atomicity:
+The manifest is the source of truth for which segments are live. Compaction publishes results via a **5-step atomic-rename protocol**:
 
-1. Write new segment to a temp file. `fsync`.
-2. Write new manifest to a temp file. `fsync`.
-3. Rename new manifest over old manifest. Atomic on POSIX (`rename(2)`). On Windows, use `ReplaceFile` for equivalent semantics. v1 targets POSIX; Windows support is a future concern.
-4. Delete old input segments.
+1. Write all new segment temp files; `fsync` each.
+2. Write `manifest.json.tmp`; `fsync`.
+3. `rename(manifest.json.tmp, manifest.json)`. Atomic on POSIX (`rename(2)`). v1 targets POSIX; Windows (`ReplaceFile`) parity is a future concern.
+4. Atomically swap the in-memory `Arc<Manifest>`.
+5. Schedule deferred deletion of old segment files (via the reclamation sweep — see §7.6).
+
+Compaction holds the per-table manifest lock only for steps 2–4 (manifest write through in-memory swap). Steps 1 and 5 are lock-free, so lock hold time is milliseconds, not job duration.
 
 If the process crashes at any point:
 - Before step 3: the old manifest is still current; temp files are orphans (cleaned up on next startup).
-- After step 3: the new manifest is current; old segments may still exist on disk (cleaned up on next startup).
+- After step 3, before step 5: the new manifest is current; old segments may still exist on disk (cleaned up on next startup).
 
-**Orphan cleanup on startup.** When the database is opened, the startup routine scans each `(window, shard)` directory and compares files on disk against the manifest's active segment list. Files not referenced by the manifest and not currently being written (identified by a `.tmp` suffix) are deleted. This handles both crashed compactions (temp output files) and deferred segment deletions (old inputs from a completed compaction).
+**Orphan cleanup on startup.** Conservative sweep: deletes only `*.tmp` files and unreferenced `segment_*.seg` files in `(window, shard)` directories the manifest knows about. Directories the manifest does not know about are not touched. See [compaction-concurrency.md](storage/compaction-concurrency.md) §8 for the full failure-recovery protocol.
 
 ### 7.5 Deletes
 
@@ -330,11 +333,13 @@ Tombstone files are small (`__seq_id`, `__batch_id`, entity ID values, and bound
 
 ### 7.6 Query Snapshots and Compaction
 
-Queries acquire a reference to the current manifest at query start. Compaction publishes a new manifest and only deletes old segments after all in-process queries referencing them have released. This is a lightweight reference-counting scheme:
+Queries acquire a reference to the current manifest at query start via `Arc::clone(&current_manifest)`. Compaction publishes a new manifest and defers deletion of old segments until all in-process queries referencing them have released. The reclamation mechanism is a periodic sweep (default: every 10 seconds) that checks `Arc::strong_count` on each retired manifest — when only the scheduler's own reference remains, the orphaned segment files are deleted.
 
-- Queries increment a per-manifest refcount on start, decrement on completion.
-- Compaction waits for the old manifest's refcount to reach zero before deleting its segments.
-- No locks on the query read path.
+- Queries take `Arc::clone` on start; the refcount drops when the query finalizes.
+- The `CompactionScheduler` retains retired manifests in a `retired_versions: Vec<Arc<Manifest>>` list.
+- No locks on the query read path. No timeout or forced invalidation for long-running queries.
+
+See [compaction-concurrency.md](storage/compaction-concurrency.md) §7 for the full reclamation protocol and long-running-query policy.
 
 ### 7.7 Subcompaction for Large Merges
 
@@ -347,7 +352,7 @@ For very large `(window, shard)` merges (input may be tens or hundreds of gigaby
 
 Subcompactions never split an entity — the boundary picker snaps to the next entity-id transition, exactly like morsel boundaries in the execution model (execution-model.md §9.3). This preserves the entity-locality invariant the read path relies on.
 
-Subcompaction parallelism interacts with the query worker pool (execution-model.md §9.4). The compaction scheduler uses the same active-count cooperation as the main compaction path.
+Subcompaction parallelism is governed by the core-budget semaphore ([compaction-concurrency.md](storage/compaction-concurrency.md) §4). Each compaction worker acquires one permit before each row-group of work and releases it at the row-group boundary, pausing mid-job when queries hold all permits. This replaces the earlier "active-count cooperation" sketch with a concrete semaphore-gated protocol.
 
 ---
 
@@ -1095,13 +1100,13 @@ The lock file uses `flock()` on POSIX systems. Queries, ingestion, and compactio
 
 ### 14.2 Queries and Compaction Within One Process
 
-Compaction does not block query execution inside the owning process. The mechanism (Section 7.6):
+Compaction does not block query execution inside the owning process. Queries and compaction share a core-budget semaphore (`num_cores` permits) that naturally interleaves their work:
 
-1. Queries snapshot the manifest at query start.
-2. Compaction writes new segments and publishes a new manifest.
-3. Old segments are deleted only after all in-process queries referencing the old manifest have finished.
+1. Queries acquire permits proportional to their worker count on start and release on finalization.
+2. Compaction workers acquire one permit per row-group of work and release it at row-group boundaries, pausing when all permits are held by queries.
+3. Old segments are reclaimed via a periodic sweep on `Arc::strong_count` (Section 7.6).
 
-This is lock-free on the query read path. Queries never wait for compaction; compaction never waits for queries except to defer old-segment cleanup.
+This is lock-free on the query read path. See [compaction-concurrency.md](storage/compaction-concurrency.md) §4 for the full cooperative-gating model and §7 for the reclamation protocol.
 
 ### 14.3 Concurrent Ingestion
 
@@ -1174,7 +1179,7 @@ Encoded as three components:
 | Batch ID | 64-bit, returned to caller, supports batch-level deletion | Enables undo of bad ingests |
 | Delete mechanism | Per-shard `tombstones.json` with row/batch/entity/time-range deletes; **not** in the manifest | Re-inserted entities get the right semantics; local writes for per-shard deletes |
 | Decode strategy | Near-zero-copy to Arrow, late materialization | DictionaryArray/RunEndEncoded propagate through pipeline |
-| Concurrency | Lock file for writes, manifest snapshots for reads | Lock-free read path |
+| Concurrency | Lock file for writes, core-budget semaphore for query/compaction interleaving, `Arc`-refcount reclamation sweep | Lock-free read path; see [compaction-concurrency.md](storage/compaction-concurrency.md) |
 | Memory budget split | 75% query / 20% compaction / 5% ingest | Query-dominant workload |
 
 ---
