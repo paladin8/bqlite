@@ -134,7 +134,6 @@ impl EncodingType {
             4 => Ok(Self::BitPacking),
             5 => Ok(Self::Rle),
             6 => Ok(Self::Constant),
-            8 => Ok(Self::For),
             other => Err(BqliteError::Execution(format!(
                 "unknown encoding discriminant {other} — segment written by an incompatible version"
             ))),

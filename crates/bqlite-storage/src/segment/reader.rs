@@ -876,8 +876,6 @@ fn parse_encoding_params_len(
         EncodingType::BitPacking => Ok(9),
         // `run_count: u32 LE`.
         EncodingType::Rle => Ok(4),
-        // `block_size: u16 LE` + `block_count: u32 LE`.
-        EncodingType::For => Ok(6),
         EncodingType::Constant => {
             if after_discriminant.is_empty() {
                 return Err("Constant encoding missing value_kind byte".to_string());
