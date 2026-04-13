@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-416",
+  "claimed_at": "2026-04-13T02:56:21Z",
+  "branch": "task/TASK-416",
+  "description": "FSST encoding"
+}
