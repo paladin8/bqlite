@@ -373,8 +373,17 @@ For `MergeSources`, the output entity-key column is always named `entity_id` reg
 
 **TASK-423 (parser: alias definitions):**
 - Accept `(alias_def)* pipeline` top-level grammar per § 2.3.
-- Reject forward references with span-accurate diagnostic.
-- Duplicate alias name resolution follows `query-language.md` § 18.1's "last wins" (shadow-permitted) rule.
+  The public `parse()` function returns `Vec<Statement>` where zero or more
+  `Statement::DefineAlias` items appear first (in source order) and the
+  terminal statement is last; the Vec always has ≥ 1 element.
+- Duplicate alias name resolution follows `query-language.md` § 18.1's "last wins"
+  (shadow-permitted) rule; the parser records both definitions in source order and
+  emits no diagnostic — last-wins enforcement is a bind-time responsibility (TASK-425).
+- Bare reserved keywords in alias-name position produce `ParseError::ReservedKeyword`
+  with `NameRole::AliasName` at parse time (detectable via 2-token lookahead `kw "="`).
+- Forward-reference validation (`TypeError::UndefinedAlias`, error table § 8.1) is a
+  **bind-time** concern deferred to TASK-425 — the parser records definitions in source
+  order without checking whether alias bodies reference names not yet defined.
 
 **TASK-451 (parser: `IN QUERY` / bare `IN alias`):**
 - Add `IN QUERY (pipeline)` and bare `IN alias` forms to the expression grammar.
@@ -398,6 +407,9 @@ For `MergeSources`, the output entity-key column is always named `entity_id` reg
 
 **TASK-425 (AST-to-logical lowering, Wave 4):**
 - Top-down alias binding (§ 2.3).
+- Forward-reference detection: reject references to alias names not yet defined
+  in source order, producing `TypeError::UndefinedAlias` with span-accurate
+  diagnostic (error table § 8.1).
 - Cycle detection via DFS producing `TypeError::AliasCycle` (§ 2.8).
 - Cohort normalization: aliases and subqueries with identical inner plans share one materialized cohort (§ 2.5, § 2.11).
 - `MergeSources` lowering for JOIN source expressions (§ 3.7).

@@ -148,13 +148,22 @@ impl Engine {
     ///   the engine never signals cancellation, but the error
     ///   variant is still propagated verbatim from the operators.
     pub fn query(&self, text: &str, db: &mut Database) -> Result<ExecutionResult> {
-        // 1. Parse. The Wave 1 parser only accepts a bare table
-        //    identifier, so the text is always very short; we convert
-        //    its typed `ParseError` into a `BqliteError::Parse(String)`
-        //    because the unified error enum uses `String` for parse
-        //    failures (see `bqlite_core::error::BqliteError::Parse`).
-        let statement =
-            bqlite_parser::parse(text).map_err(|e| BqliteError::Parse(e.to_string()))?;
+        // 1. Parse. `parse()` returns a Vec: zero or more
+        //    `Statement::DefineAlias` items followed by the terminal
+        //    statement (query, DDL, …). Its typed `ParseError` is
+        //    converted to `BqliteError::Parse(String)` because the
+        //    unified error enum uses `String` for parse failures.
+        //    Alias execution semantics land in TASK-425; until then we
+        //    reject submissions that contain alias definitions so they
+        //    are not silently ignored.
+        let stmts = bqlite_parser::parse(text).map_err(|e| BqliteError::Parse(e.to_string()))?;
+        let statement = if stmts.len() == 1 {
+            stmts.into_iter().next().unwrap()
+        } else {
+            return Err(BqliteError::Plan(
+                "alias definitions require Wave 4 planner support (TASK-407 / TASK-425)".into(),
+            ));
+        };
 
         // 2. Plan. The database's `ManifestCatalog<'_>` implements
         //    `Catalog`, and the planner only needs a `&dyn Catalog` —

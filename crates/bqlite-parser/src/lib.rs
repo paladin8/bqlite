@@ -65,14 +65,25 @@ use bqlite_ast::Statement;
 
 pub use crate::error::{Expected, LiteralKind, NameRole, ParseError, UnterminatedKind};
 
-/// Parse a BQL query text into a [`Statement`].
+/// Parse a BQL submission into an ordered list of statements.
 ///
-/// As of Wave 2, the parser accepts pipeline queries (source + optional
-/// `|`-separated `WHERE` / `SELECT` / `LIMIT` stages), `DROP TABLE`,
-/// `DESCRIBE`, `EXPLAIN pipeline`, and (soon) `CREATE TABLE` and
-/// `ALTER TABLE ADD COLUMN`. INSERT and DELETE land in later Wave 2
-/// tasks; every form the grammar does not yet support returns a
-/// [`ParseError`] naming the offending position.
+/// A BQL submission follows the grammar (query-language.md §26):
+///
+/// ```text
+/// query     := (alias_def)* terminal
+/// alias_def := identifier "=" pipeline_body
+/// ```
+///
+/// The returned [`Vec`] always contains at least one element:
+/// - Zero or more [`Statement::DefineAlias`] items appear first (in
+///   source order).
+/// - The last element is the **terminal statement** — a query pipeline,
+///   DDL, or DML statement.
+///
+/// Alias execution semantics (forward-reference validation, cycle
+/// detection, per-submission caching) are planner-level concerns
+/// deferred to TASK-425. The parser records definition order without
+/// validating reference or shadowing rules.
 ///
 /// # Examples
 ///
@@ -80,22 +91,46 @@ pub use crate::error::{Expected, LiteralKind, NameRole, ParseError, Unterminated
 /// use bqlite_parser::parse;
 /// use bqlite_ast::Statement;
 ///
-/// let stmt = parse("events").unwrap();
-/// match stmt {
+/// // A plain pipeline with no aliases — returns a one-element Vec.
+/// let stmts = parse("events").unwrap();
+/// assert_eq!(stmts.len(), 1);
+/// match &stmts[0] {
 ///     Statement::Query(p) => assert_eq!(p.source.primary.name.text, "events"),
 ///     _ => unreachable!("bare-source parses to a Query statement"),
 /// }
+///
+/// // A submission with one alias definition and a terminal query.
+/// let stmts = parse("buyers = purchases | LIMIT 10\nevents").unwrap();
+/// assert_eq!(stmts.len(), 2);
+/// assert!(matches!(&stmts[0], Statement::DefineAlias { .. }));
+/// assert!(matches!(&stmts[1], Statement::Query(_)));
 /// ```
-pub fn parse(text: &str) -> Result<Statement, ParseError> {
+pub fn parse(text: &str) -> Result<Vec<Statement>, ParseError> {
     let mut p = parser::Parser::new(text)?;
-    let stmt = parser::statement(&mut p)?;
+    let stmts = parser::parse_script(&mut p)?;
     p.expect_eof()?;
-    Ok(stmt)
+    Ok(stmts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extract the single terminal statement from a no-alias submission.
+    ///
+    /// Most tests exercise single-statement input; this helper avoids
+    /// repeating `.into_iter().last().unwrap()` in every test.
+    fn parse_one(text: &str) -> Result<Statement, ParseError> {
+        parse(text).map(|mut v| {
+            assert_eq!(
+                v.len(),
+                1,
+                "expected exactly one statement, got {}",
+                v.len()
+            );
+            v.remove(0)
+        })
+    }
 
     fn name_of(stmt: &Statement) -> &str {
         match stmt {
@@ -110,7 +145,7 @@ mod tests {
 
     #[test]
     fn parses_bare_identifier() {
-        let stmt = parse("events").unwrap();
+        let stmt = parse_one("events").unwrap();
         assert_eq!(name_of(&stmt), "events");
         match stmt {
             Statement::Query(pipe) => {
@@ -126,13 +161,13 @@ mod tests {
 
     #[test]
     fn parses_identifier_with_underscores_and_digits() {
-        let stmt = parse("_user_events_42").unwrap();
+        let stmt = parse_one("_user_events_42").unwrap();
         assert_eq!(name_of(&stmt), "_user_events_42");
     }
 
     #[test]
     fn parses_leading_whitespace() {
-        let stmt = parse("   events").unwrap();
+        let stmt = parse_one("   events").unwrap();
         assert_eq!(name_of(&stmt), "events");
         match stmt {
             Statement::Query(pipe) => {
@@ -145,25 +180,25 @@ mod tests {
 
     #[test]
     fn parses_trailing_whitespace() {
-        assert_eq!(name_of(&parse("events   ").unwrap()), "events");
+        assert_eq!(name_of(&parse_one("events   ").unwrap()), "events");
     }
 
     #[test]
     fn parses_both_leading_and_trailing_whitespace() {
-        assert_eq!(name_of(&parse("  events\n").unwrap()), "events");
+        assert_eq!(name_of(&parse_one("  events\n").unwrap()), "events");
     }
 
     #[test]
     fn parses_trailing_semicolon() {
         // Framework-doc §12 #3: the parser tolerates a single trailing
         // `;` as a statement terminator for REPL ergonomics.
-        assert_eq!(name_of(&parse("events;").unwrap()), "events");
-        assert_eq!(name_of(&parse("events ;").unwrap()), "events");
+        assert_eq!(name_of(&parse_one("events;").unwrap()), "events");
+        assert_eq!(name_of(&parse_one("events ;").unwrap()), "events");
     }
 
     #[test]
     fn parses_backtick_quoted_identifier() {
-        let stmt = parse("`weird name`").unwrap();
+        let stmt = parse_one("`weird name`").unwrap();
         assert_eq!(name_of(&stmt), "weird name");
         match stmt {
             Statement::Query(pipe) => {
@@ -177,7 +212,7 @@ mod tests {
     #[test]
     fn parses_backtick_with_symbols_inside() {
         assert_eq!(
-            name_of(&parse("`table.with.dots`").unwrap()),
+            name_of(&parse_one("`table.with.dots`").unwrap()),
             "table.with.dots"
         );
     }
@@ -185,7 +220,7 @@ mod tests {
     #[test]
     fn parses_backtick_with_doubled_backtick() {
         // `` `a``b` `` → literal identifier `a`b`
-        assert_eq!(name_of(&parse("`a``b`").unwrap()), "a`b");
+        assert_eq!(name_of(&parse_one("`a``b`").unwrap()), "a`b");
     }
 
     // ------------------------------------------------------------------
@@ -382,7 +417,7 @@ mod tests {
     fn backtick_wrapped_keyword_is_accepted_by_parser() {
         // §26.3 rule 3 defers keyword-shadowing rejection to the
         // planner; the parser accepts `` `MATCH` `` as a name.
-        let stmt = parse("`MATCH`").unwrap();
+        let stmt = parse_one("`MATCH`").unwrap();
         assert_eq!(name_of(&stmt), "MATCH");
     }
 
@@ -411,10 +446,142 @@ mod tests {
 
     #[test]
     fn parse_result_is_cloneable_and_comparable() {
-        // The returned Statement should be comparable and cloneable
-        // like every other AST node.
+        // The returned Vec should be comparable and cloneable.
         let a = parse("events").unwrap();
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    // ------------------------------------------------------------------
+    // Alias definition parsing (TASK-423)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_single_alias_def_and_terminal_pipeline() {
+        // `buyers = purchases LAST 30d\nevents` → [DefineAlias, Query]
+        let stmts = parse("buyers = purchases LAST 30d\nevents").unwrap();
+        assert_eq!(stmts.len(), 2, "expected alias + terminal");
+        match &stmts[0] {
+            Statement::DefineAlias { name, body, .. } => {
+                assert_eq!(name.text, "buyers");
+                assert_eq!(body.source.primary.name.text, "purchases");
+            }
+            other => panic!("expected DefineAlias, got {other:?}"),
+        }
+        match &stmts[1] {
+            Statement::Query(p) => assert_eq!(p.source.primary.name.text, "events"),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_multiple_alias_defs_before_terminal() {
+        // Two alias defs, then the terminal pipeline.
+        let src = "a = events\nb = purchases\nresults";
+        let stmts = parse(src).unwrap();
+        assert_eq!(stmts.len(), 3, "expected two aliases + terminal");
+        assert!(matches!(&stmts[0], Statement::DefineAlias { name, .. } if name.text == "a"));
+        assert!(matches!(&stmts[1], Statement::DefineAlias { name, .. } if name.text == "b"));
+        assert!(matches!(&stmts[2], Statement::Query(_)));
+    }
+
+    #[test]
+    fn alias_body_may_include_pipeline_stages() {
+        // Alias body is a full pipeline: `buyers = events | LIMIT 5`
+        let stmts = parse("buyers = events | LIMIT 5\nresults").unwrap();
+        assert_eq!(stmts.len(), 2);
+        match &stmts[0] {
+            Statement::DefineAlias { name, body, .. } => {
+                assert_eq!(name.text, "buyers");
+                assert_eq!(body.stages.len(), 1);
+            }
+            other => panic!("expected DefineAlias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_with_backtick_name_is_accepted() {
+        // Backtick-wrapped alias names are accepted by the parser per
+        // §26.3 rule 3; planner rejects reserved names at bind time.
+        let stmts = parse("`my alias` = events\nresults").unwrap();
+        assert_eq!(stmts.len(), 2);
+        match &stmts[0] {
+            Statement::DefineAlias { name, .. } => assert_eq!(name.text, "my alias"),
+            other => panic!("expected DefineAlias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_alias_name_allowed_last_wins() {
+        // Shadowing is permitted; the planner applies last-wins resolution.
+        // cohorts-aliases-joins.md §2.2.
+        let stmts = parse("x = events\nx = purchases\nresults").unwrap();
+        assert_eq!(stmts.len(), 3);
+        // Both DefineAlias items are preserved in source order.
+        assert!(matches!(&stmts[0], Statement::DefineAlias { name, .. } if name.text == "x"));
+        assert!(matches!(&stmts[1], Statement::DefineAlias { name, .. } if name.text == "x"));
+        match &stmts[0] {
+            Statement::DefineAlias { body, .. } => {
+                assert_eq!(body.source.primary.name.text, "events")
+            }
+            _ => unreachable!(),
+        }
+        match &stmts[1] {
+            Statement::DefineAlias { body, .. } => {
+                assert_eq!(body.source.primary.name.text, "purchases")
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn alias_reserved_keyword_name_is_rejected() {
+        // A bare keyword in alias-name position produces ReservedKeyword.
+        match parse("WHERE = events\nresults") {
+            Err(ParseError::ReservedKeyword { keyword, role, .. }) => {
+                assert_eq!(keyword, "WHERE");
+                assert_eq!(role, NameRole::AliasName);
+            }
+            other => panic!("expected ReservedKeyword, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_only_input_missing_terminal_is_error() {
+        // A submission with only an alias def but no terminal pipeline
+        // is a grammar error — the parser hits EOF where it expects a
+        // statement.
+        match parse("buyers = events") {
+            Err(ParseError::UnexpectedEof { expected, .. }) => {
+                // After the alias body `events`, EOF is reached where a
+                // terminal statement is required.
+                assert_eq!(expected, Expected::Name);
+            }
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_span_covers_name_through_body() {
+        // The span on DefineAlias covers from the alias name to the end
+        // of the pipeline body.
+        let stmts = parse("ab = events\nresults").unwrap();
+        match &stmts[0] {
+            Statement::DefineAlias { name, span, .. } => {
+                // Alias name starts at byte 0, body ends after "events" (byte 11).
+                assert_eq!(name.span.start, 0);
+                assert_eq!(span.start, 0);
+                assert_eq!(span.end, "ab = events".len());
+            }
+            other => panic!("expected DefineAlias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_alias_input_returns_single_element_vec() {
+        // A plain pipeline returns a Vec with exactly one element.
+        let stmts = parse("events").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(&stmts[0], Statement::Query(_)));
     }
 }

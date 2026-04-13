@@ -847,7 +847,14 @@ mod tests {
         // rather than surfacing as a generic smoke-test failure.
         let scratch = Scratch::new("compose");
         let mut db = create_db_with_bootstrap(scratch.path());
-        let stmt = bqlite_parser::parse("events").expect("parse events");
+        let mut stmts = bqlite_parser::parse("events").expect("parse events");
+        assert_eq!(
+            stmts.len(),
+            1,
+            "expected single statement, got {}",
+            stmts.len()
+        );
+        let stmt = stmts.remove(0);
         let physical = {
             let catalog = db.catalog();
             plan(stmt, &catalog, 0).expect("plan events")

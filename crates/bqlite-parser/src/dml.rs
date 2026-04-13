@@ -369,7 +369,15 @@ mod tests {
     use bqlite_ast::{InsertBody, Statement};
 
     fn parse_ok(src: &str) -> Statement {
-        crate::parse(src).unwrap_or_else(|e| panic!("parse failed for `{src}`: {e:?}"))
+        let mut stmts =
+            crate::parse(src).unwrap_or_else(|e| panic!("parse failed for `{src}`: {e:?}"));
+        assert_eq!(
+            stmts.len(),
+            1,
+            "expected single statement, got {}",
+            stmts.len()
+        );
+        stmts.remove(0)
     }
 
     fn insert_from_of(stmt: &Statement) -> (&str, &[InsertOption], &Option<Vec<ColumnMapping>>) {

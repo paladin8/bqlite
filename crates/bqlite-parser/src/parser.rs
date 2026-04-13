@@ -10,6 +10,11 @@
 //! `|`-separated tail. DDL and DML productions (TASK-221 / TASK-222 /
 //! TASK-238) plug into the same dispatcher by peeking the first token
 //! and branching into their own entry points.
+//!
+//! TASK-423 extends the entry point from `pipeline` to
+//! `(alias_def)* pipeline` so that zero or more `name = pipeline`
+//! alias definitions can precede the terminal query. See
+//! `docs/design/language/cohorts-aliases-joins.md` §2 and [`parse_script`].
 
 use bqlite_ast::{Name, Pipeline, Source, Span, Statement, TableRef, TimeRange};
 
@@ -419,6 +424,90 @@ fn parse_time_range(p: &mut Parser) -> Result<(Option<TimeRange>, Option<Span>),
     } else {
         Ok((None, None))
     }
+}
+
+/// Parse a complete BQL script: zero or more alias definitions followed
+/// by a single terminal statement.
+///
+/// Grammar (query-language.md §26):
+/// ```text
+/// query     := (alias_def)* terminal
+/// alias_def := identifier "=" pipeline_body
+/// ```
+///
+/// Alias definitions are recognized by a **2-token lookahead**: if the
+/// current token is an identifier or backtick-quoted name *and* the
+/// next token is `=`, the pair starts an alias definition. Any other
+/// first token falls through to the terminal statement dispatcher.
+///
+/// The returned `Vec` always has at least one element. Zero or more
+/// `Statement::DefineAlias` items come first; the last element is the
+/// terminal statement (always a non-`DefineAlias` variant).
+///
+/// Forward-reference validation and alias cycle detection are
+/// planner-level concerns deferred to TASK-425. The parser records
+/// alias definitions in source order without validating reference order.
+///
+/// **Shadowing:** duplicate alias names are allowed — the last-wins rule
+/// from `cohorts-aliases-joins.md` §2.2 applies at planner bind time.
+/// The parser emits no diagnostic for duplicate alias names.
+pub(crate) fn parse_script(p: &mut Parser) -> Result<Vec<Statement>, ParseError> {
+    let mut stmts: Vec<Statement> = Vec::new();
+
+    // Collect alias definitions. The 2-token lookahead pattern is
+    // `something "="`. What `something` is determines the action:
+    //
+    //  - Ident | QuotedName  → valid alias name, parse it.
+    //  - Kw                  → reserved keyword used as alias name;
+    //                          produce ReservedKeyword(AliasName) per
+    //                          cohorts-aliases-joins.md §2.2, error table §8.1.
+    //  - anything else       → not an alias def, break to the terminal
+    //                          statement dispatcher.
+    loop {
+        // If position 1 is not `=`, we are not in an alias definition.
+        if !matches!(p.peek_at(1).kind, TokenKind::Eq) {
+            break;
+        }
+
+        match p.peek_kind() {
+            // Valid alias-name position — fall through to consumption.
+            TokenKind::Ident(_) | TokenKind::QuotedName(_) => {}
+
+            // Keyword used as alias name. `expect_name(AliasName)` below
+            // would also catch this, but checking here lets us produce the
+            // error before the `=` is consumed, keeping the error span
+            // tight to the keyword token.
+            TokenKind::Kw(kw) => {
+                let tok = p.peek();
+                return Err(ParseError::ReservedKeyword {
+                    offset: tok.start,
+                    keyword: kw.canonical(),
+                    role: NameRole::AliasName,
+                });
+            }
+
+            // Something else followed by `=` (e.g., a literal) — not an
+            // alias def. Fall through to the terminal statement dispatcher.
+            _ => break,
+        }
+
+        // Consume `name "=" pipeline_body`.
+        let name = p.expect_name(NameRole::AliasName)?;
+        let name_span = name.span;
+        p.bump(); // consume `=`
+
+        // Parse the alias body — a full pipeline starting with a source name.
+        let body = parse_pipeline_body(p)?;
+        let span = name_span.merged(body.span);
+
+        stmts.push(Statement::DefineAlias { name, body, span });
+    }
+
+    // Parse the terminal statement (pipeline, DDL, DML, …).
+    let terminal = statement(p)?;
+    stmts.push(terminal);
+
+    Ok(stmts)
 }
 
 /// Parse a pipeline body and wrap it in `Statement::Query`.
