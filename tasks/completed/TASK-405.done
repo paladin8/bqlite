@@ -2,6 +2,7 @@
   "agent_id": "agent-4",
   "task_id": "TASK-405",
   "claimed_at": "2026-04-13T01:51:20Z",
+  "completed_at": "2026-04-13T02:30:00Z",
   "branch": "task/TASK-405",
   "description": "SESSIONIZE operator"
 }
