@@ -227,8 +227,12 @@ pub struct Sessionize {
     /// `gap: <duration>` — inactivity gap in nanoseconds that ends a
     /// session.
     pub gap: i64,
-    /// `end: <event>` — optional event that forcibly ends a session.
-    pub end: Option<EventRef>,
+    /// `end: <event_list>` — optional event type(s) that forcibly end a
+    /// session. Accepts either a single event ref or a parenthesised list
+    /// `(e1, e2, …)`. The `Vec` always has length ≥ 1 when `Some`.
+    /// Duplicate names within the list are rejected at parse time
+    /// (sessionize.md §5.4).
+    pub end: Option<Vec<EventRef>>,
     pub span: Span,
 }
 
