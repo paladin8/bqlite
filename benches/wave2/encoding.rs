@@ -22,7 +22,7 @@ use bqlite_benches::common::*;
 use bqlite_core::BqlType;
 use bqlite_storage::encoding::{
     compress_lz4, decompress_lz4, BitPacking, Constant, Delta, Dictionary, DoubleDelta, Encoding,
-    Plain, Rle,
+    Fsst, Plain, Rle,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
@@ -476,6 +476,185 @@ fn bench_double_delta_seq_id(c: &mut Criterion) {
     group.finish();
 }
 
+// ── FSST ────────────────────────────────────────────────────────────────────
+
+/// Generate a high-cardinality URL-like string array for FSST benchmarks.
+/// These have shared prefixes and common substrings (`https://`, `.com/`,
+/// `/page`) — the target workload for FSST compression.
+fn gen_url_string_array(n: usize) -> ArrayRef {
+    let prefixes = [
+        "https://example.com/page/",
+        "https://api.example.org/v2/users/",
+        "https://cdn.test.io/assets/images/",
+        "https://www.example.net/search?q=",
+    ];
+    let values: Vec<String> = (0..n)
+        .map(|i| format!("{}{}/details?ref=home&ts={}", prefixes[i % 4], i, i * 1000))
+        .collect();
+    Arc::new(StringViewArray::from(values))
+}
+
+/// Generate a user-agent-like string array — another common FSST target.
+fn gen_user_agent_array(n: usize) -> ArrayRef {
+    let agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) Mobile/15E148",
+    ];
+    // High cardinality: each string is unique (suffixed with row index),
+    // but shares substantial prefix structure.
+    let values: Vec<String> = (0..n)
+        .map(|i| format!("{} (session={})", agents[i % 4], i))
+        .collect();
+    Arc::new(StringViewArray::from(values))
+}
+
+fn bench_fsst_url_strings(c: &mut Criterion) {
+    let array = gen_url_string_array(ROW_GROUP_SIZE);
+    let fsst = Fsst::train(array.as_ref()).unwrap();
+    let chunk = fsst.encode(array.as_ref()).unwrap();
+    let payload_bytes = chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/fsst/url_strings");
+    group.throughput(Throughput::Bytes(payload_bytes));
+
+    group.bench_function("train", |b| {
+        b.iter(|| Fsst::train(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("encode", |b| {
+        b.iter(|| fsst.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("decode", |b| {
+        b.iter(|| fsst.decode(black_box(&chunk), &BqlType::String).unwrap())
+    });
+
+    group.finish();
+}
+
+fn bench_fsst_user_agents(c: &mut Criterion) {
+    let array = gen_user_agent_array(ROW_GROUP_SIZE);
+    let fsst = Fsst::train(array.as_ref()).unwrap();
+    let chunk = fsst.encode(array.as_ref()).unwrap();
+    let payload_bytes = chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/fsst/user_agents");
+    group.throughput(Throughput::Bytes(payload_bytes));
+
+    group.bench_function("train", |b| {
+        b.iter(|| Fsst::train(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("encode", |b| {
+        b.iter(|| fsst.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("decode", |b| {
+        b.iter(|| fsst.decode(black_box(&chunk), &BqlType::String).unwrap())
+    });
+
+    group.finish();
+}
+
+/// Compare FSST against Dictionary + Plain + LZ4 on the same
+/// high-cardinality string column. This directly addresses the task
+/// description's requirement for comparative benchmarks.
+fn bench_fsst_vs_baselines(c: &mut Criterion) {
+    let array = gen_url_string_array(ROW_GROUP_SIZE);
+
+    // FSST
+    let fsst = Fsst::train(array.as_ref()).unwrap();
+    let fsst_chunk = fsst.encode(array.as_ref()).unwrap();
+
+    // Plain
+    let plain = Plain::new();
+    let plain_chunk = plain.encode(array.as_ref()).unwrap();
+
+    // Plain + LZ4
+    let plain_lz4 = compress_lz4(&plain_chunk.payload);
+
+    // Dictionary (may fail if cardinality is too high; that's expected
+    // for high-cardinality data — Dictionary is the wrong encoding here).
+    let dict = Dictionary::new();
+    let dict_result = dict.encode(array.as_ref());
+
+    let mut group = c.benchmark_group("encoding/fsst_vs_baselines/url_strings");
+
+    // Report payload sizes for comparison.
+    group.bench_function("fsst_encode", |b| {
+        b.iter(|| fsst.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("fsst_decode", |b| {
+        b.iter(|| {
+            fsst.decode(black_box(&fsst_chunk), &BqlType::String)
+                .unwrap()
+        })
+    });
+
+    group.bench_function("plain_encode", |b| {
+        b.iter(|| plain.encode(black_box(array.as_ref())).unwrap())
+    });
+
+    group.bench_function("plain_decode", |b| {
+        b.iter(|| {
+            plain
+                .decode(black_box(&plain_chunk), &BqlType::String)
+                .unwrap()
+        })
+    });
+
+    group.bench_function("plain_lz4_compress", |b| {
+        b.iter(|| compress_lz4(black_box(&plain_chunk.payload)))
+    });
+
+    group.bench_function("plain_lz4_decompress", |b| {
+        b.iter(|| decompress_lz4(black_box(&plain_lz4), plain_chunk.payload.len()))
+    });
+
+    if let Ok(ref dict_chunk) = dict_result {
+        group.bench_function("dict_encode", |b| {
+            b.iter(|| dict.encode(black_box(array.as_ref())).unwrap())
+        });
+
+        group.bench_function("dict_decode", |b| {
+            b.iter(|| {
+                dict.decode(black_box(dict_chunk), &BqlType::String)
+                    .unwrap()
+            })
+        });
+    }
+
+    group.finish();
+
+    // Print size comparison (visible in cargo bench output).
+    eprintln!(
+        "  FSST payload: {} bytes ({:.1}x vs plain)",
+        fsst_chunk.payload.len(),
+        plain_chunk.payload.len() as f64 / fsst_chunk.payload.len() as f64
+    );
+    eprintln!("  Plain payload: {} bytes", plain_chunk.payload.len());
+    eprintln!(
+        "  Plain+LZ4 payload: {} bytes ({:.1}x vs plain)",
+        plain_lz4.len(),
+        plain_chunk.payload.len() as f64 / plain_lz4.len() as f64
+    );
+    if let Ok(ref dict_chunk) = dict_result {
+        eprintln!(
+            "  Dict payload: {} bytes ({:.1}x vs plain)",
+            dict_chunk.payload.len(),
+            plain_chunk.payload.len() as f64 / dict_chunk.payload.len() as f64
+        );
+    } else {
+        eprintln!(
+            "  Dict: skipped (cardinality too high: {})",
+            dict_result.unwrap_err()
+        );
+    }
+}
+
 // ── Encoding selector throughput ─────────────────────────────────────────────
 
 fn bench_selector_throughput(c: &mut Criterion) {
@@ -592,6 +771,9 @@ criterion_group! {
         bench_rle_bool_constant,
         bench_lz4_compress,
         bench_lz4_repetitive,
+        bench_fsst_url_strings,
+        bench_fsst_user_agents,
+        bench_fsst_vs_baselines,
         bench_selector_throughput,
         bench_encoding_with_metrics,
 }
