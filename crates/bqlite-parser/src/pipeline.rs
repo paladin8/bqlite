@@ -25,8 +25,8 @@
 #![allow(dead_code)] // TASK-221 / TASK-222 productions reach this module later.
 
 use bqlite_ast::{
-    AggItem, Expr, Funnel, GroupItem, MatchMode, MatchPattern, Name, OrderItem, PipelineStage,
-    SelectItem, SelectItemKind, SortDir,
+    AggItem, BracketSpec, EventRef, Expr, Funnel, GroupItem, MatchMode, MatchPattern, Name,
+    OrderItem, PipelineStage, Retention, SelectItem, SelectItemKind, Sessionize, SortDir,
 };
 
 use crate::pattern::parse_step_list;
@@ -35,36 +35,45 @@ use crate::error::{Expected, NameRole, ParseError};
 use crate::expr::parse_expression;
 use crate::lex::{token_span, Keyword, TokenKind};
 use crate::parser::Parser;
-use crate::pattern::{parse_match_modifiers, parse_sequence};
+use crate::pattern::{parse_event_ref, parse_match_modifiers, parse_sequence};
 
 /// Parse the `("|" stage)*` tail of a pipeline, returning the ordered
 /// stage list. Stops at the first token that is not a `|`. The caller
 /// is responsible for the source expression that precedes the tail.
 ///
-/// FUNNEL is a terminal stage — if a `|` appears immediately after a
-/// FUNNEL stage the parser emits an error rather than continuing
-/// (query-language.md §6.1: "FUNNEL is terminal sugar").
+/// FUNNEL and RETENTION are terminal stages — if a `|` appears
+/// immediately after them the parser emits an error rather than
+/// continuing (query-language.md §6.1, §6.3, §25.2).
 pub(crate) fn parse_pipeline_stages(p: &mut Parser) -> Result<Vec<PipelineStage>, ParseError> {
     let mut stages = Vec::new();
     while matches!(p.peek_kind(), TokenKind::Pipe) {
         p.bump(); // consume `|`
         let stage = parse_stage(p)?;
-        let is_terminal = matches!(stage, PipelineStage::Funnel(_));
+        let terminal_name: Option<&'static str> = match &stage {
+            PipelineStage::Funnel(_) => Some("FUNNEL"),
+            PipelineStage::Retention(_) => Some("RETENTION"),
+            _ => None,
+        };
         stages.push(stage);
-        // FUNNEL cannot be followed by another pipe stage.
-        if is_terminal && matches!(p.peek_kind(), TokenKind::Pipe) {
-            let tok = p.peek().clone();
-            return Err(ParseError::Unexpected {
-                offset: tok.start,
-                line: tok.line,
-                column: tok.column,
-                expected: Expected::Eof,
-                found: "|".to_string(),
-                detail: Some(
-                    "FUNNEL is a terminal stage and cannot be followed by another pipe stage; \
-                     write the desugared MATCH + STATS form explicitly if you need downstream operators",
-                ),
-            });
+        // Terminal stages cannot be followed by another pipe stage.
+        if let Some(name) = terminal_name {
+            if matches!(p.peek_kind(), TokenKind::Pipe) {
+                let tok = p.peek().clone();
+                return Err(ParseError::Unexpected {
+                    offset: tok.start,
+                    line: tok.line,
+                    column: tok.column,
+                    expected: Expected::Eof,
+                    found: "|".to_string(),
+                    detail: Some(if name == "FUNNEL" {
+                        "FUNNEL is a terminal stage and cannot be followed by another pipe stage; \
+                         write the desugared MATCH + STATS form explicitly if you need downstream operators"
+                    } else {
+                        "RETENTION is a terminal stage and cannot be followed by another pipe stage; \
+                         write the desugared MATCH + STATS form explicitly if you need downstream operators"
+                    }),
+                });
+            }
         }
     }
     Ok(stages)
@@ -83,6 +92,10 @@ fn parse_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
         TokenKind::Kw(Keyword::Match) => parse_match_stage(p),
         // `FUNNEL(…) (WITHIN duration)?` — terminal funnel sugar (§6.1, TASK-316).
         TokenKind::Kw(Keyword::Funnel) => parse_funnel_stage(p),
+        // `RETENTION(entry: …, activity: …, brackets: …)` — terminal retention sugar (§6.3, TASK-420).
+        TokenKind::Kw(Keyword::Retention) => parse_retention_stage(p),
+        // `SESSIONIZE(gap: …, end: …)` — session assignment (§8, TASK-420).
+        TokenKind::Kw(Keyword::Sessionize) => parse_sessionize_stage(p),
 
         // Every other first token is either a later-wave verb that
         // is not yet implemented, or an error. The error message names
@@ -792,6 +805,331 @@ fn parse_funnel_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
         window: window.map(|(ns, _)| ns),
         span,
     }))
+}
+
+// ----------------------------------------------------------------------
+// RETENTION
+// ----------------------------------------------------------------------
+
+/// Parse `| RETENTION(entry: event, activity: event, brackets: [d, …] [, cumulative: bool])`.
+///
+/// Named arguments are accepted in any order. Required: `entry:`,
+/// `activity:`, `brackets:`. Optional: `cumulative:` (default `false`).
+/// Duplicate argument names are a parse error.
+///
+/// RETENTION is terminal: the caller rejects a subsequent `|` stage
+/// (query-language.md §25.2).
+fn parse_retention_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    let ret_tok = p.expect_kw(Keyword::Retention)?;
+    let start_span = token_span(&ret_tok);
+
+    p.expect_punct(&TokenKind::LParen, "(")?;
+
+    let mut entry: Option<EventRef> = None;
+    let mut activity: Option<EventRef> = None;
+    let mut brackets_durations: Option<Vec<i64>> = None;
+    let mut brackets_span: Option<bqlite_ast::Span> = None;
+    let mut cumulative: Option<bool> = None;
+
+    let mut first = true;
+    loop {
+        if matches!(p.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+            break;
+        }
+        if !first {
+            p.expect_punct(&TokenKind::Comma, ",")?;
+            // After the comma the loop-top guard re-checks for `)`, which breaks
+            // out of the loop. A trailing comma (e.g. `brackets: [7d],)`) is
+            // therefore caught by the downstream missing-arg checks, not here.
+        }
+        first = false;
+
+        // Dispatch on the argument keyword or identifier.
+        match p.peek_kind().clone() {
+            TokenKind::Ident(ref name) if name == "entry" => {
+                if entry.is_some() {
+                    return Err(p.error_unexpected(
+                        Expected::Keyword("activity:"),
+                        Some("duplicate `entry:` argument — each argument appears exactly once in RETENTION"),
+                    ));
+                }
+                p.bump(); // consume "entry"
+                p.expect_punct(&TokenKind::Colon, ":")?;
+                entry = Some(parse_event_ref(p)?);
+            }
+            TokenKind::Ident(ref name) if name == "activity" => {
+                if activity.is_some() {
+                    return Err(p.error_unexpected(
+                        Expected::Keyword("brackets:"),
+                        Some("duplicate `activity:` argument — each argument appears exactly once in RETENTION"),
+                    ));
+                }
+                p.bump(); // consume "activity"
+                p.expect_punct(&TokenKind::Colon, ":")?;
+                activity = Some(parse_event_ref(p)?);
+            }
+            TokenKind::Kw(Keyword::Brackets) => {
+                if brackets_durations.is_some() {
+                    return Err(p.error_unexpected(
+                        Expected::Keyword("cumulative:"),
+                        Some("duplicate `brackets:` argument — each argument appears exactly once in RETENTION"),
+                    ));
+                }
+                let brack_tok = p.bump(); // consume "brackets"
+                let brack_start = token_span(&brack_tok);
+                p.expect_punct(&TokenKind::Colon, ":")?;
+                let (durations, end_span) = parse_bracket_duration_list(p)?;
+                brackets_durations = Some(durations);
+                brackets_span = Some(brack_start.merged(end_span));
+            }
+            TokenKind::Kw(Keyword::Cumulative) => {
+                if cumulative.is_some() {
+                    return Err(p.error_unexpected(
+                        Expected::Punct(")"),
+                        Some("duplicate `cumulative:` argument — each argument appears exactly once in RETENTION"),
+                    ));
+                }
+                p.bump(); // consume "cumulative"
+                p.expect_punct(&TokenKind::Colon, ":")?;
+                cumulative = Some(parse_bool_literal(p)?);
+            }
+            _ => {
+                return Err(p.error_unexpected(
+                    Expected::Keyword("entry:"),
+                    Some("unknown RETENTION argument; expected entry, activity, brackets, or cumulative"),
+                ));
+            }
+        }
+    }
+
+    // Validate required arguments are present (point at `)` or EOF for the
+    // error location — callers see which arg is missing from the detail).
+    let entry = entry.ok_or_else(|| {
+        p.error_unexpected(
+            Expected::Keyword("entry:"),
+            Some("missing required `entry:` argument in RETENTION"),
+        )
+    })?;
+    let activity = activity.ok_or_else(|| {
+        p.error_unexpected(
+            Expected::Keyword("activity:"),
+            Some("missing required `activity:` argument in RETENTION"),
+        )
+    })?;
+    let durations = brackets_durations.ok_or_else(|| {
+        p.error_unexpected(
+            Expected::Keyword("brackets:"),
+            Some("missing required `brackets:` argument in RETENTION"),
+        )
+    })?;
+
+    let rparen_tok = p.expect_punct(&TokenKind::RParen, ")")?;
+    let rparen_span = token_span(&rparen_tok);
+    let span = start_span.merged(rparen_span);
+
+    Ok(PipelineStage::Retention(Retention {
+        entry,
+        activity,
+        brackets: BracketSpec {
+            durations,
+            cumulative: cumulative.unwrap_or(false),
+            span: brackets_span.unwrap_or(bqlite_ast::Span::EMPTY),
+        },
+        span,
+    }))
+}
+
+/// Parse `[d1, d2, …]` — the bracket duration list for RETENTION.
+///
+/// Returns the parsed durations (nanoseconds) and the span covering the
+/// `[…]` delimiters. At least one duration is required.
+fn parse_bracket_duration_list(p: &mut Parser) -> Result<(Vec<i64>, bqlite_ast::Span), ParseError> {
+    let lbracket_tok = p.expect_punct(&TokenKind::LBracket, "[")?;
+    let lbracket_span = token_span(&lbracket_tok);
+
+    if matches!(p.peek_kind(), TokenKind::RBracket) {
+        return Err(p.error_unexpected(
+            Expected::Literal,
+            Some("RETENTION brackets list requires at least one duration (e.g. [7d, 14d, 30d])"),
+        ));
+    }
+
+    let mut durations = Vec::new();
+    loop {
+        let tok = p.peek();
+        if let TokenKind::Duration(ns) = tok.kind {
+            p.bump();
+            durations.push(ns);
+        } else {
+            return Err(p.error_unexpected(
+                Expected::Literal,
+                Some("expected a duration literal (e.g. 7d) in RETENTION brackets list"),
+            ));
+        }
+        if p.try_kind(&TokenKind::Comma).is_none() {
+            break;
+        }
+    }
+
+    let rbracket_tok = p.expect_punct(&TokenKind::RBracket, "]")?;
+    let rbracket_span = token_span(&rbracket_tok);
+
+    Ok((durations, lbracket_span.merged(rbracket_span)))
+}
+
+/// Parse a bare `true` or `false` boolean literal.
+fn parse_bool_literal(p: &mut Parser) -> Result<bool, ParseError> {
+    match p.peek().kind {
+        TokenKind::Bool(b) => {
+            p.bump();
+            Ok(b)
+        }
+        _ => Err(p.error_unexpected(Expected::Literal, Some("expected `true` or `false`"))),
+    }
+}
+
+// ----------------------------------------------------------------------
+// SESSIONIZE
+// ----------------------------------------------------------------------
+
+/// Parse `| SESSIONIZE(gap: duration [, end: event_ref_list])`.
+///
+/// Named arguments are accepted in any order. Required: `gap:`.
+/// Optional: `end:` (accepts a single event ref or a parenthesised
+/// list). Duplicate argument names are a parse error. Duplicate event
+/// names within an `end:` list are also a parse error.
+///
+/// Per sessionize.md §5.4, `end: (logout, logout)` is rejected.
+fn parse_sessionize_stage(p: &mut Parser) -> Result<PipelineStage, ParseError> {
+    let sess_tok = p.expect_kw(Keyword::Sessionize)?;
+    let start_span = token_span(&sess_tok);
+
+    p.expect_punct(&TokenKind::LParen, "(")?;
+
+    let mut gap_ns: Option<i64> = None;
+    let mut end_events: Option<Vec<EventRef>> = None;
+
+    let mut first = true;
+    loop {
+        if matches!(p.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+            break;
+        }
+        if !first {
+            p.expect_punct(&TokenKind::Comma, ",")?;
+        }
+        first = false;
+
+        match p.peek_kind().clone() {
+            TokenKind::Ident(ref name) if name == "gap" => {
+                if gap_ns.is_some() {
+                    return Err(p.error_unexpected(
+                        Expected::Keyword("end:"),
+                        Some("duplicate `gap:` argument — each argument appears exactly once in SESSIONIZE"),
+                    ));
+                }
+                p.bump(); // consume "gap"
+                p.expect_punct(&TokenKind::Colon, ":")?;
+                let tok = p.peek();
+                if let TokenKind::Duration(ns) = tok.kind {
+                    p.bump();
+                    gap_ns = Some(ns);
+                } else {
+                    return Err(p.error_unexpected(
+                        Expected::Literal,
+                        Some("expected a duration literal (e.g. 30m) after `gap:`"),
+                    ));
+                }
+            }
+            TokenKind::Kw(Keyword::End) => {
+                if end_events.is_some() {
+                    return Err(p.error_unexpected(
+                        Expected::Punct(")"),
+                        Some("duplicate `end:` argument — each argument appears exactly once in SESSIONIZE"),
+                    ));
+                }
+                p.bump(); // consume "end"
+                p.expect_punct(&TokenKind::Colon, ":")?;
+                end_events = Some(parse_end_event_list(p)?);
+            }
+            _ => {
+                return Err(p.error_unexpected(
+                    Expected::Keyword("gap:"),
+                    Some("unknown SESSIONIZE argument; expected gap or end"),
+                ));
+            }
+        }
+    }
+
+    // Validate required `gap:` argument.
+    let gap_ns = gap_ns.ok_or_else(|| {
+        p.error_unexpected(
+            Expected::Keyword("gap:"),
+            Some("missing required `gap:` argument in SESSIONIZE"),
+        )
+    })?;
+
+    let rparen_tok = p.expect_punct(&TokenKind::RParen, ")")?;
+    let rparen_span = token_span(&rparen_tok);
+    let span = start_span.merged(rparen_span);
+
+    Ok(PipelineStage::Sessionize(Sessionize {
+        gap: gap_ns,
+        end: end_events,
+        span,
+    }))
+}
+
+/// Parse `event_ref_list = event_ref | "(" event_ref ("," event_ref)* ")"`.
+///
+/// Duplicate event names within a list are rejected (sessionize.md §5.4).
+/// Returns a `Vec<EventRef>` with length ≥ 1.
+fn parse_end_event_list(p: &mut Parser) -> Result<Vec<EventRef>, ParseError> {
+    // Parenthesised list form: `(logout, timeout, session_end)`.
+    if p.try_kind(&TokenKind::LParen).is_some() {
+        let mut events: Vec<EventRef> = Vec::new();
+
+        // At least one event ref is required inside the parens.
+        if matches!(p.peek_kind(), TokenKind::RParen) {
+            return Err(p.error_unexpected(
+                Expected::EventRef,
+                Some("SESSIONIZE end: list requires at least one event name"),
+            ));
+        }
+
+        loop {
+            let ev = parse_event_ref(p)?;
+            // Reject duplicate (table, event) pairs (case-sensitive).
+            // Two refs are duplicates only when both the table qualifier AND the
+            // event name are identical. `events.logout` and `purchases.logout`
+            // are different qualified refs and are not considered duplicates here.
+            let ev_table = ev.table.as_ref().map(|t| t.text.as_str());
+            if events.iter().any(|e| {
+                e.event.text == ev.event.text
+                    && e.table.as_ref().map(|t| t.text.as_str()) == ev_table
+            }) {
+                return Err(ParseError::Unexpected {
+                    offset: ev.span.start,
+                    line: ev.span.line,
+                    column: ev.span.column,
+                    expected: Expected::Punct(","),
+                    found: ev.event.text.to_string(),
+                    detail: Some(
+                        "duplicate event name in SESSIONIZE end: list — each event type must appear at most once",
+                    ),
+                });
+            }
+            events.push(ev);
+            if p.try_kind(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+
+        p.expect_punct(&TokenKind::RParen, ")")?;
+        Ok(events)
+    } else {
+        // Single event ref (no parentheses).
+        Ok(vec![parse_event_ref(p)?])
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -2476,5 +2814,410 @@ mod tests {
             }
             other => panic!("expected parse error for FUNNEL followed by STATS, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // RETENTION tests
+    // -----------------------------------------------------------------------
+
+    fn retention_of(stmt: &Statement) -> &bqlite_ast::Retention {
+        match stages_of(stmt)
+            .iter()
+            .find(|s| matches!(s, PipelineStage::Retention(_)))
+        {
+            Some(PipelineStage::Retention(r)) => r,
+            _ => panic!("expected a Retention stage"),
+        }
+    }
+
+    #[test]
+    fn retention_basic() {
+        // Canonical named-arg order: entry, activity, brackets.
+        let stmt = parse_stmt(
+            "events | RETENTION(entry: signup, activity: purchase, brackets: [7d, 14d, 30d])",
+        );
+        let r = retention_of(&stmt);
+        assert_eq!(r.entry.event.text.as_str(), "signup");
+        assert_eq!(r.activity.event.text.as_str(), "purchase");
+        assert_eq!(
+            r.brackets.durations,
+            vec![
+                7 * 86_400_000_000_000i64,
+                14 * 86_400_000_000_000i64,
+                30 * 86_400_000_000_000i64,
+            ]
+        );
+        assert!(!r.brackets.cumulative, "cumulative defaults to false");
+    }
+
+    #[test]
+    fn retention_with_cumulative_true() {
+        let stmt = parse_stmt(
+            "events | RETENTION(entry: signup, activity: purchase, brackets: [7d, 30d], cumulative: true)",
+        );
+        let r = retention_of(&stmt);
+        assert!(r.brackets.cumulative);
+    }
+
+    #[test]
+    fn retention_with_cumulative_false() {
+        let stmt = parse_stmt(
+            "events | RETENTION(entry: signup, activity: purchase, brackets: [7d, 30d], cumulative: false)",
+        );
+        let r = retention_of(&stmt);
+        assert!(!r.brackets.cumulative);
+    }
+
+    #[test]
+    fn retention_parameter_ordering_brackets_first() {
+        // Named args in a non-canonical order: brackets before entry/activity.
+        let stmt =
+            parse_stmt("events | RETENTION(brackets: [7d], entry: signup, activity: purchase)");
+        let r = retention_of(&stmt);
+        assert_eq!(r.entry.event.text.as_str(), "signup");
+        assert_eq!(r.activity.event.text.as_str(), "purchase");
+        assert_eq!(r.brackets.durations.len(), 1);
+    }
+
+    #[test]
+    fn retention_parameter_ordering_cumulative_first() {
+        // cumulative: before the required args.
+        let stmt = parse_stmt(
+            "events | RETENTION(cumulative: true, entry: signup, activity: purchase, brackets: [7d])",
+        );
+        let r = retention_of(&stmt);
+        assert!(r.brackets.cumulative);
+    }
+
+    #[test]
+    fn retention_qualified_event_refs() {
+        // query-language.md §19.3: RETENTION accepts table-qualified event refs.
+        let stmt = parse_stmt(
+            "events | RETENTION(entry: users.signup, activity: users.purchase, brackets: [30d])",
+        );
+        let r = retention_of(&stmt);
+        assert_eq!(
+            r.entry.table.as_ref().map(|t| t.text.as_str()),
+            Some("users")
+        );
+        assert_eq!(
+            r.activity.table.as_ref().map(|t| t.text.as_str()),
+            Some("users")
+        );
+    }
+
+    #[test]
+    fn retention_is_terminal_pipe_after_errors() {
+        // RETENTION must not be followed by another pipe stage.
+        match crate::parse(
+            "events | RETENTION(entry: signup, activity: purchase, brackets: [7d]) | STATS n = COUNT(*)",
+        ) {
+            Err(ParseError::Unexpected { expected, detail, .. }) => {
+                assert_eq!(expected, Expected::Eof);
+                assert!(
+                    detail.map(|d| d.contains("RETENTION")).unwrap_or(false),
+                    "error detail should mention RETENTION"
+                );
+            }
+            other => panic!("expected terminal error for RETENTION | STATS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_duplicate_entry_key_errors() {
+        match crate::parse(
+            "events | RETENTION(entry: signup, entry: login, activity: purchase, brackets: [7d])",
+        ) {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                assert!(
+                    detail
+                        .map(|d| d.contains("duplicate") && d.contains("entry"))
+                        .unwrap_or(false),
+                    "error detail should mention duplicate entry"
+                );
+            }
+            other => panic!("expected duplicate-key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_duplicate_activity_key_errors() {
+        match crate::parse(
+            "events | RETENTION(entry: signup, activity: purchase, activity: login, brackets: [7d])",
+        ) {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                assert!(
+                    detail.map(|d| d.contains("duplicate") && d.contains("activity")).unwrap_or(false),
+                    "error detail should mention duplicate activity"
+                );
+            }
+            other => panic!("expected duplicate-key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_duplicate_brackets_key_errors() {
+        match crate::parse(
+            "events | RETENTION(entry: signup, activity: purchase, brackets: [7d], brackets: [30d])",
+        ) {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                assert!(
+                    detail.map(|d| d.contains("duplicate") && d.contains("brackets")).unwrap_or(false),
+                    "error detail should mention duplicate brackets"
+                );
+            }
+            other => panic!("expected duplicate-key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_duplicate_cumulative_key_errors() {
+        match crate::parse(
+            "events | RETENTION(entry: signup, activity: purchase, brackets: [7d], cumulative: true, cumulative: false)",
+        ) {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                assert!(
+                    detail.map(|d| d.contains("duplicate") && d.contains("cumulative")).unwrap_or(false),
+                    "error detail should mention duplicate cumulative"
+                );
+            }
+            other => panic!("expected duplicate-key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_missing_entry_errors() {
+        match crate::parse("events | RETENTION(activity: purchase, brackets: [7d])") {
+            Err(ParseError::Unexpected { detail, .. })
+            | Err(ParseError::UnexpectedEof { detail, .. }) => {
+                assert!(
+                    detail.map(|d| d.contains("entry")).unwrap_or(false),
+                    "error detail should mention missing entry"
+                );
+            }
+            other => panic!("expected missing-entry error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_missing_activity_errors() {
+        match crate::parse("events | RETENTION(entry: signup, brackets: [7d])") {
+            Err(ParseError::Unexpected { detail, .. })
+            | Err(ParseError::UnexpectedEof { detail, .. }) => {
+                assert!(
+                    detail.map(|d| d.contains("activity")).unwrap_or(false),
+                    "error detail should mention missing activity"
+                );
+            }
+            other => panic!("expected missing-activity error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_missing_brackets_errors() {
+        match crate::parse("events | RETENTION(entry: signup, activity: purchase)") {
+            Err(ParseError::Unexpected { detail, .. })
+            | Err(ParseError::UnexpectedEof { detail, .. }) => {
+                assert!(
+                    detail.map(|d| d.contains("brackets")).unwrap_or(false),
+                    "error detail should mention missing brackets"
+                );
+            }
+            other => panic!("expected missing-brackets error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_empty_brackets_list_errors() {
+        match crate::parse("events | RETENTION(entry: signup, activity: purchase, brackets: [])") {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                assert!(
+                    detail.map(|d| d.contains("brackets")).unwrap_or(false),
+                    "error should mention brackets requirement"
+                );
+            }
+            other => panic!("expected empty-brackets error, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SESSIONIZE tests
+    // -----------------------------------------------------------------------
+
+    fn sessionize_of(stmt: &Statement) -> &bqlite_ast::Sessionize {
+        match stages_of(stmt)
+            .iter()
+            .find(|s| matches!(s, PipelineStage::Sessionize(_)))
+        {
+            Some(PipelineStage::Sessionize(s)) => s,
+            _ => panic!("expected a Sessionize stage"),
+        }
+    }
+
+    #[test]
+    fn sessionize_gap_only() {
+        // Simplest form: only the required gap parameter.
+        let stmt = parse_stmt("events | SESSIONIZE(gap: 30m)");
+        let s = sessionize_of(&stmt);
+        assert_eq!(s.gap, 30 * 60 * 1_000_000_000i64, "30m in nanoseconds");
+        assert!(s.end.is_none(), "no end events in gap-only mode");
+    }
+
+    #[test]
+    fn sessionize_gap_and_single_end_event() {
+        // Single end event — no parentheses required.
+        let stmt = parse_stmt("events | SESSIONIZE(gap: 30m, end: logout)");
+        let s = sessionize_of(&stmt);
+        assert_eq!(s.gap, 30 * 60 * 1_000_000_000i64);
+        let end = s.end.as_ref().expect("end should be set");
+        assert_eq!(end.len(), 1);
+        assert_eq!(end[0].event.text.as_str(), "logout");
+    }
+
+    #[test]
+    fn sessionize_end_list_parenthesised() {
+        // Multiple end events in a parenthesised list.
+        let stmt = parse_stmt("events | SESSIONIZE(gap: 30m, end: (logout, timeout, session_end))");
+        let s = sessionize_of(&stmt);
+        let end = s.end.as_ref().expect("end should be set");
+        assert_eq!(end.len(), 3);
+        assert_eq!(end[0].event.text.as_str(), "logout");
+        assert_eq!(end[1].event.text.as_str(), "timeout");
+        assert_eq!(end[2].event.text.as_str(), "session_end");
+    }
+
+    #[test]
+    fn sessionize_parameter_ordering_end_before_gap() {
+        // Named args in reverse order: end before gap.
+        let stmt = parse_stmt("events | SESSIONIZE(end: logout, gap: 1h)");
+        let s = sessionize_of(&stmt);
+        assert_eq!(s.gap, 3_600_000_000_000i64, "1h in nanoseconds");
+        let end = s.end.as_ref().expect("end should be set");
+        assert_eq!(end[0].event.text.as_str(), "logout");
+    }
+
+    #[test]
+    fn sessionize_duplicate_gap_key_errors() {
+        match crate::parse("events | SESSIONIZE(gap: 30m, gap: 1h)") {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                assert!(
+                    detail
+                        .map(|d| d.contains("duplicate") && d.contains("gap"))
+                        .unwrap_or(false),
+                    "error detail should mention duplicate gap"
+                );
+            }
+            other => panic!("expected duplicate-key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sessionize_duplicate_end_key_errors() {
+        match crate::parse("events | SESSIONIZE(gap: 30m, end: logout, end: timeout)") {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                assert!(
+                    detail
+                        .map(|d| d.contains("duplicate") && d.contains("end"))
+                        .unwrap_or(false),
+                    "error detail should mention duplicate end"
+                );
+            }
+            other => panic!("expected duplicate-key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sessionize_duplicate_names_in_end_list_errors() {
+        // Duplicate event names inside the end: list are rejected at parse time
+        // (sessionize.md §5.4).
+        match crate::parse("events | SESSIONIZE(gap: 30m, end: (logout, timeout, logout))") {
+            Err(ParseError::Unexpected { detail, found, .. }) => {
+                assert_eq!(found, "logout", "found should be the duplicate event name");
+                assert!(
+                    detail.map(|d| d.contains("duplicate")).unwrap_or(false),
+                    "error detail should mention duplicate"
+                );
+            }
+            other => panic!("expected duplicate-in-list error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sessionize_missing_gap_errors() {
+        match crate::parse("events | SESSIONIZE(end: logout)") {
+            Err(ParseError::Unexpected { detail, .. })
+            | Err(ParseError::UnexpectedEof { detail, .. }) => {
+                assert!(
+                    detail.map(|d| d.contains("gap")).unwrap_or(false),
+                    "error detail should mention missing gap"
+                );
+            }
+            other => panic!("expected missing-gap error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sessionize_within_session_surface_accepted() {
+        // A downstream MATCH using WITHIN SESSION is valid BQL after SESSIONIZE.
+        // The parser level surface for this is that the pipeline parses without
+        // error and both stages are present.
+        let stmt = parse_stmt(
+            "events | SESSIONIZE(gap: 30m) | MATCH FIRST SEQUENCE(search THEN checkout) WITHIN SESSION",
+        );
+        let stages = stages_of(&stmt);
+        assert!(
+            stages
+                .iter()
+                .any(|s| matches!(s, PipelineStage::Sessionize(_))),
+            "SESSIONIZE stage must be present"
+        );
+        assert!(
+            stages
+                .iter()
+                .any(|s| matches!(s, PipelineStage::Match { .. })),
+            "MATCH stage must be present after SESSIONIZE"
+        );
+    }
+
+    #[test]
+    fn sessionize_qualified_end_event_ref() {
+        // End event ref can be table-qualified in multi-table queries.
+        let stmt = parse_stmt("events | SESSIONIZE(gap: 30m, end: users.logout)");
+        let s = sessionize_of(&stmt);
+        let end = s.end.as_ref().expect("end should be set");
+        assert_eq!(
+            end[0].table.as_ref().map(|t| t.text.as_str()),
+            Some("users")
+        );
+        assert_eq!(end[0].event.text.as_str(), "logout");
+    }
+
+    #[test]
+    fn sessionize_single_element_parenthesised_end_list() {
+        // `end: (logout)` — single event in a parenthesised list is valid.
+        let stmt = parse_stmt("events | SESSIONIZE(gap: 30m, end: (logout))");
+        let s = sessionize_of(&stmt);
+        let end = s.end.as_ref().expect("end should be set");
+        assert_eq!(end.len(), 1);
+        assert_eq!(end[0].event.text.as_str(), "logout");
+    }
+
+    #[test]
+    fn sessionize_cross_table_qualified_end_refs_not_duplicate() {
+        // `end: (events.logout, purchases.logout)` — same bare name but different
+        // table qualifiers: NOT a duplicate (duplicate detection considers the
+        // full (table, event) pair, not the bare name alone).
+        let stmt =
+            parse_stmt("events | SESSIONIZE(gap: 30m, end: (events.logout, purchases.logout))");
+        let s = sessionize_of(&stmt);
+        let end = s.end.as_ref().expect("end should be set");
+        assert_eq!(end.len(), 2);
+        assert_eq!(end[0].event.text.as_str(), "logout");
+        assert_eq!(end[1].event.text.as_str(), "logout");
+        assert_ne!(
+            end[0].table.as_ref().map(|t| t.text.as_str()),
+            end[1].table.as_ref().map(|t| t.text.as_str()),
+            "table qualifiers should differ"
+        );
     }
 }
