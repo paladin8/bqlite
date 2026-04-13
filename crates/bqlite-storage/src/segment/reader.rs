@@ -66,7 +66,7 @@ use crate::encoding::dictionary::{
 };
 use crate::encoding::{
     decompress_lz4, BitPacking, BorrowedEncodedChunk, Constant, Delta, DoubleDelta, Encoding,
-    EncodingType, Plain, Rle,
+    EncodingType, ForEncoding, Plain, Rle,
 };
 use crate::segment::layout::{
     ColumnChunkMeta, CompressionType, FooterV1, FooterV2, SegmentFooter, CHECKSUM_LEN,
@@ -876,6 +876,8 @@ fn parse_encoding_params_len(
         EncodingType::BitPacking => Ok(9),
         // `run_count: u32 LE`.
         EncodingType::Rle => Ok(4),
+        // `block_size: u16 LE` + `block_count: u32 LE`.
+        EncodingType::For => Ok(6),
         EncodingType::Constant => {
             if after_discriminant.is_empty() {
                 return Err("Constant encoding missing value_kind byte".to_string());
@@ -916,8 +918,6 @@ fn parse_encoding_params_len(
         // v2 encoding params sizes per segment-format-v2.md §5.
         // symbol_table_id(4)
         EncodingType::Fsst => Ok(4),
-        // block_size(2) + block_count(4)
-        EncodingType::For => Ok(6),
         // block_size(2) + block_count(4)
         EncodingType::PFor => Ok(6),
         // exponent(1) + factor(8) + patch_count(4) + for_block_size(2) + for_block_count(4)
@@ -1007,12 +1007,13 @@ fn dispatch_decode(
         EncodingType::BitPacking => BitPacking.decode_borrowed(chunk, ty),
         EncodingType::Constant => Constant.decode_borrowed(chunk, ty),
         EncodingType::Rle => Rle.decode_borrowed(chunk, ty),
-        // v2 encodings — decode implementations land in TASK-415 through TASK-418, TASK-450.
+        EncodingType::DoubleDelta => DoubleDelta.decode_borrowed(chunk, ty),
+        EncodingType::For => ForEncoding.decode_borrowed(chunk, ty),
+        // v2 encodings — decode implementations land in TASK-416 through TASK-418, TASK-450.
         EncodingType::Fsst
-        | EncodingType::For
         | EncodingType::PFor
         | EncodingType::Alp => Err(BqliteError::Execution(format!(
-            "v2 encoding {encoding:?} decode not yet implemented (TASK-414–TASK-418)"
+            "v2 encoding {encoding:?} decode not yet implemented (TASK-416–TASK-418)"
         ))),
     }
 }

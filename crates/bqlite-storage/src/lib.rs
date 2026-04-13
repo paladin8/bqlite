@@ -59,7 +59,7 @@ pub use database::{
 };
 pub use encoding::{
     select_encoding, select_encoding_type, BitPacking, CompressionType, Constant, Delta,
-    Dictionary, DoubleDelta, EncodedChunk, Encoding, EncodingType, Fsst, Plain, Rle,
+    Dictionary, DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Fsst, Plain, Rle,
     SelectedEncoding,
 };
 pub use manifest::{

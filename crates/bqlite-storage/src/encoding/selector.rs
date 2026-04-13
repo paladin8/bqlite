@@ -63,7 +63,7 @@ use bqlite_core::{BqlType, BqliteError, Result};
 
 use super::{
     compress_lz4, require_dense, BitPacking, CompressionType, Constant, Delta, Dictionary,
-    DoubleDelta, EncodedChunk, Encoding, EncodingType, Plain, Rle,
+    DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Plain, Rle,
 };
 
 /// LZ4 minimum compression threshold per `storage-format.md` §10.7
@@ -304,13 +304,12 @@ fn encode_with(encoding: EncodingType, array: &dyn Array) -> Result<EncodedChunk
         EncodingType::BitPacking => BitPacking.encode(array),
         EncodingType::Rle => Rle.encode(array),
         EncodingType::DoubleDelta => DoubleDelta.encode(array),
-        // v2 encodings — implementations land in TASK-415 through TASK-418.
+        EncodingType::For => ForEncoding.encode(array),
+        // v2 encodings — implementations land in TASK-416 through TASK-418, TASK-450.
         // The selector never picks these; this arm exists only for exhaustiveness.
-        EncodingType::Fsst | EncodingType::For | EncodingType::PFor | EncodingType::Alp => {
-            Err(BqliteError::Execution(format!(
-                "v2 encoding {encoding:?} encode not yet implemented"
-            )))
-        }
+        EncodingType::Fsst | EncodingType::PFor | EncodingType::Alp => Err(BqliteError::Execution(
+            format!("v2 encoding {encoding:?} encode not yet implemented"),
+        )),
     }
 }
 
@@ -435,6 +434,7 @@ mod tests {
             EncodingType::BitPacking => BitPacking.decode(&selected.chunk, &ty),
             EncodingType::Rle => Rle.decode(&selected.chunk, &ty),
             EncodingType::DoubleDelta => DoubleDelta.decode(&selected.chunk, &ty),
+            EncodingType::For => ForEncoding.decode(&selected.chunk, &ty),
             other => panic!("selector should never pick unimplemented encoding {other:?}"),
         }
         .expect("decode must succeed");

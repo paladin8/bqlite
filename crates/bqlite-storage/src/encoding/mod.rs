@@ -49,6 +49,7 @@ pub mod constant;
 pub mod delta;
 pub mod dictionary;
 pub mod double_delta;
+pub mod for_encoding;
 pub mod frequency;
 pub mod fsst;
 pub mod lz4;
@@ -61,6 +62,7 @@ pub use constant::Constant;
 pub use delta::Delta;
 pub use dictionary::Dictionary;
 pub use double_delta::DoubleDelta;
+pub use for_encoding::ForEncoding;
 pub use fsst::Fsst;
 pub use lz4::{compress_lz4, decompress_lz4, CompressionType};
 pub use plain::Plain;
@@ -68,15 +70,14 @@ pub use rle::Rle;
 pub use selector::{decode_cost, select_encoding, select_encoding_type, SelectedEncoding};
 
 /// On-disk encoding discriminant per `segment-format-v1.md` §9 and
-/// `segment-format-v2.md`.
+/// `segment-format-v2.md` §4.
 ///
 /// Values match the `EncodingType` enum documented in
-/// `storage-format.md` §10.2. v1 readers recognize exactly the five
-/// v1 variants plus the Wave 4 `Rle` (TASK-413) and `Fsst` (TASK-416)
-/// variants. Any other discriminant in a segment file is treated as
-/// corruption.
-/// Later waves extend this enum by adding variants (and bumping the
-/// segment format version); existing discriminants never change.
+/// `storage-format.md` §10.2 and `advanced-encodings.md` §1.2.
+/// v1 discriminants (Plain, Dictionary, Delta, BitPacking, Constant)
+/// are unchanged. Wave 4 adds Rle (TASK-413), DoubleDelta (TASK-414),
+/// For (TASK-415), Fsst (TASK-416), and further variants in later
+/// tasks. Existing discriminants never change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum EncodingType {
@@ -117,7 +118,7 @@ impl EncodingType {
 
     /// Parse a byte read out of a segment file back into an
     /// [`EncodingType`]. Unknown discriminants — including any
-    /// reserved-for-later-waves value (`3`, `8`, `9` ..) — produce
+    /// reserved-for-later-waves value (`9`, `10`, ..) — produce
     /// [`BqliteError::Execution`] so the reader can surface a
     /// corruption error without panicking.
     ///
@@ -133,6 +134,7 @@ impl EncodingType {
             4 => Ok(Self::BitPacking),
             5 => Ok(Self::Rle),
             6 => Ok(Self::Constant),
+            8 => Ok(Self::For),
             other => Err(BqliteError::Execution(format!(
                 "unknown encoding discriminant {other} — segment written by an incompatible version"
             ))),
@@ -350,9 +352,9 @@ mod tests {
     }
 
     #[test]
-    fn encoding_type_discriminants_match_segment_format_v1_spec() {
+    fn encoding_type_discriminants_match_segment_format_spec() {
         // Values pinned to `segment-format-v1.md` §9 and
-        // `storage-format.md` §10.2 and `advanced-encodings.md` §3
+        // `segment-format-v2.md` §4 and `advanced-encodings.md` §1.2
         // so that later-wave encodings (Fsst = 7, ...) can be added
         // without renumbering.
         assert_eq!(EncodingType::Plain.discriminant(), 0);
@@ -363,6 +365,7 @@ mod tests {
         assert_eq!(EncodingType::Rle.discriminant(), 5);
         assert_eq!(EncodingType::Constant.discriminant(), 6);
         assert_eq!(EncodingType::Fsst.discriminant(), 7);
+        assert_eq!(EncodingType::For.discriminant(), 8);
     }
 
     #[test]

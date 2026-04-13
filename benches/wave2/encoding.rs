@@ -1,8 +1,12 @@
-//! Per-encoding encode/decode microbenches for the v1 encoding set.
+//! Per-encoding encode/decode microbenches for the v1 and Wave 4 encoding set.
 //!
 //! Covers the Wave 2 performance gate "encoding" line:
 //! Plain, Dictionary, Delta, BitPacking, Constant, and the LZ4
 //! post-encoding wrapper.
+//!
+//! Wave 4 additions (TASK-413 RLE, TASK-415 FOR) are also benchmarked here
+//! to produce the decode-throughput evidence required by
+//! `advanced-encodings.md` §5.3.
 //!
 //! Each benchmark measures `encode` and `decode` throughput on a
 //! 65,536-row column chunk (the default row-group size) and reports
@@ -22,7 +26,7 @@ use bqlite_benches::common::*;
 use bqlite_core::BqlType;
 use bqlite_storage::encoding::{
     compress_lz4, decompress_lz4, BitPacking, Constant, Delta, Dictionary, DoubleDelta, Encoding,
-    Fsst, Plain, Rle,
+    ForEncoding, Fsst, Plain, Rle,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
@@ -749,6 +753,130 @@ fn bench_encoding_with_metrics(c: &mut Criterion) {
     collector.finish();
 }
 
+// ── FOR (Frame-of-Reference) — Wave 4 / TASK-415 ────────────────────────────
+
+/// FOR on clustered int64 data — best case for per-block framing.
+///
+/// Simulates a numeric property column (e.g. `amount`) where values cluster
+/// in two distinct ranges within a 65 536-row chunk: rows 0–32 767 in
+/// [100, 115] and rows 32 768–65 535 in [10 000, 10 015]. This mirrors the
+/// TASK-401 §5.2 "narrow-range integers with local clustering" profile.
+///
+/// FOR achieves ~4 bits/value per block, while global BitPacking needs
+/// ~14 bits/value (range ≈ 9 915). The bench measures FOR encode/decode and
+/// BitPacking encode/decode on the same data so the selector's size advantage
+/// is directly observable from the throughput numbers.
+fn bench_for_int64_clustered(c: &mut Criterion) {
+    // Build a clustered column: first half in [100, 116), second in [10000, 10016).
+    let values: Vec<i64> = (0..ROW_GROUP_SIZE as i64)
+        .map(|i| {
+            if i < (ROW_GROUP_SIZE as i64) / 2 {
+                100 + (i % 16)
+            } else {
+                10_000 + (i % 16)
+            }
+        })
+        .collect();
+    let array: ArrayRef = Arc::new(Int64Array::from(values));
+
+    let for_chunk = ForEncoding.encode(array.as_ref()).unwrap();
+    let bp_chunk = BitPacking.encode(array.as_ref()).unwrap();
+    let for_payload_bytes = for_chunk.payload.len() as u64;
+    let bp_payload_bytes = bp_chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/for/clustered_int64");
+
+    group.throughput(Throughput::Bytes(for_payload_bytes));
+    group.bench_function("for_encode", |b| {
+        b.iter(|| ForEncoding.encode(black_box(array.as_ref())).unwrap())
+    });
+    group.bench_function("for_decode", |b| {
+        b.iter(|| {
+            ForEncoding
+                .decode(black_box(&for_chunk), &BqlType::Int)
+                .unwrap()
+        })
+    });
+
+    // BitPacking on the same array for direct comparison.
+    group.throughput(Throughput::Bytes(bp_payload_bytes));
+    group.bench_function("bitpacking_encode", |b| {
+        b.iter(|| BitPacking.encode(black_box(array.as_ref())).unwrap())
+    });
+    group.bench_function("bitpacking_decode", |b| {
+        b.iter(|| {
+            BitPacking
+                .decode(black_box(&bp_chunk), &BqlType::Int)
+                .unwrap()
+        })
+    });
+
+    group.finish();
+}
+
+/// FOR on globally sequential int64 data — comparable to BitPacking.
+///
+/// Sequential integers [0, 65535] have a 16-bit global range. Both FOR
+/// and BitPacking choose 16 bits/value. FOR's per-block overhead
+/// (~9 bytes per 128-row block = ~4.6 KB for 512 blocks) makes it
+/// slightly larger than BitPacking here, confirming the selector guard:
+/// FOR should not be chosen over BitPacking when per-block bit widths
+/// equal the global bit width.
+fn bench_for_int64_sequential(c: &mut Criterion) {
+    let values: Vec<i64> = (0..ROW_GROUP_SIZE as i64).collect();
+    let array: ArrayRef = Arc::new(Int64Array::from(values));
+
+    let for_chunk = ForEncoding.encode(array.as_ref()).unwrap();
+    let payload_bytes = for_chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/for/sequential_int64");
+    group.throughput(Throughput::Bytes(payload_bytes));
+
+    group.bench_function("for_encode", |b| {
+        b.iter(|| ForEncoding.encode(black_box(array.as_ref())).unwrap())
+    });
+    group.bench_function("for_decode", |b| {
+        b.iter(|| {
+            ForEncoding
+                .decode(black_box(&for_chunk), &BqlType::Int)
+                .unwrap()
+        })
+    });
+
+    group.finish();
+}
+
+/// FOR on timestamp data — monotonic-within-entity timestamps with 1 ms
+/// spacing, base ≈ 1.7×10¹⁸ ns. Per block, the range is 128 ms = 128 000 000 ns,
+/// which needs 27 bits. Global BitPacking sees the same range since timestamps
+/// are monotonically increasing. FOR and BitPacking converge here.
+fn bench_for_timestamp(c: &mut Criterion) {
+    let array = gen_timestamp_array(
+        ROW_GROUP_SIZE,
+        1_700_000_000_000_000_000,
+        1_000_000, /* 1ms */
+    );
+
+    let for_chunk = ForEncoding.encode(array.as_ref()).unwrap();
+    let payload_bytes = for_chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/for/timestamp");
+    group.throughput(Throughput::Bytes(payload_bytes));
+
+    group.bench_function("for_encode", |b| {
+        b.iter(|| ForEncoding.encode(black_box(array.as_ref())).unwrap())
+    });
+    group.bench_function("for_decode", |b| {
+        b.iter(|| {
+            ForEncoding
+                .decode(black_box(&for_chunk), &BqlType::Timestamp)
+                .unwrap()
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = encoding_benches;
     config = criterion_for_mode(BenchMode::from_env());
@@ -769,6 +897,9 @@ criterion_group! {
         bench_rle_int64_long_runs,
         bench_rle_string_long_runs,
         bench_rle_bool_constant,
+        bench_for_int64_clustered,
+        bench_for_int64_sequential,
+        bench_for_timestamp,
         bench_lz4_compress,
         bench_lz4_repetitive,
         bench_fsst_url_strings,
