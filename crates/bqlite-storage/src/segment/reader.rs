@@ -796,7 +796,6 @@ fn decode_column_chunk(
         | EncodingType::BitPacking
         | EncodingType::Constant
         | EncodingType::Rle
-        | EncodingType::DoubleDelta
         | EncodingType::Fsst
         | EncodingType::For
         | EncodingType::PFor
@@ -894,8 +893,6 @@ fn parse_encoding_params_len(
             Ok(1 + literal_len)
         }
         // v2 encoding params sizes per segment-format-v2.md §5.
-        // base_value(8) + first_delta(8) + dd_bit_width(1)
-        EncodingType::DoubleDelta => Ok(17),
         // symbol_table_id(4)
         EncodingType::Fsst => Ok(4),
         // block_size(2) + block_count(4)
@@ -989,9 +986,8 @@ fn dispatch_decode(
         EncodingType::BitPacking => BitPacking.decode_borrowed(chunk, ty),
         EncodingType::Constant => Constant.decode_borrowed(chunk, ty),
         EncodingType::Rle => Rle.decode_borrowed(chunk, ty),
-        // v2 encodings — decode implementations land in TASK-414 through TASK-418, TASK-450.
-        EncodingType::DoubleDelta
-        | EncodingType::Fsst
+        // v2 encodings — decode implementations land in TASK-415 through TASK-418, TASK-450.
+        EncodingType::Fsst
         | EncodingType::For
         | EncodingType::PFor
         | EncodingType::Alp => Err(BqliteError::Execution(format!(

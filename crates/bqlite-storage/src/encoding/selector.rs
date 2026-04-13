@@ -703,13 +703,13 @@ mod tests {
     fn decode_cost_orders_encodings_correctly() {
         // The cost table is the tiebreaker; assert the relative order
         // matches the documented "fastest decode wins" rule.
-        // Full ordering: Constant < Plain < Rle < BitPacking < Delta < Dictionary.
+        // Full ordering: Constant < Plain < Rle < BitPacking < Delta < DoubleDelta < Dictionary.
         assert!(decode_cost(EncodingType::Constant) < decode_cost(EncodingType::Plain));
         assert!(decode_cost(EncodingType::Plain) < decode_cost(EncodingType::Rle));
         assert!(decode_cost(EncodingType::Rle) < decode_cost(EncodingType::BitPacking));
         assert!(decode_cost(EncodingType::BitPacking) < decode_cost(EncodingType::Delta));
-        assert!(decode_cost(EncodingType::Delta) < decode_cost(EncodingType::Dictionary));
-        assert!(decode_cost(EncodingType::Dictionary) < decode_cost(EncodingType::DoubleDelta));
+        assert!(decode_cost(EncodingType::Delta) < decode_cost(EncodingType::DoubleDelta));
+        assert!(decode_cost(EncodingType::DoubleDelta) < decode_cost(EncodingType::Dictionary));
     }
 
     #[test]
@@ -723,8 +723,8 @@ mod tests {
         // - DoubleDelta: 8 bytes padded (1 dd value at 1-bit width padded)
         //
         // All three compact encodings produce 8-byte payloads. The
-        // selector picks BitPacking (decode cost 2), beating Delta
-        // (cost 3) and DoubleDelta (cost 6).
+        // selector picks BitPacking (decode cost 3), beating Delta
+        // (cost 5) and DoubleDelta (cost 6).
         let array: ArrayRef = Arc::new(Int64Array::from(vec![0_i64, 1, 2]));
         let chosen = select_encoding_type(array.as_ref(), &BqlType::Int).unwrap();
         assert_eq!(
