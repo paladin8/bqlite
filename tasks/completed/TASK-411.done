@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-411",
   "claimed_at": "2026-04-13T02:19:11Z",
+  "completed_at": "2026-04-13T03:45:00Z",
   "branch": "task/TASK-411",
   "description": "EventSelect and SAMPLE operators"
 }
