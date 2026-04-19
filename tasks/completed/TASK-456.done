@@ -3,5 +3,6 @@
   "task_id": "TASK-456",
   "claimed_at": "2026-04-19T23:35:45Z",
   "branch": "task/TASK-456",
-  "description": "Wave 4 docs and examples refresh"
+  "description": "Wave 4 docs and examples refresh",
+  "completed_at": "2026-04-19T23:56:23Z"
 }
