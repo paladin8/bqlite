@@ -638,11 +638,10 @@ fn scalar_to_single_row_array(value: &ScalarValue, data_type: &DataType) -> Arra
 fn collect_predicate_columns(expr: &CompiledExpr, names: &mut Vec<String>) {
     use bqlite_planner::compiled::CompiledNode;
     match &expr.node {
-        CompiledNode::Column { name, .. } => {
-            if !names.contains(name) {
-                names.push(name.clone());
-            }
+        CompiledNode::Column { name, .. } if !names.contains(name) => {
+            names.push(name.clone());
         }
+        CompiledNode::Column { .. } => {}
         CompiledNode::Literal(_) => {}
         CompiledNode::Arith { left, right, .. } => {
             collect_predicate_columns(left, names);
