@@ -5,6 +5,7 @@
 **Status**: complete
 **Depends on**: TASK-331 (pprof profiling pass)
 **Depended on by**: TASK-399 (Wave 3 quality audit)
+**Implemented by**: TASK-454 (Wave 4 — `BindingValue::String` migrated to `CompactString`)
 
 ---
 
@@ -278,15 +279,24 @@ The conversion is a single-file change in `bqlite-operators/src/matcher/bindings
 The migration does NOT touch `bqlite-planner` or `bqlite-core` — it is
 confined to the `bqlite-operators` crate's binding module.
 
-### 6.5 Why Not Now
+### 6.5 Implementation Status (TASK-454)
 
-This task is a DESIGN evaluation (output: this document). The actual migration
-should be filed as a separate implementation task with the following scope:
-- Change `BindingValue::String` variant
-- Update extraction
-- Run the binding matcher benchmarks (`linear_bindings_3step`, `linear_full_3step`)
-  before/after
-- Verify no regression on the canonical funnel benchmark
+The migration was completed in TASK-454 (Wave 4). Changes made:
+
+- `BindingValue::String` changed from `Box<str>` to `CompactString`
+  in `crates/bqlite-operators/src/matcher/bindings.rs`.
+- `extract_binding_value` updated to use `CompactString::from(arr.value(row))`.
+- The existing Wave 3 benchmark evidence in §4.3 backs the change;
+  the `benches/wave3/compactstring_eval.rs` suite remains as the
+  canonical performance reference.
+
+**Wave 4 operator call-outs:**
+
+| Operator | Surface | Status |
+|----------|---------|--------|
+| SESSIONIZE (TASK-428) | `end_events: HashSet<String>` | No conversion — lookup-only, never cloned in hot path (see §6.2). Per-entity `SessionizeState` carries no string fields. |
+| ATTRIBUTE (TASK-431) | `TouchpointDequeEntry.key: Option<CompactString>` | Already `CompactString` at initial implementation. |
+| Cohort / SubqueryFilter (TASK-437) | Hash-set keys | Not yet implemented; conversion deferred until TASK-437 lands. |
 
 ---
 

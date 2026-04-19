@@ -26,12 +26,19 @@
 //!
 //! ## Design deviations
 //!
-//! - `Box<str>` instead of `CompactString` (compact_str crate): avoids
-//!   a new dependency; `Box<str>` has no capacity overhead like `String`
-//!   and is correct. Inline small-string optimization is a follow-up.
 //! - Custom `OrderedFloat` instead of `FloatOrd` (float-ord crate):
 //!   avoids a dependency; same semantics (NaN == NaN for binding
 //!   purposes per §6.2).
+//!
+//! ## CompactString adoption
+//!
+//! `BindingValue::String` uses [`compact_str::CompactString`] (TASK-454)
+//! rather than `Box<str>`. For strings ≤ 24 bytes (typical analytics
+//! binding values: plan names, countries, categories), clone is a
+//! 24-byte stack memcpy with zero allocator interaction — roughly 10×
+//! faster than `Box<str>` on the dominant binding-clone path. See
+//! `docs/design/operators/compactstring-evaluation.md` §4.3 for the
+//! benchmark evidence.
 //!
 //! ## Design references
 //!
@@ -42,6 +49,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+
+use compact_str::CompactString;
 
 use arrow::array::{
     Array, BooleanArray, Float64Array, Int64Array, StringViewArray, TimestampNanosecondArray,
@@ -133,8 +142,11 @@ pub enum BindingValue {
     Bool(bool),
     Int(i64),
     Float(OrderedFloat),
-    /// Stored as `Box<str>` for minimal heap overhead.
-    String(Box<str>),
+    /// Stored as [`CompactString`]: strings ≤ 24 bytes are inline (no
+    /// heap allocation). Clone is a 24-byte stack memcpy — ~10× faster
+    /// than `Box<str>` for the typical short binding values seen in
+    /// analytics workloads (see compactstring-evaluation.md §4.3).
+    String(CompactString),
     /// Epoch nanoseconds.
     Timestamp(i64),
 }
@@ -223,7 +235,7 @@ fn extract_binding_value(array: &dyn Array, row: usize) -> Option<BindingValue> 
     // Try each supported type. The order reflects expected frequency
     // in analytics workloads (strings > ints > timestamps > floats > bools).
     if let Some(arr) = array.as_any().downcast_ref::<StringViewArray>() {
-        return Some(BindingValue::String(arr.value(row).into()));
+        return Some(BindingValue::String(CompactString::from(arr.value(row))));
     }
     if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
         return Some(BindingValue::Int(arr.value(row)));

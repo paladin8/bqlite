@@ -201,7 +201,7 @@ fn build_binding_column(
             let mut builder = StringViewBuilder::with_capacity(total);
             for bv in iter_completions.chain(iter_partials.into_iter().flatten()) {
                 match bv {
-                    Some(BindingValue::String(s)) => builder.append_value(s.as_ref()),
+                    Some(BindingValue::String(s)) => builder.append_value(s.as_str()),
                     _ => builder.append_value(""),
                 }
             }
