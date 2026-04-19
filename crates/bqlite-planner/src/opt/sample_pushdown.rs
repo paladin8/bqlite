@@ -646,7 +646,10 @@ mod tests {
             panic!("expected MergeSources after push, got {out:?}");
         };
         assert_eq!(ms.tables.len(), 1);
-        let s = ms.tables[0].sample.as_ref().expect("sub-scan sample attached");
+        let s = ms.tables[0]
+            .sample
+            .as_ref()
+            .expect("sub-scan sample attached");
         assert!((s.fraction - 0.9).abs() < f64::EPSILON);
         assert_eq!(s.seed, 99);
     }
