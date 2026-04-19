@@ -72,6 +72,34 @@
 //! without needing any hint of its own. `WillNeed` for the next
 //! row group and the compaction-specific hint pair are deferred
 //! to Wave 4 per `docs/design/storage-format.md` §8.2.
+//!
+//! # Tombstone transparency (TASK-434)
+//!
+//! The k-way merge is intentionally oblivious to tombstones. Per
+//! `docs/design/storage/deletes.md` §7, tombstone filtering is applied
+//! **per-segment** after zone-map pushdown and before the merge: the
+//! scan operator wraps each affected segment's `Box<dyn SegmentScan>`
+//! in a [`crate::tombstone_scan::TombstoneScanWrapper`] before handing
+//! the vec to [`KWayMergeScan`]. As a result:
+//!
+//! - Every row this merge sees is already tombstone-filtered; the
+//!   merge never re-checks tombstones.
+//! - Cross-segment and cross-window correctness is automatic: an
+//!   entity whose rows are tombstoned only in one segment still
+//!   surfaces through the merge for segments in other windows/shards
+//!   that carry surviving rows (the per-query snapshot resolves
+//!   per-`(window, shard)` — see deletes.md §6).
+//! - Merge inputs with zero surviving rows produce zero-length
+//!   `RecordBatch`es from the wrapper; the merge already handles empty
+//!   batches as scan-exhausted candidates, so no new merge path is
+//!   needed.
+//!
+//! This file therefore does not take a `TombstoneSnapshot` argument.
+//! If a future refactor needs to hoist wrapping into the merge
+//! constructor (e.g. to amortise wrapper allocation across many
+//! scans in the joined-source runtime from TASK-436), the scan
+//! operator — `crates/bqlite-operators/src/scan.rs` — is where that
+//! plumbing should change; the merge stays a pure ordering operator.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
@@ -2210,5 +2238,148 @@ mod tests {
             }
         }
         assert_eq!(got, vec![1i64, 2, 3]);
+    }
+
+    // ── Tombstone transparency (TASK-434) ───────────────────────────
+
+    /// The merge must be oblivious to tombstones: when each input scan
+    /// is wrapped in a [`crate::tombstone_scan::TombstoneScanWrapper`],
+    /// the merged output must reflect the filtered rows only, and the
+    /// global `(entity_id, ts)` ordering must still hold across
+    /// segments.
+    ///
+    /// This mirrors the scan-operator integration in TASK-434: the
+    /// per-query snapshot wraps affected segments **before** the merge
+    /// runs, so cross-segment correctness is a direct consequence of
+    /// per-segment filtering plus existing k-way merge semantics.
+    #[test]
+    fn wrapped_segments_preserve_merge_ordering() {
+        use crate::tombstone::{TombstoneFile, TombstoneFilter};
+        use bqlite_core::ScalarValue;
+
+        // Wrapper kept local to the test — we don't want to depend on
+        // `crate::tombstone_scan::TombstoneScanWrapper` here, but this
+        // is functionally identical (see tombstone_scan.rs doc).
+        struct FilteringScan {
+            inner: MockScan,
+            tombstones: TombstoneFile,
+        }
+
+        impl SegmentScan for FilteringScan {
+            fn row_group_count(&self) -> usize {
+                self.inner.row_group_count()
+            }
+            fn row_group_zone_maps(&self, idx: usize) -> Result<HashMap<String, ZoneMap>> {
+                self.inner.row_group_zone_maps(idx)
+            }
+            fn next_row_group(&mut self) -> Result<Option<RecordBatch>> {
+                match self.inner.next_row_group()? {
+                    None => Ok(None),
+                    Some(batch) => {
+                        let filter = TombstoneFilter::new(&self.tombstones, "entity_id", "ts");
+                        Ok(Some(filter.filter_batch(batch)?))
+                    }
+                }
+            }
+        }
+
+        let schema = events_schema();
+        // Segment A: alice@100, bob@200. Tombstone alice.
+        let seg_a = FilteringScan {
+            inner: MockScan::new(vec![build_batch(
+                &schema,
+                &["alice", "bob"],
+                &[100, 200],
+                &["e1", "e2"],
+            )]),
+            tombstones: TombstoneFile::for_entities([ScalarValue::String("alice".into())]),
+        };
+        // Segment B: alice@300, carol@400. No tombstones (different shard).
+        let seg_b = FilteringScan {
+            inner: MockScan::new(vec![build_batch(
+                &schema,
+                &["alice", "carol"],
+                &[300, 400],
+                &["e3", "e4"],
+            )]),
+            tombstones: TombstoneFile::default(),
+        };
+
+        let mut merge =
+            KWayMergeScan::new(vec![Box::new(seg_a), Box::new(seg_b)], schema, 0, 1).unwrap();
+        let rows = drain_merge(&mut merge);
+        // alice@100 is tombstoned in seg A; alice@300 from seg B
+        // survives. Global ordering: (alice,300) < (bob,200) by
+        // entity-first lexicographic key, so the merge emits
+        // alice before bob.
+        let out: Vec<(String, i64)> = rows.into_iter().map(|(e, t, _)| (e, t)).collect();
+        assert_eq!(
+            out,
+            vec![
+                ("alice".to_string(), 300),
+                ("bob".to_string(), 200),
+                ("carol".to_string(), 400),
+            ]
+        );
+    }
+
+    #[test]
+    fn fully_filtered_segment_contributes_no_rows_to_merge() {
+        // When a wrapped segment has every row tombstoned, the
+        // wrapper emits zero-row batches which the merge treats as
+        // exhausted inputs. Other segments' rows flow through
+        // unaffected.
+        use crate::tombstone::{TombstoneFile, TombstoneFilter};
+        use bqlite_core::ScalarValue;
+
+        struct FilteringScan {
+            inner: MockScan,
+            tombstones: TombstoneFile,
+        }
+
+        impl SegmentScan for FilteringScan {
+            fn row_group_count(&self) -> usize {
+                self.inner.row_group_count()
+            }
+            fn row_group_zone_maps(&self, idx: usize) -> Result<HashMap<String, ZoneMap>> {
+                self.inner.row_group_zone_maps(idx)
+            }
+            fn next_row_group(&mut self) -> Result<Option<RecordBatch>> {
+                match self.inner.next_row_group()? {
+                    None => Ok(None),
+                    Some(batch) => {
+                        let filter = TombstoneFilter::new(&self.tombstones, "entity_id", "ts");
+                        Ok(Some(filter.filter_batch(batch)?))
+                    }
+                }
+            }
+        }
+
+        let schema = events_schema();
+        // seg_a: all alice, entity-tombstoned.
+        let seg_a = FilteringScan {
+            inner: MockScan::new(vec![build_batch(
+                &schema,
+                &["alice", "alice"],
+                &[100, 200],
+                &["e1", "e2"],
+            )]),
+            tombstones: TombstoneFile::for_entities([ScalarValue::String("alice".into())]),
+        };
+        // seg_b: unrelated, no tombstones.
+        let seg_b = FilteringScan {
+            inner: MockScan::new(vec![build_batch(
+                &schema,
+                &["bob", "carol"],
+                &[300, 400],
+                &["e3", "e4"],
+            )]),
+            tombstones: TombstoneFile::default(),
+        };
+        let mut merge =
+            KWayMergeScan::new(vec![Box::new(seg_a), Box::new(seg_b)], schema, 0, 1).unwrap();
+        let rows = drain_merge(&mut merge);
+        let out: Vec<String> = rows.into_iter().map(|(e, _, _)| e).collect();
+        assert_eq!(out, vec!["bob".to_string(), "carol".to_string()]);
     }
 }

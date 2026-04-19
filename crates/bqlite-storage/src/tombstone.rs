@@ -295,6 +295,28 @@ impl TombstoneSnapshot {
         }
     }
 
+    /// Build a snapshot directly from `(window, shard) → TombstoneFile`
+    /// entries. Empty files are dropped so [`TombstoneSnapshot::get`] on
+    /// a shard with only empty tombstones returns `None`, matching the
+    /// shape produced by [`load_tombstone_snapshot`].
+    ///
+    /// Intended for engine-side composition (e.g. merging snapshots
+    /// across tables for a joined-source query) and tests that want to
+    /// exercise the scan-time filter without writing tombstone files to
+    /// disk.
+    pub fn from_map<I>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = ((u32, u16), TombstoneFile)>,
+    {
+        let mut shards: HashMap<(u32, u16), TombstoneFile> = HashMap::new();
+        for (key, tf) in entries {
+            if !tf.is_empty() {
+                shards.insert(key, tf);
+            }
+        }
+        Self { shards }
+    }
+
     /// Retrieve the tombstone state for a specific `(window, shard)`.
     ///
     /// Returns `None` if there are no tombstones for that shard.
@@ -305,6 +327,13 @@ impl TombstoneSnapshot {
     /// Returns `true` if the snapshot contains no tombstones at all.
     pub fn is_empty(&self) -> bool {
         self.shards.is_empty()
+    }
+
+    /// Number of `(window, shard)` entries in the snapshot. Each entry
+    /// holds a non-empty [`TombstoneFile`] — shards with no tombstones
+    /// are not represented.
+    pub fn len(&self) -> usize {
+        self.shards.len()
     }
 }
 
@@ -976,6 +1005,34 @@ mod tests {
         let scratch = Scratch::new("snap-unknown");
         let snap = load_tombstone_snapshot(scratch.path(), "events", &[(1, 0)]).unwrap();
         assert!(snap.get(99, 99).is_none());
+    }
+
+    #[test]
+    fn from_map_drops_empty_entries() {
+        let snap = TombstoneSnapshot::from_map([
+            ((0, 0), TombstoneFile::for_rows([1, 2])),
+            ((0, 1), TombstoneFile::default()), // empty — should be dropped
+            ((1, 0), TombstoneFile::for_batches([42])),
+        ]);
+        assert_eq!(snap.len(), 2);
+        assert!(snap.get(0, 0).is_some());
+        assert!(snap.get(0, 1).is_none(), "empty entry dropped");
+        assert!(snap.get(1, 0).is_some());
+    }
+
+    #[test]
+    fn from_map_preserves_non_empty_contents() {
+        let tf = TombstoneFile::for_entities([ScalarValue::String("alice".into())]);
+        let snap = TombstoneSnapshot::from_map([((7, 3), tf.clone())]);
+        let got = snap.get(7, 3).expect("entry present");
+        assert_eq!(got, &tf);
+    }
+
+    #[test]
+    fn from_map_empty_input_is_empty() {
+        let snap = TombstoneSnapshot::from_map(std::iter::empty());
+        assert!(snap.is_empty());
+        assert_eq!(snap.len(), 0);
     }
 
     // ── TombstoneFilter ────────────────────────────────────────────────
