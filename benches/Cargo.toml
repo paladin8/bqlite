@@ -49,6 +49,11 @@ path = "wave2/scan.rs"
 harness = false
 
 [[bench]]
+name = "scan_encoded"
+path = "wave2/scan_encoded.rs"
+harness = false
+
+[[bench]]
 name = "ingest"
 path = "wave2/ingest.rs"
 harness = false
