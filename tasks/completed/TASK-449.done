@@ -2,6 +2,7 @@
   "agent_id": "agent-4",
   "task_id": "TASK-449",
   "claimed_at": "2026-04-19T19:10:23Z",
+  "completed_at": "2026-04-19T22:15:00Z",
   "branch": "task/TASK-449",
   "description": "Parquet ingest path"
 }
