@@ -1139,7 +1139,7 @@ In single-table queries (no JOIN), the table prefix is never written — bare ev
 
 ### 19.2 No Self-Joins
 
-A table cannot appear more than once in a source expression. `events JOIN events` is a planner error. Self-joins would require table aliases to disambiguate `events.signup` (which events?), and v1 does not introduce table aliases for the source expression. If you need multiple independent views of the same table (e.g., to find pairs of events within one entity's stream), use variable bindings inside a single MATCH or use aliases.
+A table cannot appear more than once in a source expression. `events JOIN events` is a **parse error** (`ParseError::SelfJoin`). Self-joins would require table aliases to disambiguate `events.signup` (which events?), and v1 does not introduce table aliases for the source expression. If you need multiple independent views of the same table (e.g., to find pairs of events within one entity's stream), use variable bindings inside a single MATCH or use aliases.
 
 ### 19.3 FUNNEL and RETENTION Inside JOINs
 

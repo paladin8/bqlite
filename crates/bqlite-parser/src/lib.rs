@@ -297,10 +297,11 @@ mod tests {
 
     #[test]
     fn rejects_dotted_name_as_trailing_input() {
-        // The new lexer tokenizes `schema.events` as Ident, Dot, Ident.
-        // The dispatcher accepts the first Ident and expect_eof rejects
-        // the `.` with `Expected::Eof`. Wave 2 does not yet support
-        // qualified source references (§26 line 1492 is single-name).
+        // The lexer tokenizes `schema.events` as Ident, Dot, Ident.
+        // The source expression grammar is `name time_range? (JOIN name)*`
+        // (§26 line 1560) — source names are always bare identifiers, never
+        // dot-qualified. After reading "schema" as the primary name and
+        // finding no JOIN keyword, expect_eof sees `.` and errors.
         match parse("schema.events") {
             Err(ParseError::Unexpected {
                 offset, expected, ..
@@ -438,6 +439,88 @@ mod tests {
                 assert!(found.ends_with('…'), "snippet should be ellipsized");
             }
             other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Source JOIN (TASK-452)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_source_with_single_join() {
+        let stmts = parse("events JOIN purchases").unwrap();
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0] {
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.primary.name.text, "events");
+                assert_eq!(pipe.source.joins.len(), 1);
+                assert_eq!(pipe.source.joins[0].name.text, "purchases");
+                assert!(pipe.source.time_range.is_none());
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_source_with_multiple_joins() {
+        let stmts = parse("events JOIN purchases JOIN support_tickets").unwrap();
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0] {
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.joins.len(), 2);
+                assert_eq!(pipe.source.joins[0].name.text, "purchases");
+                assert_eq!(pipe.source.joins[1].name.text, "support_tickets");
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_join_with_time_range_and_pipeline_stage() {
+        let stmts = parse("events LAST 30d JOIN purchases | LIMIT 5").unwrap();
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0] {
+            Statement::Query(pipe) => {
+                assert!(pipe.source.time_range.is_some());
+                assert_eq!(pipe.source.joins.len(), 1);
+                assert_eq!(pipe.stages.len(), 1);
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_self_join() {
+        match parse("events JOIN events") {
+            Err(ParseError::SelfJoin { name, offset }) => {
+                assert_eq!(name, "events");
+                assert_eq!(offset, "events JOIN ".len());
+            }
+            other => panic!("expected SelfJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_join_table() {
+        match parse("events JOIN purchases JOIN purchases") {
+            Err(ParseError::SelfJoin { name, .. }) => {
+                assert_eq!(name, "purchases");
+            }
+            other => panic!("expected SelfJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_body_may_use_join() {
+        // An alias body is a full pipeline, so it may include a JOIN source.
+        let stmts = parse("merged = events JOIN purchases\nresults").unwrap();
+        assert_eq!(stmts.len(), 2);
+        match &stmts[0] {
+            Statement::DefineAlias { name, body, .. } => {
+                assert_eq!(name.text, "merged");
+                assert_eq!(body.source.joins.len(), 1);
+            }
+            other => panic!("expected DefineAlias, got {other:?}"),
         }
     }
 

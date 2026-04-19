@@ -321,9 +321,13 @@ pub(crate) fn statement(p: &mut Parser) -> Result<Statement, ParseError> {
 /// resulting [`Pipeline`].
 ///
 /// The source is a bare table name followed by an optional time-range
-/// filter (`LAST <duration>` or `BETWEEN '<ts>' AND '<ts>'`), per
-/// query-language.md §3.1. Joins are deferred to Wave 4. Pipeline
-/// stages are delegated to [`crate::pipeline::parse_pipeline_stages`].
+/// filter (`LAST <duration>` or `BETWEEN '<ts>' AND '<ts>'`) and zero
+/// or more `JOIN name` clauses, per query-language.md §3.1 and §19.
+/// Pipeline stages are delegated to [`crate::pipeline::parse_pipeline_stages`].
+///
+/// Self-joins — where any joined table name repeats the primary table
+/// name or any previously joined table name — are rejected here with
+/// [`ParseError::SelfJoin`] (cohorts-aliases-joins.md §8.2).
 ///
 /// Consumers:
 /// - [`parse_query_pipeline`] wraps the result in `Statement::Query`.
@@ -336,13 +340,17 @@ pub(crate) fn parse_pipeline_body(p: &mut Parser) -> Result<Pipeline, ParseError
         span: primary_span,
     };
     let (time_range, tr_span) = parse_time_range(p)?;
-    let source_span = match tr_span {
-        Some(s) => primary_span.merged(s),
-        None => primary_span,
+    let (joins, joins_span) = parse_joins(p, &primary.name.text)?;
+
+    // Source span covers: primary name + optional time range + optional joins.
+    let source_span = match (tr_span, joins_span) {
+        (_, Some(js)) => primary_span.merged(js),
+        (Some(ts), None) => primary_span.merged(ts),
+        (None, None) => primary_span,
     };
     let source = Source {
         primary,
-        joins: vec![],
+        joins,
         time_range,
         span: source_span,
     };
@@ -364,6 +372,55 @@ pub(crate) fn parse_pipeline_body(p: &mut Parser) -> Result<Pipeline, ParseError
         stages,
         span: pipeline_span,
     })
+}
+
+/// Parse zero or more `JOIN name` clauses following the time-range on a
+/// source expression.
+///
+/// Grammar (query-language.md §26):
+/// ```text
+/// source := name time_range? (JOIN name)*
+/// ```
+///
+/// Self-joins — where a joined table name equals the primary table name
+/// or any previously seen join name — are rejected immediately with
+/// [`ParseError::SelfJoin`].  This covers both `events JOIN events` and
+/// `events JOIN purchases JOIN events`.
+///
+/// Returns the list of joined [`TableRef`]s and the combined span of the
+/// entire join list (`None` when the list is empty).
+fn parse_joins(
+    p: &mut Parser,
+    primary_name: &str,
+) -> Result<(Vec<TableRef>, Option<Span>), ParseError> {
+    let mut joins: Vec<TableRef> = Vec::new();
+    let mut combined_span: Option<Span> = None;
+
+    while p.try_kw(Keyword::Join).is_some() {
+        let table = p.expect_name(NameRole::TableName)?;
+        let table_span = table.span;
+
+        // Reject self-joins: the joined name must not duplicate the primary
+        // table name or any already-listed join name. Comparison uses the raw
+        // `.text` field — no alias substitution happens at parse time.
+        if table.text == primary_name || joins.iter().any(|j| j.name.text == table.text) {
+            return Err(ParseError::SelfJoin {
+                offset: table_span.start,
+                name: table.text,
+            });
+        }
+
+        combined_span = Some(match combined_span {
+            Some(s) => s.merged(table_span),
+            None => table_span,
+        });
+        joins.push(TableRef {
+            name: table,
+            span: table_span,
+        });
+    }
+
+    Ok((joins, combined_span))
 }
 
 /// Parse an optional source time-range: `LAST <duration>` or
@@ -659,6 +716,177 @@ mod tests {
                 assert!(pipe.source.time_range.is_none());
             }
             _ => panic!("expected Query, got {stmt:?}"),
+        }
+    }
+
+    // ── JOIN clause parsing ──────────────────────────────────────────────
+
+    #[test]
+    fn single_join_is_parsed() {
+        let mut p = Parser::new("events JOIN purchases").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.primary.name.text, "events");
+                assert_eq!(pipe.source.joins.len(), 1);
+                assert_eq!(pipe.source.joins[0].name.text, "purchases");
+            }
+            _ => panic!("expected Query, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_joins_are_parsed() {
+        let mut p = Parser::new("events JOIN purchases JOIN support_tickets").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.joins.len(), 2);
+                assert_eq!(pipe.source.joins[0].name.text, "purchases");
+                assert_eq!(pipe.source.joins[1].name.text, "support_tickets");
+            }
+            _ => panic!("expected Query, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn join_with_time_range() {
+        let mut p = Parser::new("events LAST 30d JOIN purchases").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert!(pipe.source.time_range.is_some());
+                assert_eq!(pipe.source.joins.len(), 1);
+                assert_eq!(pipe.source.joins[0].name.text, "purchases");
+            }
+            _ => panic!("expected Query, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn join_with_pipeline_stages() {
+        let mut p = Parser::new("events JOIN purchases | LIMIT 10").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.joins.len(), 1);
+                assert_eq!(pipe.stages.len(), 1);
+            }
+            _ => panic!("expected Query, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn self_join_primary_vs_join_is_rejected() {
+        let mut p = Parser::new("events JOIN events").unwrap();
+        match statement(&mut p) {
+            Err(crate::error::ParseError::SelfJoin { name, .. }) => {
+                assert_eq!(name, "events");
+            }
+            other => panic!("expected SelfJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_join_duplicate_join_table_is_rejected() {
+        let mut p = Parser::new("events JOIN purchases JOIN purchases").unwrap();
+        match statement(&mut p) {
+            Err(crate::error::ParseError::SelfJoin { name, .. }) => {
+                assert_eq!(name, "purchases");
+            }
+            other => panic!("expected SelfJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_join_primary_repeated_after_other_join_is_rejected() {
+        let mut p = Parser::new("events JOIN purchases JOIN events").unwrap();
+        match statement(&mut p) {
+            Err(crate::error::ParseError::SelfJoin { name, .. }) => {
+                assert_eq!(name, "events");
+            }
+            other => panic!("expected SelfJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_with_backtick_names() {
+        let mut p = Parser::new("`my events` JOIN `my purchases`").unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.primary.name.text, "my events");
+                assert_eq!(pipe.source.joins[0].name.text, "my purchases");
+            }
+            _ => panic!("expected Query, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn self_join_with_backtick_names_is_rejected() {
+        let mut p = Parser::new("`events` JOIN `events`").unwrap();
+        match statement(&mut p) {
+            Err(crate::error::ParseError::SelfJoin { name, .. }) => {
+                assert_eq!(name, "events");
+            }
+            other => panic!("expected SelfJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_keyword_as_table_name_is_rejected() {
+        // JOIN is a reserved keyword; using it as a join-target table name
+        // produces ReservedKeyword(TableName) rather than some other error.
+        let mut p = Parser::new("events JOIN JOIN").unwrap();
+        match statement(&mut p) {
+            Err(crate::error::ParseError::ReservedKeyword { keyword, role, .. }) => {
+                assert_eq!(keyword, "JOIN");
+                assert_eq!(role, crate::error::NameRole::TableName);
+            }
+            other => panic!("expected ReservedKeyword, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_source_span_covers_all_tables() {
+        let input = "events JOIN purchases";
+        let mut p = Parser::new(input).unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                // Source span must cover from "events" through "purchases"
+                assert_eq!(pipe.source.span.start, 0);
+                assert_eq!(pipe.source.span.end, input.len());
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn join_with_time_range_source_span_covers_all() {
+        let input = "events LAST 30d JOIN purchases";
+        let mut p = Parser::new(input).unwrap();
+        let stmt = statement(&mut p).unwrap();
+        match stmt {
+            Statement::Query(pipe) => {
+                assert_eq!(pipe.source.span.start, 0);
+                assert_eq!(pipe.source.span.end, input.len());
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn self_join_offset_points_to_duplicate_table() {
+        // The SelfJoin offset should point to the duplicate table name.
+        let input = "events JOIN events";
+        let mut p = Parser::new(input).unwrap();
+        match statement(&mut p) {
+            Err(crate::error::ParseError::SelfJoin { offset, .. }) => {
+                // "events JOIN " is 12 bytes; the duplicate "events" starts there.
+                assert_eq!(offset, "events JOIN ".len());
+            }
+            other => panic!("expected SelfJoin, got {other:?}"),
         }
     }
 

@@ -93,6 +93,21 @@ pub enum ParseError {
         /// Which name slot the keyword was used in.
         role: NameRole,
     },
+
+    /// A table name appears more than once in a source expression's JOIN list.
+    ///
+    /// Self-joins are forbidden at parse time because BQL v1 has no
+    /// table-alias syntax — `events JOIN events` would leave all
+    /// `events.signup` references ambiguous. For multi-pass analysis over
+    /// a single table, use variable bindings inside a single MATCH or use
+    /// aliases (query-language.md §19.2; cohorts-aliases-joins.md §8.2).
+    #[error("table `{name}` cannot appear more than once in a source JOIN list")]
+    SelfJoin {
+        /// Byte offset of the duplicate table name token.
+        offset: usize,
+        /// The table name that was repeated.
+        name: String,
+    },
 }
 
 /// A closed vocabulary of parser-facing expectations used in error
@@ -316,5 +331,18 @@ mod tests {
         assert!(text.contains("integer literal"));
         assert!(text.contains("byte 4"));
         assert!(text.contains("value exceeds i64::MAX"));
+    }
+
+    #[test]
+    fn parse_error_self_join_display_names_table() {
+        let err = ParseError::SelfJoin {
+            offset: 12,
+            name: "events".into(),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("events"),
+            "table name should appear in message"
+        );
     }
 }
