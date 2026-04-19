@@ -428,3 +428,58 @@ from this protocol:
   count/size thresholds), SS7 (sweep period), SS8.3 (retry cooldown)
   become user-visible config. Exact config module placement is TASK-408
   scope.
+
+---
+
+## 12. Implementation status (TASK-408)
+
+TASK-408 lands the executor, scheduler, `compact_now`, the
+`core_budget` semaphore surface, the backlog metric, the manifest
+publication primitive (one closure per job, see SS6), the 60-second
+mid-job retry cooldown, and reuses the startup orphan sweep already
+shipped by TASK-239 (`reconcile_segments`) without modification.
+
+Manifest publication uses a new
+`Manifest::replace_segments(table, window, shard, removed_ids,
+new_meta)` mutation invoked through the existing
+`Database::update_manifest` closure path (promoted to `pub(crate)` in
+the same checkpoint). One closure removes every input and adds the
+output, so the on-disk manifest never observes a half-state -- the
+SS6 all-or-nothing publish guarantee is preserved.
+
+**Deferred items, kept honest with this doc:**
+
+- SS6 step 4 in-memory `Arc<Manifest>` swap and SS7 10-second
+  `Arc::strong_count` reclamation sweep wait on the `Arc<Manifest>`
+  migration that TASK-438 (engine bind step) is the natural place to
+  land. Until then, `Database` owns its `Manifest` by value; there are
+  no concurrent readers holding a stale snapshot, so superseded
+  segment files are deleted immediately after the manifest update
+  succeeds. The `retired_versions` hook is intentionally absent -- it
+  would have nothing to track.
+- SS9 tombstone snapshot at job start and the manifest-first
+  reclamation ordering land in TASK-434 (tombstone-aware scan) and
+  TASK-435 (tombstone reclamation during compaction). The compaction
+  executor in TASK-408 does not consult `tombstones.json`.
+- SS4 query-side permit acquisition is TASK-438's job. TASK-408 ships
+  the `CoreBudget` type and the per-job acquire/release inside the
+  worker; until TASK-438 wires query workers into the same semaphore,
+  the compaction worker effectively never blocks.
+
+### 12.1 Streaming row-group writer (Wave 5 follow-on)
+
+The TASK-408 executor materialises the merged stream into one
+in-memory `RecordBatch` via `arrow::compute::concat_batches` before
+encoding. With the v1 256 MiB L0 size threshold and `pool_size =
+num_cores / 4`, peak per-worker memory is approximately
+`2 x L0_total_bytes` (input + concat double-buffer); on a 16-core
+machine that is roughly 512 MiB x 4 workers, ~2 GiB. This is the
+deliberate v1 cap.
+
+A streaming row-group writer that encodes one row group at a time and
+flushes to disk before pulling the next merged batch is filed as a
+Wave 5 follow-on. TASK-441 (advanced-analytics benchmarks) will
+measure the actual peak and decide whether the streaming rewrite is
+worth shipping; the per-row-group `core_budget` acquire/release model
+already in place for the streaming variant is preserved by the v1
+executor for forward compatibility.

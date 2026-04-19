@@ -45,6 +45,7 @@
 //! their end-to-end paths.
 
 pub mod catalog;
+pub mod compaction;
 pub mod database;
 pub mod encoding;
 pub mod ingest;
@@ -56,6 +57,7 @@ pub mod writer;
 pub mod zone_map;
 
 pub use catalog::{bootstrap_events_schema, ManifestCatalog, BOOTSTRAP_EVENTS_TABLE_NAME};
+pub use compaction::{CompactionConfig, CompactionMetrics, CoreBudget, CoreBudgetPermit};
 pub use database::{
     empty_segment_reader, Database, LOCK_FILE_NAME, MANIFEST_FILE_NAME, MANIFEST_TMP_FILE_NAME,
 };
