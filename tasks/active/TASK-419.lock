@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-419",
+  "claimed_at": "2026-04-19T20:07:27Z",
+  "branch": "task/TASK-419",
+  "description": "Advanced encoding selector integration + reader/writer compatibility"
+}
