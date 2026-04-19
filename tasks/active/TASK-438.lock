@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-438",
+  "claimed_at": "2026-04-19T23:12:25Z",
+  "branch": "task/TASK-438",
+  "description": "Engine bind step extension for Wave 4 query nodes"
+}
