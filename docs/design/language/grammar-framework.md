@@ -659,6 +659,15 @@ No production needs more than 2 tokens of lookahead in Wave 2. Wave 3's MATCH
 step separators push this to 3 in one spot (`WITHOUT <event_ref> THEN`).
 `peek_at(n)` scales linearly with `n`; since `n ≤ 3` forever, this is free.
 
+**Wave 4 exception — `IN` tuple disambiguation (`is_tuple_lhs`, TASK-451).**
+The grammar at `query-language.md` §26 has `tuple_expr` (2+ columns) and a
+parenthesized `addition` as distinct `comparison` arms, but both start with
+`(`. Finite lookahead cannot resolve the ambiguity in the general case (the
+first comma at depth 1 may be arbitrarily many tokens in). The `is_tuple_lhs`
+helper scans forward using only `peek_at` (no cursor mutation, §7.5
+no-backtracking invariant preserved) and is capped at 256 tokens as a
+defensive bound. Within that cap the scan is O(1) for any realistic expression.
+
 The parser never **mutates** a token it has only peeked at — `peek_at` returns
 a borrow, `bump`/`try_kw`/`expect_kw` are the only mutators. This invariant is
 what makes partial production state impossible: every production either

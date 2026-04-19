@@ -388,7 +388,12 @@ For `MergeSources`, the output entity-key column is always named `entity_id` reg
 **TASK-451 (parser: `IN QUERY` / bare `IN alias`):**
 - Add `IN QUERY (pipeline)` and bare `IN alias` forms to the expression grammar.
 - Support single-column and tuple cohort keys at the syntax level.
-- Emit diagnostics for duplicate/empty tuples.
+- Emit a diagnostic for empty RHS lists (`x IN ()` is rejected).
+- Empty LHS tuples `() IN …` are prevented by the grammar (tuple requires ≥ 2 elements).
+- Structural-duplicate detection for LHS tuples (e.g. `(a, a) IN alias`) is
+  **deferred to TASK-425** (planner/bind-time). Full name resolution is not
+  available at parse time, and the `Name` AST node embeds source spans that
+  prevent simple structural equality from working across positions.
 - Semantic resolution is downstream in TASK-425 / TASK-437.
 
 **TASK-452 (parser: entity-aligned source JOIN):**

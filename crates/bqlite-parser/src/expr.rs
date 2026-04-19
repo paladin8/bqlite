@@ -47,7 +47,7 @@
 // from tripping `clippy -D warnings` until the consumer lands.
 #![allow(dead_code)]
 
-use bqlite_ast::{BinaryOp, CompareOp, Expr, Literal, Name, Spanned, UnaryOp};
+use bqlite_ast::{BinaryOp, CompareOp, Expr, InRhs, Literal, Name, Span, Spanned, UnaryOp};
 
 use crate::error::{Expected, NameRole, ParseError};
 use crate::lex::{token_span, Keyword, TokenKind};
@@ -108,6 +108,15 @@ fn parse_not(p: &mut Parser) -> Result<Spanned<Expr>, ParseError> {
 }
 
 fn parse_comparison(p: &mut Parser) -> Result<Spanned<Expr>, ParseError> {
+    // Multi-column tuple LHS: `(a, b, …) NOT? IN in_rhs`.
+    //
+    // Use lookahead to detect a top-level comma inside parens before
+    // calling `parse_addition`, which would fail on `(a, b)` because a
+    // comma is not a valid binary operator inside a parenthesized expression.
+    if is_tuple_lhs(p) {
+        return parse_tuple_in(p);
+    }
+
     let lhs = parse_addition(p)?;
 
     // IS NULL / IS NOT NULL — handled inside `comparison` so `a = b IS
@@ -128,6 +137,39 @@ fn parse_comparison(p: &mut Parser) -> Result<Spanned<Expr>, ParseError> {
             Expr::IsNull {
                 expr: Box::new(lhs),
                 negated,
+            },
+            span,
+        ));
+    }
+
+    // `NOT IN` — two-token compound operator.  NOT is consumed here so it
+    // binds to IN rather than wrapping the whole comparison via parse_not.
+    // `NOT` at this level must be followed by `IN`; any other token is a
+    // parse error, since `NOT` in boolean-NOT position is handled upstream
+    // in parse_not.
+    if p.try_kw(Keyword::Not).is_some() {
+        p.expect_kw(Keyword::In)?;
+        let (rhs, rhs_span) = parse_in_rhs(p)?;
+        let span = lhs.span.merged(rhs_span);
+        return Ok(Spanned::new(
+            Expr::In {
+                lhs: vec![lhs],
+                rhs,
+                negated: true,
+            },
+            span,
+        ));
+    }
+
+    // `IN` (without NOT).
+    if p.try_kw(Keyword::In).is_some() {
+        let (rhs, rhs_span) = parse_in_rhs(p)?;
+        let span = lhs.span.merged(rhs_span);
+        return Ok(Spanned::new(
+            Expr::In {
+                lhs: vec![lhs],
+                rhs,
+                negated: false,
             },
             span,
         ));
@@ -156,6 +198,216 @@ fn parse_comparison(p: &mut Parser) -> Result<Spanned<Expr>, ParseError> {
             right: Box::new(rhs),
         },
         span,
+    ))
+}
+
+/// Return `true` if the current token sequence starts a tuple LHS
+/// suitable for multi-column `IN`: `"(" addition ("," addition)+ ")"`.
+///
+/// Uses lookahead to scan forward **without consuming any tokens**. A
+/// comma found at parenthesis depth 1 (the top level of the outer parens)
+/// signals a tuple. A `)` that closes the outermost paren without a
+/// prior top-level comma means a single parenthesized expression, which
+/// is handled by the normal `parse_addition` → `parse_primary` path.
+///
+/// # Lookahead bound
+///
+/// `grammar-framework.md` §7.4 establishes a 2–3 token lookahead budget
+/// for Wave 2–3 productions.  This disambiguation *inherently* requires
+/// more: `(a + b * c, d)` needs 5 tokens to find the top-level comma.
+/// The grammar is ambiguous with any fixed finite lookahead (see §7.5).
+///
+/// The function satisfies the no-backtracking invariant (§7.5): the
+/// cursor is never mutated — only `peek_at` is used.  A defensive scan
+/// cap of [`IS_TUPLE_LHS_SCAN_CAP`] tokens prevents pathological inputs
+/// from causing excessive work; if the cap is reached the function
+/// conservatively returns `false` and lets `parse_addition` commit.
+const IS_TUPLE_LHS_SCAN_CAP: usize = 256;
+
+fn is_tuple_lhs(p: &Parser) -> bool {
+    if !matches!(p.peek_kind(), TokenKind::LParen) {
+        return false;
+    }
+    // depth starts at 0; the opening `(` at i=0 increments it to 1 on
+    // the first loop iteration, so depth is always ≥ 1 when an RParen is
+    // first encountered.
+    let mut depth: usize = 0;
+    let mut i = 0;
+    loop {
+        if i >= IS_TUPLE_LHS_SCAN_CAP {
+            // Pathological input: conservatively treat as non-tuple.
+            return false;
+        }
+        match &p.peek_at(i).kind {
+            TokenKind::LParen => depth += 1,
+            TokenKind::RParen => {
+                // depth ≥ 1 here (see comment above), so no underflow.
+                depth -= 1;
+                if depth == 0 {
+                    return false; // closed without finding a top-level comma
+                }
+            }
+            TokenKind::Comma if depth == 1 => return true,
+            TokenKind::Eof => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Parse a multi-column tuple LHS followed by `NOT? IN in_rhs`.
+///
+/// Grammar:
+/// ```text
+/// "(" addition ("," addition)+ ")" NOT? IN in_rhs
+/// ```
+///
+/// Callers must first confirm via [`is_tuple_lhs`] that the token stream
+/// starts a tuple before calling this function.
+///
+/// # Scope of parse-time diagnostics
+///
+/// - Empty tuple `() IN …`: prevented at the grammar level — [`is_tuple_lhs`]
+///   only fires when a top-level comma is present, so there are always ≥ 2
+///   elements by the time this function is called.
+/// - Structural duplicates `(a, a) IN alias`: **deferred to TASK-425**
+///   (planner/bind-time).  Full name resolution is not available at parse
+///   time, and the `Name` AST node embeds source spans that prevent simple
+///   structural equality comparisons from working correctly across positions.
+fn parse_tuple_in(p: &mut Parser) -> Result<Spanned<Expr>, ParseError> {
+    let lparen = p.expect_punct(&TokenKind::LParen, "(")?;
+    let tuple_start = token_span(&lparen);
+
+    let first = parse_addition(p)?;
+    let mut elems: Vec<Spanned<Expr>> = vec![first];
+    while p.try_kind(&TokenKind::Comma).is_some() {
+        elems.push(parse_addition(p)?);
+    }
+
+    let rparen = p.expect_punct(&TokenKind::RParen, ")")?;
+    let tuple_span = tuple_start.merged(token_span(&rparen));
+
+    // An empty tuple `()` is prevented at the grammar level: `is_tuple_lhs`
+    // only fires when a comma is found inside the parens, so we always have
+    // at least two elements here.  Structural-duplicate detection (e.g.
+    // `(a, a)`) is a planner/bind-time concern where full name resolution is
+    // available; the parser does not attempt it.
+
+    // Parse `NOT? IN in_rhs`.
+    let negated = if p.try_kw(Keyword::Not).is_some() {
+        p.expect_kw(Keyword::In)?;
+        true
+    } else {
+        p.expect_kw(Keyword::In)?;
+        false
+    };
+
+    let (rhs, rhs_span) = parse_in_rhs(p)?;
+    let span = tuple_span.merged(rhs_span);
+
+    Ok(Spanned::new(
+        Expr::In {
+            lhs: elems,
+            rhs,
+            negated,
+        },
+        span,
+    ))
+}
+
+/// Parse the right-hand side of an `IN` / `NOT IN` expression.
+///
+/// Three forms per `query-language.md` §17 and §26:
+///
+/// ```text
+/// in_rhs := "QUERY" "(" pipeline ")"   -- inline subquery
+///          | "(" expr ("," expr)* ")"  -- inline expression list
+///          | identifier                 -- bare alias reference
+/// ```
+///
+/// # Diagnostics
+///
+/// - Empty inline list `IN ()`: rejected — always false, likely a typo.
+/// - Reserved keyword in alias position: `ReservedKeyword(AliasName)`.
+///
+/// # Design note
+///
+/// The `QUERY` keyword is required to distinguish `IN QUERY (pipeline)`
+/// from a one-element inline list `IN (expr)`.  Without it, `WHERE x IN
+/// (events)` would be ambiguous between a list containing a column
+/// reference and a subquery over the `events` table (`query-language.md`
+/// §17.2, §26 line 1751).
+fn parse_in_rhs(p: &mut Parser) -> Result<(InRhs, Span), ParseError> {
+    // IN QUERY (pipeline) — inline subquery.
+    if matches!(p.peek_kind(), TokenKind::Kw(Keyword::Query)) {
+        let query_tok = p.bump();
+        let query_span = token_span(&query_tok);
+        p.expect_punct(&TokenKind::LParen, "(")?;
+        let pipeline = crate::parser::parse_pipeline_body(p)?;
+        let rparen = p.expect_punct(&TokenKind::RParen, ")")?;
+        let span = query_span.merged(token_span(&rparen));
+        return Ok((InRhs::Query(Box::new(pipeline)), span));
+    }
+
+    // IN (expr, …) — inline expression list.
+    //
+    // `IN (name)` is a single-element list containing a column reference,
+    // NOT a subquery.  The `QUERY` keyword must be used for subqueries.
+    if matches!(p.peek_kind(), TokenKind::LParen) {
+        let lparen_tok = p.bump();
+        let lparen_span = token_span(&lparen_tok);
+
+        // Reject empty list `IN ()`.
+        if matches!(p.peek_kind(), TokenKind::RParen) {
+            return Err(p.error_unexpected(
+                Expected::Expression,
+                Some("empty IN list is never true; use `IN (val, …)` or `IN QUERY (…)`"),
+            ));
+        }
+
+        // RHS list items are parsed at the full `expression` level (boolean
+        // operators allowed) rather than `addition` level.  Tuple LHS elements
+        // use `addition` (see `parse_tuple_in`) to prevent bare comparison
+        // operators in the LHS without parentheses.  The asymmetry is
+        // intentional: LHS positions are key expressions, RHS positions are
+        // arbitrary scalar values.
+        let mut items = vec![parse_expression(p)?];
+        while p.try_kind(&TokenKind::Comma).is_some() {
+            items.push(parse_expression(p)?);
+        }
+        let rparen = p.expect_punct(&TokenKind::RParen, ")")?;
+        let span = lparen_span.merged(token_span(&rparen));
+        return Ok((InRhs::List(items), span));
+    }
+
+    // IN alias_name — bare alias reference.
+    //
+    // Per `query-language.md` §17.3 a bare identifier always resolves to
+    // an alias defined earlier in the same submission; there is no fallback
+    // to column lookup.  Planner-level undefined-alias detection is TASK-425.
+    if matches!(
+        p.peek_kind(),
+        TokenKind::Ident(_) | TokenKind::QuotedName(_)
+    ) {
+        let name = p.expect_name(NameRole::AliasName)?;
+        let span = name.span;
+        return Ok((InRhs::Alias(name), span));
+    }
+
+    // Reserved keyword in alias position — give a specific error variant.
+    if let TokenKind::Kw(kw) = p.peek_kind() {
+        let kw = *kw;
+        let tok = p.peek();
+        return Err(ParseError::ReservedKeyword {
+            offset: tok.start,
+            keyword: kw.canonical(),
+            role: NameRole::AliasName,
+        });
+    }
+
+    Err(p.error_unexpected(
+        Expected::Name,
+        Some("expected an alias name, `QUERY (pipeline)`, or `(expr, …)` after IN"),
     ))
 }
 
@@ -1021,5 +1273,349 @@ mod tests {
     #[test]
     fn cast_missing_lparen_errors() {
         assert!(expr_of("CAST x AS INT)").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // IN / NOT IN — single-column forms
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_in_literal_list_single() {
+        let e = parse_ok("x IN (1, 2, 3)");
+        match e.node {
+            Expr::In { lhs, rhs, negated } => {
+                assert!(!negated);
+                assert_eq!(lhs.len(), 1);
+                assert!(matches!(lhs[0].node, Expr::Column(_)));
+                assert!(matches!(rhs, InRhs::List(items) if items.len() == 3));
+            }
+            other => panic!("expected In, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_not_in_literal_list() {
+        let e = parse_ok("x NOT IN (1, 2, 3)");
+        match e.node {
+            Expr::In { negated, .. } => assert!(negated),
+            other => panic!("expected In, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_in_single_element_list() {
+        // A one-element list is valid.
+        let e = parse_ok("x IN (42)");
+        match e.node {
+            Expr::In {
+                rhs: InRhs::List(items),
+                ..
+            } => assert_eq!(items.len(), 1),
+            other => panic!("expected In with List(1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_in_alias_reference() {
+        let e = parse_ok("entity_id IN buyers");
+        match e.node {
+            Expr::In {
+                lhs,
+                rhs: InRhs::Alias(name),
+                negated,
+            } => {
+                assert!(!negated);
+                assert_eq!(lhs.len(), 1);
+                assert_eq!(name.text, "buyers");
+            }
+            other => panic!("expected In with Alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_not_in_alias_reference() {
+        let e = parse_ok("entity_id NOT IN churned");
+        match e.node {
+            Expr::In {
+                rhs: InRhs::Alias(name),
+                negated,
+                ..
+            } => {
+                assert!(negated);
+                assert_eq!(name.text, "churned");
+            }
+            other => panic!("expected In with Alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_in_subquery() {
+        // Minimal pipeline: just a source name.
+        let e = parse_ok("entity_id IN QUERY (events)");
+        match e.node {
+            Expr::In {
+                rhs: InRhs::Query(pipeline),
+                ..
+            } => {
+                assert_eq!(pipeline.source.primary.name.text, "events");
+            }
+            other => panic!("expected In with Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_not_in_subquery() {
+        let e = parse_ok("entity_id NOT IN QUERY (events)");
+        match e.node {
+            Expr::In {
+                rhs: InRhs::Query(_),
+                negated,
+                ..
+            } => assert!(negated),
+            other => panic!("expected In with Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_in_subquery_with_pipeline_stages() {
+        // `LAST 30d` is a time-range on the source, not a pipeline stage.
+        // The two stages are WHERE and SELECT.
+        let e = parse_ok(
+            "entity_id IN QUERY (events LAST 30d | WHERE amount > 100 | SELECT entity_id)",
+        );
+        match e.node {
+            Expr::In {
+                rhs: InRhs::Query(pipeline),
+                ..
+            } => {
+                assert_eq!(pipeline.source.primary.name.text, "events");
+                assert_eq!(pipeline.stages.len(), 2);
+            }
+            other => panic!("expected In with Query pipeline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_in_with_paren_lhs_expression() {
+        // `(a + b) IN (1, 2)` — parenthesized single-column LHS.
+        let e = parse_ok("(a + b) IN (1, 2)");
+        match e.node {
+            Expr::In { lhs, .. } => {
+                assert_eq!(lhs.len(), 1);
+                // LHS is a parenthesized binary expression.
+                assert!(matches!(lhs[0].node, Expr::Paren(_)));
+            }
+            other => panic!("expected In, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // IN / NOT IN — multi-column tuple LHS
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_tuple_in_alias() {
+        let e = parse_ok("(entity_id, day) IN active_days");
+        match e.node {
+            Expr::In {
+                lhs,
+                rhs: InRhs::Alias(name),
+                negated,
+            } => {
+                assert!(!negated);
+                assert_eq!(lhs.len(), 2);
+                assert!(matches!(lhs[0].node, Expr::Column(_)));
+                assert!(matches!(lhs[1].node, Expr::Column(_)));
+                assert_eq!(name.text, "active_days");
+            }
+            other => panic!("expected In with 2-element tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tuple_not_in_alias() {
+        let e = parse_ok("(user_id, plan) NOT IN excluded");
+        match e.node {
+            Expr::In { lhs, negated, .. } => {
+                assert!(negated);
+                assert_eq!(lhs.len(), 2);
+            }
+            other => panic!("expected In, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_triple_tuple_in_query() {
+        let e = parse_ok("(a, b, c) IN QUERY (events)");
+        match e.node {
+            Expr::In {
+                lhs,
+                rhs: InRhs::Query(_),
+                ..
+            } => {
+                assert_eq!(lhs.len(), 3);
+            }
+            other => panic!("expected In with 3-tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_in_rhs_list() {
+        // Multi-column LHS with inline list — unusual but grammatically legal.
+        let e = parse_ok("(a, b) IN (1, 2)");
+        match e.node {
+            Expr::In {
+                lhs,
+                rhs: InRhs::List(items),
+                ..
+            } => {
+                assert_eq!(lhs.len(), 2);
+                assert_eq!(items.len(), 2);
+            }
+            other => panic!("expected In, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // IN in compound boolean expressions
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn in_inside_and_expression() {
+        // `x IN (1, 2) AND y = 3`
+        let e = parse_ok("x IN (1, 2) AND y = 3");
+        match e.node {
+            Expr::And(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(items[0].node, Expr::In { .. }));
+                assert!(matches!(items[1].node, Expr::Compare { .. }));
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_wraps_in_when_written_as_not_expr_in_rhs() {
+        // `NOT x IN alias` → Not(In { lhs: [x], rhs: Alias, negated: false })
+        // This is semantically equivalent to `x NOT IN alias` but syntactically
+        // uses the NOT boolean prefix operator above the comparison level.
+        let e = parse_ok("NOT x IN alias");
+        match e.node {
+            Expr::Not(inner) => {
+                assert!(matches!(inner.node, Expr::In { negated: false, .. }));
+            }
+            other => panic!("expected Not(In), got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // IN span tracking
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn in_alias_span_covers_full_expression() {
+        let src = "entity_id IN buyers";
+        let e = parse_ok(src);
+        assert_eq!(e.span.start, 0);
+        assert_eq!(e.span.end, src.len());
+    }
+
+    #[test]
+    fn in_query_span_covers_full_expression() {
+        let src = "entity_id IN QUERY (events)";
+        let e = parse_ok(src);
+        assert_eq!(e.span.start, 0);
+        assert_eq!(e.span.end, src.len());
+    }
+
+    #[test]
+    fn tuple_in_span_covers_full_expression() {
+        let src = "(a, b) IN alias";
+        let e = parse_ok(src);
+        assert_eq!(e.span.start, 0);
+        assert_eq!(e.span.end, src.len());
+    }
+
+    // ------------------------------------------------------------------
+    // IN error cases
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn empty_in_list_errors() {
+        // `x IN ()` — empty list is always false; reject at parse time.
+        match expr_of("x IN ()") {
+            Err(ParseError::Unexpected { detail, .. }) => {
+                let detail = detail.expect("expected detail message");
+                assert!(
+                    detail.contains("empty"),
+                    "detail should mention 'empty': {detail}"
+                );
+            }
+            Err(ParseError::UnexpectedEof { detail, .. }) => {
+                let detail = detail.expect("expected detail message");
+                assert!(
+                    detail.contains("empty"),
+                    "detail should mention 'empty': {detail}"
+                );
+            }
+            other => panic!("expected error for empty IN list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_reserved_keyword_as_alias_errors() {
+        // `x IN WHERE` — WHERE is a reserved keyword, cannot be alias name.
+        match expr_of("x IN WHERE") {
+            Err(ParseError::ReservedKeyword { keyword, role, .. }) => {
+                assert_eq!(keyword, "WHERE");
+                assert_eq!(role, NameRole::AliasName);
+            }
+            other => panic!("expected ReservedKeyword, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_query_missing_parens_errors() {
+        // `x IN QUERY events` — pipeline not wrapped in parens; the parser
+        // should report "expected `(`" at the `events` token.
+        match expr_of("x IN QUERY events") {
+            Err(ParseError::Unexpected { expected, .. }) => {
+                assert_eq!(expected, Expected::Punct("("));
+            }
+            other => panic!("expected Unexpected/Punct(\"(\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_in_missing_in_keyword_errors() {
+        // `(a, b) alias` — missing IN keyword.
+        match expr_of("(a, b) alias") {
+            Err(ParseError::Unexpected { .. } | ParseError::UnexpectedEof { .. }) => {}
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_in_duplicate_elements_parses_successfully() {
+        // `(a, a) IN alias` parses successfully at the parser level.
+        // Structural-duplicate detection in the LHS tuple is deferred to
+        // TASK-425 (planner/bind-time) because the `Name` AST node includes
+        // source spans that prevent simple equality comparison across positions.
+        let e = parse_ok("(a, a) IN alias");
+        match e.node {
+            Expr::In {
+                lhs,
+                rhs: InRhs::Alias(name),
+                negated,
+            } => {
+                assert!(!negated);
+                assert_eq!(lhs.len(), 2);
+                // Both LHS elements reference column "a", but their spans differ.
+                assert!(matches!(&lhs[0].node, Expr::Column(n) if n.text == "a"));
+                assert!(matches!(&lhs[1].node, Expr::Column(n) if n.text == "a"));
+                assert_eq!(name.text, "alias");
+            }
+            other => panic!("expected In, got {other:?}"),
+        }
     }
 }
