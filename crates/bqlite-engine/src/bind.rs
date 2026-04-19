@@ -364,6 +364,19 @@ impl PhysicalOperator for SequenceMatchAdapter {
 /// therefore has no fused path — it always routes output through the
 /// non-fused `pending` buffer. The fused path will be added in Wave 5
 /// alongside the operator-side changes that enable it.
+///
+/// ## TODO(Wave 5 / QueryContext)
+///
+/// Per `docs/design/execution-model.md §4.1`, the adapter should gain:
+/// - **Output-batch accumulation**: collect per-entity output batches into
+///   a target-row-count buffer before returning to the caller, avoiding the
+///   "one-row `RecordBatch` per entity pathology" for high-entity pipelines.
+/// - **Cooperative cancellation**: check `QueryContext::cancelled` between
+///   entities so a cancelled query observes a per-entity latency bound.
+///
+/// These are blocked on the `QueryContext` type landing in the engine;
+/// `SequenceMatchAdapter` has the same gap and will be updated at the same
+/// time.
 struct EntityOperatorAdapter<Op: EntityOperator> {
     operator: Op,
     child: Box<dyn PhysicalOperator>,
@@ -400,13 +413,15 @@ impl<Op: EntityOperator> EntityOperatorAdapter<Op> {
         }
     }
 
-    /// Finalize `entity`: call `finish_entity` and buffer the result.
-    fn finalize_entity(&mut self, entity: EntityId, state: Op::State) -> Result<()> {
+    /// Finalize the in-flight entity: call `finish_entity` and buffer the result.
+    ///
+    /// Unlike `SequenceMatchAdapter::finalize_entity`, we do not need the entity
+    /// id here: Wave 4 operators fill the entity-id column themselves from their
+    /// buffered input rows (e.g. `SessionizeOperator` always writes the entity id
+    /// it received in `create_state` into every output row). No post-finalization
+    /// id-fill step is required.
+    fn finalize_entity(&mut self, state: Op::State) -> Result<()> {
         if let Some(batch) = self.operator.finish_entity(state) {
-            // Entity-key columns are filled by the operator from the
-            // buffered input rows (e.g. Sessionize buffers "entity_id"
-            // from the scan). No post-processing fill is needed here.
-            let _ = entity;
             self.pending.push_back(batch);
         }
         Ok(())
@@ -424,10 +439,10 @@ impl<Op: EntityOperator> EntityOperatorAdapter<Op> {
 
             // Detect entity boundary.
             if self.current_entity.as_ref() != Some(&row_entity) {
-                if let (Some(prev_entity), Some(prev_state)) =
+                if let (Some(_prev_entity), Some(prev_state)) =
                     (self.current_entity.take(), self.current_state.take())
                 {
-                    self.finalize_entity(prev_entity, prev_state)?;
+                    self.finalize_entity(prev_state)?;
                 }
                 let new_state = self.operator.create_state(&row_entity);
                 self.current_entity = Some(row_entity.clone());
@@ -472,10 +487,10 @@ impl<Op: EntityOperator> PhysicalOperator for EntityOperatorAdapter<Op> {
             match self.child.next_batch()? {
                 None => {
                     // Child exhausted: finalize the last in-flight entity.
-                    if let (Some(entity), Some(state)) =
+                    if let (Some(_entity), Some(state)) =
                         (self.current_entity.take(), self.current_state.take())
                     {
-                        self.finalize_entity(entity, state)?;
+                        self.finalize_entity(state)?;
                     }
                     self.exhausted = true;
                     // Loop once more to drain `pending`.
@@ -1160,6 +1175,15 @@ fn bind_event_select(
         resolve_entity_key_col(child.as_ref(), ek_col_name, "EventSelectAdapter")?;
     // Use the planner's schema for operator construction — it includes
     // `__seq_id` which the operator requires for ts-tiebreaking.
+    //
+    // SAFETY NOTE: `EventSelectOperator` stores `seq_id_idx` (resolved here
+    // from the planner schema) for use in same-ts tiebreaking. Until
+    // `ScanOperator` materialises `__seq_id` in its output batches, the
+    // resolved index will exceed the runtime batch column count. Any
+    // `process_sub_batch` call that reaches the tiebreaking path will
+    // therefore panic. The empty-table smoke test (CP1) does not exercise
+    // this path; data-driven EventSelect tests are gated on scan-layer
+    // `__seq_id` materialisation.
     let operator = EventSelectOperator::new(es, es.input.output_schema());
     Ok(Box::new(EntityOperatorAdapter::new(
         operator,
