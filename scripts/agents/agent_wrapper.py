@@ -52,7 +52,7 @@ class WrapperConfigError(RuntimeError):
 # dep-satisfied task in its wave and spin up the right model for it.
 _MODEL_FOR_DIFFICULTY = {
     "EASY": {"model": "claude-sonnet-4-6", "effort": "high"},
-    "HARD": {"model": "claude-opus-4-6[1m]", "effort": "high"},
+    "HARD": {"model": "claude-opus-4-7[1m]", "effort": "high"},
 }
 
 

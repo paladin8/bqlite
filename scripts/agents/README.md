@@ -119,7 +119,7 @@ Every task in `TASKS.md` is tagged either `[EASY]` or `[HARD]`. The wrapper pick
 | Tag | Model | Effort |
 |---|---|---|
 | `[EASY]` | `claude-sonnet-4-6` | `high` |
-| `[HARD]` | `claude-opus-4-6[1m]` | `high` |
+| `[HARD]` | `claude-opus-4-7[1m]` | `high` |
 
 There is no container-level pool assignment — all running wrappers draw from the same claimable queue. This keeps the fleet well-utilized even when the wave is unbalanced (e.g. mostly HARD tasks with a single EASY trailing). It also means there is no implicit cap on concurrent Opus runs: if the next N claimable tasks are all `[HARD]`, every agent will pick Opus at once. For a Max subscription this is fine (CC backs off on 429s); for per-token billing, factor that in before sizing the fleet.
 

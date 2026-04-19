@@ -53,7 +53,7 @@ class AgentWrapperArgsTests(unittest.TestCase):
         )
         self.assertEqual(
             agent_wrapper._MODEL_FOR_DIFFICULTY["HARD"]["model"],
-            "claude-opus-4-6[1m]",
+            "claude-opus-4-7[1m]",
         )
 
 

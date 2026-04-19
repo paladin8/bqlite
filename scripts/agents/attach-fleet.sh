@@ -23,7 +23,7 @@ Count-based (-c) and targeted (--attach) flags cannot be combined in a
 single invocation.
 
 Difficulty is now per-task: each wrapper claims any dep-satisfied tagged
-task in the wave and picks the claude model (Sonnet for [EASY], Opus for
+task in the wave and picks the claude model (Sonnet for [EASY], Opus 4.7 for
 [HARD]) based on the task's own tag. There is no pool routing at the
 container level anymore.
 
