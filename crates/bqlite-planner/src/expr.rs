@@ -493,9 +493,16 @@ impl TypedExpr {
             )),
 
             Expr::In { lhs, rhs, negated } => {
+                // Multi-column `IN` only makes sense against a subquery / alias
+                // RHS (tuple cohort keys, cohorts-aliases-joins.md §4.1). Those
+                // forms are routed through `lower_where` at the pipeline-stage
+                // layer; if they reach `TypedExpr::from_ast`, someone nested an
+                // `IN QUERY` / `IN alias` inside a larger expression, which is
+                // not supported.
                 if lhs.len() != 1 {
                     return Err(unsupported(
-                        "multi-column IN predicates are deferred to Wave 4 (TASK-407 cohorts)",
+                        "multi-column IN is only supported against IN QUERY / IN alias \
+                         at the top level of a WHERE conjunct",
                         expr.span,
                     ));
                 }
@@ -527,11 +534,14 @@ impl TypedExpr {
                         })
                     }
                     InRhs::Query(_) => Err(unsupported(
-                        "IN QUERY (cohort subqueries) is deferred to Wave 4 (TASK-407)",
+                        "IN QUERY (cohort subqueries) must appear as a top-level \
+                         WHERE conjunct — nested use (inside OR, NOT, function calls, \
+                         CASE, etc.) is not supported",
                         expr.span,
                     )),
                     InRhs::Alias(_) => Err(unsupported(
-                        "IN <alias> is deferred to Wave 4 (TASK-407)",
+                        "IN <alias> must appear as a top-level WHERE conjunct — \
+                         nested use is not supported",
                         expr.span,
                     )),
                 }

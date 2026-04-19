@@ -40,7 +40,7 @@
 
 use std::collections::HashSet;
 
-use bqlite_ast::expr::{Expr, Literal, SortDir, Spanned};
+use bqlite_ast::expr::{Expr, InRhs, Literal, SortDir, Spanned};
 use bqlite_ast::pattern::{BracketSpec, MatchMode, MatchPattern, MatchWindow, StepEvent};
 use bqlite_ast::pipeline::{Pipeline, TimeRange};
 use bqlite_ast::{
@@ -1110,10 +1110,7 @@ fn fold_stage(
     source_table: &TableSchema,
 ) -> Result<LogicalPlan> {
     match stage {
-        PipelineStage::Where { predicate, .. } => {
-            let typed = TypedExpr::from_ast(&predicate, acc.output_schema(), registry)?;
-            LogicalPlan::filter(typed, acc)
-        }
+        PipelineStage::Where { predicate, .. } => lower_where(predicate, acc, registry, catalog),
 
         PipelineStage::Select {
             distinct, items, ..
@@ -1196,6 +1193,176 @@ fn stage_kind_name(stage: &PipelineStage) -> &'static str {
         PipelineStage::Sample(_) => "SAMPLE",
         PipelineStage::Attribute(_) => "ATTRIBUTE",
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WHERE lowering — handles plain predicates + cohort-subquery conjuncts
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower a `WHERE <predicate>` pipeline stage.
+///
+/// The top-level conjuncts of the predicate are walked (flattening nested
+/// `AND` chains); each conjunct is dispatched on shape:
+/// - `<lhs> IN QUERY (<subquery>)` / `(<lhs1>, ..., <lhsN>) IN QUERY (<subquery>)`:
+///   the conjunct is lifted into a [`LogicalPlan::SubqueryFilter`] wrapper
+///   above `acc`. The subquery is fully lowered via [`lower_query_pipeline`],
+///   and arity / positional type compatibility with the LHS tuple is enforced
+///   per `docs/design/language/cohorts-aliases-joins.md` §4.
+/// - `<lhs> IN <alias>`: deferred to CP4 — produces a `Plan` error in this
+///   checkpoint.
+/// - Anything else: stays in the residual predicate that becomes a standard
+///   [`LogicalPlan::Filter`] on top of all the lifted `SubqueryFilter`s.
+///
+/// `NOT IN (subquery)` is rejected in v1 — the semantics (NULL propagation
+/// rules per BQL §4.3) are non-obvious and the workload hasn't come up.
+fn lower_where(
+    predicate: Spanned<Expr>,
+    acc: LogicalPlan,
+    registry: &FunctionRegistry,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan> {
+    // Flatten top-level AND chain into a vec of conjuncts.
+    let mut conjuncts: Vec<Spanned<Expr>> = Vec::new();
+    flatten_and_conjuncts(predicate, &mut conjuncts);
+
+    // Partition into subquery-filter conjuncts (IN QUERY / IN alias) and
+    // residual predicate conjuncts. Alias conjuncts are rejected here in CP3
+    // and wired up in CP4.
+    let mut acc = acc;
+    let mut residual: Vec<Spanned<Expr>> = Vec::new();
+    for conjunct in conjuncts {
+        match &conjunct.node {
+            Expr::In {
+                lhs,
+                rhs: InRhs::Query(subq),
+                negated,
+            } => {
+                if *negated {
+                    return Err(BqliteError::Plan(
+                        "NOT IN (subquery) is not supported in v1 — BQL's three-valued logic \
+                         makes NULL-handling ambiguous (type-system.md §4.3); deferred to a later wave"
+                            .into(),
+                    ));
+                }
+                acc = apply_subquery_filter(lhs, subq, acc, registry, catalog)?;
+            }
+            Expr::In {
+                rhs: InRhs::Alias(_),
+                ..
+            } => {
+                return Err(BqliteError::Plan(
+                    "IN <alias> cohort references are deferred to TASK-425 CP4 (alias binding)"
+                        .into(),
+                ));
+            }
+            _ => residual.push(conjunct),
+        }
+    }
+
+    // If any conjuncts remain, re-combine them via AND (or the single
+    // conjunct verbatim) and wrap `acc` in a Filter.
+    if let Some(combined) = recombine_and_conjuncts(residual) {
+        let typed = TypedExpr::from_ast(&combined, acc.output_schema(), registry)?;
+        return LogicalPlan::filter(typed, acc);
+    }
+
+    Ok(acc)
+}
+
+/// Flatten a predicate expression that may be an `AND` chain into its
+/// top-level conjuncts. Preserves ordering. Drills through `Paren` wrappers
+/// so that `(a AND b) AND c` flattens to `[a, b, c]` like `a AND b AND c`.
+fn flatten_and_conjuncts(pred: Spanned<Expr>, out: &mut Vec<Spanned<Expr>>) {
+    match pred.node {
+        Expr::And(children) => {
+            for child in children {
+                flatten_and_conjuncts(child, out);
+            }
+        }
+        Expr::Paren(inner) => flatten_and_conjuncts(*inner, out),
+        other => out.push(Spanned::new(other, pred.span)),
+    }
+}
+
+/// Rebuild a single expression from a list of conjuncts. Returns `None` for
+/// an empty list (no residual predicate needed).
+fn recombine_and_conjuncts(mut conjuncts: Vec<Spanned<Expr>>) -> Option<Spanned<Expr>> {
+    match conjuncts.len() {
+        0 => None,
+        1 => Some(conjuncts.pop().unwrap()),
+        _ => {
+            // Re-package as Expr::And, preserving the first conjunct's span
+            // as the overall span (diagnostics anchor on the leading term).
+            let anchor_span = conjuncts[0].span;
+            Some(Spanned::new(Expr::And(conjuncts), anchor_span))
+        }
+    }
+}
+
+/// Apply a single `<lhs> IN QUERY (subq)` conjunct, producing a
+/// [`LogicalPlan::SubqueryFilter`] above `acc`.
+///
+/// Validates:
+/// - The subquery's non-system output columns number equals the LHS tuple
+///   arity (cohorts-aliases-joins.md §4.1).
+/// - Per-column positional types match exactly (no coercion in v1). The BQL
+///   `PartialEq` over `BqlType` is the comparison; differing types produce
+///   `BqliteError::Plan("IN QUERY column N type mismatch: LHS <a>, subquery <b>")`.
+/// - Each LHS expression type-checks against the outer schema.
+fn apply_subquery_filter(
+    lhs: &[Spanned<Expr>],
+    subquery: &Pipeline,
+    acc: LogicalPlan,
+    registry: &FunctionRegistry,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan> {
+    if lhs.is_empty() {
+        return Err(BqliteError::Plan(
+            "IN QUERY: LHS must have at least one expression".into(),
+        ));
+    }
+
+    // Lower the subquery. Clone because the outer caller owns the predicate.
+    let subq_plan = lower_query_pipeline(subquery.clone(), catalog)?;
+
+    // Collect the subquery's non-system output columns in declaration order.
+    // Cohorts project only user columns — system columns (__seq_id / __batch_id)
+    // are filtered out per cohorts-aliases-joins.md §4.1, which states the
+    // "subquery produces one row per cohort member" using declared columns.
+    let subq_cols: Vec<&ColumnDef> = subq_plan
+        .output_schema()
+        .columns()
+        .iter()
+        .filter(|c| !c.is_system())
+        .collect();
+
+    if subq_cols.len() != lhs.len() {
+        return Err(BqliteError::Plan(format!(
+            "IN QUERY arity mismatch: LHS has {} column(s), subquery produces {}",
+            lhs.len(),
+            subq_cols.len()
+        )));
+    }
+
+    let outer_schema = acc.output_schema().clone();
+    let mut typed_lhs: Vec<TypedExpr> = Vec::with_capacity(lhs.len());
+    for (i, (lhs_expr, subq_col)) in lhs.iter().zip(subq_cols.iter()).enumerate() {
+        let typed = TypedExpr::from_ast(lhs_expr, &outer_schema, registry)?;
+        if typed.result_type != subq_col.bql_type {
+            return Err(BqliteError::Plan(format!(
+                "IN QUERY column {} type mismatch: LHS `{}`, subquery `{}`",
+                i, typed.result_type, subq_col.bql_type
+            )));
+        }
+        typed_lhs.push(typed);
+    }
+
+    Ok(LogicalPlan::SubqueryFilter {
+        columns: typed_lhs,
+        subquery: Box::new(subq_plan),
+        input: Box::new(acc),
+        output_schema: outer_schema,
+    })
 }
 
 /// Lower a `SELECT` stage into a `Project` node.
@@ -6339,6 +6506,405 @@ mod tests {
         assert!(
             matches!(err, BqliteError::Plan(msg) if msg.contains("duplicate touchpoint event type"))
         );
+    }
+
+    // ── Wave 4 CP3: IN QUERY → SubqueryFilter lowering ────────────────────
+
+    fn in_query_single_col(outer_col: &str, inner_table: &str, inner_col: &str) -> Spanned<Expr> {
+        let inner_pipeline = Pipeline {
+            source: Source {
+                primary: TableRef {
+                    name: Name::synthetic(inner_table),
+                    span: Span::EMPTY,
+                },
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![PipelineStage::Select {
+                distinct: false,
+                items: vec![select_bare_column(inner_col)],
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        };
+        Spanned::new(
+            Expr::In {
+                lhs: vec![column_expr(outer_col)],
+                rhs: InRhs::Query(Box::new(inner_pipeline)),
+                negated: false,
+            },
+            Span::EMPTY,
+        )
+    }
+
+    fn orders_schema() -> TableSchema {
+        TableSchema::new(
+            "orders",
+            vec![
+                CoreColumnDef::required("user_id", BqlType::String),
+                CoreColumnDef::required("ts", BqlType::Timestamp),
+                CoreColumnDef::required("event", BqlType::String),
+            ],
+            "user_id",
+            "ts",
+            "event",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn where_in_query_single_column_lowers_to_subquery_filter() {
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: in_query_single_col("user_id", "orders", "user_id"),
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::SubqueryFilter {
+                columns,
+                subquery,
+                input,
+                output_schema,
+            } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].result_type, BqlType::String);
+                assert!(matches!(*input, LogicalPlan::Scan { .. }));
+                // Outer output schema is identity of the outer input.
+                assert_eq!(&output_schema, input.output_schema());
+                // Subquery lowered through lower_query_pipeline → Project(Scan).
+                assert!(matches!(*subquery, LogicalPlan::Project { .. }));
+            }
+            other => panic!("expected SubqueryFilter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn where_in_query_arity_mismatch_rejected() {
+        // Outer LHS has 1 element, subquery has 3 non-system output columns.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let inner_pipeline = Pipeline {
+            source: Source {
+                primary: TableRef {
+                    name: Name::synthetic("orders"),
+                    span: Span::EMPTY,
+                },
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            // SELECT * expands to 3 columns (user_id, ts, event).
+            stages: vec![PipelineStage::Select {
+                distinct: false,
+                items: vec![SelectItem {
+                    kind: SelectItemKind::Wildcard,
+                    alias: None,
+                    span: Span::EMPTY,
+                }],
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        };
+        let predicate = Spanned::new(
+            Expr::In {
+                lhs: vec![column_expr("user_id")],
+                rhs: InRhs::Query(Box::new(inner_pipeline)),
+                negated: false,
+            },
+            Span::EMPTY,
+        );
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate,
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("arity mismatch")));
+    }
+
+    #[test]
+    fn where_in_query_type_mismatch_rejected() {
+        // outer LHS is `amount` (Float), subquery selects `user_id` (String).
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: in_query_single_col("amount", "orders", "user_id"),
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("type mismatch")));
+    }
+
+    #[test]
+    fn where_negated_in_query_rejected() {
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let inner_pipeline = Pipeline {
+            source: Source {
+                primary: TableRef {
+                    name: Name::synthetic("orders"),
+                    span: Span::EMPTY,
+                },
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![PipelineStage::Select {
+                distinct: false,
+                items: vec![select_bare_column("user_id")],
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        };
+        let predicate = Spanned::new(
+            Expr::In {
+                lhs: vec![column_expr("user_id")],
+                rhs: InRhs::Query(Box::new(inner_pipeline)),
+                negated: true,
+            },
+            Span::EMPTY,
+        );
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate,
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("NOT IN")));
+    }
+
+    #[test]
+    fn where_in_alias_deferred_until_cp4() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let predicate = Spanned::new(
+            Expr::In {
+                lhs: vec![column_expr("user_id")],
+                rhs: InRhs::Alias(Name::synthetic("vip")),
+                negated: false,
+            },
+            Span::EMPTY,
+        );
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate,
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("alias")));
+    }
+
+    #[test]
+    fn where_in_query_combined_with_other_conjuncts() {
+        // `WHERE event = 'checkout' AND user_id IN QUERY (orders | SELECT user_id)
+        //        AND amount > 100` — the IN QUERY gets lifted into SubqueryFilter
+        // while the remaining conjuncts fold into a Filter on top.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let conj1 = Spanned::new(
+            Expr::Compare {
+                op: bqlite_ast::CompareOp::Equal,
+                left: Box::new(column_expr("event")),
+                right: Box::new(Spanned::new(
+                    Expr::Literal(Literal::String("checkout".into())),
+                    Span::EMPTY,
+                )),
+            },
+            Span::EMPTY,
+        );
+        let conj2 = in_query_single_col("user_id", "orders", "user_id");
+        let conj3 = Spanned::new(
+            Expr::Compare {
+                op: bqlite_ast::CompareOp::Greater,
+                left: Box::new(column_expr("amount")),
+                right: Box::new(Spanned::new(Expr::Literal(Literal::Int(100)), Span::EMPTY)),
+            },
+            Span::EMPTY,
+        );
+        let combined = Spanned::new(Expr::And(vec![conj1, conj2, conj3]), Span::EMPTY);
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: combined,
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        // Top: Filter (residual event = 'checkout' AND amount > 100).
+        // Under: SubqueryFilter. Under that: Scan.
+        let LogicalPlan::Filter {
+            predicate, input, ..
+        } = plan
+        else {
+            panic!("expected Filter on top");
+        };
+        assert_eq!(predicate.result_type, BqlType::Bool);
+        let LogicalPlan::SubqueryFilter {
+            input: inner_input, ..
+        } = *input
+        else {
+            panic!("expected SubqueryFilter under Filter");
+        };
+        assert!(matches!(*inner_input, LogicalPlan::Scan { .. }));
+    }
+
+    #[test]
+    fn where_only_in_query_produces_bare_subquery_filter() {
+        // When the entire WHERE is a single IN QUERY conjunct, no outer
+        // Filter should be emitted.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: in_query_single_col("user_id", "orders", "user_id"),
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        assert!(matches!(plan, LogicalPlan::SubqueryFilter { .. }));
+    }
+
+    #[test]
+    fn where_nested_in_query_inside_or_rejected() {
+        // `WHERE foo OR (user_id IN QUERY (...))` — the subquery conjunct is
+        // no longer at the top-level AND chain, so it reaches TypedExpr::from_ast
+        // and surfaces the "IN QUERY must appear as a top-level conjunct" error.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let foo = Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY);
+        let in_query = in_query_single_col("user_id", "orders", "user_id");
+        let predicate = Spanned::new(Expr::Or(vec![foo, in_query]), Span::EMPTY);
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate,
+                span: Span::EMPTY,
+            }],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("top-level WHERE conjunct")));
+    }
+
+    #[test]
+    fn where_in_query_tuple_two_columns() {
+        // `(user_id, event) IN QUERY (orders | SELECT user_id, event)` — tuple cohort.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let inner_pipeline = Pipeline {
+            source: Source {
+                primary: TableRef {
+                    name: Name::synthetic("orders"),
+                    span: Span::EMPTY,
+                },
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![PipelineStage::Select {
+                distinct: false,
+                items: vec![select_bare_column("user_id"), select_bare_column("event")],
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        };
+        let predicate = Spanned::new(
+            Expr::In {
+                lhs: vec![column_expr("user_id"), column_expr("event")],
+                rhs: InRhs::Query(Box::new(inner_pipeline)),
+                negated: false,
+            },
+            Span::EMPTY,
+        );
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate,
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::SubqueryFilter { columns, .. } => {
+                assert_eq!(columns.len(), 2);
+                assert_eq!(columns[0].result_type, BqlType::String);
+                assert_eq!(columns[1].result_type, BqlType::String);
+            }
+            other => panic!("expected SubqueryFilter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn where_flattens_nested_and_with_in_query() {
+        // `(a AND user_id IN QUERY (...)) AND (b AND c)` — flatten into four
+        // conjuncts: [a, IN_QUERY, b, c]. IN_QUERY lifts to SubqueryFilter;
+        // residual a AND b AND c folds into Filter.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let a = Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY);
+        let b = Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY);
+        let c = Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY);
+        let in_q = in_query_single_col("user_id", "orders", "user_id");
+        let left = Spanned::new(Expr::And(vec![a, in_q]), Span::EMPTY);
+        let right = Spanned::new(Expr::And(vec![b, c]), Span::EMPTY);
+        let predicate = Spanned::new(Expr::And(vec![left, right]), Span::EMPTY);
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate,
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        // Filter (residual a AND b AND c) over SubqueryFilter over Scan.
+        let LogicalPlan::Filter { input, .. } = plan else {
+            panic!("expected Filter on top");
+        };
+        assert!(matches!(*input, LogicalPlan::SubqueryFilter { .. }));
+    }
+
+    #[test]
+    fn where_paren_wrapper_drills_through() {
+        // `WHERE (user_id IN QUERY (...))` — the Paren wrapper should not
+        // block the flatten walker from noticing the IN QUERY conjunct.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(orders_schema());
+        let in_q = in_query_single_col("user_id", "orders", "user_id");
+        let wrapped = Spanned::new(Expr::Paren(Box::new(in_q)), Span::EMPTY);
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: wrapped,
+                span: Span::EMPTY,
+            }],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        // Bare SubqueryFilter (no residual Filter wrapping it).
+        assert!(matches!(plan, LogicalPlan::SubqueryFilter { .. }));
     }
 
     #[test]
