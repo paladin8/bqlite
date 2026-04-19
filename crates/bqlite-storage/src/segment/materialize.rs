@@ -238,11 +238,8 @@ fn materialize_dictionary(
         None => rows,
         Some(b) => super::reader::count_set_bits_pub(b, rows),
     };
-    let codes = crate::encoding::dictionary::unpack_codes(
-        &chunk.payload,
-        non_null_count,
-        code_bit_width,
-    )?;
+    let codes =
+        crate::encoding::dictionary::unpack_codes(&chunk.payload, non_null_count, code_bit_width)?;
     let dense: ArrayRef = match ty {
         BqlType::Int => {
             if !values.len().is_multiple_of(8) {

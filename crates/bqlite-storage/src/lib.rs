@@ -81,3 +81,8 @@ pub use segment::encoded::pin_column_chunk;
 pub use segment::materialize::{
     materialize_encoded_batch, materialize_encoded_column, materialize_encoded_column_selected,
 };
+
+// Zero-copy scan/filter (CP5): stitched multi-segment merge.
+pub use segment::merge::{
+    EncodedBatchSource, EncodedKWayMergeScan, KWayMergeScan, DEFAULT_STITCHED_BATCH_ROWS,
+};

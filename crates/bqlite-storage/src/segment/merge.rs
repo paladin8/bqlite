@@ -81,8 +81,13 @@ use ::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, Stri
 use ::arrow::compute::interleave;
 use ::arrow::datatypes::{DataType, Schema as ArrowSchema, TimeUnit};
 
+use bqlite_core::encoded::{
+    EncodedBatch, RowRef, RowRun, RowSelection, StitchedBatch, StitchedRows,
+};
 use bqlite_core::storage::SegmentScan;
-use bqlite_core::{BqliteError, Result};
+use bqlite_core::{BqlType, BqliteError, Result};
+
+use crate::segment::materialize::materialize_encoded_column;
 
 /// Default number of rows emitted per merged [`RecordBatch`].
 ///
@@ -593,6 +598,565 @@ impl KWayMergeScan {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Encoded-preserving k-way merge (CP5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Default number of rows emitted per merged [`StitchedBatch`].
+///
+/// Kept separate from [`DEFAULT_MERGE_BATCH_ROWS`] so the encoded-merge
+/// emit size can diverge from the materialized merge's without
+/// cross-path coupling.
+pub const DEFAULT_STITCHED_BATCH_ROWS: usize = 65_536;
+
+/// Pull-based iterator of pre-filtered encoded row groups.
+///
+/// The injection point between [`crate::segment::reader::SegmentFileScan`]
+/// plus per-source predicate kernels (owned by `bqlite-operators`)
+/// and [`EncodedKWayMergeScan`] (this module). Each call returns the
+/// next `(EncodedBatch, RowSelection)` pair; the selection narrows
+/// the batch to rows that survived the source-local pushable
+/// predicates. `Ok(None)` marks the source exhausted.
+///
+/// Implementations should skip fully-filtered batches internally so
+/// the merge doesn't churn reloads over empties, but the merge still
+/// tolerates an empty selection as a defensive belt-and-suspenders.
+pub trait EncodedBatchSource: Send {
+    fn next(&mut self) -> Result<Option<(EncodedBatch, RowSelection)>>;
+}
+
+/// Small walker that advances through a [`RowSelection`] without
+/// materializing the full index list up front.
+///
+/// The `Runs` variant is critical: RLE predicate kernels (CP4) emit
+/// `RowSelection::Runs` specifically to preserve run shape through
+/// filter. Flattening those runs into a `Vec<u32>` at cursor-load time
+/// would (a) force `O(total_rows)` memory and (b) discard the shape
+/// downstream consumers still rely on through CP6/CP7. The walker is
+/// ~30 lines and keeps both variants intact.
+#[derive(Debug)]
+enum SelectionCursor {
+    Indices {
+        indices: Vec<u32>,
+        pos: usize,
+    },
+    Runs {
+        runs: Vec<RowRun>,
+        run_idx: usize,
+        run_offset: u32,
+    },
+}
+
+impl SelectionCursor {
+    /// Invariant: `run_idx == runs.len()` (cursor done) OR
+    /// `run_offset < runs[run_idx].len` (pointing at a live row).
+    /// `from_selection` establishes it by skipping leading zero-length
+    /// runs; `advance()` preserves it.
+    fn from_selection(sel: RowSelection) -> Self {
+        match sel {
+            RowSelection::Indices(sv) => SelectionCursor::Indices {
+                indices: sv.into_vec(),
+                pos: 0,
+            },
+            RowSelection::Runs(runs) => {
+                let mut run_idx = 0;
+                while run_idx < runs.len() && runs[run_idx].len == 0 {
+                    run_idx += 1;
+                }
+                SelectionCursor::Runs {
+                    runs,
+                    run_idx,
+                    run_offset: 0,
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn current(&self) -> Option<u32> {
+        match self {
+            SelectionCursor::Indices { indices, pos } => {
+                if *pos < indices.len() {
+                    Some(indices[*pos])
+                } else {
+                    None
+                }
+            }
+            SelectionCursor::Runs {
+                runs,
+                run_idx,
+                run_offset,
+            } => {
+                if *run_idx < runs.len() {
+                    Some(runs[*run_idx].start + *run_offset)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        match self {
+            SelectionCursor::Indices { pos, .. } => *pos += 1,
+            SelectionCursor::Runs {
+                runs,
+                run_idx,
+                run_offset,
+            } => {
+                *run_offset += 1;
+                while *run_idx < runs.len() && *run_offset >= runs[*run_idx].len {
+                    *run_idx += 1;
+                    *run_offset = 0;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn is_done(&self) -> bool {
+        match self {
+            SelectionCursor::Indices { indices, pos } => *pos >= indices.len(),
+            SelectionCursor::Runs { runs, run_idx, .. } => *run_idx >= runs.len(),
+        }
+    }
+}
+
+/// Per-source loaded encoded row group plus selection walker and
+/// decoded sort-key arrays.
+///
+/// Decoding only `entity_id` + `ts` matches design-doc §8.5 ("only
+/// sort-key columns are materialized inside the merge"); every other
+/// column stays pinned in `batch`.
+struct LoadedEncodedBatch {
+    batch: EncodedBatch,
+    selection: SelectionCursor,
+    entity_arr: ArrayRef,
+    ts_arr: ArrayRef,
+}
+
+/// Per-source cursor state.
+struct EncodedCursor {
+    source: Box<dyn EncodedBatchSource>,
+    loaded: Option<LoadedEncodedBatch>,
+    exhausted: bool,
+}
+
+/// Heap entry for one source's current row under the encoded merge.
+///
+/// Mirrors [`HeapEntry`] exactly — pre-extracted `(entity_key,
+/// ts_nanos)` for zero-dispatch comparison, plus `scan_idx` / `row_idx`
+/// for deterministic tie-break. Tie-break order `entity_key → ts_nanos
+/// → scan_idx → row_idx` pins the lower-indexed source to win on
+/// equal `(entity_id, ts)` tuples.
+struct EncodedHeapEntry {
+    scan_idx: usize,
+    row_idx: u32,
+    entity_key: EntityKeyValue,
+    ts_nanos: i64,
+}
+
+impl Ord for EncodedHeapEntry {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.entity_key
+            .cmp(&other.entity_key)
+            .then_with(|| self.ts_nanos.cmp(&other.ts_nanos))
+            .then_with(|| self.scan_idx.cmp(&other.scan_idx))
+            .then_with(|| self.row_idx.cmp(&other.row_idx))
+    }
+}
+
+impl PartialOrd for EncodedHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for EncodedHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for EncodedHeapEntry {}
+
+/// Streaming k-way merge across a set of encoded row-group sources.
+///
+/// Emits [`StitchedBatch`]es whose `sources` hold Arc-cloned encoded
+/// columns (zero payload copies) and whose `rows` describe pick order
+/// via [`StitchedRows::Indices`]. Consumers call
+/// [`crate::materialize_encoded_column`] plus
+/// `bqlite_operators::materialize_stitched` to project the stitched
+/// batch to a dense Arrow `RecordBatch`.
+///
+/// # Sort key
+///
+/// `(entity_id, ts)` tuples across every source. Equal tuples break
+/// toward the lower-indexed source; callers wanting "newer segments
+/// shadow older ones" must hand sources in that order.
+///
+/// # CP5 scope
+///
+/// CP5 ships `Indices`-only emission. `SingleSource { selection:
+/// Some(...) }` and `Runs` compaction (preserving RLE selection shape
+/// through the merge boundary) are a scheduled follow-up — see CP5
+/// plan §4 Step 8 and the design doc's §7.3.
+pub struct EncodedKWayMergeScan {
+    schema: Arc<ArrowSchema>,
+    sources: Vec<EncodedCursor>,
+    entity_key_col: usize,
+    ts_col: usize,
+    /// BqlType of the entity-key column, derived at construction from
+    /// the Arrow schema and cached so per-reload decodes don't re-map.
+    entity_bql: BqlType,
+    /// BqlType of the ts column; always [`BqlType::Timestamp`] after
+    /// [`validate_key_types`] passes.
+    ts_bql: BqlType,
+    batch_target_rows: usize,
+    active_heap: BinaryHeap<Reverse<EncodedHeapEntry>>,
+    exhausted: bool,
+}
+
+impl std::fmt::Debug for EncodedKWayMergeScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedKWayMergeScan")
+            .field("sources", &self.sources.len())
+            .field("active_sources", &self.active_heap.len())
+            .field("entity_key_col", &self.entity_key_col)
+            .field("ts_col", &self.ts_col)
+            .field("batch_target_rows", &self.batch_target_rows)
+            .field("exhausted", &self.exhausted)
+            .finish()
+    }
+}
+
+impl EncodedKWayMergeScan {
+    /// Construct an encoded k-way merge across `sources`.
+    ///
+    /// `schema` is the shared Arrow schema every source's batches
+    /// conform to after predicate application. `entity_key_col` and
+    /// `ts_col` are ordinals in `schema` for the sort keys. The
+    /// constructor validates the key-column types mirror
+    /// [`KWayMergeScan::new`]'s rules; no IO happens until
+    /// [`Self::next_stitched_batch`] is called.
+    pub fn new(
+        sources: Vec<Box<dyn EncodedBatchSource>>,
+        schema: Arc<ArrowSchema>,
+        entity_key_col: usize,
+        ts_col: usize,
+    ) -> Result<Self> {
+        Self::with_batch_size(
+            sources,
+            schema,
+            entity_key_col,
+            ts_col,
+            DEFAULT_STITCHED_BATCH_ROWS,
+        )
+    }
+
+    /// Construct a merge with a custom emitted-batch row cap.
+    pub fn with_batch_size(
+        sources: Vec<Box<dyn EncodedBatchSource>>,
+        schema: Arc<ArrowSchema>,
+        entity_key_col: usize,
+        ts_col: usize,
+        batch_target_rows: usize,
+    ) -> Result<Self> {
+        if entity_key_col >= schema.fields().len() {
+            return Err(BqliteError::Execution(format!(
+                "encoded merge: entity_key_col {entity_key_col} out of range for schema with {} fields",
+                schema.fields().len()
+            )));
+        }
+        if ts_col >= schema.fields().len() {
+            return Err(BqliteError::Execution(format!(
+                "encoded merge: ts_col {ts_col} out of range for schema with {} fields",
+                schema.fields().len()
+            )));
+        }
+        validate_key_types(schema.as_ref(), entity_key_col, ts_col)?;
+        if batch_target_rows == 0 {
+            return Err(BqliteError::Execution(
+                "encoded merge: batch_target_rows must be positive".into(),
+            ));
+        }
+
+        let entity_bql = bql_type_for_sort_key(schema.field(entity_key_col).data_type());
+        let ts_bql = bql_type_for_sort_key(schema.field(ts_col).data_type());
+
+        let cursors = sources
+            .into_iter()
+            .map(|source| EncodedCursor {
+                source,
+                loaded: None,
+                exhausted: false,
+            })
+            .collect();
+
+        Ok(Self {
+            schema,
+            sources: cursors,
+            entity_key_col,
+            ts_col,
+            entity_bql,
+            ts_bql,
+            batch_target_rows,
+            active_heap: BinaryHeap::new(),
+            exhausted: false,
+        })
+    }
+
+    /// Number of input sources.
+    pub fn input_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Shared Arrow schema of the stitched output (per-source batches
+    /// must decode to this schema).
+    pub fn schema(&self) -> &Arc<ArrowSchema> {
+        &self.schema
+    }
+
+    /// Yield the next merged [`StitchedBatch`], or `Ok(None)` when
+    /// every source has been drained.
+    ///
+    /// The emitted batch holds rows in strict `(entity_id, ts)` order
+    /// across every source; equal keys break toward the lower-indexed
+    /// source. CP5 always emits [`StitchedRows::Indices`] — see the
+    /// type-level docs for the deferred `SingleSource` / `Runs`
+    /// compaction follow-up.
+    pub fn next_stitched_batch(&mut self) -> Result<Option<StitchedBatch>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        self.reload_needed_sources()?;
+
+        if self.active_heap.is_empty() && self.all_sources_done() {
+            self.exhausted = true;
+            return Ok(None);
+        }
+
+        let mut picks: Vec<RowRef> = Vec::with_capacity(self.batch_target_rows);
+        while picks.len() < self.batch_target_rows {
+            let Some(Reverse(entry)) = self.active_heap.pop() else {
+                break;
+            };
+
+            let source_u16 = u16::try_from(entry.scan_idx).map_err(|_| {
+                BqliteError::Execution(format!(
+                    "encoded merge: source index {} exceeds u16::MAX; \
+                     StitchedBatch::RowRef cannot represent it",
+                    entry.scan_idx
+                ))
+            })?;
+            picks.push(RowRef {
+                source: source_u16,
+                row: entry.row_idx,
+            });
+
+            // Advance the walker and re-push the heap entry if more
+            // selected rows remain in this source's current batch.
+            let cursor = &mut self.sources[entry.scan_idx];
+            if let Some(loaded) = cursor.loaded.as_mut() {
+                loaded.selection.advance();
+                if !loaded.selection.is_done() {
+                    let next_entry = Self::heap_entry_for_loaded(entry.scan_idx, loaded);
+                    self.active_heap.push(Reverse(next_entry));
+                }
+            }
+        }
+
+        if picks.is_empty() {
+            // Nothing picked — every source's current batch drained to
+            // its end during pick without any new row available, and
+            // the heap is empty. Reload will try again on the next
+            // call; mark exhausted iff every source is done.
+            if self.all_sources_done() {
+                self.exhausted = true;
+            }
+            return Ok(None);
+        }
+
+        // Drop any loaded batch whose selection is done so the next
+        // call reloads it fresh. Collect currently-pinned sources for
+        // inclusion in the stitched output first — every source index
+        // referenced in `picks` must still appear in `sources`.
+        let stitched_sources: Vec<EncodedBatch> = self
+            .sources
+            .iter()
+            .map(|cursor| {
+                cursor
+                    .loaded
+                    .as_ref()
+                    .map(|l| l.batch.clone())
+                    .unwrap_or_else(|| EncodedBatch::new(0, Vec::new()))
+            })
+            .collect();
+
+        // Clear fully-drained cursors for the next reload cycle. Must
+        // happen after `stitched_sources` is built above (we just
+        // cloned the Arc-backed EncodedBatch; clearing the cursor does
+        // not invalidate the clones).
+        for cursor in self.sources.iter_mut() {
+            let drained = cursor
+                .loaded
+                .as_ref()
+                .map(|l| l.selection.is_done())
+                .unwrap_or(false);
+            if drained {
+                cursor.loaded = None;
+            }
+        }
+
+        Ok(Some(StitchedBatch {
+            sources: stitched_sources,
+            rows: StitchedRows::Indices(picks),
+        }))
+    }
+
+    /// Ensure every non-exhausted source has a live `LoadedEncodedBatch`.
+    ///
+    /// Loops past empty selections (skip fully-filtered batches).
+    /// Sources that return `Ok(None)` are marked exhausted. Newly
+    /// loaded cursors push their first row into the active heap.
+    fn reload_needed_sources(&mut self) -> Result<()> {
+        let mut ready_indices: Vec<usize> = Vec::new();
+        for i in 0..self.sources.len() {
+            if self.sources[i].loaded.is_some() || self.sources[i].exhausted {
+                continue;
+            }
+            loop {
+                match self.sources[i].source.next()? {
+                    Some((batch, selection)) => {
+                        if selection.is_empty() {
+                            // Fully-filtered batch — skip it and try
+                            // the next one. Keeps the merge free of
+                            // heap entries that would immediately
+                            // advance-to-done.
+                            continue;
+                        }
+                        let loaded = self.load_batch(batch, selection)?;
+                        self.sources[i].loaded = Some(loaded);
+                        ready_indices.push(i);
+                        break;
+                    }
+                    None => {
+                        self.sources[i].exhausted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for i in ready_indices {
+            let loaded = self.sources[i]
+                .loaded
+                .as_ref()
+                .expect("just-loaded cursor has Some(loaded)");
+            let entry = Self::heap_entry_for_loaded(i, loaded);
+            self.active_heap.push(Reverse(entry));
+        }
+        Ok(())
+    }
+
+    /// Decode only the sort-key columns of `batch` into dense Arrow
+    /// arrays and bundle them with a walker over `selection`.
+    fn load_batch(
+        &self,
+        batch: EncodedBatch,
+        selection: RowSelection,
+    ) -> Result<LoadedEncodedBatch> {
+        if batch.columns.len() != self.schema.fields().len() {
+            return Err(BqliteError::Execution(format!(
+                "encoded merge: source batch has {} columns but merge schema has {}",
+                batch.columns.len(),
+                self.schema.fields().len()
+            )));
+        }
+        let entity_arr =
+            materialize_encoded_column(&batch.columns[self.entity_key_col], &self.entity_bql)?;
+        let ts_arr = materialize_encoded_column(&batch.columns[self.ts_col], &self.ts_bql)?;
+        // Defend against sources that hand back decoded arrays whose
+        // DataType disagrees with the merge schema — otherwise
+        // `EntityKeyValue::extract` / `extract_ts_nanos` would panic on
+        // the downcast. The trait is public, so a future adapter could
+        // violate the implicit contract if it isn't checked here.
+        let expected_ek = self.schema.field(self.entity_key_col).data_type();
+        if entity_arr.data_type() != expected_ek {
+            return Err(BqliteError::Execution(format!(
+                "encoded merge: entity_key column decoded as {:?}, expected {:?}",
+                entity_arr.data_type(),
+                expected_ek
+            )));
+        }
+        let expected_ts = self.schema.field(self.ts_col).data_type();
+        let expected_rows = batch.row_count as usize;
+        if entity_arr.len() != expected_rows
+            || ts_arr.len() != expected_rows
+            || !matches!(
+                ts_arr.data_type(),
+                DataType::Timestamp(TimeUnit::Nanosecond, _)
+            )
+            || ts_arr.data_type() != expected_ts
+        {
+            return Err(BqliteError::Execution(format!(
+                "encoded merge: sort-key arrays invalid (entity_len={}, ts_len={}, \
+                 ts_type={:?}, expected ts_type={:?}, row_count={})",
+                entity_arr.len(),
+                ts_arr.len(),
+                ts_arr.data_type(),
+                expected_ts,
+                batch.row_count,
+            )));
+        }
+        Ok(LoadedEncodedBatch {
+            batch,
+            selection: SelectionCursor::from_selection(selection),
+            entity_arr,
+            ts_arr,
+        })
+    }
+
+    /// Build a heap entry pointing at the cursor's current row.
+    fn heap_entry_for_loaded(scan_idx: usize, loaded: &LoadedEncodedBatch) -> EncodedHeapEntry {
+        let row = loaded
+            .selection
+            .current()
+            .expect("heap_entry_for_loaded called with a done cursor");
+        let entity_key = EntityKeyValue::extract(&loaded.entity_arr, row as usize);
+        let ts_nanos = extract_ts_nanos(&loaded.ts_arr, row as usize);
+        EncodedHeapEntry {
+            scan_idx,
+            row_idx: row,
+            entity_key,
+            ts_nanos,
+        }
+    }
+
+    /// True once every source has been drained and has no loaded batch.
+    fn all_sources_done(&self) -> bool {
+        self.sources
+            .iter()
+            .all(|c| c.exhausted && c.loaded.is_none())
+    }
+}
+
+/// Map an Arrow `DataType` that `validate_key_types` has already
+/// accepted into its [`BqlType`]. Unreachable branches for types the
+/// validator would have rejected.
+fn bql_type_for_sort_key(data_type: &DataType) -> BqlType {
+    match data_type {
+        DataType::Utf8 | DataType::Utf8View => BqlType::String,
+        DataType::Int64 => BqlType::Int,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => BqlType::Timestamp,
+        other => unreachable!(
+            "bql_type_for_sort_key: {other:?} should have been rejected by validate_key_types"
+        ),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Key comparison helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -634,6 +1198,7 @@ mod tests {
     use super::*;
     use ::arrow::array::{Int64Array, StringViewArray, TimestampNanosecondArray};
     use ::arrow::datatypes::{Field, Schema as ArrowSchema, TimeUnit};
+    use bqlite_core::encoded::SelectionVector;
     use bqlite_core::storage::ZoneMap;
     use std::collections::HashMap;
 
@@ -1135,5 +1700,515 @@ mod tests {
         .unwrap();
         assert_eq!(merge.input_count(), 3);
         assert!(Arc::ptr_eq(merge.schema(), &schema));
+    }
+
+    // ── EncodedKWayMergeScan (CP5 Step 1) ─────────────────────────────
+
+    /// Mock `EncodedBatchSource` that returns a pre-built queue of
+    /// `(EncodedBatch, RowSelection)` pairs.
+    struct MockEncodedSource {
+        pairs: std::collections::VecDeque<(EncodedBatch, RowSelection)>,
+    }
+
+    impl MockEncodedSource {
+        fn new(pairs: Vec<(EncodedBatch, RowSelection)>) -> Self {
+            Self {
+                pairs: pairs.into(),
+            }
+        }
+    }
+
+    impl EncodedBatchSource for MockEncodedSource {
+        fn next(&mut self) -> Result<Option<(EncodedBatch, RowSelection)>> {
+            Ok(self.pairs.pop_front())
+        }
+    }
+
+    #[test]
+    fn encoded_new_rejects_out_of_range_entity_key_col() {
+        let schema = events_schema();
+        let err = EncodedKWayMergeScan::new(vec![], schema, 99, 1).unwrap_err();
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("entity_key_col"), "got: {msg}")
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encoded_new_rejects_out_of_range_ts_col() {
+        let schema = events_schema();
+        let err = EncodedKWayMergeScan::new(vec![], schema, 0, 99).unwrap_err();
+        match err {
+            BqliteError::Execution(msg) => assert!(msg.contains("ts_col"), "got: {msg}"),
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encoded_new_validates_sort_key_types() {
+        // event_type (col 2) is Utf8View — legal as entity_key but not as ts.
+        let schema = events_schema();
+        let err = EncodedKWayMergeScan::new(vec![], schema, 0, 2).unwrap_err();
+        match err {
+            BqliteError::Execution(msg) => assert!(msg.contains("ts column"), "got: {msg}"),
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encoded_new_rejects_zero_batch_size() {
+        let schema = events_schema();
+        let err = EncodedKWayMergeScan::with_batch_size(vec![], schema, 0, 1, 0).unwrap_err();
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("batch_target_rows"), "got: {msg}")
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encoded_new_accepts_empty_source_vec() {
+        let schema = events_schema();
+        let merge = EncodedKWayMergeScan::new(vec![], schema.clone(), 0, 1).unwrap();
+        assert_eq!(merge.input_count(), 0);
+        assert!(Arc::ptr_eq(merge.schema(), &schema));
+    }
+
+    #[test]
+    fn encoded_new_accepts_int64_entity_key() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("entity_id", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let merge = EncodedKWayMergeScan::new(vec![], schema, 0, 1).unwrap();
+        assert_eq!(merge.input_count(), 0);
+    }
+
+    #[test]
+    fn encoded_empty_source_returns_none() {
+        // Source returns Ok(None) immediately — merge should mark it
+        // exhausted and return None. Repeated calls stay None.
+        let schema = events_schema();
+        let mut merge =
+            EncodedKWayMergeScan::new(vec![Box::new(MockEncodedSource::new(vec![]))], schema, 0, 1)
+                .unwrap();
+        assert!(merge.next_stitched_batch().unwrap().is_none());
+        assert!(merge.next_stitched_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn selection_cursor_indices_walk() {
+        let mut c = SelectionCursor::from_selection(RowSelection::Indices(
+            SelectionVector::from_sorted(vec![2, 5, 8]),
+        ));
+        assert_eq!(c.current(), Some(2));
+        c.advance();
+        assert_eq!(c.current(), Some(5));
+        c.advance();
+        assert_eq!(c.current(), Some(8));
+        c.advance();
+        assert!(c.is_done());
+        assert_eq!(c.current(), None);
+    }
+
+    #[test]
+    fn selection_cursor_runs_walk_preserves_shape() {
+        // Two runs: [10,11,12] then [20,21]. Walking should emit them
+        // in order without flattening to a Vec<u32>.
+        let mut c = SelectionCursor::from_selection(RowSelection::from_runs(vec![
+            RowRun { start: 10, len: 3 },
+            RowRun { start: 20, len: 2 },
+        ]));
+        let mut got = Vec::new();
+        while let Some(row) = c.current() {
+            got.push(row);
+            c.advance();
+        }
+        assert_eq!(got, vec![10, 11, 12, 20, 21]);
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn selection_cursor_empty_runs_is_done() {
+        let mut c = SelectionCursor::from_selection(RowSelection::from_runs(vec![]));
+        assert!(c.is_done());
+        assert_eq!(c.current(), None);
+        // Advance on empty is a no-op.
+        c.advance();
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn selection_cursor_empty_indices_is_done() {
+        let c = SelectionCursor::from_selection(RowSelection::empty());
+        assert!(c.is_done());
+        assert_eq!(c.current(), None);
+    }
+
+    #[test]
+    fn selection_cursor_runs_skips_leading_zero_length() {
+        // Leading zero-length runs must not prevent current()/is_done()
+        // from reporting the first live row. Walker invariant: after
+        // from_selection, run_idx points at a run with len > 0 (or
+        // runs.len() if none exist).
+        let mut c = SelectionCursor::from_selection(RowSelection::from_runs(vec![
+            RowRun { start: 5, len: 0 },
+            RowRun { start: 7, len: 0 },
+            RowRun { start: 10, len: 2 },
+        ]));
+        assert!(!c.is_done());
+        assert_eq!(c.current(), Some(10));
+        c.advance();
+        assert_eq!(c.current(), Some(11));
+        c.advance();
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn selection_cursor_runs_all_zero_length_is_done() {
+        let c = SelectionCursor::from_selection(RowSelection::from_runs(vec![
+            RowRun { start: 3, len: 0 },
+            RowRun { start: 5, len: 0 },
+        ]));
+        assert!(c.is_done());
+        assert_eq!(c.current(), None);
+    }
+
+    // ── Encoded driver (CP5 Step 2+) ──────────────────────────────────
+
+    use bqlite_core::encoded::EncodedColumn;
+
+    /// Build an `EncodedBatch` whose columns are all `Materialized`
+    /// fallbacks — Arrow arrays carried directly. Mirrors the
+    /// `events_schema` column layout (entity_id, ts, event_type).
+    /// Keeps tests focused on merge semantics rather than encoded-byte
+    /// layout (the latter is covered by the encoding tests).
+    fn build_encoded_batch(
+        entity_ids: &[&str],
+        timestamps: &[i64],
+        event_types: &[&str],
+    ) -> EncodedBatch {
+        let rows = entity_ids.len() as u32;
+        let entity: StringViewArray = entity_ids.iter().copied().map(Some).collect();
+        let ts =
+            TimestampNanosecondArray::from(timestamps.iter().map(|v| Some(*v)).collect::<Vec<_>>())
+                .with_timezone("UTC");
+        let event: StringViewArray = event_types.iter().copied().map(Some).collect();
+        EncodedBatch::new(
+            rows,
+            vec![
+                EncodedColumn::Materialized {
+                    array: Arc::new(entity),
+                    rows,
+                },
+                EncodedColumn::Materialized {
+                    array: Arc::new(ts),
+                    rows,
+                },
+                EncodedColumn::Materialized {
+                    array: Arc::new(event),
+                    rows,
+                },
+            ],
+        )
+    }
+
+    /// Drain the merge and collect `(source_idx, entity_id, ts)`
+    /// triples by consulting each stitched batch's `sources` and
+    /// `rows`.
+    fn drain_encoded(merge: &mut EncodedKWayMergeScan) -> Vec<(u16, String, i64)> {
+        let mut out = Vec::new();
+        while let Some(stitched) = merge.next_stitched_batch().unwrap() {
+            let indices = match &stitched.rows {
+                StitchedRows::Indices(idx) => idx.clone(),
+                other => panic!("CP5 expects Indices; got {other:?}"),
+            };
+            for rr in indices {
+                let src = &stitched.sources[rr.source as usize];
+                let entity_col = match &src.columns[0] {
+                    EncodedColumn::Materialized { array, .. } => {
+                        array.as_any().downcast_ref::<StringViewArray>().unwrap()
+                    }
+                    EncodedColumn::Encoded { .. } => {
+                        panic!("test fixture used Materialized columns only")
+                    }
+                };
+                let ts_col = match &src.columns[1] {
+                    EncodedColumn::Materialized { array, .. } => array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap(),
+                    EncodedColumn::Encoded { .. } => {
+                        panic!("test fixture used Materialized columns only")
+                    }
+                };
+                out.push((
+                    rr.source,
+                    entity_col.value(rr.row as usize).to_string(),
+                    ts_col.value(rr.row as usize),
+                ));
+            }
+        }
+        out
+    }
+
+    fn all_rows_selection(rows: u32) -> RowSelection {
+        RowSelection::from_indices(SelectionVector::all_rows(rows))
+    }
+
+    #[test]
+    fn encoded_merge_single_source_emits_indices() {
+        let schema = events_schema();
+        let batch = build_encoded_batch(&["u1", "u2", "u3"], &[1, 2, 3], &["a", "b", "c"]);
+        let source = MockEncodedSource::new(vec![(batch, all_rows_selection(3))]);
+        let mut merge = EncodedKWayMergeScan::new(vec![Box::new(source)], schema, 0, 1).unwrap();
+
+        let rows = drain_encoded(&mut merge);
+        assert_eq!(
+            rows,
+            vec![
+                (0u16, "u1".to_string(), 1),
+                (0, "u2".to_string(), 2),
+                (0, "u3".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn encoded_merge_two_sources_interleaved() {
+        let schema = events_schema();
+        let b0 = build_encoded_batch(&["u1", "u3"], &[1, 3], &["a", "a"]);
+        let b1 = build_encoded_batch(&["u2", "u2", "u4"], &[2, 5, 10], &["b", "b", "b"]);
+        let s0 = MockEncodedSource::new(vec![(b0, all_rows_selection(2))]);
+        let s1 = MockEncodedSource::new(vec![(b1, all_rows_selection(3))]);
+        let mut merge =
+            EncodedKWayMergeScan::new(vec![Box::new(s0), Box::new(s1)], schema, 0, 1).unwrap();
+
+        let rows = drain_encoded(&mut merge);
+        let entities: Vec<&str> = rows.iter().map(|(_, e, _)| e.as_str()).collect();
+        assert_eq!(entities, vec!["u1", "u2", "u2", "u3", "u4"]);
+    }
+
+    #[test]
+    fn encoded_merge_equal_keys_tie_break_to_lower_indexed_source() {
+        let schema = events_schema();
+        // Both sources share `(u1, 10)`. Lower-indexed source (idx 0)
+        // must appear first; the `event_type` distinguishes them.
+        let b0 = build_encoded_batch(&["u1"], &[10], &["a"]);
+        let b1 = build_encoded_batch(&["u1"], &[10], &["b"]);
+        let s0 = MockEncodedSource::new(vec![(b0, all_rows_selection(1))]);
+        let s1 = MockEncodedSource::new(vec![(b1, all_rows_selection(1))]);
+        let mut merge =
+            EncodedKWayMergeScan::new(vec![Box::new(s0), Box::new(s1)], schema, 0, 1).unwrap();
+
+        let rows = drain_encoded(&mut merge);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 0, "lower-indexed source must win tie-break");
+        assert_eq!(rows[1].0, 1);
+    }
+
+    #[test]
+    fn encoded_merge_skips_fully_filtered_source_batches() {
+        let schema = events_schema();
+        // Source 0 emits a non-empty batch whose selection is empty
+        // (fully filtered), then a real batch.
+        let b0_empty = build_encoded_batch(&["u1"], &[1], &["a"]);
+        let b0_real = build_encoded_batch(&["u5"], &[5], &["a"]);
+        let s0 = MockEncodedSource::new(vec![
+            (b0_empty, RowSelection::empty()),
+            (b0_real, all_rows_selection(1)),
+        ]);
+        let b1 = build_encoded_batch(&["u2", "u3"], &[2, 3], &["b", "b"]);
+        let s1 = MockEncodedSource::new(vec![(b1, all_rows_selection(2))]);
+        let mut merge =
+            EncodedKWayMergeScan::new(vec![Box::new(s0), Box::new(s1)], schema, 0, 1).unwrap();
+
+        let rows = drain_encoded(&mut merge);
+        let entities: Vec<&str> = rows.iter().map(|(_, e, _)| e.as_str()).collect();
+        assert_eq!(entities, vec!["u2", "u3", "u5"]);
+    }
+
+    #[test]
+    fn encoded_merge_empty_source_drains_others() {
+        let schema = events_schema();
+        // Source 0 is empty; source 1 has all the rows.
+        let s0 = MockEncodedSource::new(vec![]);
+        let b1 = build_encoded_batch(&["u1", "u2"], &[1, 2], &["a", "b"]);
+        let s1 = MockEncodedSource::new(vec![(b1, all_rows_selection(2))]);
+        let mut merge =
+            EncodedKWayMergeScan::new(vec![Box::new(s0), Box::new(s1)], schema, 0, 1).unwrap();
+
+        let rows = drain_encoded(&mut merge);
+        let entities: Vec<&str> = rows.iter().map(|(_, e, _)| e.as_str()).collect();
+        assert_eq!(entities, vec!["u1", "u2"]);
+        // Every surviving pick came from source 1.
+        assert!(rows.iter().all(|(src, _, _)| *src == 1));
+    }
+
+    #[test]
+    fn encoded_merge_reloads_across_row_group_boundaries() {
+        let schema = events_schema();
+        // Source 0 emits two back-to-back batches; merge must reload
+        // between them without reordering.
+        let b0a = build_encoded_batch(&["u1"], &[1], &["a"]);
+        let b0b = build_encoded_batch(&["u3"], &[3], &["a"]);
+        let s0 = MockEncodedSource::new(vec![
+            (b0a, all_rows_selection(1)),
+            (b0b, all_rows_selection(1)),
+        ]);
+        let b1 = build_encoded_batch(&["u2"], &[2], &["b"]);
+        let s1 = MockEncodedSource::new(vec![(b1, all_rows_selection(1))]);
+        let mut merge =
+            EncodedKWayMergeScan::new(vec![Box::new(s0), Box::new(s1)], schema, 0, 1).unwrap();
+
+        let rows = drain_encoded(&mut merge);
+        let entities: Vec<&str> = rows.iter().map(|(_, e, _)| e.as_str()).collect();
+        assert_eq!(entities, vec!["u1", "u2", "u3"]);
+    }
+
+    #[test]
+    fn encoded_merge_small_batch_size_emits_multiple_stitched_batches() {
+        let schema = events_schema();
+        let b = build_encoded_batch(
+            &["u1", "u2", "u3", "u4", "u5"],
+            &[1, 2, 3, 4, 5],
+            &["a", "a", "a", "a", "a"],
+        );
+        let s = MockEncodedSource::new(vec![(b, all_rows_selection(5))]);
+        let mut merge =
+            EncodedKWayMergeScan::with_batch_size(vec![Box::new(s)], schema, 0, 1, 2).unwrap();
+
+        let mut emits = 0;
+        let mut total_rows = 0;
+        while let Some(stitched) = merge.next_stitched_batch().unwrap() {
+            emits += 1;
+            match &stitched.rows {
+                StitchedRows::Indices(idx) => total_rows += idx.len(),
+                other => panic!("CP5 expects Indices; got {other:?}"),
+            }
+        }
+        assert_eq!(emits, 3, "5 rows / cap 2 → 3 emits");
+        assert_eq!(total_rows, 5);
+    }
+
+    #[test]
+    fn encoded_merge_preserves_runs_shape_on_rle_selection() {
+        // Source emits a batch whose RowSelection::Runs has a 4-row
+        // run. The walker must advance through the run without
+        // flattening; drained rows must be the run's indices in order.
+        let schema = events_schema();
+        let b = build_encoded_batch(
+            &["u0", "u1", "u2", "u3", "u4", "u5"],
+            &[0, 1, 2, 3, 4, 5],
+            &["a", "a", "a", "a", "a", "a"],
+        );
+        // Select rows 2..=5 via a single 4-row run (indices 2,3,4,5).
+        let sel = RowSelection::from_runs(vec![RowRun { start: 2, len: 4 }]);
+        let s = MockEncodedSource::new(vec![(b, sel)]);
+        let mut merge = EncodedKWayMergeScan::new(vec![Box::new(s)], schema, 0, 1).unwrap();
+
+        let rows = drain_encoded(&mut merge);
+        let entities: Vec<&str> = rows.iter().map(|(_, e, _)| e.as_str()).collect();
+        assert_eq!(entities, vec!["u2", "u3", "u4", "u5"]);
+    }
+
+    #[test]
+    fn encoded_merge_rejects_batch_with_wrong_column_count() {
+        // 3-col schema; source yields a 2-col batch — must error.
+        let schema = events_schema();
+        let ent = StringViewArray::from(vec!["u1"]);
+        let ts = TimestampNanosecondArray::from(vec![1i64]).with_timezone("UTC");
+        let bad = EncodedBatch::new(
+            1,
+            vec![
+                EncodedColumn::Materialized {
+                    array: Arc::new(ent),
+                    rows: 1,
+                },
+                EncodedColumn::Materialized {
+                    array: Arc::new(ts),
+                    rows: 1,
+                },
+            ],
+        );
+        let s = MockEncodedSource::new(vec![(bad, all_rows_selection(1))]);
+        let mut merge = EncodedKWayMergeScan::new(vec![Box::new(s)], schema, 0, 1).unwrap();
+        let err = merge.next_stitched_batch().unwrap_err();
+        match err {
+            BqliteError::Execution(msg) => assert!(msg.contains("columns"), "got: {msg}"),
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encoded_merge_int64_entity_key() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("entity_id", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        // Build a two-column EncodedBatch (no event_type) so the schema
+        // matches.
+        let ent = Int64Array::from(vec![1i64, 3]);
+        let ts = TimestampNanosecondArray::from(vec![10i64, 30]).with_timezone("UTC");
+        let b0 = EncodedBatch::new(
+            2,
+            vec![
+                EncodedColumn::Materialized {
+                    array: Arc::new(ent),
+                    rows: 2,
+                },
+                EncodedColumn::Materialized {
+                    array: Arc::new(ts),
+                    rows: 2,
+                },
+            ],
+        );
+        let ent1 = Int64Array::from(vec![2i64]);
+        let ts1 = TimestampNanosecondArray::from(vec![20i64]).with_timezone("UTC");
+        let b1 = EncodedBatch::new(
+            1,
+            vec![
+                EncodedColumn::Materialized {
+                    array: Arc::new(ent1),
+                    rows: 1,
+                },
+                EncodedColumn::Materialized {
+                    array: Arc::new(ts1),
+                    rows: 1,
+                },
+            ],
+        );
+        let s0 = MockEncodedSource::new(vec![(b0, all_rows_selection(2))]);
+        let s1 = MockEncodedSource::new(vec![(b1, all_rows_selection(1))]);
+        let mut merge =
+            EncodedKWayMergeScan::new(vec![Box::new(s0), Box::new(s1)], schema, 0, 1).unwrap();
+
+        let mut got: Vec<i64> = Vec::new();
+        while let Some(stitched) = merge.next_stitched_batch().unwrap() {
+            if let StitchedRows::Indices(idx) = &stitched.rows {
+                for rr in idx {
+                    let src = &stitched.sources[rr.source as usize];
+                    let col = match &src.columns[0] {
+                        EncodedColumn::Materialized { array, .. } => {
+                            array.as_any().downcast_ref::<Int64Array>().unwrap()
+                        }
+                        _ => unreachable!(),
+                    };
+                    got.push(col.value(rr.row as usize));
+                }
+            }
+        }
+        assert_eq!(got, vec![1i64, 2, 3]);
     }
 }

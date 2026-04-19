@@ -295,10 +295,7 @@ fn translate_runs_through_bitmap(
 /// satisfies `matches`. Each output run is `[prev_end, run_end)`.
 /// Adjacent matching runs are merged so the output keeps
 /// [`RowSelection::from_runs`]'s non-overlapping invariant tight.
-fn select_runs_matching_i64(
-    runs: &[(u32, i64)],
-    matches: &impl Fn(i64) -> bool,
-) -> Vec<RowRun> {
+fn select_runs_matching_i64(runs: &[(u32, i64)], matches: &impl Fn(i64) -> bool) -> Vec<RowRun> {
     let mut out: Vec<RowRun> = Vec::new();
     let mut prev_end: u32 = 0;
     for &(end, val) in runs {
@@ -591,11 +588,7 @@ fn popcount_bitmap(bitmap: &[u8], bit_count: usize) -> usize {
 
 /// Drop rows whose validity bit is unset. Used by the "dictionary has
 /// a matching code for every row" fast path.
-fn narrow_by_nulls(
-    nulls: Option<&[u8]>,
-    rows: u32,
-    input: &RowSelection,
-) -> RowSelection {
+fn narrow_by_nulls(nulls: Option<&[u8]>, rows: u32, input: &RowSelection) -> RowSelection {
     let Some(bitmap) = nulls else {
         return input.clone();
     };
@@ -1242,13 +1235,7 @@ mod tests {
         // Dict [10, 20, 30]. Rows values [10, 20, 30, 20, 10] →
         // codes [0, 1, 2, 1, 0] at 2-bit width. Filter == 20 → code 1
         // → rows {1, 3}.
-        let col = dict_column(
-            &[0, 1, 2, 1, 0],
-            2,
-            int_dict_bytes(&[10, 20, 30]),
-            5,
-            None,
-        );
+        let col = dict_column(&[0, 1, 2, 1, 0], 2, int_dict_bytes(&[10, 20, 30]), 5, None);
         let kernel = DictionaryEqKernel::new(vec![ScalarValue::Int(20)], BqlType::Int);
         let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 5 }]);
         let out = kernel.apply(&col.view(), &input);
@@ -1259,13 +1246,7 @@ mod tests {
     fn dictionary_eq_int_literal_not_in_dict_returns_empty() {
         // Literal 99 binary-searches miss → `target_codes` empty →
         // kernel short-circuits without scanning the code stream.
-        let col = dict_column(
-            &[0, 1, 2, 1, 0],
-            2,
-            int_dict_bytes(&[10, 20, 30]),
-            5,
-            None,
-        );
+        let col = dict_column(&[0, 1, 2, 1, 0], 2, int_dict_bytes(&[10, 20, 30]), 5, None);
         let kernel = DictionaryEqKernel::new(vec![ScalarValue::Int(99)], BqlType::Int);
         let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 5 }]);
         let out = kernel.apply(&col.view(), &input);
@@ -1276,13 +1257,7 @@ mod tests {
     fn dictionary_eq_multi_value_in_list_hits_any() {
         // IN (10, 30) against dict [10, 20, 30] → target codes {0, 2}.
         // Values [10, 20, 30, 20, 10] → match rows {0, 2, 4}.
-        let col = dict_column(
-            &[0, 1, 2, 1, 0],
-            2,
-            int_dict_bytes(&[10, 20, 30]),
-            5,
-            None,
-        );
+        let col = dict_column(&[0, 1, 2, 1, 0], 2, int_dict_bytes(&[10, 20, 30]), 5, None);
         let kernel = DictionaryEqKernel::new(
             vec![ScalarValue::Int(10), ScalarValue::Int(30)],
             BqlType::Int,
@@ -1295,13 +1270,7 @@ mod tests {
     #[test]
     fn dictionary_eq_multi_value_mix_of_hit_and_miss() {
         // IN (20, 99) — 99 misses, 20 hits code 1 → rows {1, 3}.
-        let col = dict_column(
-            &[0, 1, 2, 1, 0],
-            2,
-            int_dict_bytes(&[10, 20, 30]),
-            5,
-            None,
-        );
+        let col = dict_column(&[0, 1, 2, 1, 0], 2, int_dict_bytes(&[10, 20, 30]), 5, None);
         let kernel = DictionaryEqKernel::new(
             vec![ScalarValue::Int(20), ScalarValue::Int(99)],
             BqlType::Int,
@@ -1338,13 +1307,7 @@ mod tests {
     fn dictionary_eq_respects_input_narrowing() {
         // Filter == 10 → code 0 → logical rows {0, 4}. Input narrows
         // to [1..5), so only row 4 survives the intersection.
-        let col = dict_column(
-            &[0, 1, 2, 1, 0],
-            2,
-            int_dict_bytes(&[10, 20, 30]),
-            5,
-            None,
-        );
+        let col = dict_column(&[0, 1, 2, 1, 0], 2, int_dict_bytes(&[10, 20, 30]), 5, None);
         let kernel = DictionaryEqKernel::new(vec![ScalarValue::Int(10)], BqlType::Int);
         let input = RowSelection::from_runs(vec![RowRun { start: 1, len: 4 }]);
         let out = kernel.apply(&col.view(), &input);
@@ -1412,13 +1375,7 @@ mod tests {
         // fires spuriously on `IN (20, 20, 20)` (three pushes, one unique
         // code) and selects every non-null row. Dedup in the kernel
         // prevents this — only rows with value 20 should match.
-        let col = dict_column(
-            &[0, 1, 2, 1, 0],
-            2,
-            int_dict_bytes(&[10, 20, 30]),
-            5,
-            None,
-        );
+        let col = dict_column(&[0, 1, 2, 1, 0], 2, int_dict_bytes(&[10, 20, 30]), 5, None);
         let kernel = DictionaryEqKernel::new(
             vec![
                 ScalarValue::Int(20),
@@ -1438,8 +1395,7 @@ mod tests {
         // bug. The kernel fails closed (empty) rather than passing
         // input through, which would violate the "never widens" rule.
         let col = dict_column(&[0, 1], 1, int_dict_bytes(&[10, 20]), 2, None);
-        let kernel =
-            DictionaryEqKernel::new(vec![ScalarValue::String("10".into())], BqlType::Int);
+        let kernel = DictionaryEqKernel::new(vec![ScalarValue::String("10".into())], BqlType::Int);
         let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 2 }]);
         let out = kernel.apply(&col.view(), &input);
         assert!(out.is_empty());

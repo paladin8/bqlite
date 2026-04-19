@@ -83,18 +83,18 @@ use arrow::compute::{self, kernels::boolean};
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::encoded::{RowRun, RowSelection};
+use bqlite_core::encoded::{EncodedBatch, RowRun, RowSelection};
 use bqlite_core::{
     BqlType, BqliteError, ColumnDef, ColumnProjection, OperatorSchema, Predicate, PropertyValue,
     RangeOp, Result, ScanConjunct, ScanPredicate, SegmentHandle, SegmentReader, SegmentScan,
     TableSchema,
 };
 use bqlite_planner::compiled::{CompareOp, CompiledExpr, CompiledNode};
-use bqlite_storage::segment::merge::KWayMergeScan;
+use bqlite_storage::segment::merge::{EncodedBatchSource, EncodedKWayMergeScan, KWayMergeScan};
 
 use crate::encoded_filter::{apply_encoded_eq, partition_encoded_eq, EncodedEqShape};
 use crate::eval;
-use crate::materialize::materialize_selected;
+use crate::materialize::{materialize_selected, materialize_stitched};
 use crate::operator::{CancellationToken, PhysicalOperator};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +219,12 @@ pub struct ScanOperator {
     /// when `scan_path != Materialized` and exactly one segment handle
     /// is visible — otherwise we fall back to the merge.
     encoded_scan: Option<Box<dyn SegmentScan>>,
+    /// Encoded-preserving k-way merge (CP5). `Some` only when
+    /// `scan_path != Materialized` and at least two segments are
+    /// visible — otherwise a single-segment scan uses `encoded_scan`
+    /// and the materialized path uses `merge`. The `debug_assert!` in
+    /// `open()` enforces at most one of these three holders is `Some`.
+    encoded_merge: Option<EncodedKWayMergeScan>,
     /// Latches on the first `Ok(None)` from `next_batch` and keeps
     /// subsequent pulls cheap and side-effect-free.
     exhausted: bool,
@@ -259,7 +265,9 @@ impl std::fmt::Debug for ScanOperator {
             .field("post_filter_count", &self.post_filters.len())
             .field(
                 "open",
-                &(self.merge.is_some() || self.encoded_scan.is_some()),
+                &(self.merge.is_some()
+                    || self.encoded_scan.is_some()
+                    || self.encoded_merge.is_some()),
             )
             .field("exhausted", &self.exhausted)
             .field("scan_path", &self.scan_path)
@@ -378,6 +386,7 @@ impl ScanOperator {
             ts_col,
             merge: None,
             encoded_scan: None,
+            encoded_merge: None,
             exhausted: false,
             scan_path,
             types,
@@ -458,6 +467,50 @@ impl ScanOperator {
         }
     }
 
+    /// Multi-segment encoded pull (CP5): drive [`EncodedKWayMergeScan`]
+    /// to get a [`StitchedBatch`](bqlite_core::encoded::StitchedBatch),
+    /// materialize it through the shared `materialize_stitched`
+    /// consumer, then enforce any residual `CompiledExpr`s exactly as
+    /// `encoded_next_batch` does for the single-segment path.
+    ///
+    /// Loops past fully-filtered results so consumers never see empty
+    /// batches. Checks cancellation each iteration because a merge
+    /// over many sources may run long between emissions.
+    fn encoded_merge_next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(BqliteError::Cancelled);
+            }
+            let merge = self
+                .encoded_merge
+                .as_mut()
+                .expect("encoded_merge is Some (checked by caller)");
+            let Some(stitched) = merge.next_stitched_batch()? else {
+                self.exhausted = true;
+                return Ok(None);
+            };
+            let fb = materialize_stitched(&stitched, &self.types, self.arrow_schema.clone())?;
+            let batch = fb.batch;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            // Residual predicates mirror `encoded_next_batch`:
+            // - No recognized shapes → run the full `post_filters` list.
+            // - Otherwise → only the non-shape residual (already
+            //   partitioned at construction time).
+            let batch = if self.encoded_shapes.is_empty() {
+                self.apply_post_filters(batch)?
+            } else if self.encoded_residual.is_empty() {
+                batch
+            } else {
+                apply_compiled_filters(&self.encoded_residual, batch)?
+            };
+            if batch.num_rows() > 0 {
+                return Ok(Some(batch));
+            }
+        }
+    }
+
     /// Evaluate every entry in `post_filters` against `batch` and
     /// return the subset of rows that satisfy all of them.
     ///
@@ -505,25 +558,54 @@ impl PhysicalOperator for ScanOperator {
             scans.push(scan);
         }
 
-        // Encoded single-segment fast path: when the caller requested
-        // the encoded read path and exactly one segment is visible,
-        // bypass KWayMergeScan and drive the segment directly via
-        // `next_encoded_row_group`. Multi-segment encoded scans fall
-        // through to the merge path below until CP5's stitched merge
-        // producer lands.
-        if self.scan_path != ScanPath::Materialized && scans.len() == 1 {
+        let encoded_requested = self.scan_path != ScanPath::Materialized;
+        if encoded_requested && scans.len() == 1 {
+            // Single-segment encoded fast path: drive the segment
+            // directly via `next_encoded_row_group`, no merge.
             self.encoded_scan = Some(scans.pop().unwrap());
-            self.exhausted = false;
-            return Ok(());
+        } else if encoded_requested {
+            // Multi-segment encoded path (CP5): wrap each segment in a
+            // `KernelAppliedSource` that shares the compiled shapes +
+            // types by `Arc`, and hand the vec to `EncodedKWayMergeScan`.
+            let shapes: Arc<[EncodedEqShape]> = Arc::from(self.encoded_shapes.as_slice());
+            let types: Arc<[BqlType]> = Arc::from(self.types.as_slice());
+            let sources: Vec<Box<dyn EncodedBatchSource>> = scans
+                .into_iter()
+                .map(|scan| -> Box<dyn EncodedBatchSource> {
+                    Box::new(KernelAppliedSource::new(
+                        scan,
+                        shapes.clone(),
+                        types.clone(),
+                        self.cancel.clone(),
+                    ))
+                })
+                .collect();
+            let merge = EncodedKWayMergeScan::new(
+                sources,
+                self.arrow_schema.clone(),
+                self.entity_col,
+                self.ts_col,
+            )?;
+            self.encoded_merge = Some(merge);
+        } else {
+            let merge = KWayMergeScan::new(
+                scans,
+                self.arrow_schema.clone(),
+                self.entity_col,
+                self.ts_col,
+            )?;
+            self.merge = Some(merge);
         }
 
-        let merge = KWayMergeScan::new(
-            scans,
-            self.arrow_schema.clone(),
-            self.entity_col,
-            self.ts_col,
-        )?;
-        self.merge = Some(merge);
+        debug_assert!(
+            (self.encoded_scan.is_some() as u8
+                + self.encoded_merge.is_some() as u8
+                + self.merge.is_some() as u8)
+                <= 1,
+            "ScanOperator scan-holder invariant: at most one of \
+             encoded_scan/encoded_merge/merge may be Some"
+        );
+
         self.exhausted = false;
         Ok(())
     }
@@ -535,8 +617,17 @@ impl PhysicalOperator for ScanOperator {
         if self.cancel.is_cancelled() {
             return Err(BqliteError::Cancelled);
         }
+        // Explicit precedence order: single-segment encoded bypass
+        // wins over the multi-segment encoded merge, which wins over
+        // the materialized merge. The `debug_assert!` in `open()`
+        // guarantees at most one holder is `Some`; this order simply
+        // pins a deterministic fall-through if a future bug violates
+        // that invariant in release builds.
         if self.encoded_scan.is_some() {
             return self.encoded_next_batch();
+        }
+        if self.encoded_merge.is_some() {
+            return self.encoded_merge_next_batch();
         }
         loop {
             let merge = self.merge.as_mut().ok_or_else(|| {
@@ -561,12 +652,13 @@ impl PhysicalOperator for ScanOperator {
     }
 
     fn close(&mut self) -> Result<()> {
-        // Dropping both scan holders releases every held per-segment
+        // Dropping every scan holder releases every held per-segment
         // scan (file handles, decompression state) via destructors.
-        // `close` must tolerate being called with both fields `None`
+        // `close` must tolerate being called with each field `None`
         // after a failed `open` or without ever reaching `open`.
         self.merge = None;
         self.encoded_scan = None;
+        self.encoded_merge = None;
         self.exhausted = true;
         Ok(())
     }
@@ -590,6 +682,85 @@ fn apply_compiled_filters(predicates: &[CompiledExpr], batch: RecordBatch) -> Re
     let mask = combined.expect("predicates non-empty");
     let filtered = compute::filter_record_batch(&batch, &mask)?;
     Ok(filtered)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-segment encoded adapter (CP5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wraps a per-segment `Box<dyn SegmentScan>` into an
+/// [`EncodedBatchSource`] by applying the recognised
+/// [`EncodedEqShape`]s from the scan operator to every row group
+/// before handing the `(EncodedBatch, RowSelection)` pair to
+/// [`EncodedKWayMergeScan`].
+///
+/// Mirrors the single-segment pull loop in
+/// [`ScanOperator::encoded_next_batch`], minus the materialization
+/// step — the merge does that via `materialize_stitched` after picks.
+///
+/// Shared state (the shape list and per-column `BqlType`s) is borrowed
+/// through `Arc` so every source wrapper references the same data
+/// without per-batch clones.
+struct KernelAppliedSource {
+    inner: Box<dyn SegmentScan>,
+    shapes: Arc<[EncodedEqShape]>,
+    types: Arc<[BqlType]>,
+    cancel: CancellationToken,
+}
+
+impl KernelAppliedSource {
+    fn new(
+        inner: Box<dyn SegmentScan>,
+        shapes: Arc<[EncodedEqShape]>,
+        types: Arc<[BqlType]>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            shapes,
+            types,
+            cancel,
+        }
+    }
+}
+
+impl EncodedBatchSource for KernelAppliedSource {
+    fn next(&mut self) -> Result<Option<(EncodedBatch, RowSelection)>> {
+        loop {
+            // Check cancellation per-row-group: a deep segment where
+            // every row gets filtered can spin here for a long time
+            // before yielding back to `encoded_merge_next_batch`.
+            if self.cancel.is_cancelled() {
+                return Err(BqliteError::Cancelled);
+            }
+            let Some(encoded) = self.inner.next_encoded_row_group()? else {
+                return Ok(None);
+            };
+            let rows = encoded.row_count;
+            if rows == 0 {
+                // Skip empty row groups; the merge would otherwise
+                // pay a reload round-trip for no picks.
+                continue;
+            }
+            let mut sel = RowSelection::from_runs(vec![RowRun {
+                start: 0,
+                len: rows,
+            }]);
+            for shape in self.shapes.iter() {
+                if sel.is_empty() {
+                    break;
+                }
+                sel = apply_encoded_eq(shape, &encoded, &sel, &self.types[shape.col_index])?;
+            }
+            if sel.is_empty() {
+                // Every row filtered — skip up-front rather than
+                // forwarding an empty selection for the merge to
+                // discard.
+                continue;
+            }
+            return Ok(Some((encoded, sel)));
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1838,14 +2009,11 @@ mod tests {
     }
 
     #[test]
-    fn encoded_path_falls_back_to_merge_on_multi_segment() {
-        // Until CP5's stitched merge producer is wired, multi-segment
-        // scans must stay on the materialized merge path even when
-        // `ScanPath::Encoded` is requested — otherwise a naïve encoded
-        // single-source loop would violate the `(entity_id, ts)`
-        // ordering contract by emitting one segment completely before
-        // the next starts. The test asserts the globally-sorted output
-        // shape is preserved.
+    fn encoded_path_multi_segment_preserves_entity_ts_order() {
+        // CP5: multi-segment `ScanPath::Encoded` now runs through
+        // `EncodedKWayMergeScan` rather than falling back to the
+        // materialized merge. The globally-sorted `(entity_id, ts)`
+        // contract must still hold across segments.
         let s1 = make_batch(&["u1", "u3"], &[100, 300], &["a", "c"]);
         let s2 = make_batch(&["u2", "u2", "u4"], &[150, 200, 400], &["b", "b", "d"]);
         let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
@@ -1868,5 +2036,161 @@ mod tests {
             drain_entity_ids(&mut op),
             vec!["u1", "u2", "u2", "u3", "u4"],
         );
+    }
+
+    #[test]
+    fn encoded_and_materialized_paths_agree_on_multi_segment_with_pushable_eq() {
+        // Parity test: two segments, pushable `event_type == 'keep'`.
+        // Both paths must produce the same sorted row list.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("event_type"), string_lit("keep")),
+            &output_schema,
+        );
+        let s1 = make_batch(&["u1", "u3"], &[100, 300], &["keep", "skip"]);
+        let s2 = make_batch(
+            &["u2", "u2", "u4"],
+            &[150, 200, 400],
+            &["keep", "skip", "keep"],
+        );
+        let make_reader = || -> Arc<dyn SegmentReader> {
+            Arc::new(VecReader::with_segments(
+                minimal_schema(),
+                vec![
+                    (make_handle(1, 2), vec![s1.clone()], vec![HashMap::new()]),
+                    (make_handle(2, 3), vec![s2.clone()], vec![HashMap::new()]),
+                ],
+            ))
+        };
+
+        let mut mat_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            vec![pred.clone()],
+            CancellationToken::new(),
+            ScanPath::Materialized,
+        )
+        .unwrap();
+        mat_op.open().unwrap();
+        let mat_pairs = drain_pairs(&mut mat_op);
+
+        let mut enc_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            vec![pred],
+            CancellationToken::new(),
+            ScanPath::Encoded,
+        )
+        .unwrap();
+        enc_op.open().unwrap();
+        let enc_pairs = drain_pairs(&mut enc_op);
+
+        assert_eq!(
+            mat_pairs,
+            vec![
+                ("u1".to_string(), "keep".to_string()),
+                ("u2".to_string(), "keep".to_string()),
+                ("u4".to_string(), "keep".to_string()),
+            ],
+        );
+        assert_eq!(enc_pairs, mat_pairs, "encoded and materialized must agree");
+    }
+
+    #[test]
+    fn encoded_multi_segment_preserves_tie_break_on_duplicate_entity_ts() {
+        // Two segments share a `(u1, 100)` row, distinguished by
+        // `event_type`. Lower-indexed segment must appear first in
+        // both paths — testing the row count alone would silently
+        // pass on a tie-break regression.
+        let s1 = make_batch(&["u1"], &[100], &["a"]);
+        let s2 = make_batch(&["u1"], &[100], &["b"]);
+        let make_reader = || -> Arc<dyn SegmentReader> {
+            Arc::new(VecReader::with_segments(
+                minimal_schema(),
+                vec![
+                    (make_handle(1, 1), vec![s1.clone()], vec![HashMap::new()]),
+                    (make_handle(2, 1), vec![s2.clone()], vec![HashMap::new()]),
+                ],
+            ))
+        };
+
+        let mut mat_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            Vec::new(),
+            CancellationToken::new(),
+            ScanPath::Materialized,
+        )
+        .unwrap();
+        mat_op.open().unwrap();
+        let mat_pairs = drain_pairs(&mut mat_op);
+
+        let mut enc_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            Vec::new(),
+            CancellationToken::new(),
+            ScanPath::Encoded,
+        )
+        .unwrap();
+        enc_op.open().unwrap();
+        let enc_pairs = drain_pairs(&mut enc_op);
+
+        assert_eq!(
+            mat_pairs,
+            vec![
+                ("u1".to_string(), "a".to_string()),
+                ("u1".to_string(), "b".to_string()),
+            ],
+            "lower-indexed segment (event_type='a') must come first",
+        );
+        assert_eq!(enc_pairs, mat_pairs);
+    }
+
+    #[test]
+    fn encoded_multi_segment_with_fully_filtered_source() {
+        // Two segments; predicate removes every row from segment 1.
+        // Both paths must return only segment 0's surviving rows.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("event_type"), string_lit("keep")),
+            &output_schema,
+        );
+        let s1 = make_batch(&["u1", "u3"], &[100, 300], &["keep", "keep"]);
+        let s2 = make_batch(&["u2", "u4"], &[200, 400], &["skip", "skip"]);
+        let make_reader = || -> Arc<dyn SegmentReader> {
+            Arc::new(VecReader::with_segments(
+                minimal_schema(),
+                vec![
+                    (make_handle(1, 2), vec![s1.clone()], vec![HashMap::new()]),
+                    (make_handle(2, 2), vec![s2.clone()], vec![HashMap::new()]),
+                ],
+            ))
+        };
+
+        let mut mat_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            vec![pred.clone()],
+            CancellationToken::new(),
+            ScanPath::Materialized,
+        )
+        .unwrap();
+        mat_op.open().unwrap();
+        let mat_ids = drain_entity_ids(&mut mat_op);
+
+        let mut enc_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            vec![pred],
+            CancellationToken::new(),
+            ScanPath::Encoded,
+        )
+        .unwrap();
+        enc_op.open().unwrap();
+        let enc_ids = drain_entity_ids(&mut enc_op);
+
+        assert_eq!(mat_ids, vec!["u1".to_string(), "u3".to_string()]);
+        assert_eq!(enc_ids, mat_ids);
     }
 }
