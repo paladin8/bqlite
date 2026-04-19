@@ -428,7 +428,7 @@ fn encode_string(values: &[&str]) -> Result<EncodedChunk> {
 
 // ── distinct-value counting (for estimate_size) ──────────────────────────────
 
-fn count_distinct(array: &dyn Array) -> Result<usize> {
+pub(crate) fn count_distinct(array: &dyn Array) -> Result<usize> {
     match array.data_type() {
         DataType::Int64 => {
             let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {

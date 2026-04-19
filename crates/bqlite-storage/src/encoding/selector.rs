@@ -80,11 +80,11 @@ use arrow::array::{
     TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use bqlite_core::{BqlType, BqliteError, Result};
+use bqlite_core::{BqlType, Result};
 
 use super::{
     compress_lz4, require_dense, Alp, BitPacking, CompressionType, Constant, Delta, Dictionary,
-    DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Pfor, Plain, Rle,
+    DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Fsst, Pfor, Plain, Rle,
 };
 
 /// LZ4 minimum compression threshold per `storage-format.md` §10.7
@@ -147,8 +147,18 @@ impl SelectedEncoding {
 /// payload region is to emit `on_disk_payload` verbatim.
 pub fn select_encoding(array: &dyn Array, ty: &BqlType) -> Result<SelectedEncoding> {
     require_dense(array, "select_encoding")?;
-    let chosen = pick_encoding(array, ty)?;
-    let chunk = encode_with(chosen, array)?;
+    let (chosen, fsst_cached) = pick_encoding_inner(array, ty)?;
+    // Reuse the speculative FSST encode if we already produced one
+    // during selection — FSST encode is expensive and there's no
+    // reason to pay for it twice.
+    let chunk = if chosen == EncodingType::Fsst {
+        match fsst_cached {
+            Some(c) => c,
+            None => encode_with(chosen, array)?,
+        }
+    } else {
+        encode_with(chosen, array)?
+    };
     let (compression, on_disk_payload) = pick_compression(&chunk);
     Ok(SelectedEncoding {
         chunk,
@@ -163,19 +173,22 @@ pub fn select_encoding(array: &dyn Array, ty: &BqlType) -> Result<SelectedEncodi
 /// to avoid double work.
 pub fn select_encoding_type(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
     require_dense(array, "select_encoding_type")?;
-    pick_encoding(array, ty)
+    pick_encoding_inner(array, ty).map(|(e, _)| e)
 }
 
 // ── core heuristic ───────────────────────────────────────────────────────────
 
-fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
+fn pick_encoding_inner(
+    array: &dyn Array,
+    ty: &BqlType,
+) -> Result<(EncodingType, Option<EncodedChunk>)> {
     let row_count = array.len();
 
     // Phase 1: empty arrays. Plain handles them; Constant errors on
     // empty input; Delta errors on row_count == 0; Dictionary handles
     // empty but Plain is the universal fallback the spec calls out.
     if row_count == 0 {
-        return Ok(EncodingType::Plain);
+        return Ok((EncodingType::Plain, None));
     }
 
     // Phase 2: uniformity check → Constant.
@@ -186,7 +199,7 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
     // truly uniform. Doing this check first short-circuits the
     // estimator pass for trivial chunks.
     if Constant.applicable_to(ty) && is_uniform(array) {
-        return Ok(EncodingType::Constant);
+        return Ok((EncodingType::Constant, None));
     }
 
     // Phase 3: rank applicable encodings by estimated payload size.
@@ -219,8 +232,18 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
         &ForEncoding,
         &Pfor,
         &Alp,
+        &Fsst,
     ];
     let mut best: Option<(EncodingType, usize, u8)> = None;
+    // FSST's trait-level `estimate_size` is a conservative 2× upper
+    // bound (per trait contract) that cannot win the score ranking on
+    // any realistic string column. The spec's §10 guard requires the
+    // *actual* FSST payload to beat Plain, so we do a one-shot
+    // speculative encode when FSST is a candidate and cache the
+    // resulting chunk for reuse from [`select_encoding`]. The encode
+    // cost is only paid on String columns whose Dictionary candidate
+    // already lost the cardinality guard.
+    let mut fsst_cached: Option<EncodedChunk> = None;
     for enc in candidates {
         if !enc.applicable_to(ty) {
             continue;
@@ -228,13 +251,24 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
         if !candidate_passes_guard(enc.encoding_type(), array) {
             continue;
         }
-        // `estimate_size` may return an error for legitimate reasons
-        // (e.g. Delta on a chunk whose i128 residuals overflow i64).
-        // Skip the encoding when that happens — Plain remains in the
-        // pool as the universal fallback.
-        let size = match enc.estimate_size(array) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let size = if enc.encoding_type() == EncodingType::Fsst {
+            match Fsst.encode(array) {
+                Ok(chunk) => {
+                    let actual = chunk.payload.len();
+                    fsst_cached = Some(chunk);
+                    actual
+                }
+                Err(_) => continue,
+            }
+        } else {
+            // `estimate_size` may return an error for legitimate
+            // reasons (e.g. Delta on a chunk whose i128 residuals
+            // overflow i64). Skip the encoding when that happens —
+            // Plain remains in the pool as the universal fallback.
+            match enc.estimate_size(array) {
+                Ok(s) => s,
+                Err(_) => continue,
+            }
         };
         let cost = decode_cost(enc.encoding_type());
         let candidate = (enc.encoding_type(), size, cost);
@@ -255,7 +289,14 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
     // subsequent `encode_with(Plain, ...)` call will surface the
     // deferred-nested-encoding error. This keeps every BqlType in the
     // selector's domain without a special case.
-    Ok(best.map(|(e, _, _)| e).unwrap_or(EncodingType::Plain))
+    let chosen = best.map(|(e, _, _)| e).unwrap_or(EncodingType::Plain);
+    // Only keep the cached FSST chunk when FSST actually won.
+    let cached = if chosen == EncodingType::Fsst {
+        fsst_cached
+    } else {
+        None
+    };
+    Ok((chosen, cached))
 }
 
 /// Per-codec guard from `docs/design/storage/advanced-encodings.md`
@@ -274,6 +315,32 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
 /// TASK-419 CP2 — it is coupled to the writer's symbol-table hoist.
 fn candidate_passes_guard(encoding: EncodingType, array: &dyn Array) -> bool {
     match encoding {
+        // Dictionary §10.5 / v2 Phase 2 step 3 — only prefer Dictionary
+        // when cardinality / row_count < 0.3. At higher cardinality,
+        // Dictionary's segment-level value bytes (which
+        // `Dictionary::estimate_size` excludes by design) dominate,
+        // and FSST / Plain+LZ4 are the right choices per the v2
+        // selection policy. Skip Dictionary once the ratio crosses
+        // 0.3 so the selector can consider those alternatives on
+        // high-cardinality string or integer columns.
+        EncodingType::Dictionary => {
+            let row_count = array.len();
+            if row_count == 0 {
+                return false;
+            }
+            match super::dictionary::count_distinct(array) {
+                // `card * 10 < row_count * 3` is the integer form of
+                // `card / row_count < 0.3`. Dictionary's code-stream
+                // size scales with cardinality, so `estimate_size`
+                // already penalizes higher cardinality — the guard
+                // just caps the explicit spec threshold.
+                Ok(card) => card * 10 < row_count * 3,
+                // Unsupported dtype for count_distinct — Dictionary's
+                // `applicable_to` should have filtered those out, but
+                // drop the candidate defensively.
+                Err(_) => false,
+            }
+        }
         // RLE §3.7 — run_count * 2 < row_count (i.e. avg run length > 2).
         // An exact scan is cheap (one pass over the dense values) and
         // it's strictly cheaper than the full `Rle::estimate_size` pass
@@ -290,6 +357,16 @@ fn candidate_passes_guard(encoding: EncodingType, array: &dyn Array) -> bool {
                 Err(_) => false,
             }
         }
+        // FSST's guard is encode-based — see `fsst_speculative_size` in
+        // `pick_encoding` for the full §7.7 check. The trait-level
+        // [`Encoding::estimate_size`] contract requires a safe upper
+        // bound (2× input) that's too loose to let FSST compete under
+        // the score ranking, so the selector does a one-shot
+        // speculative encode and uses the real payload size. Filtering
+        // at the guard level would duplicate the encode effort; we
+        // keep the guard a no-op for FSST and handle selection in the
+        // ranking loop instead.
+        EncodingType::Fsst => !array.is_empty(),
         _ => true,
     }
 }
@@ -380,12 +457,14 @@ fn encode_with(encoding: EncodingType, array: &dyn Array) -> Result<EncodedChunk
         EncodingType::For => ForEncoding.encode(array),
         EncodingType::Alp => Alp.encode(array),
         EncodingType::PFor => Pfor.encode(array),
-        // Fsst encode is wired by TASK-416 through a dedicated path
-        // (segment-level symbol table), not the selector; the arm exists
-        // here only for exhaustiveness until that wiring lands.
-        EncodingType::Fsst => Err(BqliteError::Execution(format!(
-            "v2 encoding {encoding:?} encode not yet implemented"
-        ))),
+        // FSST produces a self-contained [`EncodedChunk`] with the
+        // FSST symbol-table blob inlined into `params`. The writer
+        // hoists that blob into the segment-level FSST region and
+        // rewrites the chunk's `params` to the 4-byte `symbol_table_id`
+        // shape before serializing to disk — see
+        // `crate::writer::hoist_fsst_chunk` and
+        // `segment-format-v2.md` §5.3.
+        EncodingType::Fsst => Fsst.encode(array),
     }
 }
 
@@ -513,7 +592,7 @@ mod tests {
             EncodingType::For => ForEncoding.decode(&selected.chunk, &ty),
             EncodingType::PFor => Pfor.decode(&selected.chunk, &ty),
             EncodingType::Alp => Alp.decode(&selected.chunk, &ty),
-            other => panic!("selector should never pick unimplemented encoding {other:?}"),
+            EncodingType::Fsst => Fsst.decode(&selected.chunk, &ty),
         }
         .expect("decode must succeed");
         assert_eq!(
@@ -995,5 +1074,38 @@ mod tests {
         let array: ArrayRef = Arc::new(Float64Array::from(values));
         let chosen = select_encoding_type(array.as_ref(), &BqlType::Float).unwrap();
         assert_ne!(chosen, EncodingType::Alp);
+    }
+
+    #[test]
+    fn fsst_wins_on_high_cardinality_urls() {
+        // 256 distinct URL-like strings with a shared "https://example.com/"
+        // prefix. FSST's substring symbols compress the prefix across
+        // rows while Dictionary would need a 256-entry table with full
+        // strings, losing the per-row compression FSST offers.
+        let values: Vec<String> = (0..256)
+            .map(|i| format!("https://example.com/users/{i:05}/profile"))
+            .collect();
+        let refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+        let array: ArrayRef = Arc::new(StringViewArray::from(refs));
+        let chosen = select_and_round_trip(array, BqlType::String);
+        assert_eq!(chosen, EncodingType::Fsst);
+    }
+
+    #[test]
+    fn fsst_skipped_on_short_low_cardinality_strings() {
+        // Three distinct short strings repeated many times: Dictionary
+        // is the intended winner per §7.7 and §10.5. FSST may still
+        // pass its guard (substrings compress the repeats) but
+        // Dictionary's ~1-bit codes on 3 distinct values outscore FSST's
+        // per-row overhead.
+        let mut values = Vec::with_capacity(300);
+        for _ in 0..100 {
+            values.push("click");
+            values.push("view");
+            values.push("buy");
+        }
+        let array: ArrayRef = Arc::new(StringViewArray::from(values));
+        let chosen = select_and_round_trip(array, BqlType::String);
+        assert_ne!(chosen, EncodingType::Fsst);
     }
 }

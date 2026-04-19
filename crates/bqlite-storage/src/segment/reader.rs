@@ -682,6 +682,7 @@ impl SegmentFileScan {
                         write_time_col,
                         row_count,
                         &self.dictionaries,
+                        self.footer.fsst_symbol_tables(),
                         self.footer.format_version(),
                     )?
                 }
@@ -723,6 +724,8 @@ impl SegmentFileScan {
                     let wt_col = write_time_col.clone();
                     let meta_clone = meta.clone();
                     let format_version = self.footer.format_version();
+                    let fsst_tables: Vec<crate::segment::layout::FsstSymbolTableRef> =
+                        self.footer.fsst_symbol_tables().to_vec();
                     crate::segment::encoded::pin_column_chunk(
                         &self.bytes,
                         meta,
@@ -737,6 +740,7 @@ impl SegmentFileScan {
                                 &wt_col,
                                 row_count,
                                 &dictionaries,
+                                &fsst_tables,
                                 format_version,
                             )
                         },
@@ -771,6 +775,7 @@ fn decode_column_chunk(
     write_time_col: &ColumnDef,
     row_group_row_count: usize,
     dictionaries: &[DictionaryValues],
+    fsst_symbol_tables: &[crate::segment::layout::FsstSymbolTableRef],
     format_version: u16,
 ) -> Result<ArrayRef> {
     let chunk_start = meta.byte_offset as usize;
@@ -922,16 +927,65 @@ fn decode_column_chunk(
                 &write_time_col.bql_type,
             )?
         }
-        // NOTE: When TASK-419 wires the v2 reader, FSST will need its
-        // own match arm here (like Dictionary above) to access the
-        // segment-level FSST symbol tables.
+        // FSST reads the symbol-table blob from the segment-level
+        // `fsst_symbol_tables` region using the 4-byte
+        // `symbol_table_id: u32 LE` carried in the chunk's params,
+        // mirroring how Dictionary reads segment-level values via
+        // `dict_id`. The blob is the FSST crate's native 2312-byte
+        // format, referenced verbatim into `bytes` — no per-chunk
+        // copy of the symbol table.
+        EncodingType::Fsst => {
+            if on_disk_params.len() != 4 {
+                return Err(BqliteError::Corruption(format!(
+                    "segment reader: FSST on-disk params for `{}` are {} bytes (expected 4)",
+                    write_time_col.name,
+                    on_disk_params.len()
+                )));
+            }
+            let symbol_table_id = u32::from_le_bytes(
+                on_disk_params[..4]
+                    .try_into()
+                    .expect("slice length checked above"),
+            ) as usize;
+            if symbol_table_id >= fsst_symbol_tables.len() {
+                return Err(BqliteError::Corruption(format!(
+                    "segment reader: FSST symbol_table_id {symbol_table_id} out of range \
+                     (segment has {} FSST symbol tables)",
+                    fsst_symbol_tables.len()
+                )));
+            }
+            let st = &fsst_symbol_tables[symbol_table_id];
+            if st.column_ordinal != meta.column_ordinal {
+                return Err(BqliteError::Corruption(format!(
+                    "segment reader: FSST symbol_table_id {symbol_table_id} covers column \
+                     ordinal {}, but this chunk is for column ordinal {}",
+                    st.column_ordinal, meta.column_ordinal
+                )));
+            }
+            let start = st.byte_offset as usize;
+            let end = start.checked_add(st.byte_length as usize).ok_or_else(|| {
+                BqliteError::Corruption("segment reader: FSST symbol-table offset overflow".into())
+            })?;
+            if end > bytes.len() {
+                return Err(BqliteError::Corruption(format!(
+                    "segment reader: FSST symbol table [{start}, {end}) extends beyond file ({})",
+                    bytes.len()
+                )));
+            }
+            let symbol_bytes = &bytes[start..end];
+            crate::encoding::fsst::decode_from_params(
+                symbol_bytes,
+                uncompressed_payload.as_ref(),
+                meta.row_count as usize,
+                &write_time_col.bql_type,
+            )?
+        }
         EncodingType::Plain
         | EncodingType::Delta
         | EncodingType::DoubleDelta
         | EncodingType::BitPacking
         | EncodingType::Constant
         | EncodingType::Rle
-        | EncodingType::Fsst
         | EncodingType::For
         | EncodingType::PFor
         | EncodingType::Alp => {
@@ -1132,12 +1186,15 @@ fn dispatch_decode(
         EncodingType::For => ForEncoding.decode_borrowed(chunk, ty),
         EncodingType::Alp => Alp.decode_borrowed(chunk, ty),
         EncodingType::PFor => Pfor.decode_borrowed(chunk, ty),
-        // Fsst decode is wired by TASK-416 through a dedicated path that
-        // needs the segment-level symbol table; the reader arm above this
-        // dispatch already carries a TODO pointing there.
-        EncodingType::Fsst => Err(BqliteError::Execution(format!(
-            "v2 encoding {encoding:?} decode not yet implemented (TASK-416)"
-        ))),
+        // FSST chunks are handled by the caller before dispatch — the
+        // segment-level symbol-table blob must be located via the
+        // segment footer's `fsst_symbol_tables` and isn't reachable
+        // from a borrowed chunk view alone.
+        EncodingType::Fsst => Err(BqliteError::Execution(
+            "segment reader: Fsst chunks must be decoded directly from the segment-level \
+             FSST symbol tables, not via dispatch_decode"
+                .into(),
+        )),
     }
 }
 

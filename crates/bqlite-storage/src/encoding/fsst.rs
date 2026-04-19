@@ -175,6 +175,29 @@ impl Encoding for Fsst {
     }
 }
 
+/// Number of FSST symbols recorded in a serialized symbol-table blob.
+///
+/// The `fsst` crate encodes `(header & 0xFF)` as the symbol count in
+/// the first byte of the blob. When the encoder took the small-input
+/// passthrough path the blob still carries this count so decoders can
+/// reconstruct the table; TASK-419 uses this value to populate the
+/// `symbol_count` field of a segment-level [`FsstSymbolTableRef`].
+///
+/// bqlite's on-disk segment format is little-endian throughout (see
+/// `segment-format-v1.md` §4), so the header is read with
+/// [`u64::from_le_bytes`] — matching the byte order the `fsst` crate
+/// produces on the little-endian hosts bqlite targets.
+///
+/// Returns `0` when the blob is shorter than the 8-byte header —
+/// callers should first validate the blob with [`Fsst::from_params`].
+pub fn fsst_symbol_count_from_bytes(bytes: &[u8]) -> u16 {
+    if bytes.len() < 8 {
+        return 0;
+    }
+    let header = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+    (header & 0xFF) as u16
+}
+
 /// Decode from a self-contained params block plus payload.
 pub fn decode_from_params(
     params: &[u8],

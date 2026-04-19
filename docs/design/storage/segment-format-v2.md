@@ -576,21 +576,28 @@ symbol tables region. The footer's
 
 ### 6.2 Symbol table on-disk format
 
-Each symbol table is a contiguous byte sequence:
+Each symbol table is stored as a fixed-size **2312-byte blob** produced
+by the `fsst` crate's `FSST_SYMBOL_TABLE_SIZE` layout:
 
 ```
-symbol_count: u16 LE                    // number of symbols (1..=256)
-For each symbol (symbol_count symbols):
-    sym_len:  u8                        // 1..=8
-    sym_bytes: [u8; sym_len]            // the symbol's bytes
+header:  8 bytes        // low byte = symbol_count, bit 24 = encoder_switch
+symbols: 256 × 8 bytes  // 8-byte right-padded symbol bytes per slot
+lens:    256 × 1 byte   // per-symbol length (0..=8; 0 means unused)
 ```
 
-The maximum size of a single symbol table is:
-`2 + 256 * (1 + 8) = 2306` bytes.
+The logically-variable `(symbol_count, (sym_len, sym_bytes)…)` layout
+described in earlier drafts of this section is recoverable from the
+crate blob by reading `symbol_count = header & 0xFF` and walking the
+`symbols`/`lens` arrays for that many slots. The crate-native blob is
+stored verbatim because it also carries the `encoder_switch` flag the
+crate uses for small-input passthrough; losing that flag breaks decode
+for small inputs.
 
 Symbol tables are stored contiguously in the region with no padding
 between them. The footer's `FsstSymbolTableRef` entries provide the
-byte offset and length for each table.
+byte offset, length (always 2312 unless the crate bumps
+`FSST_SYMBOL_TABLE_SIZE` in a future version — readers treat the
+length as authoritative), and symbol count for each table.
 
 ### 6.3 Symbol table construction
 

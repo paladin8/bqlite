@@ -107,8 +107,8 @@ use crate::ingest::partitioner::Partitioner;
 use crate::manifest::{ColumnStats, SegmentMeta};
 use crate::segment::layout::{SEGMENT_FORMAT_VERSION_V1, SEGMENT_FORMAT_VERSION_V2};
 use crate::segment::writer::{
-    write_segment, PreparedColumnChunk, PreparedDictionary, PreparedRowGroup, SegmentWriteRequest,
-    SegmentWriteSummary,
+    write_segment, PreparedColumnChunk, PreparedDictionary, PreparedFsstSymbolTable,
+    PreparedRowGroup, SegmentWriteRequest, SegmentWriteSummary,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -360,10 +360,11 @@ fn prepare_segment(
     let groups = plan_row_groups(sorted_events, config.row_group_size);
     debug_assert!(!groups.is_empty());
 
-    // 3. Walk row groups, encode columns, hoist dictionaries, gather
-    //    aggregates.
+    // 3. Walk row groups, encode columns, hoist dictionaries and FSST
+    //    symbol tables, gather aggregates.
     let mut prepared_groups: Vec<PreparedRowGroup> = Vec::with_capacity(groups.len());
     let mut dictionaries: Vec<PreparedDictionary> = Vec::new();
+    let mut fsst_symbol_tables: Vec<PreparedFsstSymbolTable> = Vec::new();
     let mut column_aggregates: Vec<ColumnAggregate> = schema
         .columns()
         .iter()
@@ -384,7 +385,13 @@ fn prepare_segment(
 
         for (col_ordinal, col_def) in schema.columns().iter().enumerate() {
             let array = group_batch.column(col_ordinal).clone();
-            let chunk = build_column_chunk(col_ordinal as u32, col_def, &array, &mut dictionaries)?;
+            let chunk = build_column_chunk(
+                col_ordinal as u32,
+                col_def,
+                &array,
+                &mut dictionaries,
+                &mut fsst_symbol_tables,
+            )?;
 
             // Fold the chunk's stats into the segment-level aggregates.
             let agg = &mut column_aggregates[col_ordinal];
@@ -429,7 +436,7 @@ fn prepare_segment(
         seq_id_range,
         batch_id,
         compaction_level: 0,
-        fsst_symbol_tables: vec![],
+        fsst_symbol_tables,
         format_version,
     };
 
@@ -848,6 +855,7 @@ fn build_column_chunk(
     col_def: &ColumnDef,
     array: &ArrayRef,
     segment_dicts: &mut Vec<PreparedDictionary>,
+    fsst_tables: &mut Vec<PreparedFsstSymbolTable>,
 ) -> Result<PreparedColumnChunk> {
     let null_count = array.null_count();
 
@@ -879,11 +887,13 @@ fn build_column_chunk(
         on_disk_payload: _,
     } = selected;
 
-    // Dictionary hoist (no-op for every other encoding).
-    let final_chunk = if chunk.encoding == EncodingType::Dictionary {
-        hoist_dictionary_chunk(&chunk, column_ordinal, &col_def.bql_type, segment_dicts)?
-    } else {
-        chunk
+    // Dictionary and FSST hoist (no-op for every other encoding).
+    let final_chunk = match chunk.encoding {
+        EncodingType::Dictionary => {
+            hoist_dictionary_chunk(&chunk, column_ordinal, &col_def.bql_type, segment_dicts)?
+        }
+        EncodingType::Fsst => hoist_fsst_chunk(&chunk, column_ordinal, fsst_tables)?,
+        _ => chunk,
     };
 
     Ok(PreparedColumnChunk {
@@ -1233,6 +1243,57 @@ pub(crate) fn hoist_dictionary_chunk(
 
     Ok(EncodedChunk {
         encoding: EncodingType::Dictionary,
+        params: on_disk_params,
+        payload: chunk.payload.clone(),
+        row_count: chunk.row_count,
+    })
+}
+
+// ── FSST hoist ──────────────────────────────────────────────────────────────
+
+/// Convert a self-contained FSST [`EncodedChunk`] into the on-disk v2
+/// hoisted form by registering its symbol-table blob as a segment-level
+/// [`PreparedFsstSymbolTable`] and rewriting the chunk's `params` to the
+/// 4-byte `symbol_table_id: u32 LE` shape from `segment-format-v2.md`
+/// §5.3.
+///
+/// The chunk's `payload` (the compressed strings) is unchanged.
+///
+/// Unlike segment-level dictionaries, the FSST symbol-table bytes stored
+/// on disk are the `fsst` crate's native blob (FSST_SYMBOL_TABLE_SIZE —
+/// 2312 bytes) rather than the variable-length §6.2 layout. We keep the
+/// crate-native form intact because it preserves the encoder-switch
+/// flag the crate uses for small-input passthrough; the segment
+/// footer's `FsstSymbolTableRef.symbol_count` still records the logical
+/// symbol count so callers that want a view of the §6.2 layout can
+/// reconstruct it without losing information.
+pub(crate) fn hoist_fsst_chunk(
+    chunk: &EncodedChunk,
+    column_ordinal: u32,
+    fsst_tables: &mut Vec<PreparedFsstSymbolTable>,
+) -> Result<EncodedChunk> {
+    if chunk.encoding != EncodingType::Fsst {
+        return Err(BqliteError::Execution(format!(
+            "writer: hoist_fsst_chunk called with non-FSST chunk ({:?})",
+            chunk.encoding
+        )));
+    }
+
+    let symbol_table_id = u32::try_from(fsst_tables.len()).map_err(|_| {
+        BqliteError::Execution(
+            "writer: too many FSST symbol tables to fit a u32 symbol_table_id".into(),
+        )
+    })?;
+    let symbol_count = crate::encoding::fsst::fsst_symbol_count_from_bytes(&chunk.params);
+    fsst_tables.push(PreparedFsstSymbolTable {
+        column_ordinal,
+        bytes: chunk.params.clone(),
+        symbol_count,
+    });
+
+    let on_disk_params = symbol_table_id.to_le_bytes().to_vec();
+    Ok(EncodedChunk {
+        encoding: EncodingType::Fsst,
         params: on_disk_params,
         payload: chunk.payload.clone(),
         row_count: chunk.row_count,
@@ -1807,6 +1868,222 @@ mod tests {
             .join(format!("segment_{}.seg", meta.segment_id));
         let reader = SegmentFileReader::open(&path, events_schema()).unwrap();
         assert_eq!(reader.footer().format_version(), SEGMENT_FORMAT_VERSION_V1);
+    }
+
+    #[test]
+    fn write_bucket_round_trips_high_cardinality_strings_via_fsst() {
+        // High-cardinality strings — distinct URLs per event — force
+        // the selector to pick FSST for the entity_id column.
+        // End-to-end: ingest, write the segment, reopen via
+        // `SegmentFileReader`, decode every row, verify the original
+        // strings come back unchanged.
+        let scratch = Scratch::new("e2e-fsst-roundtrip");
+        let mut db = open_db_with_events_table(scratch.path());
+
+        let events: Vec<Event> = (0..200)
+            .map(|i| {
+                let user_id = format!("https://example.com/users/{i:05}/profile?ref=landing",);
+                ev(&user_id, 1_700_000_000_000_000_000 + i, "click")
+            })
+            .collect();
+        let mut sorted = events;
+        sorted.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.timestamp.cmp(&b.timestamp)));
+
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        let mut writer = SegmentWriter::new(&mut db);
+        let meta = writer
+            .write_bucket("events", 0, 0, batch_id, &sorted)
+            .expect("write_bucket");
+        assert_eq!(meta.row_count, 200);
+
+        let path = scratch
+            .path()
+            .join("events")
+            .join("windows")
+            .join("w_000000")
+            .join("shard_00")
+            .join(format!("segment_{}.seg", meta.segment_id));
+        let reader = SegmentFileReader::open(&path, events_schema()).expect("open segment");
+
+        // Footer must be v2 and must carry at least one FSST symbol
+        // table (the `user_id` column after selector registration).
+        assert_eq!(reader.footer().format_version(), SEGMENT_FORMAT_VERSION_V2);
+        assert!(
+            !reader.footer().fsst_symbol_tables().is_empty(),
+            "high-cardinality string column should produce an FSST symbol table"
+        );
+
+        // Read every row and reconstruct the user_id column. It must
+        // match the original sorted input exactly.
+        let mut scan = reader.scan(&ColumnProjection::all(), None).expect("scan");
+        let mut observed: Vec<String> = Vec::with_capacity(200);
+        while let Some(rg) = scan.next_row_group().expect("decode row group") {
+            let col = rg
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("user_id is StringView");
+            for i in 0..col.len() {
+                observed.push(col.value(i).to_string());
+            }
+        }
+        assert_eq!(observed.len(), 200);
+        let expected: Vec<String> = sorted
+            .iter()
+            .map(|e| match &e.entity {
+                EntityId::String(s) => s.clone(),
+                other => panic!("unexpected entity {other:?}"),
+            })
+            .collect();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn write_bucket_multi_row_group_fsst_round_trip() {
+        // Use a small `row_group_size` so the 200 distinct URLs span
+        // multiple row groups. Each row group produces its own FSST
+        // symbol table — the writer must hoist and the reader must
+        // dereference *all* of them correctly, not just the first.
+        let scratch = Scratch::new("e2e-fsst-multi-rg");
+        let mut db = open_db_with_events_table(scratch.path());
+
+        let events: Vec<Event> = (0..200)
+            .map(|i| {
+                let user_id = format!("https://example.com/users/{i:05}/profile?ref=landing");
+                ev(&user_id, 1_700_000_000_000_000_000 + i, "click")
+            })
+            .collect();
+        let mut sorted = events;
+        sorted.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.timestamp.cmp(&b.timestamp)));
+
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        let mut writer = SegmentWriter::with_config(&mut db, WriterConfig { row_group_size: 50 });
+        let meta = writer
+            .write_bucket("events", 0, 0, batch_id, &sorted)
+            .expect("write_bucket");
+        assert_eq!(meta.row_count, 200);
+
+        let path = scratch
+            .path()
+            .join("events")
+            .join("windows")
+            .join("w_000000")
+            .join("shard_00")
+            .join(format!("segment_{}.seg", meta.segment_id));
+        let reader = SegmentFileReader::open(&path, events_schema()).expect("open segment");
+        assert_eq!(reader.row_group_count(), 4);
+        assert!(
+            reader.footer().fsst_symbol_tables().len() >= 4,
+            "every row group's FSST column must hoist its own symbol table"
+        );
+
+        let mut scan = reader.scan(&ColumnProjection::all(), None).expect("scan");
+        let mut observed: Vec<String> = Vec::with_capacity(200);
+        while let Some(rg) = scan.next_row_group().expect("decode row group") {
+            let col = rg
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("user_id is StringView");
+            for i in 0..col.len() {
+                observed.push(col.value(i).to_string());
+            }
+        }
+        assert_eq!(observed.len(), 200);
+        let expected: Vec<String> = sorted
+            .iter()
+            .map(|e| match &e.entity {
+                EntityId::String(s) => s.clone(),
+                other => panic!("unexpected entity {other:?}"),
+            })
+            .collect();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn write_bucket_fsst_nullable_column_round_trip() {
+        // `country` is the nullable String column in `events_schema`.
+        // Populate most rows with distinct URL-like values and omit
+        // every fifth, producing a mix of dense non-null values (that
+        // FSST densifies into a single encoded chunk) and null
+        // positions (recorded in the per-chunk null bitmap).
+        let scratch = Scratch::new("e2e-fsst-nullable");
+        let mut db = open_db_with_events_table(scratch.path());
+
+        let events: Vec<Event> = (0..200)
+            .map(|i| {
+                let ts = 1_700_000_000_000_000_000 + i;
+                if i % 5 == 0 {
+                    ev(&format!("u{i:03}"), ts, "click")
+                } else {
+                    ev_with(
+                        &format!("u{i:03}"),
+                        ts,
+                        "click",
+                        vec![(
+                            "country",
+                            PropertyValue::String(format!(
+                                "https://maps.example.com/country/{i:05}/page"
+                            )),
+                        )],
+                    )
+                }
+            })
+            .collect();
+        let mut sorted = events;
+        sorted.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.timestamp.cmp(&b.timestamp)));
+
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        let mut writer = SegmentWriter::new(&mut db);
+        let meta = writer
+            .write_bucket("events", 0, 0, batch_id, &sorted)
+            .expect("write_bucket");
+        assert_eq!(meta.row_count, 200);
+
+        let path = scratch
+            .path()
+            .join("events")
+            .join("windows")
+            .join("w_000000")
+            .join("shard_00")
+            .join(format!("segment_{}.seg", meta.segment_id));
+        let reader = SegmentFileReader::open(&path, events_schema()).unwrap();
+
+        let country_idx = events_schema()
+            .columns()
+            .iter()
+            .position(|c| c.name == "country")
+            .unwrap();
+
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let mut total_rows = 0;
+        let mut total_nulls = 0;
+        while let Some(rg) = scan.next_row_group().unwrap() {
+            total_rows += rg.num_rows();
+            total_nulls += rg.column(country_idx).null_count();
+        }
+        assert_eq!(total_rows, 200);
+        assert_eq!(total_nulls, 40);
+    }
+
+    #[test]
+    fn hoist_fsst_chunk_rejects_non_fsst_input() {
+        // Defensive: hoist_fsst_chunk must refuse chunks it wasn't
+        // designed for. `build_column_chunk` already routes by
+        // encoding type so this is a safety net.
+        let chunk = EncodedChunk {
+            encoding: EncodingType::Plain,
+            params: vec![],
+            payload: vec![],
+            row_count: 0,
+        };
+        let mut fsst_tables = Vec::new();
+        let err = hoist_fsst_chunk(&chunk, 0, &mut fsst_tables).unwrap_err();
+        match err {
+            BqliteError::Execution(msg) => assert!(msg.contains("non-FSST")),
+            other => panic!("expected Execution error, got {other:?}"),
+        }
+        assert!(fsst_tables.is_empty());
     }
 
     #[test]
