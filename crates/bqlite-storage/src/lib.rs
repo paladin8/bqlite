@@ -75,3 +75,9 @@ pub use tombstone::{
 };
 pub use tombstone_scan::TombstoneScanWrapper;
 pub use writer::{SegmentWriter, WriterConfig, DEFAULT_ROW_GROUP_SIZE};
+
+// Zero-copy scan/filter (CP2): encoded read-path helpers.
+pub use segment::encoded::pin_column_chunk;
+pub use segment::materialize::{
+    materialize_encoded_batch, materialize_encoded_column, materialize_encoded_column_selected,
+};

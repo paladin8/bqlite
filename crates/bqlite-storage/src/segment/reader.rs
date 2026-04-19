@@ -605,6 +605,46 @@ impl SegmentScan for SegmentFileScan {
             return self.decode_row_group(idx).map(Some);
         }
     }
+
+    fn next_encoded_row_group(&mut self) -> Result<Option<bqlite_core::encoded::EncodedBatch>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        loop {
+            if self.next_idx >= self.footer.row_groups().len() {
+                self.exhausted = true;
+                return Ok(None);
+            }
+            let idx = self.next_idx;
+            self.next_idx += 1;
+
+            // Same zone-map pruning as `next_row_group`. Kept in
+            // lockstep so the encoded path observes identical
+            // row-group selection.
+            if let Some(pred) = &self.predicate {
+                if let Some(sp) = pred
+                    .as_any()
+                    .downcast_ref::<bqlite_core::storage::ScanPredicate>()
+                {
+                    let rg = &self.footer.row_groups()[idx];
+                    if !crate::zone_map::accepts_row_group_inline(
+                        sp,
+                        rg,
+                        self.footer.schema().columns(),
+                    ) {
+                        continue;
+                    }
+                } else {
+                    let scan: &dyn SegmentScan = &*self;
+                    if !crate::zone_map::should_decode_row_group(scan, &**pred, idx)? {
+                        continue;
+                    }
+                }
+            }
+
+            return self.decode_encoded_row_group(idx).map(Some);
+        }
+    }
 }
 
 impl SegmentFileScan {
@@ -642,6 +682,59 @@ impl SegmentFileScan {
                 "segment reader: failed to assemble row group {idx}: {e}"
             ))
         })
+    }
+
+    /// Build an [`EncodedBatch`] for row group `idx` using the CP2
+    /// `pin_column_chunk` helper. Supported encodings return real
+    /// `EncodedColumn::Encoded` views; everything else falls back to
+    /// `EncodedColumn::Materialized` backed by the existing
+    /// `decode_column_chunk` path.
+    fn decode_encoded_row_group(&self, idx: usize) -> Result<bqlite_core::encoded::EncodedBatch> {
+        use bqlite_core::encoded::EncodedColumn;
+
+        let rg = &self.footer.row_groups()[idx];
+        let row_count = rg.row_count as usize;
+
+        let mut columns: Vec<EncodedColumn> = Vec::with_capacity(self.plan.entries.len());
+        for entry in &self.plan.entries {
+            let col = match &entry.source {
+                PlannedColumnSource::FromSegment {
+                    write_time_ordinal,
+                    write_time_col,
+                } => {
+                    let meta = &rg.columns[*write_time_ordinal];
+                    let bytes = self.bytes.clone();
+                    let dictionaries = self.dictionaries.clone();
+                    let wt_col = write_time_col.clone();
+                    let meta_clone = meta.clone();
+                    crate::segment::encoded::pin_column_chunk(
+                        &self.bytes,
+                        meta,
+                        write_time_col,
+                        row_count,
+                        move || {
+                            decode_column_chunk(
+                                &bytes,
+                                &meta_clone,
+                                &wt_col,
+                                row_count,
+                                &dictionaries,
+                            )
+                        },
+                    )?
+                }
+                PlannedColumnSource::BackfillAllNull => EncodedColumn::Materialized {
+                    array: backfill_all_null(&entry.output_type, row_count)?,
+                    rows: row_count as u32,
+                },
+            };
+            columns.push(col);
+        }
+
+        Ok(bqlite_core::encoded::EncodedBatch::new(
+            row_count as u32,
+            columns,
+        ))
     }
 }
 
@@ -859,6 +952,14 @@ fn decode_column_chunk(
 /// size. For every encoding except `Constant` this is a fixed
 /// per-discriminant value; `Constant` needs the column type and the
 /// `value_kind` byte to determine the length.
+pub(super) fn parse_encoding_params_len_pub(
+    encoding: EncodingType,
+    after_discriminant: &[u8],
+    col_type: &BqlType,
+) -> std::result::Result<usize, String> {
+    parse_encoding_params_len(encoding, after_discriminant, col_type)
+}
+
 fn parse_encoding_params_len(
     encoding: EncodingType,
     after_discriminant: &[u8],
@@ -1066,6 +1167,19 @@ fn splice_nulls(
             "segment reader: null splicing for nested type {ty:?} is not yet implemented"
         ))),
     }
+}
+
+pub(super) fn count_set_bits_pub(bitmap: &[u8], len: usize) -> usize {
+    count_set_bits(bitmap, len)
+}
+
+pub(super) fn splice_nulls_pub(
+    dense: &ArrayRef,
+    null_bitmap: &[u8],
+    row_group_row_count: usize,
+    ty: &BqlType,
+) -> Result<ArrayRef> {
+    splice_nulls(dense, null_bitmap, row_group_row_count, ty)
 }
 
 /// Count the number of bits set to 1 in the first `len` bits of
@@ -4331,5 +4445,210 @@ mod tests {
         assert_eq!(reader.row_count(), 1);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── CP2 differential tests ──────────────────────────────────────
+    //
+    // The zero-copy scan/filter plan (CP2) ships a new
+    // `next_encoded_row_group` API that returns an `EncodedBatch`.
+    // Pushing that batch through `materialize_encoded_batch` must
+    // produce the same values as the classic `next_row_group` path.
+
+    #[test]
+    fn cp2_encoded_path_materializes_to_same_record_batch() {
+        use bqlite_core::BqlType;
+
+        let schema = roundtrip_schema();
+        let entity_values = ["u1", "u1", "u2", "u2"];
+        let ts_values: Vec<i64> = vec![
+            1_700_000_000_000_000_000,
+            1_700_000_000_100_000_000,
+            1_700_000_000_200_000_000,
+            1_700_000_000_300_000_000,
+        ];
+        let event_values = ["view", "checkout", "view", "click"];
+        let amount_values: Vec<i64> = vec![10, 20, 30, 40];
+
+        let entity_chunk = encode_plain_string(&entity_values);
+        let ts_chunk = encode_plain_timestamp(&ts_values);
+        let event_chunk = encode_plain_string(&event_values);
+        let amount_chunk = encode_plain_int(&amount_values);
+        let amount_bitmap = build_null_bitmap(&[true, true, true, true]);
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 4,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: entity_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u2".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: ts_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(ts_values[0])),
+                        zone_max: Some(PropertyValue::Timestamp(*ts_values.last().unwrap())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: event_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("checkout".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(amount_bitmap),
+                        encoded: amount_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(10)),
+                        zone_max: Some(PropertyValue::Int(40)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 1_700_000_000_000_000_000,
+            seq_id_range: (0, 3),
+            batch_id: 1,
+            compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
+        };
+
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let types = vec![
+            BqlType::String,
+            BqlType::Timestamp,
+            BqlType::String,
+            BqlType::Int,
+        ];
+
+        // Materialized path.
+        let mut scan1 = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let materialized = scan1.next_row_group().unwrap().expect("row group");
+
+        // Encoded path → boundary materialization.
+        let mut scan2 = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let encoded = scan2.next_encoded_row_group().unwrap().expect("row group");
+        let columns =
+            crate::segment::materialize::materialize_encoded_batch(&encoded, &types).unwrap();
+        let rebuilt =
+            ::arrow::array::RecordBatch::try_new(materialized.schema(), columns).unwrap();
+
+        assert_eq!(materialized.num_rows(), rebuilt.num_rows());
+        assert_eq!(materialized.num_columns(), rebuilt.num_columns());
+        for i in 0..materialized.num_columns() {
+            let a = materialized.column(i);
+            let b = rebuilt.column(i);
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "column {i} differs between materialized and encoded paths"
+            );
+        }
+    }
+
+    #[test]
+    fn cp2_constant_encoding_pins_scalar_value() {
+        // Build a segment using the standard roundtrip_schema where
+        // entity_id is Constant-encoded (`u1` × 3). The CP2 encoded
+        // path must pin the literal as a ScalarValue.
+        use bqlite_core::encoded::{EncodedColumn, EncodedKind};
+        use bqlite_core::scalar::ScalarValue;
+
+        let schema = roundtrip_schema();
+        let entity_chunk = ConstantEnc
+            .encode(&ArrowStringView::from(vec!["u1", "u1", "u1"]))
+            .unwrap();
+        let ts_values: Vec<i64> = vec![
+            1_700_000_000_000_000_000,
+            1_700_000_000_100_000_000,
+            1_700_000_000_200_000_000,
+        ];
+        let ts_chunk = encode_plain_timestamp(&ts_values);
+        let event_chunk = encode_plain_string(&["a", "b", "c"]);
+        let amount_chunk = encode_plain_int(&[1, 2, 3]);
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 3,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: entity_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u1".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: ts_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(ts_values[0])),
+                        zone_max: Some(PropertyValue::Timestamp(*ts_values.last().unwrap())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: event_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("a".into())),
+                        zone_max: Some(PropertyValue::String("c".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true, true, true])),
+                        encoded: amount_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(1)),
+                        zone_max: Some(PropertyValue::Int(3)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 2),
+            batch_id: 1,
+            compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
+        };
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let encoded = scan.next_encoded_row_group().unwrap().expect("row group");
+
+        match &encoded.columns[0] {
+            EncodedColumn::Encoded {
+                kind: EncodedKind::Constant { value },
+                rows,
+                ..
+            } => {
+                assert_eq!(*rows, 3);
+                assert_eq!(**value, ScalarValue::String("u1".to_string()));
+            }
+            other => panic!("expected entity_id as Encoded::Constant, got {other:?}"),
+        }
     }
 }

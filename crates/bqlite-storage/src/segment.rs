@@ -37,7 +37,9 @@
 
 pub(crate) mod advise;
 pub mod cleanup;
+pub mod encoded;
 pub mod layout;
+pub mod materialize;
 pub mod merge;
 pub mod reader;
 pub mod writer;
