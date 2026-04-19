@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-440",
   "claimed_at": "2026-04-19T23:18:16Z",
+  "completed_at": "2026-04-19T23:32:24Z",
   "branch": "task/TASK-440",
   "description": "Delete + compaction integration tests"
 }
