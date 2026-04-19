@@ -3955,6 +3955,124 @@ mod tests {
     }
 
     #[test]
+    fn sample_filter_prunes_singleton_entity_row_group_via_zone_map() {
+        // TASK-430 CP3: when a row group is entity-major with its
+        // entity-id zone bounded to a single entity, the reader must
+        // invoke `SampleFilter::accepts_zone_group` at row-group
+        // boundaries and skip the whole group if the filter rejects.
+        // Exercises the full SegmentFileReader → `should_decode_row_group`
+        // path with a real on-disk segment.
+        use crate::sample::SampleFilter;
+
+        let schema = roundtrip_schema();
+
+        // Find a `(fraction, seed)` pair and two entity keys — one
+        // the filter rejects, one it accepts. Brute-force search
+        // avoids pinning the xxhash64 output here; the
+        // `int_entity_hash_is_little_endian_stable` unit test in
+        // `sample.rs` already guards the hash stability contract.
+        let fraction = 0.5_f64;
+        let seed = 7_i64;
+        let probe = SampleFilter::new(fraction, seed, "entity_id", BqlType::String).unwrap();
+        let mut rejected: Option<String> = None;
+        let mut accepted: Option<String> = None;
+        for i in 0..10_000u64 {
+            let key = format!("ent_{i}");
+            if probe.accepts_str(key.as_bytes()) {
+                accepted.get_or_insert(key);
+            } else {
+                rejected.get_or_insert(key);
+            }
+            if rejected.is_some() && accepted.is_some() {
+                break;
+            }
+        }
+        let reject = rejected.expect("fraction 0.5 rejects some entity within 10k");
+        let accept = accepted.expect("fraction 0.5 accepts some entity within 10k");
+
+        // Write two segments, each a single row group with a
+        // singleton entity-id zone map. The SampleFilter should
+        // prune the rejected one at zone-map time and accept the
+        // other.
+        let build_request = |entity: &str| SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 1,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&[entity]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String(entity.into())),
+                        zone_max: Some(PropertyValue::String(entity.into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&[0]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(0)),
+                        zone_max: Some(PropertyValue::Timestamp(0)),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&["view"]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true])),
+                        encoded: encode_plain_int(&[1]),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(1)),
+                        zone_max: Some(PropertyValue::Int(1)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 0,
+            seq_id_range: (0, 0),
+            batch_id: 0,
+            compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
+        };
+
+        let filter: Arc<dyn Predicate> =
+            Arc::new(SampleFilter::new(fraction, seed, "entity_id", BqlType::String).unwrap());
+
+        // Rejected entity: zone-map pruning must skip the row group.
+        let reject_bytes = encode_segment(&build_request(&reject)).unwrap();
+        let reader = SegmentFileReader::from_bytes(reject_bytes, schema.clone()).unwrap();
+        let mut scan = reader
+            .scan(&ColumnProjection::all(), Some(filter.clone()))
+            .unwrap();
+        assert!(
+            scan.next_row_group().unwrap().is_none(),
+            "SampleFilter failed to prune singleton-entity row group for rejected entity `{reject}`"
+        );
+
+        // Accepted entity: row group must survive and materialize.
+        let accept_bytes = encode_segment(&build_request(&accept)).unwrap();
+        let reader = SegmentFileReader::from_bytes(accept_bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), Some(filter)).unwrap();
+        let batch = scan
+            .next_row_group()
+            .unwrap()
+            .expect("row group must survive for accepted entity");
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[test]
     fn predicate_prunes_row_group_even_when_column_not_projected() {
         // Zone-map pruning must be driven by the predicate's own
         // referenced columns, not the scan's projection — otherwise

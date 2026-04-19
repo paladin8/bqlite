@@ -18,11 +18,12 @@
 //! The filter is constructed once per query and shared by `Arc` across
 //! every segment scan in that query.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Int64Array, StringViewArray};
 use arrow::datatypes::DataType;
-use bqlite_core::{BqlType, BqliteError, PropertyValue, Result, TableSchema, ZoneMap};
+use bqlite_core::{BqlType, BqliteError, Predicate, PropertyValue, Result, TableSchema, ZoneMap};
 use twox_hash::XxHash64;
 
 /// Entity-ID hash filter for the SAMPLE operator.
@@ -56,6 +57,10 @@ pub struct SampleFilter {
     /// BQL type of the entity-id column. Used to dispatch between the
     /// string and integer byte-serialization paths (design §16.2).
     entity_type: BqlType,
+    /// Cached `[entity_col]` slice source for
+    /// [`Predicate::referenced_columns`]. Living inside the filter
+    /// keeps the `Predicate` impl zero-allocation per call.
+    referenced: Vec<String>,
 }
 
 impl SampleFilter {
@@ -100,12 +105,15 @@ impl SampleFilter {
         } else {
             (fraction * u64::MAX as f64) as u64
         };
+        let entity_col = entity_col.into();
+        let referenced = vec![entity_col.clone()];
         Ok(Self {
             threshold,
             fraction,
             seed,
-            entity_col: entity_col.into(),
+            entity_col,
             entity_type,
+            referenced,
         })
     }
 
@@ -305,6 +313,141 @@ impl SampleFilter {
 /// Shared reference type that the scan operator, reader, and engine
 /// bind step can all hand around without cloning the filter body.
 pub type SharedSampleFilter = Arc<SampleFilter>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Predicate impl — lets the reader skip row groups whose entity-id zone map
+// is singleton and fails the threshold test (design §18.1 / §18.2).
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl Predicate for SampleFilter {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn accepts_zone(&self, column: &str, zone: &ZoneMap) -> bool {
+        // The filter only has something to say about the entity-id
+        // column; every other column zone accepts conservatively.
+        if column != self.entity_col {
+            return true;
+        }
+        self.accepts_zone(zone)
+    }
+
+    fn accepts_zone_group(&self, zones: &HashMap<String, ZoneMap>) -> bool {
+        // Only the entity-id zone matters. Missing entry accepts
+        // conservatively per the reader's pruning contract.
+        zones
+            .get(&self.entity_col)
+            .is_none_or(|z| self.accepts_zone(z))
+    }
+
+    fn referenced_columns(&self) -> &[String] {
+        &self.referenced
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compound predicate: scan predicate AND sample filter
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Conjunctive predicate that combines an arbitrary
+/// [`Predicate`] (typically a [`crate::segment::…`] scan predicate
+/// built from `CompiledExpr` pushdown) with a [`SampleFilter`].
+///
+/// The scan operator builds one of these when a query carries both a
+/// pushed scan predicate and a SAMPLE filter so the segment reader
+/// can prune row groups that fail *either* check at zone-map time.
+/// The two predicates are logically AND'd; a row group is decoded
+/// only when both accept it.
+///
+/// Both components share the `Arc<dyn Predicate>` surface so the
+/// reader's existing `open_segment(..., Option<Arc<dyn Predicate>>)`
+/// API keeps its single-predicate shape.
+#[derive(Debug)]
+pub struct AndPredicate {
+    parts: Vec<Arc<dyn Predicate>>,
+    referenced: Vec<String>,
+}
+
+impl AndPredicate {
+    /// Construct an AND over every input predicate. Collapses the
+    /// `referenced_columns` lists into a deduplicated first-
+    /// occurrence-ordered vec so the reader can drive pruning from
+    /// a single call.
+    ///
+    /// Returns `None` when `parts` is empty — callers should pass
+    /// no predicate to `open_segment` in that case. The degenerate
+    /// single-element case still allocates a wrapper; production
+    /// callers short-circuit that at the scan-operator layer.
+    pub fn new(parts: Vec<Arc<dyn Predicate>>) -> Option<Self> {
+        if parts.is_empty() {
+            return None;
+        }
+        let mut referenced: Vec<String> = Vec::new();
+        for p in &parts {
+            for col in p.referenced_columns() {
+                if !referenced.iter().any(|r| r == col) {
+                    referenced.push(col.clone());
+                }
+            }
+        }
+        Some(Self { parts, referenced })
+    }
+}
+
+impl Predicate for AndPredicate {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn accepts_zone(&self, column: &str, zone: &ZoneMap) -> bool {
+        self.parts.iter().all(|p| p.accepts_zone(column, zone))
+    }
+
+    fn accepts_zone_group(&self, zones: &HashMap<String, ZoneMap>) -> bool {
+        self.parts.iter().all(|p| p.accepts_zone_group(zones))
+    }
+
+    fn referenced_columns(&self) -> &[String] {
+        &self.referenced
+    }
+
+    fn resolve_dictionary_codes(
+        &self,
+        column: &str,
+        dict: &bqlite_core::DictionaryIndex<'_>,
+    ) -> bqlite_core::DictRewrite {
+        // Dictionary rewriting is a per-component concern. Today the
+        // only dict-rewritable producer is `ScanPredicate`;
+        // `SampleFilter` always returns `NoRewrite` (default impl),
+        // so walking `parts` and returning the first non-`NoRewrite`
+        // answer is correct in practice.
+        //
+        // **Invariant — at most one non-`NoRewrite` per column.** If
+        // a future component starts rewriting the same column as
+        // another, this walk is no longer correct: the trait's
+        // semantics imply that two rewrites should *intersect* code
+        // sets, not override each other. Adding such a producer must
+        // extend this loop to accumulate codes across parts.
+        let mut result = bqlite_core::DictRewrite::NoRewrite;
+        let mut found = false;
+        for p in &self.parts {
+            let rw = p.resolve_dictionary_codes(column, dict);
+            if matches!(rw, bqlite_core::DictRewrite::NoRewrite) {
+                continue;
+            }
+            debug_assert!(
+                !found,
+                "AndPredicate: more than one part rewrites column `{column}`; \
+                 the N-ary composition must intersect code sets rather than \
+                 pick the first non-NoRewrite answer"
+            );
+            found = true;
+            result = rw;
+        }
+        result
+    }
+}
 
 #[cfg(test)]
 mod tests {

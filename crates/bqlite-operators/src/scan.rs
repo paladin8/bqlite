@@ -123,7 +123,7 @@ use bqlite_core::{
 };
 use bqlite_planner::compiled::{CompareOp, CompiledExpr, CompiledNode};
 use bqlite_storage::segment::merge::{EncodedBatchSource, EncodedKWayMergeScan, KWayMergeScan};
-use bqlite_storage::{SampleFilter, TombstoneScanWrapper, TombstoneSnapshot};
+use bqlite_storage::{AndPredicate, SampleFilter, TombstoneScanWrapper, TombstoneSnapshot};
 
 use crate::encoded_filter::{apply_encoded_eq, partition_encoded_eq, EncodedEqShape};
 use crate::eval;
@@ -728,12 +728,42 @@ impl PhysicalOperator for ScanOperator {
         let handles: Result<Vec<SegmentHandle>> = self.reader.segments().collect();
         let handles = handles?;
 
+        // Build the per-segment zone-map predicate. When both a base
+        // scan predicate (from the pushdown pass) and a sample filter
+        // (from TASK-430) are attached, compose them under AND so the
+        // reader's row-group pruning evaluates both checks in one
+        // traversal. Either side being `None` short-circuits to the
+        // other; both `None` disables zone-map pruning entirely.
+        let zone_predicate: Option<Arc<dyn Predicate>> =
+            match (self.scan_predicate.clone(), self.sample_filter.clone()) {
+                (None, None) => None,
+                (Some(p), None) => Some(p),
+                (None, Some(sample)) => {
+                    if sample.is_pass_through() {
+                        // Pass-through accepts every zone by
+                        // definition — no point handing the reader a
+                        // predicate it cannot prune anything with.
+                        None
+                    } else {
+                        Some(sample as Arc<dyn Predicate>)
+                    }
+                }
+                (Some(base), Some(sample)) => {
+                    if sample.is_pass_through() {
+                        Some(base)
+                    } else {
+                        AndPredicate::new(vec![base, sample as Arc<dyn Predicate>])
+                            .map(|p| Arc::new(p) as Arc<dyn Predicate>)
+                    }
+                }
+            };
+
         let mut scans: Vec<Box<dyn SegmentScan>> = Vec::with_capacity(handles.len());
         let mut any_wrapped = false;
         for handle in &handles {
             let scan =
                 self.reader
-                    .open_segment(handle, &self.projection, self.scan_predicate.clone())?;
+                    .open_segment(handle, &self.projection, zone_predicate.clone())?;
             // Tombstone wrapping (deletes.md §7): every segment whose
             // `(window_id, shard_id)` has a non-empty entry in the
             // per-query snapshot is wrapped so tombstone filtering runs
@@ -2973,6 +3003,110 @@ mod tests {
         // smaller than the input with high probability; assert it's not
         // the pass-through set and not empty.
         assert!(ids1.len() < all.len() && !ids1.is_empty());
+    }
+
+    /// Build a zone-map fixture where each row group has a singleton
+    /// entity-id bound (`min == max`). Mirrors a compaction layout
+    /// where each large entity lives in its own row group.
+    fn entity_singleton_zone(entity: &str) -> HashMap<String, ZoneMap> {
+        let mut zm = HashMap::new();
+        zm.insert(
+            "entity_id".to_string(),
+            ZoneMap {
+                min: Some(PropertyValue::String(entity.into())),
+                max: Some(PropertyValue::String(entity.into())),
+                null_count: 0,
+                row_count: 1,
+            },
+        );
+        zm
+    }
+
+    #[test]
+    fn sample_filter_zone_map_prunes_rejected_row_groups() {
+        // Four segments, one row group each, one entity each.
+        // With `fraction: 1.0` all zones pass; with an empty-set
+        // filter the short-circuit in `open()` avoids the reader
+        // entirely. The interesting path is an in-range fraction
+        // that rejects a known entity — the VecReader's
+        // `pred.accepts_zone_group` call should skip that segment's
+        // row group, and the output must match what the per-row
+        // filter would have produced anyway (i.e. exact semantics
+        // preserved under pruning).
+
+        // Pick a filter configuration and two entities we can sort
+        // into accept/reject piles. We avoid hashing by construction:
+        // evaluate the filter once, partition, then drive the reader.
+        let filter =
+            bqlite_storage::SampleFilter::new(0.5, 42, "entity_id", BqlType::String).unwrap();
+        let names = ["u0", "u1", "u2", "u3"];
+        let accepted: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| filter.accepts_str(n.as_bytes()))
+            .collect();
+        let rejected: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| !filter.accepts_str(n.as_bytes()))
+            .collect();
+        assert!(
+            !accepted.is_empty() && !rejected.is_empty(),
+            "need both sides"
+        );
+
+        // Build one segment per entity with a zone map that pins its
+        // entity_id min == max. The VecReader's `next_row_group`
+        // implementation calls `pred.accepts_zone_group` — rejected
+        // entities skip the whole row group, and the per-row filter
+        // downstream cannot reject what was never decoded.
+        let mut segments = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let batch = make_batch(&[name], &[100 + i as i64], &["a"]);
+            segments.push((
+                make_handle(i as u64, 1),
+                vec![batch],
+                vec![entity_singleton_zone(name)],
+            ));
+        }
+        let reader: Arc<dyn SegmentReader> =
+            Arc::new(VecReader::with_segments(minimal_schema(), segments));
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.with_sample_filter(Arc::new(filter));
+        op.open().unwrap();
+        let ids = drain_entity_ids(&mut op);
+
+        // Output equals the accepted set, in entity-sorted order.
+        let mut expected: Vec<String> = accepted.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "zone-pruned output must match per-row filter"
+        );
+    }
+
+    #[test]
+    fn sample_filter_zone_map_pass_through_accepts_every_zone() {
+        // `fraction: 1.0` should never prune a zone — even a singleton
+        // zone for an entity with any conceivable hash passes.
+        let filter =
+            bqlite_storage::SampleFilter::new(1.0, 0, "entity_id", BqlType::String).unwrap();
+        let names = ["u0", "u1"];
+        let mut segments = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let batch = make_batch(&[name], &[100 + i as i64], &["a"]);
+            segments.push((
+                make_handle(i as u64, 1),
+                vec![batch],
+                vec![entity_singleton_zone(name)],
+            ));
+        }
+        let reader: Arc<dyn SegmentReader> =
+            Arc::new(VecReader::with_segments(minimal_schema(), segments));
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.with_sample_filter(Arc::new(filter));
+        op.open().unwrap();
+        assert_eq!(drain_entity_ids(&mut op), vec!["u0", "u1"]);
     }
 
     #[test]
