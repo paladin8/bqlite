@@ -55,6 +55,7 @@ pub mod attribute;
 pub mod distinct;
 pub mod encoded_filter;
 pub mod eval;
+pub mod event_select;
 pub mod filter;
 pub mod filtered_batch;
 pub mod limit;
@@ -80,6 +81,7 @@ pub use encoded_filter::{
     apply_encoded_eq, apply_materialized_mask, partition_encoded_eq, recognize_encoded_eq,
     ConstantEqKernel, DictionaryEqKernel, EncodedEqShape, EncodedPredicateKernel, RleIntEqKernel,
 };
+pub use event_select::EventSelectOperator;
 pub use filter::FilterOperator;
 pub use filtered_batch::FilteredBatch;
 pub use limit::LimitOperator;

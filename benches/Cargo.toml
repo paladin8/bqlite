@@ -121,3 +121,8 @@ harness = false
 name = "attribute"
 path = "wave4/attribute.rs"
 harness = false
+
+# Wave 4 EventSelectOperator benchmark (TASK-429).
+[[bench]]
+name = "event_select"
+harness = false
