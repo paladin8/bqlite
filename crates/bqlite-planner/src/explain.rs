@@ -1416,6 +1416,7 @@ mod tests {
             output_schema: events_schema_os(),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         };
         let sess = SessionizePhysical {
             gap_ns: 1_800_000_000_000,
@@ -1453,6 +1454,7 @@ mod tests {
             output_schema: events_schema_os(),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         };
         let sample = crate::physical::SamplePhysical {
             fraction: 0.25,
@@ -1479,6 +1481,7 @@ mod tests {
             output_schema: events_schema_os(),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         };
         let scan2 = ScanPhysical {
             table: "clicks".into(),
@@ -1489,6 +1492,7 @@ mod tests {
             output_schema: events_schema_os(),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         };
         let merge = crate::physical::MergeSourcesPhysical {
             tables: vec![scan1, scan2],

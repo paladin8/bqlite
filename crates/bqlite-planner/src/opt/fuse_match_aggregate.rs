@@ -447,6 +447,7 @@ mod tests {
             output_schema: scan_schema(),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         })
     }
 

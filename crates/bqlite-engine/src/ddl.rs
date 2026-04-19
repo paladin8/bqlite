@@ -576,6 +576,7 @@ mod tests {
                 .unwrap(),
                 entity_key_col: "entity_id".to_string(),
                 timestamp_col: "ts".to_string(),
+                sample: None,
             })),
             output_schema: OperatorSchema::new(vec![ColumnDef::required("plan", BqlType::String)])
                 .unwrap(),

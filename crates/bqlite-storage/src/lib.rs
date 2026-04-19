@@ -50,6 +50,7 @@ pub mod database;
 pub mod encoding;
 pub mod ingest;
 pub mod manifest;
+pub mod sample;
 pub mod segment;
 pub mod tombstone;
 pub mod tombstone_scan;
@@ -70,6 +71,7 @@ pub use manifest::{
     ColumnStats, Manifest, SegmentMeta, TableEntry, WindowManifest, DEFAULT_SHARD_COUNT,
     MANIFEST_FORMAT_VERSION,
 };
+pub use sample::{SampleFilter, SharedSampleFilter};
 pub use tombstone::{
     load_tombstone_snapshot, read_tombstone_file, tombstone_file_path, write_tombstone_atomic,
     TimeRangeDelete, TombstoneFile, TombstoneFilter, TombstoneSnapshot, TOMBSTONE_FILE_NAME,

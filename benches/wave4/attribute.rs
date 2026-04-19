@@ -147,6 +147,7 @@ fn build_operator(conversion: &[&str], touchpoints: &[&str], window_ns: i64) -> 
             output_schema: events_schema(),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         })),
         output_schema: output_schema(),
     };

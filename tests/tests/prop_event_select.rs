@@ -118,6 +118,7 @@ fn make_op(kind: EventSelectKind) -> EventSelectOperator {
             output_schema: in_schema.clone(),
             entity_key_col: "entity_id".to_string(),
             timestamp_col: "ts".to_string(),
+            sample: None,
         })),
         output_schema: output_schema(),
     };

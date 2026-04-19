@@ -92,6 +92,7 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
                 output_schema,
                 entity_key_col,
                 timestamp_col,
+                sample,
             } = scan;
 
             // Include columns referenced by scan-level pushed predicates
@@ -130,6 +131,7 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
                 output_schema,
                 entity_key_col,
                 timestamp_col,
+                sample,
             })
         }
 
@@ -460,6 +462,7 @@ mod tests {
             output_schema: schema,
             entity_key_col: "entity_id".to_string(),
             timestamp_col: "ts".to_string(),
+            sample: None,
         }
     }
 
@@ -651,6 +654,7 @@ mod tests {
             output_schema: ten_col_schema(),
             entity_key_col: "entity_id".to_string(),
             timestamp_col: "ts".to_string(),
+            sample: None,
         };
         let two_out = two_col_schema();
 

@@ -249,6 +249,37 @@ pub struct ScanPhysical {
     /// `TableSchema::timestamp_column()`. Required by the scan operator
     /// for k-way merge; the pruning pass always includes this column.
     pub timestamp_col: String,
+    /// Entity-level SAMPLE pushdown. Wave 4 (TASK-430). Empty at
+    /// lowering time; populated by [`crate::opt::sample_pushdown`]
+    /// when a parent [`SamplePhysical`] node feeds this scan through
+    /// entity-key-independent intermediate stages. Carries the
+    /// (fraction, seed) pair the scan operator's entity-id hash
+    /// filter evaluates; `None` means no sample pushdown has been
+    /// applied and the scan streams every entity the projection
+    /// would normally emit.
+    ///
+    /// See `docs/design/operators/event-select-sample.md` §18 for
+    /// the pushdown contract.
+    pub sample: Option<SamplePushdown>,
+}
+
+/// Pushed-down entity-level SAMPLE parameters attached to a
+/// [`ScanPhysical`] by the sample pushdown pass (TASK-430).
+///
+/// Mirrors the `(fraction, seed)` pair on [`SamplePhysical`] so the
+/// engine bind step can materialize a
+/// [`bqlite_storage::SampleFilter`] without looking up the original
+/// `SamplePhysical` descriptor — the pass elides it from the plan
+/// whenever the push succeeds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplePushdown {
+    /// Fraction of entities to retain, in `[0.0, 1.0]`.
+    pub fraction: f64,
+    /// Resolved seed. The planner always substitutes
+    /// [`DEFAULT_SAMPLE_SEED`] for a `None` logical seed at
+    /// lowering time, so the physical-plan level never carries an
+    /// unresolved `Option`.
+    pub seed: i64,
 }
 
 /// Plain-data description of a vectorized row filter.
@@ -1012,6 +1043,7 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                     output_schema,
                     entity_key_col: table.entity_key_column().name.clone(),
                     timestamp_col: table.timestamp_column().name.clone(),
+                    sample: None,
                 })
             } else {
                 // Entity-aligned multi-table source (TASK-425 CP5b). Fan out
@@ -1051,6 +1083,7 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                         output_schema: OperatorSchema::from_table(t),
                         entity_key_col: t.entity_key_column().name.clone(),
                         timestamp_col: t.timestamp_column().name.clone(),
+                        sample: None,
                     })
                     .collect();
                 // Canonical merge order from cohorts-aliases-joins.md §3.2.
@@ -1746,6 +1779,7 @@ mod tests {
             output_schema: OperatorSchema::from_table(&events_schema()),
             entity_key_col: "entity_id".to_string(),
             timestamp_col: "ts".to_string(),
+            sample: None,
         });
         let pred = CompiledExpr {
             node: CompiledNode::Literal(bqlite_core::PropertyValue::Bool(true)),
@@ -2739,6 +2773,7 @@ mod tests {
             output_schema: bqlite_core::OperatorSchema::from_table(&schema),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         };
         let scan2 = ScanPhysical {
             table: "clicks".into(),
@@ -2749,6 +2784,7 @@ mod tests {
             output_schema: bqlite_core::OperatorSchema::from_table(&schema),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         };
         // Build a merged output schema with __source_table_id.
         let merged_schema = bqlite_core::OperatorSchema::new(vec![

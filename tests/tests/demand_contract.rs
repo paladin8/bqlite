@@ -66,6 +66,7 @@ fn minimal_sequence_match_operator() -> impl EntityOperator {
         output_schema: schema.clone(),
         entity_key_col: "entity_id".to_string(),
         timestamp_col: "ts".to_string(),
+        sample: None,
     };
 
     let desc = SequenceMatchPhysical {

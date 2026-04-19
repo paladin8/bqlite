@@ -830,6 +830,7 @@ mod tests {
             output_schema: OperatorSchema::from_table(&bootstrap_events_schema()),
             entity_key_col: "entity_id".to_string(),
             timestamp_col: "ts".to_string(),
+            sample: None,
         })
     }
 
@@ -906,6 +907,7 @@ mod tests {
             output_schema: OperatorSchema::from_table(&bootstrap_events_schema()),
             entity_key_col: "entity_id".to_string(),
             timestamp_col: "ts".to_string(),
+            sample: None,
         });
 
         match bind_physical(&descriptor, &mut db) {

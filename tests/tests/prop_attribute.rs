@@ -89,6 +89,7 @@ fn make_operator(conversion: &[&str], touchpoints: &[&str], window_ns: i64) -> A
             output_schema: input_schema(),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         })),
         output_schema: output_schema(),
     };

@@ -916,6 +916,7 @@ mod tests {
             output_schema: events_input_schema(),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         });
         let desc = AttributePhysical {
             conversion_events: conversion.iter().map(|s| s.to_string()).collect(),
@@ -1020,6 +1021,7 @@ mod tests {
                 output_schema: events_input_schema(),
                 entity_key_col: "entity_id".into(),
                 timestamp_col: "ts".into(),
+                sample: None,
             })),
             output_schema: out,
         };
@@ -1053,6 +1055,7 @@ mod tests {
                 output_schema: events_input_schema(),
                 entity_key_col: "entity_id".into(),
                 timestamp_col: "ts".into(),
+                sample: None,
             })),
             output_schema: out,
         };
@@ -1433,6 +1436,7 @@ mod tests {
             output_schema: events_input_schema(),
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         })
     }
 
@@ -1570,6 +1574,7 @@ mod tests {
             output_schema: input_schema,
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         });
         let desc = AttributePhysical {
             conversion_events: vec!["purchase".into()],
@@ -1645,6 +1650,7 @@ mod tests {
             output_schema: input_schema,
             entity_key_col: "entity_id".into(),
             timestamp_col: "ts".into(),
+            sample: None,
         });
         let desc = AttributePhysical {
             conversion_events: vec!["purchase".into()],
