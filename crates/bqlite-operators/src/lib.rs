@@ -52,6 +52,7 @@
 
 pub mod aggregate;
 pub mod attribute;
+pub mod cohort;
 pub mod distinct;
 pub mod encoded_filter;
 pub mod eval;
@@ -76,6 +77,7 @@ pub use attribute::{
     AttributeOperator, AttributeState, EntityCapDiagnostic, ATTRIBUTE_OP_NAME,
     DEFAULT_ATTRIBUTE_DEQUE_CAP,
 };
+pub use cohort::{CohortHashSet, CohortKey, SubqueryFilterOperator};
 pub use distinct::DistinctOperator;
 pub use encoded_filter::{
     apply_encoded_eq, apply_materialized_mask, partition_encoded_eq, recognize_encoded_eq,
