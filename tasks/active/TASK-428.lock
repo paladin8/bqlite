@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-428",
+  "claimed_at": "2026-04-19T18:46:23Z",
+  "branch": "task/TASK-428",
+  "description": "SessionizeOperator"
+}
