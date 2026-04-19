@@ -58,10 +58,11 @@
 //! - Format-version migration — a later wave reads older manifests
 //!   and upgrades them in-place.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bqlite_core::error::{BqliteError, Result};
 use bqlite_core::schema::{ColumnDef, TableSchema};
@@ -107,7 +108,31 @@ pub struct Database {
     /// prefixed with `_` because nothing reads it directly — its only
     /// job is to hold the lock for the lifetime of the `Database`.
     _lock: File,
+    /// Per-`(table, window_id, shard_id)` tombstone-write mutex pool.
+    ///
+    /// Implements `docs/design/storage/deletes.md` §9: DELETE writes
+    /// to a shard's `tombstones.json` hold this lock for the duration
+    /// of the read-modify-write cycle. DELETEs to different shards
+    /// proceed in parallel because each `(table, window, shard)` key
+    /// has its own `Arc<Mutex<()>>`.
+    ///
+    /// The outer `Mutex<HashMap<...>>` only guards the lazy-insert of
+    /// new entries; once an `Arc<Mutex<()>>` is published, callers
+    /// hold the inner lock without contending on the outer mutex.
+    /// Today every mutation funnels through `&mut Database`, so the
+    /// inner locks are uncontested no-ops; the field is here to keep
+    /// the public contract honest with the spec and to avoid a silent
+    /// correctness break the moment any future task introduces
+    /// shared-handle execution.
+    ///
+    /// Multi-process serialization (SS9.2) remains deferred — would
+    /// require promoting these to `flock` on the tombstone files.
+    tombstone_locks: TombstoneLockPool,
 }
+
+/// Lazy pool of per-`(table, window_id, shard_id)` tombstone-write
+/// locks. See [`Database::tombstone_locks`].
+type TombstoneLockPool = Mutex<HashMap<(String, u32, u16), Arc<Mutex<()>>>>;
 
 impl Database {
     /// Initialize a fresh database at `path` with [`DEFAULT_SHARD_COUNT`].
@@ -173,6 +198,7 @@ impl Database {
             root,
             manifest,
             _lock: lock,
+            tombstone_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -246,6 +272,7 @@ impl Database {
             root,
             manifest,
             _lock: lock,
+            tombstone_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -380,6 +407,35 @@ impl Database {
     ) -> Result<Vec<SegmentMeta>> {
         self.manifest
             .snapshot_for_query(table_name, time_range, shard_id)
+    }
+
+    /// Return the per-shard tombstone-write `Mutex<()>` for
+    /// `(table, window_id, shard_id)`, lazily creating one on first
+    /// access.
+    ///
+    /// Implements the per-shard serialization contract from
+    /// `docs/design/storage/deletes.md` §9. Callers acquire the
+    /// returned `Arc<Mutex<()>>` for the duration of one tombstone
+    /// read-modify-write cycle. Different `(window, shard)` keys hold
+    /// independent locks so DELETEs to disjoint shards proceed in
+    /// parallel.
+    ///
+    /// The outer guard on the lock pool is held only briefly during
+    /// the lazy insert — once an entry exists, repeat callers receive
+    /// the same `Arc` clone without re-locking the pool.
+    pub fn tombstone_shard_lock(
+        &self,
+        table: &str,
+        window_id: u32,
+        shard_id: u16,
+    ) -> Arc<Mutex<()>> {
+        let mut pool = self
+            .tombstone_locks
+            .lock()
+            .expect("tombstone lock pool poisoned");
+        pool.entry((table.to_string(), window_id, shard_id))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Load a frozen tombstone snapshot for the given `(window_id,

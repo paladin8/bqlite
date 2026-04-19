@@ -61,6 +61,7 @@
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::{BqliteError, OperatorSchema, Result};
+use bqlite_planner::PhysicalPlan;
 use bqlite_storage::Database;
 
 use crate::bind::bind_physical;
@@ -76,6 +77,12 @@ use crate::bind::bind_physical;
 /// Row batches are returned in the order the root operator produced
 /// them — the engine does not re-sort, deduplicate, or re-chunk.
 /// Every batch's Arrow schema matches `schema.to_arrow_schema()`.
+///
+/// `rows_affected` is `Some(n)` for statements that mutate data and
+/// have an exact count to report (DELETE per
+/// `docs/design/storage/deletes.md` §11). `None` for SELECT, DDL,
+/// EXPLAIN, and INSERT (which today returns no count). Callers that
+/// want to render "n rows deleted" inspect this field.
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
     /// Output schema. Matches every batch in `rows`.
@@ -83,6 +90,11 @@ pub struct ExecutionResult {
     /// Materialized row batches. Empty when the query produced no
     /// rows — not a signal of failure.
     pub rows: Vec<RecordBatch>,
+    /// Exact rows-affected count for mutating statements. `None`
+    /// when the statement does not produce a count (queries, DDL,
+    /// INSERT). DELETE always populates this with `Some(n)` per
+    /// `docs/design/storage/deletes.md` §11.
+    pub rows_affected: Option<u64>,
 }
 
 impl ExecutionResult {
@@ -185,6 +197,15 @@ impl Engine {
         let catalog = db.catalog();
         let physical = bqlite_planner::plan(statement, &catalog, now_ns)?;
 
+        // DELETE is dispatched out-of-band rather than through the
+        // bind step because it produces no result rows but does
+        // populate `ExecutionResult::rows_affected` (deletes.md §11).
+        // Routing through `bind_physical` would lose that count
+        // because the trait surface only yields `RecordBatch` values.
+        if let PhysicalPlan::Delete(d) = &physical {
+            return crate::delete::execute_delete_statement(d, db);
+        }
+
         // Snapshot the root schema *before* binding. Binding consumes
         // the descriptor via `bind_physical` (by reference for Wave 1),
         // and the returned operator's `output_schema()` is the same
@@ -218,7 +239,11 @@ impl Engine {
         let rows = drive_result?;
         close_result?;
 
-        Ok(ExecutionResult { schema, rows })
+        Ok(ExecutionResult {
+            schema,
+            rows,
+            rows_affected: None,
+        })
     }
 }
 

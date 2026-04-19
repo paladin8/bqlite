@@ -595,11 +595,16 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
             "Wave 4 operator binding is not yet implemented (TASK-438)".into(),
         )),
 
-        // DELETE execution lands in C2 / C3 of TASK-453. The
-        // planner already lowers the statement; this arm wires up
-        // execution.
+        // DELETE is intentionally not bound through this path —
+        // `Engine::query` dispatches it to `crate::delete` directly so
+        // the `rows_affected` count can flow into `ExecutionResult`
+        // out-of-band (deletes.md §11). Reaching this arm means a
+        // caller bypassed `Engine::query`, which is unsupported in
+        // Wave 4.
         PhysicalPlan::Delete(_) => Err(BqliteError::Execution(
-            "DELETE execution is not yet implemented (TASK-453 C2/C3)".into(),
+            "PhysicalPlan::Delete must be executed via Engine::query, \
+             not bind_physical (deletes.md §11)"
+                .into(),
         )),
     }
 }
@@ -628,13 +633,67 @@ fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOpera
     // steps can complete after the source-range end. Step-0 entry is gated
     // separately inside the matcher using the source scan's `query_range`.
     scan_predicates.extend(build_time_range_predicates(scan, reader_range)?);
-    let op = ScanOperator::new(
+
+    // Per `docs/design/storage/deletes.md` §6, every query observes a
+    // single tombstone snapshot taken once at bind time. Walk the
+    // segments visible to the reader, collect the unique
+    // `(window_id, shard_id)` pairs they live in, and load the
+    // tombstones for that exact set. The snapshot is shared via `Arc`
+    // so later waves that fan out one scan operator per shard-task
+    // observe the same epoch.
+    //
+    // `load_tombstone_snapshot` returns an empty entry for any
+    // `(window, shard)` whose tombstone file is missing — the common
+    // path on a database with no DELETEs is therefore zero I/O for
+    // tombstone resolution.
+    let tombstones = load_scan_tombstones(reader.as_ref(), &scan.table, db)?;
+
+    let op = ScanOperator::with_tombstones(
         reader,
         &scan.projected_columns,
         scan_predicates,
         CancellationToken::new(),
+        tombstones,
     )?;
     Ok(Box::new(op))
+}
+
+/// Collect the unique `(window_id, shard_id)` pairs the reader will
+/// touch and load the per-query tombstone snapshot for that exact set.
+///
+/// Falls back to an empty snapshot when the reader yields zero
+/// segments — there is nothing to tombstone, so we save the disk
+/// walk.
+fn load_scan_tombstones(
+    reader: &dyn SegmentReader,
+    table: &str,
+    db: &Database,
+) -> Result<Arc<bqlite_storage::TombstoneSnapshot>> {
+    use std::collections::HashSet;
+    let mut targets: HashSet<(u32, u16)> = HashSet::new();
+    for handle in reader.segments() {
+        let h = handle?;
+        let window = u32::try_from(h.window_id).map_err(|_| {
+            bqlite_core::BqliteError::Execution(format!(
+                "bind_scan: segment_id {} has window_id {} that overflows u32",
+                h.segment_id, h.window_id
+            ))
+        })?;
+        let shard = u16::try_from(h.shard_id).map_err(|_| {
+            bqlite_core::BqliteError::Execution(format!(
+                "bind_scan: segment_id {} has shard_id {} that overflows u16",
+                h.segment_id, h.shard_id
+            ))
+        })?;
+        targets.insert((window, shard));
+    }
+    if targets.is_empty() {
+        return Ok(Arc::new(bqlite_storage::TombstoneSnapshot::empty()));
+    }
+    let mut targets: Vec<(u32, u16)> = targets.into_iter().collect();
+    targets.sort_unstable();
+    let snap = db.load_tombstone_snapshot(table, &targets)?;
+    Ok(Arc::new(snap))
 }
 
 /// Build row-level timestamp predicates from a resolved `TimeRange`.

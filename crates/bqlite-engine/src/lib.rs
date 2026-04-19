@@ -52,6 +52,7 @@
 
 pub mod bind;
 pub mod ddl;
+pub mod delete;
 pub mod ingest;
 pub mod query;
 pub mod render;
