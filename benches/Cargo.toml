@@ -133,3 +133,12 @@ harness = false
 name = "pfor"
 path = "wave4/pfor.rs"
 harness = false
+
+# Wave 4 advanced-encoding comparison matrix (TASK-441) — ALP coverage
+# plus same-fixture head-to-head plots for the Wave 4 integer and
+# string encodings. Frequency encoding is intentionally skipped
+# (advanced-encodings.md §9.5 is NO-GO).
+[[bench]]
+name = "encoding_matrix"
+path = "wave4/encoding_matrix.rs"
+harness = false
