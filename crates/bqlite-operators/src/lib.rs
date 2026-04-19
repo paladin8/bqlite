@@ -63,6 +63,7 @@ pub mod operator;
 pub mod project;
 pub mod scan;
 pub mod selection;
+pub mod sessionize;
 pub mod sort;
 
 pub use aggregate::{
@@ -87,4 +88,5 @@ pub use operator::{
 pub use project::ProjectOperator;
 pub use scan::{ScanOperator, ScanPath};
 pub use selection::{is_dense, selection_as_vector, selection_to_bool_array};
+pub use sessionize::{SessionizeOperator, SessionizeState, DEFAULT_SESSION_EVENT_CAP};
 pub use sort::SortOperator;
