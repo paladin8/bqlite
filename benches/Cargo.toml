@@ -15,6 +15,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+bqlite-ast = { workspace = true }
 bqlite-core = { workspace = true }
 bqlite-storage = { workspace = true }
 bqlite-operators = { workspace = true }
@@ -112,4 +113,11 @@ path = "wave3/funnel_profile.rs"
 [[bench]]
 name = "sessionize"
 path = "wave4/sessionize.rs"
+harness = false
+
+# Wave 4 benchmark: AttributeOperator throughput (TASK-431, §17.1).
+# Run with: cargo bench -p bqlite-benches --bench attribute
+[[bench]]
+name = "attribute"
+path = "wave4/attribute.rs"
 harness = false
