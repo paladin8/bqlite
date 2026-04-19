@@ -375,6 +375,16 @@ impl RowRun {
 /// RLE predicate kernels in Checkpoint 4. `Indices` is the safe
 /// fallback; mixed-variant combinators coerce to `Indices`.
 ///
+/// # Invariants
+///
+/// - `Indices` — indices are strictly ascending and unique (inherited
+///   from [`SelectionVector`]'s construction invariant).
+/// - `Runs` — runs are sorted ascending by `start` and non-overlapping
+///   (i.e. `runs[i].end() <= runs[i+1].start` for all `i`). Zero-length
+///   runs are legal but semantically redundant. `intersect_runs`,
+///   `as_indices`, and `truncate` all rely on this invariant; callers
+///   constructing `Runs` directly must uphold it.
+///
 /// See `docs/design/storage/zero-copy-scan-filter.md` §7.2 for the full
 /// contract on `intersect` behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,8 +399,14 @@ impl RowSelection {
         RowSelection::Indices(SelectionVector::new())
     }
 
-    /// Construct a `Runs` selection.
+    /// Construct a `Runs` selection. Runs must be sorted ascending by
+    /// `start` and non-overlapping — see the [`RowSelection`] type
+    /// docs. `debug_assert` validates the invariant in debug builds.
     pub fn from_runs(runs: Vec<RowRun>) -> Self {
+        debug_assert!(
+            runs.windows(2).all(|w| w[0].end() <= w[1].start),
+            "RowSelection::Runs must be sorted ascending and non-overlapping"
+        );
         RowSelection::Runs(runs)
     }
 

@@ -186,27 +186,43 @@ impl RleIntEqKernel {
 
 impl EncodedPredicateKernel for RleIntEqKernel {
     fn apply(&self, column: &EncodedColumnView<'_>, input: &RowSelection) -> RowSelection {
-        let (chunk, rows) = match column {
+        let (chunk, logical_rows) = match column {
             EncodedColumnView::Encoded { chunk, kind, rows } => match kind {
                 EncodedKind::Rle => (chunk, *rows),
                 _ => return input.clone(),
             },
             EncodedColumnView::Materialized { .. } => return input.clone(),
         };
-        let matched = match parse_rle_int_runs(chunk, rows) {
-            Some(runs) => select_runs_matching_i64(&runs, self.literal),
+        // RLE runs index into the dense (non-null) value stream, not
+        // into logical rows. For non-nullable columns those spaces
+        // coincide; for nullable columns the kernel must translate
+        // via the validity bitmap.
+        let runs = match parse_rle_int_runs(chunk) {
+            Some(r) => r,
             None => return RowSelection::empty(),
         };
-        // Intersect the predicate's matching runs with the input
-        // selection. When both are runs, result stays as runs.
-        let predicate_sel = RowSelection::from_runs(matched);
-        let narrowed = RowSelection::intersect(&predicate_sel, input);
-        // If the column has nulls, drop rows whose validity bit is
-        // unset. This coerces to Indices when splitting runs.
-        if chunk.nulls.is_some() {
-            apply_null_mask(chunk, rows, &narrowed)
-        } else {
-            narrowed
+        match chunk.nulls {
+            None => {
+                // Non-nullable: run_ends are logical row indices. Fast
+                // run-preserving path.
+                let matched = select_runs_matching_i64(&runs, self.literal);
+                let predicate_sel = RowSelection::from_runs(matched);
+                RowSelection::intersect(&predicate_sel, input)
+            }
+            Some(bitmap) => {
+                // Nullable: translate non-null-space runs to logical
+                // row indices via a single bitmap pass. Output is
+                // Indices since interspersed nulls break run shape.
+                let matched_logical = translate_runs_through_bitmap(
+                    &runs,
+                    self.literal,
+                    bitmap,
+                    logical_rows,
+                );
+                let predicate_sel =
+                    RowSelection::Indices(SelectionVector::from_sorted(matched_logical));
+                RowSelection::intersect(&predicate_sel, input)
+            }
         }
     }
 }
@@ -214,10 +230,15 @@ impl EncodedPredicateKernel for RleIntEqKernel {
 /// Parse run_ends and i64 values for an RLE-encoded Int/Timestamp
 /// column.
 ///
+/// `run_end[i]` indexes into the non-null value stream (matches the
+/// writer in `bqlite-storage/src/encoding/rle.rs`). The final
+/// `run_end` equals the non-null value count, which is `logical_rows`
+/// for non-nullable columns and `popcount(nulls_bitmap)` otherwise.
+///
 /// Returns `None` on malformed bytes (defensive — the reader already
 /// validates segment integrity, but kernels prefer "no selection" over
 /// panic on adversarial input).
-fn parse_rle_int_runs(chunk: &PinnedChunkRef<'_>, rows: u32) -> Option<Vec<(u32, i64)>> {
+fn parse_rle_int_runs(chunk: &PinnedChunkRef<'_>) -> Option<Vec<(u32, i64)>> {
     if chunk.params.len() < 4 {
         return None;
     }
@@ -236,11 +257,40 @@ fn parse_rle_int_runs(chunk: &PinnedChunkRef<'_>, rows: u32) -> Option<Vec<(u32,
         let val = i64::from_le_bytes(values_bytes[i * 8..i * 8 + 8].try_into().ok()?);
         out.push((end, val));
     }
-    // Sanity: final run_end must equal the logical row count.
-    if out.last().map(|(e, _)| *e).unwrap_or(0) != rows && run_count > 0 {
-        return None;
-    }
     Some(out)
+}
+
+/// Walk the validity bitmap in parallel with the RLE runs, emitting
+/// logical row indices for every non-null value whose run matches
+/// `literal`.
+///
+/// Runs must be sorted by `run_end` ascending (the encoder guarantees
+/// this). The returned index vector is sorted ascending by
+/// construction.
+fn translate_runs_through_bitmap(
+    runs: &[(u32, i64)],
+    literal: i64,
+    bitmap: &[u8],
+    logical_rows: u32,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut non_null_pos: u32 = 0;
+    let mut run_idx = 0usize;
+    for logical in 0..logical_rows {
+        if !bit_is_set(bitmap, logical as usize) {
+            continue;
+        }
+        // Advance run_idx to the run whose half-open range
+        // `[prev_end, run_end)` contains `non_null_pos`.
+        while run_idx < runs.len() && runs[run_idx].0 <= non_null_pos {
+            run_idx += 1;
+        }
+        if run_idx < runs.len() && runs[run_idx].1 == literal {
+            out.push(logical);
+        }
+        non_null_pos += 1;
+    }
+    out
 }
 
 /// Given parsed `(run_end, value)` pairs, emit the runs whose value
@@ -488,28 +538,77 @@ mod tests {
     }
 
     #[test]
-    fn rle_int_eq_null_bitmap_drops_null_rows() {
-        // 10 rows, runs: value 1 for rows 0..3, 2 for 3..5, 1 for 5..10.
-        // Nulls: rows 1 and 6 are null. Bitmap = 0b1111_1101_1111_1101 =
-        // bytes [0xFD, 0xBF]  (LSB-first: byte0 bit1 = 0, byte1 bit(6-8)=bit-2 off = bit 6 off).
-        //   row 0: bit 0 of byte 0 → 1
-        //   row 1: bit 1 of byte 0 → 0 (null)
-        //   row 2-7: bits 2..8 (byte 0 bits 2-7 plus byte 1 bit 0) → but
-        //     row 6 → bit 6 of byte 0 → 0 (null)
-        //   rows 3,4,5,7,8,9 → valid
-        // byte0 = 0b1011_1101 = 0xBD; byte1 = 0b0000_0011 = 0x03
-        let col = rle_int_column(
-            &[(3, 1), (5, 2), (10, 1)],
-            10,
-            Some(vec![0xBDu8, 0x03u8]),
-        );
+    fn rle_int_eq_null_bitmap_translates_nonnull_runs_to_logical_indices() {
+        // 10 logical rows, 2 nulls at rows 1 and 6 → 8 non-null values.
+        // Null bitmap LSB-first: bits 0,2,3,4,5,7,8,9 set.
+        //   byte0 = 0b10111101 = 0xBD (rows 0..=7)
+        //   byte1 = 0b00000011 = 0x03 (rows 8..=9)
+        //
+        // Dense (non-null) value stream: [1,1,1, 2,2, 1,1,1]
+        //   run_ends (non-null space) = [3, 5, 8], values = [1, 2, 1].
+        //
+        // Logical → non-null position mapping (bitmap walk):
+        //   0→0, 2→1, 3→2, 4→3, 5→4, 7→5, 8→6, 9→7.
+        //
+        // Filter value=1: non-null positions {0,1,2, 5,6,7}. Through
+        // the mapping: logical {0, 2, 3, 7, 8, 9}.
+        let col = rle_int_column(&[(3, 1), (5, 2), (8, 1)], 10, Some(vec![0xBDu8, 0x03u8]));
         let kernel = RleIntEqKernel::new(1);
         let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
         let out = kernel.apply(&col.view(), &input);
-        // value-1 runs cover rows {0,1,2, 5,6,7,8,9}. After null drop:
-        // exclude row 1 (null) and row 6 (null) → {0,2, 5,7,8,9}.
         let sv = out.as_indices();
-        assert_eq!(sv.as_slice(), &[0, 2, 5, 7, 8, 9]);
+        assert_eq!(sv.as_slice(), &[0, 2, 3, 7, 8, 9]);
+    }
+
+    #[test]
+    fn rle_int_eq_null_bitmap_intersects_with_input() {
+        // Same column as the previous test; narrow the input to
+        // [2..8). Expected matches: logical {2, 3, 7}.
+        let col = rle_int_column(&[(3, 1), (5, 2), (8, 1)], 10, Some(vec![0xBDu8, 0x03u8]));
+        let kernel = RleIntEqKernel::new(1);
+        let input = RowSelection::from_runs(vec![RowRun { start: 2, len: 6 }]);
+        let out = kernel.apply(&col.view(), &input);
+        let sv = out.as_indices();
+        assert_eq!(sv.as_slice(), &[2, 3, 7]);
+    }
+
+    /// Differential test — drives the kernel through real RLE bytes
+    /// produced by `bqlite_storage::Rle.encode`. Exercises the
+    /// pin-time contract that `rows` is the *logical* row count when
+    /// the column has nulls (not the encoder's non-null value count).
+    ///
+    /// Setup: 10 logical rows, nulls at rows 1 and 6. Dense non-null
+    /// values [1,1,1, 2,2, 1,1,1] — which RLE compresses into
+    /// run_ends [3,5,8], values [1,2,1]. The kernel must translate
+    /// non-null-space runs to logical row indices {0,2,3,7,8,9} for
+    /// literal=1.
+    #[test]
+    fn rle_int_eq_real_rle_bytes_with_nulls() {
+        use arrow::array::Int64Array;
+        use bqlite_storage::{Encoding, Rle};
+
+        // Dense non-null values as the writer's RLE encoder sees them.
+        let dense = Int64Array::from(vec![1, 1, 1, 2, 2, 1, 1, 1]);
+        let chunk = Rle.encode(&dense).expect("rle encode");
+
+        // Rebuild a PinnedChunk from the real on-disk bytes. `rows` on
+        // EncodedColumn::Encoded is the *logical* row count — 10, not
+        // the encoded 8.
+        let pinned = PinnedChunk {
+            payload: Arc::from(chunk.payload),
+            nulls: Some(Arc::from(vec![0xBDu8, 0x03u8])),
+            params: Arc::from(chunk.params),
+        };
+        let col = EncodedColumn::Encoded {
+            chunk: pinned,
+            kind: EncodedKind::Rle,
+            rows: 10,
+        };
+
+        let kernel = RleIntEqKernel::new(1);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = kernel.apply(&col.view(), &input);
+        assert_eq!(out.as_indices().as_slice(), &[0, 2, 3, 7, 8, 9]);
     }
 
     #[test]

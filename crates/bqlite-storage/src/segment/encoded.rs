@@ -184,7 +184,15 @@ pub fn pin_column_chunk(
 
     // 7. Branch on encoding: build an Encoded view where supported,
     //    else fall through to the materialized fallback.
-    let rows = meta.row_count as u32;
+    //
+    // `rows` is the **logical** row count — the denominator for row
+    // indices in the query plan's RowSelection space. For non-nullable
+    // columns this equals `meta.row_count`; for nullable columns it
+    // equals `row_group_row_count` and is larger than `meta.row_count`
+    // (which is the non-null value count the encoding actually stored).
+    // Kernels that need the non-null value count (e.g. RLE run
+    // parsing) derive it from the chunk's params.
+    let rows = row_group_row_count as u32;
     match encoding {
         EncodingType::Constant => {
             // Parse the constant literal into a ScalarValue so
