@@ -165,17 +165,9 @@ impl Engine {
         //    statement (query, DDL, …). Its typed `ParseError` is
         //    converted to `BqliteError::Parse(String)` because the
         //    unified error enum uses `String` for parse failures.
-        //    Alias execution semantics land in TASK-425; until then we
-        //    reject submissions that contain alias definitions so they
-        //    are not silently ignored.
+        //    Alias definitions are handled by the planner's
+        //    `plan_script` entrypoint (TASK-425 CP4).
         let stmts = bqlite_parser::parse(text).map_err(|e| BqliteError::Parse(e.to_string()))?;
-        let statement = if stmts.len() == 1 {
-            stmts.into_iter().next().unwrap()
-        } else {
-            return Err(BqliteError::Plan(
-                "alias definitions require Wave 4 planner support (TASK-407 / TASK-425)".into(),
-            ));
-        };
 
         // 2. Plan. The database's `ManifestCatalog<'_>` implements
         //    `Catalog`, and the planner only needs a `&dyn Catalog` —
@@ -195,7 +187,7 @@ impl Engine {
                 .unwrap_or(i64::MAX)
         };
         let catalog = db.catalog();
-        let physical = bqlite_planner::plan(statement, &catalog, now_ns)?;
+        let physical = bqlite_planner::plan_script(stmts, &catalog, now_ns)?;
 
         // DELETE is dispatched out-of-band rather than through the
         // bind step because it produces no result rows but does

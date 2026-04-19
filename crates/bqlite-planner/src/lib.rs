@@ -85,10 +85,10 @@ pub use demand::{
 pub use explain::{build_explain_node, format_explain, format_expr, ExplainNode};
 pub use expr::{FunctionRegistry, ScalarFunctionSig, TypedExpr, TypedExprKind};
 pub use logical::{
-    classify_delete_predicate, lower_statement, CheapDeleteSpec, DeleteFilter, EntityRole,
-    EventSelectKind, FusedDownstream, IngestFormat, InsertFromDescriptor, InsertLogicalBody,
-    LogicalPlan, MatchWindowSpec, ProjectItem, SequencePattern, SortDirection, TimeRangeSpec,
-    TypedAggExpr,
+    classify_delete_predicate, lower_statement, lower_statements, AliasTable, CheapDeleteSpec,
+    DeleteFilter, EntityRole, EventSelectKind, FusedDownstream, IngestFormat, InsertFromDescriptor,
+    InsertLogicalBody, LogicalPlan, MatchWindowSpec, ProjectItem, SequencePattern, SortDirection,
+    TimeRangeSpec, TypedAggExpr,
 };
 pub use physical::{
     lower_physical, AggregatePhysical, AlterTableAddColumnPhysical, AttributePhysical, CompiledAgg,
@@ -143,6 +143,26 @@ pub use physical::{
 ///   columns, missing role columns, invalid `ALTER` action).
 pub fn plan(statement: Statement, catalog: &dyn Catalog, now_ns: i64) -> Result<PhysicalPlan> {
     let logical = lower_statement(statement, catalog)?;
+    finalize_physical(logical, now_ns)
+}
+
+/// Lower a full BQL script (zero or more `DefineAlias` statements followed
+/// by exactly one terminal statement) into an optimized [`PhysicalPlan`].
+///
+/// Exists alongside [`plan`] so the engine entrypoint (which consumes the
+/// parser's `Vec<Statement>` directly) does not need to re-case the
+/// single-vs-multi path. `plan(stmt, ...)` is now a thin shim over
+/// `plan_script(vec![stmt], ...)`.
+pub fn plan_script(
+    statements: Vec<Statement>,
+    catalog: &dyn Catalog,
+    now_ns: i64,
+) -> Result<PhysicalPlan> {
+    let logical = lower_statements(statements, catalog)?;
+    finalize_physical(logical, now_ns)
+}
+
+fn finalize_physical(logical: LogicalPlan, now_ns: i64) -> Result<PhysicalPlan> {
     let physical = lower_physical(logical, now_ns);
     // Wave 3 fusion pass (TASK-320): fuse Aggregate(SequenceMatch) pairs.
     // Runs first so the plan shape downstream sees the fused schema.
@@ -407,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_define_alias_pending_wave_4() {
+    fn rejects_define_alias_as_sole_terminal_statement() {
         let catalog = InMemoryCatalog::default().with(events_schema());
         let stmt = Statement::DefineAlias {
             name: Name::synthetic("active_users"),

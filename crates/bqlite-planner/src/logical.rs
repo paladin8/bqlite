@@ -38,7 +38,8 @@
 //! custom functions can plumb a caller-owned registry through this
 //! same API surface without reshaping the fold.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashSet};
 
 use bqlite_ast::expr::{Expr, InRhs, Literal, SortDir, Spanned};
 use bqlite_ast::pattern::{BracketSpec, MatchMode, MatchPattern, MatchWindow, StepEvent};
@@ -1028,25 +1029,137 @@ fn explain_output_schema() -> OperatorSchema {
 // AST → LogicalPlan lowering
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Lower an AST [`Statement`] into a [`LogicalPlan`].
+/// Alias resolution context threaded through pipeline lowering.
 ///
-/// This is the single entry point TASK-226 (physical lowering) and
-/// the engine bind step (TASK-232) call once the parser produces
-/// Wave 2 statement shapes. Table references are resolved via
-/// `catalog`; unknown tables surface as [`BqliteError::Plan`] via
-/// `bqlite_core::catalog::unknown_table_error`.
+/// Holds the source-ordered list of alias names, their raw bodies, a cache of
+/// already-lowered bodies, and the active resolution stack for cycle
+/// detection. Uses interior mutability (`RefCell`) so callers can pass a
+/// `&AliasTable` reference through the recursive lowering chain without
+/// refactoring every helper's signature to `&mut`.
 ///
-/// Every Wave 2 depth variant from logical-plan-nodes.md §3 is
-/// covered: pipeline queries (+ EXPLAIN) landed in C1, DDL /
-/// Insert landed in C2. `Statement::Delete` is lowered through
-/// [`lower_delete`] (TASK-453) into [`LogicalPlan::Delete`].
-/// `Statement::DefineAlias` is rejected with a forward-compat
-/// message pointing at TASK-407.
+/// Semantics follow `docs/design/language/cohorts-aliases-joins.md` §2:
+/// - Source-order definitions: a reference to alias `b` in alias `a`'s body
+///   is valid only if `b` was defined earlier (§2.3 forward-reference rule).
+/// - Last-wins on duplicate names (§2.2): redefining an alias overrides the
+///   prior definition.
+/// - Cycle detection (§2.3): two aliases referring to each other (directly or
+///   transitively) raise a `Plan` error naming the full resolution path.
+#[derive(Debug, Default)]
+pub struct AliasTable {
+    /// Source-ordered list of `(alias_name, position)`. Forward-reference
+    /// check uses `position`: a reference from alias body at position `j`
+    /// is valid iff the referenced alias has a position `i < j`.
+    order: Vec<String>,
+    /// Alias name → (pipeline body, position in `order`). Last-wins: the
+    /// loader overwrites on duplicate names.
+    definitions: BTreeMap<String, (Pipeline, usize)>,
+    /// Lowered alias bodies, keyed by name. Populated lazily on first
+    /// reference. `RefCell` enables interior mutability through a shared
+    /// reference (lowering helpers take `&AliasTable`).
+    resolved: RefCell<BTreeMap<String, LogicalPlan>>,
+    /// Active resolution stack for cycle detection. Pushed when a name
+    /// starts resolving and popped when it finishes.
+    path: RefCell<Vec<String>>,
+}
+
+impl AliasTable {
+    /// Build an empty alias table — used by the legacy single-statement
+    /// entrypoint and by all pipelines lowered outside a multi-statement
+    /// script.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Install one alias definition. Position-indexed so the forward-
+    /// reference check can compare source-order positions rather than
+    /// rescan the entire map.
+    fn push_definition(&mut self, name: String, body: Pipeline) {
+        let pos = self.order.len();
+        self.order.push(name.clone());
+        // Last-wins on duplicates: later definitions shadow earlier ones
+        // (cohorts-aliases-joins.md §2.2).
+        self.definitions.insert(name, (body, pos));
+    }
+
+    /// Return the source-order position of the most recent definition of
+    /// `name`, if any. Used to enforce the forward-reference rule.
+    fn position_of(&self, name: &str) -> Option<usize> {
+        self.definitions.get(name).map(|(_, pos)| *pos)
+    }
+}
+
+/// Lower a single AST [`Statement`] into a [`LogicalPlan`] with no alias
+/// context. Back-compat shim over [`lower_statements`] for callers that do
+/// not go through a multi-statement script.
+///
+/// Table references are resolved via `catalog`; unknown tables surface as
+/// [`BqliteError::Plan`] via `bqlite_core::catalog::unknown_table_error`.
 pub fn lower_statement(statement: Statement, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+    let aliases = AliasTable::empty();
+    lower_statement_with_aliases(statement, catalog, &aliases)
+}
+
+/// Lower a sequence of `Statement`s — the shape `bqlite_parser::parse` emits
+/// from a full BQL script.
+///
+/// The input is expected to be zero or more `Statement::DefineAlias` items
+/// followed by exactly one non-alias terminal (`Query` / `Explain` / DDL /
+/// `Insert` / `Delete`). Alias definitions are collected source-order into an
+/// [`AliasTable`]; the terminal is then lowered with that table in scope so
+/// `IN alias <name>` references in the terminal's WHERE clauses resolve to
+/// the cached lowered bodies.
+pub fn lower_statements(statements: Vec<Statement>, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+    if statements.is_empty() {
+        return Err(BqliteError::Plan(
+            "empty BQL script — expected at least one terminal statement".into(),
+        ));
+    }
+
+    let mut aliases = AliasTable::empty();
+    let mut terminal: Option<Statement> = None;
+
+    for stmt in statements {
+        match stmt {
+            Statement::DefineAlias { name, body, .. } => {
+                if terminal.is_some() {
+                    return Err(BqliteError::Plan(
+                        "alias definitions must precede the terminal statement".into(),
+                    ));
+                }
+                aliases.push_definition(name.text, body);
+            }
+            other => {
+                if terminal.is_some() {
+                    return Err(BqliteError::Plan(
+                        "script must contain exactly one non-alias terminal statement".into(),
+                    ));
+                }
+                terminal = Some(other);
+            }
+        }
+    }
+
+    let terminal = terminal.ok_or_else(|| {
+        BqliteError::Plan(
+            "script contains only alias definitions — a terminal statement is required".into(),
+        )
+    })?;
+
+    lower_statement_with_aliases(terminal, catalog, &aliases)
+}
+
+/// Lower a single statement with an alias table already in scope. This is
+/// the shared implementation for both [`lower_statement`] and
+/// [`lower_statements`].
+fn lower_statement_with_aliases(
+    statement: Statement,
+    catalog: &dyn Catalog,
+    aliases: &AliasTable,
+) -> Result<LogicalPlan> {
     match statement {
-        Statement::Query(pipeline) => lower_query_pipeline(pipeline, catalog),
+        Statement::Query(pipeline) => lower_query_pipeline(pipeline, catalog, aliases),
         Statement::Explain(pipeline) => {
-            let plan = lower_query_pipeline(pipeline, catalog)?;
+            let plan = lower_query_pipeline(pipeline, catalog, aliases)?;
             Ok(LogicalPlan::explain(plan))
         }
         Statement::CreateTable(stmt) => lower_create_table(stmt, catalog),
@@ -1056,7 +1169,9 @@ pub fn lower_statement(statement: Statement, catalog: &dyn Catalog) -> Result<Lo
         Statement::Insert(stmt) => lower_insert(stmt, catalog),
         Statement::Delete(stmt) => lower_delete(stmt, catalog),
         Statement::DefineAlias { .. } => Err(BqliteError::Plan(
-            "alias definitions are deferred to Wave 4 (TASK-407)".into(),
+            "alias definitions must precede the terminal statement — \
+             they cannot appear as the terminal statement itself"
+                .into(),
         )),
     }
 }
@@ -1069,7 +1184,11 @@ pub fn lower_statement(statement: Statement, catalog: &dyn Catalog) -> Result<Lo
 /// then fold pipeline stages left-to-right so the deepest node in
 /// the final tree is the scan and the shallowest node is the last
 /// stage.
-fn lower_query_pipeline(pipeline: Pipeline, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+fn lower_query_pipeline(
+    pipeline: Pipeline,
+    catalog: &dyn Catalog,
+    aliases: &AliasTable,
+) -> Result<LogicalPlan> {
     if !pipeline.source.joins.is_empty() {
         return Err(BqliteError::Plan(
             "JOIN clauses are deferred to Wave 4 (TASK-407 cohorts / entity-joins)".into(),
@@ -1095,7 +1214,7 @@ fn lower_query_pipeline(pipeline: Pipeline, catalog: &dyn Catalog) -> Result<Log
     // Fold pipeline stages in order. Each stage wraps `plan` in a
     // new logical node whose input is the previous `plan`.
     for stage in pipeline.stages {
-        plan = fold_stage(stage, plan, &registry, catalog, &table_schema)?;
+        plan = fold_stage(stage, plan, &registry, catalog, &table_schema, aliases)?;
     }
 
     Ok(plan)
@@ -1108,9 +1227,12 @@ fn fold_stage(
     registry: &FunctionRegistry,
     catalog: &dyn Catalog,
     source_table: &TableSchema,
+    aliases: &AliasTable,
 ) -> Result<LogicalPlan> {
     match stage {
-        PipelineStage::Where { predicate, .. } => lower_where(predicate, acc, registry, catalog),
+        PipelineStage::Where { predicate, .. } => {
+            lower_where(predicate, acc, registry, catalog, aliases)
+        }
 
         PipelineStage::Select {
             distinct, items, ..
@@ -1162,8 +1284,16 @@ fn fold_stage(
         PipelineStage::Funnel(f) => {
             let (match_stage, stats_stage) = crate::opt::desugar_funnel(f)?;
             // Fold the two desugared stages in order (MATCH first, then STATS).
-            let after_match = fold_stage(match_stage, acc, registry, catalog, source_table)?;
-            fold_stage(stats_stage, after_match, registry, catalog, source_table)
+            let after_match =
+                fold_stage(match_stage, acc, registry, catalog, source_table, aliases)?;
+            fold_stage(
+                stats_stage,
+                after_match,
+                registry,
+                catalog,
+                source_table,
+                aliases,
+            )
         }
 
         // Everything else is a later-wave shape.
@@ -1220,14 +1350,14 @@ fn lower_where(
     acc: LogicalPlan,
     registry: &FunctionRegistry,
     catalog: &dyn Catalog,
+    aliases: &AliasTable,
 ) -> Result<LogicalPlan> {
     // Flatten top-level AND chain into a vec of conjuncts.
     let mut conjuncts: Vec<Spanned<Expr>> = Vec::new();
     flatten_and_conjuncts(predicate, &mut conjuncts);
 
     // Partition into subquery-filter conjuncts (IN QUERY / IN alias) and
-    // residual predicate conjuncts. Alias conjuncts are rejected here in CP3
-    // and wired up in CP4.
+    // residual predicate conjuncts.
     let mut acc = acc;
     let mut residual: Vec<Spanned<Expr>> = Vec::new();
     for conjunct in conjuncts {
@@ -1244,16 +1374,28 @@ fn lower_where(
                             .into(),
                     ));
                 }
-                acc = apply_subquery_filter(lhs, subq, acc, registry, catalog)?;
+                let subq_plan = lower_query_pipeline((**subq).clone(), catalog, aliases)?;
+                acc = apply_subquery_filter(lhs, subq_plan, acc, registry)?;
             }
             Expr::In {
-                rhs: InRhs::Alias(_),
-                ..
+                lhs,
+                rhs: InRhs::Alias(name),
+                negated,
             } => {
-                return Err(BqliteError::Plan(
-                    "IN <alias> cohort references are deferred to TASK-425 CP4 (alias binding)"
-                        .into(),
-                ));
+                if *negated {
+                    return Err(BqliteError::Plan(
+                        "NOT IN <alias> is not supported in v1 — see the NOT IN (subquery) \
+                         note for rationale"
+                            .into(),
+                    ));
+                }
+                // `IN alias` references can only appear inside the terminal
+                // pipeline (which sees the full alias table) or inside an
+                // alias body with source-order awareness. The caller-position
+                // check is handled by resolve_alias() — here we just need
+                // to pass it the alias table.
+                let subq_plan = resolve_alias(&name.text, aliases, catalog)?;
+                acc = apply_subquery_filter(lhs, subq_plan, acc, registry)?;
             }
             _ => residual.push(conjunct),
         }
@@ -1299,8 +1441,95 @@ fn recombine_and_conjuncts(mut conjuncts: Vec<Spanned<Expr>>) -> Option<Spanned<
     }
 }
 
-/// Apply a single `<lhs> IN QUERY (subq)` conjunct, producing a
-/// [`LogicalPlan::SubqueryFilter`] above `acc`.
+/// Resolve an `IN alias <name>` reference against the current alias table,
+/// returning the fully-lowered alias body as a [`LogicalPlan`].
+///
+/// Handles:
+/// - Unknown-alias rejection with a hint that references must be in source
+///   order.
+/// - Forward-reference rejection: aliases referring to other aliases defined
+///   later in source order (cohorts-aliases-joins.md §2.3).
+/// - Cycle detection via the active-resolution stack (`aliases.path`).
+/// - Per-name caching in `aliases.resolved` so repeated references share
+///   one lowered plan (still `.clone()`'d into the `SubqueryFilter.subquery`
+///   child, but the expensive lowering work runs once).
+fn resolve_alias(name: &str, aliases: &AliasTable, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+    // Unknown alias.
+    let Some(ref_pos) = aliases.position_of(name) else {
+        return Err(BqliteError::Plan(format!(
+            "alias `{name}` is undefined — all `IN alias` references must name \
+             an alias defined earlier in the script (cohorts-aliases-joins.md §2.3)"
+        )));
+    };
+
+    // Forward-reference check (§2.3): when the reference comes from inside
+    // another alias body, the referenced alias must be at a strictly earlier
+    // source-order position. Terminal-query references have no active alias
+    // on the stack, so they can refer to any defined alias.
+    if let Some(current_name) = aliases.path.borrow().last().cloned() {
+        if current_name == name {
+            return Err(BqliteError::Plan(format!(
+                "alias `{name}` cannot reference itself — self-references are a \
+                 degenerate cycle (cohorts-aliases-joins.md §2.3–§2.4)"
+            )));
+        }
+        let current_pos = aliases
+            .position_of(&current_name)
+            .expect("active alias on path must have a definition");
+        if ref_pos >= current_pos {
+            return Err(BqliteError::Plan(format!(
+                "alias `{name}` is referenced from `{current_name}` but defined later — \
+                 alias references must resolve in source order (cohorts-aliases-joins.md §2.3)"
+            )));
+        }
+    }
+
+    // Cycle detection (§2.4): if `name` is already on the active resolution
+    // stack, this reference closes a cycle.
+    //
+    // NOTE (agent-2, 2026-04-19): with the strict source-order rule above,
+    // transitive cycles (A -> B -> A) are unreachable today — any pair of
+    // aliases that could form a cycle would already fail the forward-ref
+    // check. The branch is kept as a safety net for future rule relaxations
+    // (e.g. hoisted alias scoping).
+    {
+        let path_ref = aliases.path.borrow();
+        if path_ref.iter().any(|n| n == name) {
+            let mut full_path: Vec<String> = path_ref.clone();
+            full_path.push(name.to_string());
+            return Err(BqliteError::Plan(format!(
+                "alias cycle detected: {}",
+                full_path.join(" -> ")
+            )));
+        }
+    }
+
+    // Cache hit: return the previously-lowered plan.
+    if let Some(cached) = aliases.resolved.borrow().get(name) {
+        return Ok(cached.clone());
+    }
+
+    // Cache miss — lower the alias body with `name` pushed onto the path.
+    let (body, _pos) = aliases
+        .definitions
+        .get(name)
+        .expect("position_of checked above implies definitions.get is Some");
+    aliases.path.borrow_mut().push(name.to_string());
+    let result = lower_query_pipeline(body.clone(), catalog, aliases);
+    aliases.path.borrow_mut().pop();
+    let plan = result?;
+    // Install into cache before returning.
+    aliases
+        .resolved
+        .borrow_mut()
+        .insert(name.to_string(), plan.clone());
+    Ok(plan)
+}
+
+/// Apply a single `<lhs> IN QUERY (subq)` or `<lhs> IN <alias>` conjunct,
+/// producing a [`LogicalPlan::SubqueryFilter`] above `acc`. The caller is
+/// responsible for lowering the subquery or resolving the alias — this
+/// function only performs the wrap + validation.
 ///
 /// Validates:
 /// - The subquery's non-system output columns number equals the LHS tuple
@@ -1311,19 +1540,15 @@ fn recombine_and_conjuncts(mut conjuncts: Vec<Spanned<Expr>>) -> Option<Spanned<
 /// - Each LHS expression type-checks against the outer schema.
 fn apply_subquery_filter(
     lhs: &[Spanned<Expr>],
-    subquery: &Pipeline,
+    subq_plan: LogicalPlan,
     acc: LogicalPlan,
     registry: &FunctionRegistry,
-    catalog: &dyn Catalog,
 ) -> Result<LogicalPlan> {
     if lhs.is_empty() {
         return Err(BqliteError::Plan(
             "IN QUERY: LHS must have at least one expression".into(),
         ));
     }
-
-    // Lower the subquery. Clone because the outer caller owns the predicate.
-    let subq_plan = lower_query_pipeline(subquery.clone(), catalog)?;
 
     // Collect the subquery's non-system output columns in declaration order.
     // Cohorts project only user columns — system columns (__seq_id / __batch_id)
@@ -6691,7 +6916,11 @@ mod tests {
     }
 
     #[test]
-    fn where_in_alias_deferred_until_cp4() {
+    fn lower_statement_unbound_in_alias_reference_rejected() {
+        // Using `lower_statement` (empty alias table) with an unbound
+        // `IN alias` reference must reject with an undefined-alias error.
+        // Distinct from `alias_undefined_reference_rejected` below which
+        // goes through `lower_statements` and defines zero aliases.
         let cat = InMemoryCatalog::default().with(purchases_schema());
         let predicate = Spanned::new(
             Expr::In {
@@ -6709,7 +6938,7 @@ mod tests {
             }],
         );
         let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
-        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("alias")));
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("undefined")));
     }
 
     #[test]
@@ -6905,6 +7134,320 @@ mod tests {
         let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
         // Bare SubqueryFilter (no residual Filter wrapping it).
         assert!(matches!(plan, LogicalPlan::SubqueryFilter { .. }));
+    }
+
+    // ── Wave 4 CP4: DefineAlias + IN alias resolution ─────────────────────
+
+    fn define_alias(name: &str, body: Pipeline) -> Statement {
+        Statement::DefineAlias {
+            name: Name::synthetic(name),
+            body,
+            span: Span::EMPTY,
+        }
+    }
+
+    fn in_alias_predicate(outer_col: &str, alias_name: &str) -> Spanned<Expr> {
+        Spanned::new(
+            Expr::In {
+                lhs: vec![column_expr(outer_col)],
+                rhs: InRhs::Alias(Name::synthetic(alias_name)),
+                negated: false,
+            },
+            Span::EMPTY,
+        )
+    }
+
+    fn vip_alias_body() -> Pipeline {
+        // `purchases | SELECT user_id` (simple projection; used as a cohort).
+        Pipeline {
+            source: Source {
+                primary: TableRef {
+                    name: Name::synthetic("purchases"),
+                    span: Span::EMPTY,
+                },
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![PipelineStage::Select {
+                distinct: false,
+                items: vec![select_bare_column("user_id")],
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        }
+    }
+
+    #[test]
+    fn alias_def_plus_in_alias_reference_resolves() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        // `vip = purchases | SELECT user_id`
+        // then `purchases | WHERE user_id IN alias vip`
+        let alias_stmt = define_alias("vip", vip_alias_body());
+        let terminal = Statement::Query(pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: in_alias_predicate("user_id", "vip"),
+                span: Span::EMPTY,
+            }],
+        ));
+        let plan = lower_statements(vec![alias_stmt, terminal], &cat).unwrap();
+        match plan {
+            LogicalPlan::SubqueryFilter {
+                columns,
+                subquery,
+                input,
+                ..
+            } => {
+                assert_eq!(columns.len(), 1);
+                // The subquery is the lowered vip body: Project over Scan.
+                assert!(matches!(*subquery, LogicalPlan::Project { .. }));
+                assert!(matches!(*input, LogicalPlan::Scan { .. }));
+            }
+            other => panic!("expected SubqueryFilter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_undefined_reference_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let terminal = Statement::Query(pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: in_alias_predicate("user_id", "never_defined"),
+                span: Span::EMPTY,
+            }],
+        ));
+        let err = lower_statements(vec![terminal], &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(msg) if msg.contains("never_defined") && msg.contains("undefined"))
+        );
+    }
+
+    #[test]
+    fn alias_forward_reference_rejected() {
+        // `a = purchases | WHERE user_id IN alias b   (references b before b is defined)
+        //  b = purchases | SELECT user_id
+        //  purchases | WHERE user_id IN alias a`
+        // The reference from `a`'s body to `b` is a forward reference, even
+        // though both aliases are defined before the terminal.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let a_body = Pipeline {
+            source: Source {
+                primary: TableRef {
+                    name: Name::synthetic("purchases"),
+                    span: Span::EMPTY,
+                },
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![
+                PipelineStage::Where {
+                    predicate: in_alias_predicate("user_id", "b"),
+                    span: Span::EMPTY,
+                },
+                PipelineStage::Select {
+                    distinct: false,
+                    items: vec![select_bare_column("user_id")],
+                    span: Span::EMPTY,
+                },
+            ],
+            span: Span::EMPTY,
+        };
+        let terminal = Statement::Query(pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: in_alias_predicate("user_id", "a"),
+                span: Span::EMPTY,
+            }],
+        ));
+        let err = lower_statements(
+            vec![
+                define_alias("a", a_body),
+                define_alias("b", vip_alias_body()),
+                terminal,
+            ],
+            &cat,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("defined later")));
+    }
+
+    // `alias_direct_cycle_detected` was folded into
+    // `alias_self_reference_reports_dedicated_error` — the dedicated
+    // self-ref branch supersedes the earlier "contains any `a`" assertion.
+
+    #[test]
+    fn alias_self_reference_reports_dedicated_error() {
+        // An alias body that references itself hits the dedicated self-ref
+        // branch added in CP4 review follow-up, not the generic forward-ref
+        // or cycle-detection branches.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let a_body = Pipeline {
+            source: Source {
+                primary: TableRef {
+                    name: Name::synthetic("purchases"),
+                    span: Span::EMPTY,
+                },
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![
+                PipelineStage::Where {
+                    predicate: in_alias_predicate("user_id", "a"),
+                    span: Span::EMPTY,
+                },
+                PipelineStage::Select {
+                    distinct: false,
+                    items: vec![select_bare_column("user_id")],
+                    span: Span::EMPTY,
+                },
+            ],
+            span: Span::EMPTY,
+        };
+        let terminal = Statement::Query(pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: in_alias_predicate("user_id", "a"),
+                span: Span::EMPTY,
+            }],
+        ));
+        let err = lower_statements(vec![define_alias("a", a_body), terminal], &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("cannot reference itself")));
+    }
+
+    #[test]
+    fn alias_last_wins_on_duplicate_definition() {
+        // Two definitions of `vip` with *different column types*:
+        //   vip = purchases | SELECT amount   (Float — would type-mismatch user_id)
+        //   vip = purchases | SELECT user_id  (String — type-matches user_id)
+        // Terminal uses `WHERE user_id IN alias vip`. Under last-wins the
+        // second body is picked and the plan lowers cleanly; under first-wins
+        // the type check would fail.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let first_body = Pipeline {
+            source: Source {
+                primary: TableRef {
+                    name: Name::synthetic("purchases"),
+                    span: Span::EMPTY,
+                },
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![PipelineStage::Select {
+                distinct: false,
+                items: vec![select_bare_column("amount")],
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        };
+        let second_body = vip_alias_body();
+        let terminal = Statement::Query(pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate: in_alias_predicate("user_id", "vip"),
+                span: Span::EMPTY,
+            }],
+        ));
+        let plan = lower_statements(
+            vec![
+                define_alias("vip", first_body),
+                define_alias("vip", second_body),
+                terminal,
+            ],
+            &cat,
+        )
+        .unwrap();
+        match plan {
+            LogicalPlan::SubqueryFilter { columns, .. } => {
+                // LHS was `user_id` (String). If first-wins had been used, the
+                // vip body would expose Float and `apply_subquery_filter`'s
+                // positional type check would have failed.
+                assert_eq!(columns[0].result_type, BqlType::String);
+            }
+            other => panic!("expected SubqueryFilter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_referenced_twice_caches_lowered_plan() {
+        // Two `IN alias vip` references in the same terminal — the cache
+        // should be populated after the first, and the second reference
+        // hits it. Observable via test plumbing: after calling
+        // `lower_statements`, the AliasTable is consumed, so this test
+        // mostly verifies end-to-end correctness of multiple references.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let terminal = Statement::Query(pipeline_with_stages(
+            "purchases",
+            vec![
+                PipelineStage::Where {
+                    predicate: in_alias_predicate("user_id", "vip"),
+                    span: Span::EMPTY,
+                },
+                PipelineStage::Where {
+                    predicate: in_alias_predicate("user_id", "vip"),
+                    span: Span::EMPTY,
+                },
+            ],
+        ));
+        let plan =
+            lower_statements(vec![define_alias("vip", vip_alias_body()), terminal], &cat).unwrap();
+        // Expect SubqueryFilter(SubqueryFilter(Scan)) from the two WHEREs.
+        let LogicalPlan::SubqueryFilter { input, .. } = plan else {
+            panic!("expected outer SubqueryFilter");
+        };
+        assert!(matches!(*input, LogicalPlan::SubqueryFilter { .. }));
+    }
+
+    #[test]
+    fn not_in_alias_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let predicate = Spanned::new(
+            Expr::In {
+                lhs: vec![column_expr("user_id")],
+                rhs: InRhs::Alias(Name::synthetic("vip")),
+                negated: true,
+            },
+            Span::EMPTY,
+        );
+        let terminal = Statement::Query(pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Where {
+                predicate,
+                span: Span::EMPTY,
+            }],
+        ));
+        let err = lower_statements(vec![define_alias("vip", vip_alias_body()), terminal], &cat)
+            .unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("NOT IN")));
+    }
+
+    #[test]
+    fn lower_statements_single_query_matches_lower_statement() {
+        // Back-compat regression: a single-statement Vec must produce the
+        // same plan shape as lower_statement(stmt) did pre-CP4.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let stmt = Statement::Query(bare_pipeline("purchases"));
+        let via_batch = lower_statements(vec![stmt.clone()], &cat).unwrap();
+        let via_single = lower_statement(stmt, &cat).unwrap();
+        assert_eq!(via_batch, via_single);
+    }
+
+    #[test]
+    fn empty_script_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statements(vec![], &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("empty")));
+    }
+
+    #[test]
+    fn script_with_only_aliases_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let err = lower_statements(vec![define_alias("vip", vip_alias_body())], &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("terminal")));
     }
 
     #[test]
