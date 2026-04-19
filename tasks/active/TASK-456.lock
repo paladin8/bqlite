@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-456",
+  "claimed_at": "2026-04-19T23:35:45Z",
+  "branch": "task/TASK-456",
+  "description": "Wave 4 docs and examples refresh"
+}
