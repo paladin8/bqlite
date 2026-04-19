@@ -31,6 +31,7 @@ use arrow::record_batch::RecordBatch;
 use bqlite_core::encoded::{
     EncodedBatch, RowSelection, StitchedBatch, StitchedRows,
 };
+use bqlite_core::metrics::Metrics;
 use bqlite_core::{BqlType, BqliteError, Result};
 use bqlite_storage::{materialize_encoded_column, materialize_encoded_column_selected};
 
@@ -60,6 +61,32 @@ pub fn materialize_selected(
     types: &[BqlType],
     schema: Arc<ArrowSchema>,
 ) -> Result<FilteredBatch> {
+    materialize_selected_with_metrics(batch, selection, types, schema, None)
+}
+
+/// Metrics-aware variant of [`materialize_selected`].
+///
+/// When `metrics` is `Some`, records the copy-budget counters defined
+/// in `docs/design/storage/zero-copy-scan-filter.md` §3:
+///
+/// - `selected_rows_before_materialization` — the selection's logical
+///   row count (or the batch row count when `selection` is `None`).
+/// - `materialized_rows` — the output batch's final row count.
+/// - `bytes_materialized_after_filter` — the output `RecordBatch`'s
+///   total array-buffer bytes.
+///
+/// Upstream counters (`bytes_scanned`, `bytes_decompressed`,
+/// `bytes_materialized_before_filter`) are recorded at the reader
+/// level and don't belong here. CP8 bench wiring consumes these
+/// counters from a shared [`Metrics`] handle threaded through the
+/// scan operator (landing in a subsequent change).
+pub fn materialize_selected_with_metrics(
+    batch: &EncodedBatch,
+    selection: Option<&RowSelection>,
+    types: &[BqlType],
+    schema: Arc<ArrowSchema>,
+    metrics: Option<&dyn Metrics>,
+) -> Result<FilteredBatch> {
     if batch.columns.len() != types.len() {
         return Err(BqliteError::Execution(format!(
             "materialize_selected: batch has {} columns but {} types were provided",
@@ -74,6 +101,12 @@ pub fn materialize_selected(
             schema.fields().len(),
         )));
     }
+    if let Some(m) = metrics {
+        let selected_rows = selection
+            .map(|s| s.len() as u64)
+            .unwrap_or(batch.row_count as u64);
+        m.record_selected_rows_before_materialization(selected_rows);
+    }
     let mut arrays = Vec::with_capacity(batch.columns.len());
     for (col, ty) in batch.columns.iter().zip(types.iter()) {
         arrays.push(materialize_encoded_column_selected(col, ty, selection)?);
@@ -81,7 +114,21 @@ pub fn materialize_selected(
     let record = RecordBatch::try_new(schema, arrays).map_err(|e| {
         BqliteError::Execution(format!("materialize_selected: record-batch build failed: {e}"))
     })?;
+    if let Some(m) = metrics {
+        m.record_materialized_rows(record.num_rows() as u64);
+        m.record_bytes_materialized_after_filter(record_batch_bytes(&record));
+    }
     Ok(FilteredBatch::dense(record))
+}
+
+/// Approximate the total bytes of Arrow array buffers in a record
+/// batch, by summing each column's `get_array_memory_size`.
+fn record_batch_bytes(batch: &RecordBatch) -> u64 {
+    batch
+        .columns()
+        .iter()
+        .map(|a| a.get_array_memory_size() as u64)
+        .sum()
 }
 
 /// Materialize a [`StitchedBatch`] into a dense [`FilteredBatch`]
@@ -403,6 +450,47 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(ints.values(), &[1i64, 1, 1, 1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn materialize_selected_with_metrics_records_boundary_counters() {
+        use bqlite_core::metrics::AtomicMetrics;
+        let col = materialized_column(vec![10, 20, 30, 40, 50]);
+        let batch = EncodedBatch::new(5, vec![col]);
+        let sel = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 2, 4]));
+        let metrics = AtomicMetrics::default();
+        let fb = materialize_selected_with_metrics(
+            &batch,
+            Some(&sel),
+            &[BqlType::Int],
+            i64_schema(),
+            Some(&metrics),
+        )
+        .unwrap();
+        assert_eq!(fb.batch.num_rows(), 3);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.selected_rows_before_materialization, 3);
+        assert_eq!(snap.materialized_rows, 3);
+        assert!(snap.bytes_materialized_after_filter > 0);
+    }
+
+    #[test]
+    fn materialize_selected_with_metrics_none_selection_counts_row_count() {
+        use bqlite_core::metrics::AtomicMetrics;
+        let col = materialized_column(vec![10, 20, 30]);
+        let batch = EncodedBatch::new(3, vec![col]);
+        let metrics = AtomicMetrics::default();
+        let _ = materialize_selected_with_metrics(
+            &batch,
+            None,
+            &[BqlType::Int],
+            i64_schema(),
+            Some(&metrics),
+        )
+        .unwrap();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.selected_rows_before_materialization, 3);
+        assert_eq!(snap.materialized_rows, 3);
     }
 
     #[test]

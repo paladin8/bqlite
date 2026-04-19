@@ -77,7 +77,9 @@ pub use filter::FilterOperator;
 pub use filtered_batch::FilteredBatch;
 pub use limit::LimitOperator;
 pub use matcher::SequenceMatchOperator;
-pub use materialize::{materialize_selected, materialize_stitched};
+pub use materialize::{
+    materialize_selected, materialize_selected_with_metrics, materialize_stitched,
+};
 pub use operator::{
     CancellationToken, EntityOperator, PhysicalOperator, DEFAULT_OUTPUT_BATCH_SIZE,
 };
