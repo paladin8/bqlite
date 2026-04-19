@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-448",
+  "claimed_at": "2026-04-19T23:35:42Z",
+  "branch": "task/TASK-448",
+  "description": "Delete, tombstone, and compaction semantic audit"
+}
