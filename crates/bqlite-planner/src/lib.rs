@@ -167,6 +167,13 @@ fn finalize_physical(logical: LogicalPlan, now_ns: i64) -> Result<PhysicalPlan> 
     // Wave 3 fusion pass (TASK-320): fuse Aggregate(SequenceMatch) pairs.
     // Runs first so the plan shape downstream sees the fused schema.
     let physical = opt::fuse_match_aggregate::fuse_match_aggregate(physical);
+    // Wave 4 sample pushdown (TASK-430). Runs before predicate pushdown
+    // so `Sample(Filter(Scan))` first becomes `Filter(Scan_with_sample)`;
+    // the subsequent predicate-pushdown pass then collapses the filter
+    // into `Scan::scan_predicates`. Running in the other order would
+    // leave the filter above the scan because predicate pushdown does
+    // not recurse through `Sample`.
+    let physical = opt::sample_pushdown::pushdown_sample(physical);
     // Apply Wave 2 optimizer passes in order (TASK-227, TASK-228).
     // Both passes treat DDL / DML leaves as identity, so it is safe to
     // apply them unconditionally regardless of statement kind.
@@ -306,6 +313,110 @@ mod tests {
         let catalog: &dyn Catalog = &owned;
         let stmt = Statement::Query(bare_pipeline("events"));
         assert!(plan(stmt, catalog, 0).is_ok());
+    }
+
+    // ── TASK-430: SAMPLE pushdown end-to-end ─────────────────────────
+
+    /// Build a pipeline that applies SAMPLE directly to a table scan.
+    fn sample_over_table(table: &str, fraction: f64, seed: Option<i64>) -> Pipeline {
+        Pipeline {
+            source: Source {
+                primary: table_ref(table),
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![PipelineStage::Sample(bqlite_ast::Sample {
+                fraction,
+                seed,
+                span: Span::EMPTY,
+            })],
+            span: Span::EMPTY,
+        }
+    }
+
+    #[test]
+    fn plan_pushes_sample_into_scan_and_elides_sample_node() {
+        let catalog = InMemoryCatalog::default().with(events_schema());
+        let stmt = Statement::Query(sample_over_table("events", 0.25, Some(7)));
+        let physical = plan(stmt, &catalog, 0).unwrap();
+        let PhysicalPlan::Scan(scan) = physical else {
+            panic!("expected Scan (sample pushed, Sample elided), got {physical:?}");
+        };
+        let s = scan.sample.expect("sample pushdown attached");
+        assert!((s.fraction - 0.25).abs() < f64::EPSILON);
+        assert_eq!(s.seed, 7);
+    }
+
+    #[test]
+    fn plan_pushes_sample_past_pushable_filter() {
+        // `events | WHERE event_type = 'purchase' | SAMPLE(fraction: 0.5)`.
+        // After lowering we get `Sample(Filter(Scan))`. The predicate
+        // pushdown pass first folds the filter conjunct into
+        // `Scan::scan_predicates` (producing `Sample(Scan)`), and then
+        // the sample pushdown pass elides the `Sample` node. The final
+        // shape must be a bare `Scan` carrying both the pushed predicate
+        // and the sample parameters — proving the pass ordering works.
+        let catalog = InMemoryCatalog::default().with(events_schema());
+        let where_stage = PipelineStage::Where {
+            predicate: Spanned {
+                node: Expr::Compare {
+                    op: bqlite_ast::expr::CompareOp::Equal,
+                    left: Box::new(Spanned {
+                        node: Expr::Column(Name::synthetic("event_type")),
+                        span: Span::EMPTY,
+                    }),
+                    right: Box::new(Spanned {
+                        node: Expr::Literal(Literal::String("purchase".into())),
+                        span: Span::EMPTY,
+                    }),
+                },
+                span: Span::EMPTY,
+            },
+            span: Span::EMPTY,
+        };
+        let sample_stage = PipelineStage::Sample(bqlite_ast::Sample {
+            fraction: 0.5,
+            seed: Some(17),
+            span: Span::EMPTY,
+        });
+        let pipeline = Pipeline {
+            source: Source {
+                primary: table_ref("events"),
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![where_stage, sample_stage],
+            span: Span::EMPTY,
+        };
+        let physical = plan(Statement::Query(pipeline), &catalog, 0).unwrap();
+        let PhysicalPlan::Scan(scan) = physical else {
+            panic!("expected Scan with both predicate + sample pushed, got {physical:?}");
+        };
+        assert_eq!(
+            scan.scan_predicates.len(),
+            1,
+            "filter predicate must have been pushed"
+        );
+        let s = scan.sample.expect("sample must have been pushed");
+        assert!((s.fraction - 0.5).abs() < f64::EPSILON);
+        assert_eq!(s.seed, 17);
+    }
+
+    #[test]
+    fn plan_sample_with_no_seed_substitutes_default() {
+        // `None` logical seed is resolved at lowering time to
+        // `DEFAULT_SAMPLE_SEED` per physical.rs; the pushdown pass
+        // carries that value unchanged.
+        let catalog = InMemoryCatalog::default().with(events_schema());
+        let stmt = Statement::Query(sample_over_table("events", 0.5, None));
+        let physical = plan(stmt, &catalog, 0).unwrap();
+        let PhysicalPlan::Scan(scan) = physical else {
+            panic!("expected Scan, got {physical:?}");
+        };
+        let s = scan.sample.expect("sample attached");
+        assert_eq!(s.seed, crate::physical::DEFAULT_SAMPLE_SEED);
     }
 
     // ── Unknown table ───────────────────────────────────────────────

@@ -31,15 +31,23 @@
 //! | Helper | Module | Task |
 //! |--------|--------|------|
 //! | RETENTION desugaring | [`desugar_retention`] | TASK-426 |
+//!
+//! ## Wave 4 passes
+//!
+//! | Pass | Module | Task |
+//! |------|--------|------|
+//! | Sample pushdown | [`sample_pushdown`] | TASK-430 |
 
 pub mod desugar_funnel;
 pub mod desugar_retention;
 pub mod fuse_match_aggregate;
 pub mod prune;
 pub mod pushdown;
+pub mod sample_pushdown;
 
 pub use desugar_funnel::desugar_funnel;
 pub use desugar_retention::desugar_retention;
 pub use fuse_match_aggregate::fuse_match_aggregate;
 pub use prune::prune_columns;
 pub use pushdown::pushdown_predicates;
+pub use sample_pushdown::pushdown_sample;

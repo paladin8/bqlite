@@ -123,7 +123,7 @@ use bqlite_core::{
 };
 use bqlite_planner::compiled::{CompareOp, CompiledExpr, CompiledNode};
 use bqlite_storage::segment::merge::{EncodedBatchSource, EncodedKWayMergeScan, KWayMergeScan};
-use bqlite_storage::{TombstoneScanWrapper, TombstoneSnapshot};
+use bqlite_storage::{SampleFilter, TombstoneScanWrapper, TombstoneSnapshot};
 
 use crate::encoded_filter::{apply_encoded_eq, partition_encoded_eq, EncodedEqShape};
 use crate::eval;
@@ -298,6 +298,16 @@ pub struct ScanOperator {
     /// [`TableSchema`]. Used alongside `entity_key_name` when wrapping
     /// per-segment scans with tombstone filtering.
     ts_col_name: String,
+    /// Entity-level SAMPLE filter pushed down by
+    /// [`bqlite_planner::opt::pushdown_sample`]. Populated by the
+    /// engine bind step from [`bqlite_planner::physical::ScanPhysical::sample`].
+    /// `None` disables the per-row sample test — the operator
+    /// behaves identically to the pre-TASK-430 contract.
+    ///
+    /// Held as `Arc<SampleFilter>` so future per-shard fan-out paths
+    /// can share the same filter across parallel tasks without
+    /// duplicating the precomputed threshold + seed.
+    sample_filter: Option<Arc<SampleFilter>>,
 }
 
 impl std::fmt::Debug for ScanOperator {
@@ -323,6 +333,7 @@ impl std::fmt::Debug for ScanOperator {
             )
             .field("exhausted", &self.exhausted)
             .field("scan_path", &self.scan_path)
+            .field("has_sample_filter", &self.sample_filter.is_some())
             .finish()
     }
 }
@@ -504,7 +515,25 @@ impl ScanOperator {
             tombstones,
             entity_key_name,
             ts_col_name,
+            sample_filter: None,
         })
+    }
+
+    /// Attach an entity-level SAMPLE filter pushed down from the
+    /// physical plan's [`ScanPhysical::sample`] field (TASK-430).
+    ///
+    /// Must be called before [`ScanOperator::open`]. The filter is
+    /// evaluated on every materialized batch via a boolean mask over
+    /// the entity-id column; non-sampled rows are dropped before the
+    /// batch reaches downstream operators. Combined with `post_filters`
+    /// under AND semantics — order is insignificant because the
+    /// sample test is a function of the entity-id column alone.
+    ///
+    /// Returns `&mut self` so callers can chain builders; the engine
+    /// bind step uses this form.
+    pub fn with_sample_filter(&mut self, filter: Arc<SampleFilter>) -> &mut Self {
+        self.sample_filter = Some(filter);
+        self
     }
 
     /// Convenience constructor: scan every declared column with no
@@ -573,6 +602,7 @@ impl ScanOperator {
             } else {
                 apply_compiled_filters(&self.encoded_residual, batch)?
             };
+            let batch = self.apply_sample_filter(batch)?;
             if batch.num_rows() > 0 {
                 return Ok(Some(batch));
             }
@@ -617,10 +647,37 @@ impl ScanOperator {
             } else {
                 apply_compiled_filters(&self.encoded_residual, batch)?
             };
+            let batch = self.apply_sample_filter(batch)?;
             if batch.num_rows() > 0 {
                 return Ok(Some(batch));
             }
         }
+    }
+
+    /// Apply the entity-level SAMPLE filter (TASK-430) to `batch`.
+    ///
+    /// Short-circuits when no filter is attached (the pre-TASK-430
+    /// behavior) or when the filter is in pass-through mode
+    /// (`fraction == 1.0`). Otherwise builds a boolean mask over the
+    /// entity-id column and returns a row-filtered batch.
+    ///
+    /// Rows whose entity-id fails the hash threshold drop; rows
+    /// whose entity-id is null also drop (the `SampleFilter`
+    /// invariant: sampled entities have stable hashes, nulls do
+    /// not). The entity-id column is always present in the scan
+    /// output — `ScanOperator::with_tombstones_and_scan_path` rejects
+    /// projections that omit it — so the lookup is infallible.
+    fn apply_sample_filter(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let Some(filter) = self.sample_filter.as_deref() else {
+            return Ok(batch);
+        };
+        if filter.is_pass_through() {
+            return Ok(batch);
+        }
+        let entity_col = batch.column(self.entity_col);
+        let mask = filter.apply_to_array(entity_col.as_ref())?;
+        let filtered = compute::filter_record_batch(&batch, &mask)?;
+        Ok(filtered)
     }
 
     /// Evaluate every entry in `post_filters` against `batch` and
@@ -656,6 +713,15 @@ impl PhysicalOperator for ScanOperator {
     }
 
     fn open(&mut self) -> Result<()> {
+        // Empty-set SAMPLE short-circuits the whole scan: nothing the
+        // reader produces could pass the threshold test, so avoid the
+        // segment-enumeration and merge-setup cost entirely. Callers
+        // will see `next_batch() == Ok(None)` on the first pull.
+        if matches!(&self.sample_filter, Some(f) if f.is_empty_set()) {
+            self.exhausted = true;
+            return Ok(());
+        }
+
         // Materialise the handle list up-front so any enumeration
         // error surfaces from `open()`, before results start
         // flowing — matches the `PhysicalOperator::open` doc.
@@ -788,6 +854,7 @@ impl PhysicalOperator for ScanOperator {
                 return Ok(Some(batch));
             }
             let filtered = self.apply_post_filters(batch)?;
+            let filtered = self.apply_sample_filter(filtered)?;
             if filtered.num_rows() > 0 {
                 return Ok(Some(filtered));
             }
@@ -2825,5 +2892,136 @@ mod tests {
         op.open().unwrap();
         let ids = drain_entity_ids(&mut op);
         assert_eq!(ids, vec!["bob", "carol"]);
+    }
+
+    // ── SAMPLE pushdown tests (TASK-430) ────────────────────────────────────
+
+    /// Build a two-segment reader for the SAMPLE tests. Enumerates
+    /// four distinct entity IDs ("u0".."u3"), one row per entity.
+    fn sample_reader() -> Arc<dyn SegmentReader> {
+        let s1 = make_batch(&["u0", "u1"], &[100, 200], &["a", "b"]);
+        let s2 = make_batch(&["u2", "u3"], &[300, 400], &["c", "d"]);
+        Arc::new(VecReader::with_segments(
+            minimal_schema(),
+            vec![
+                (make_handle(1, 2), vec![s1], vec![HashMap::new()]),
+                (make_handle(2, 2), vec![s2], vec![HashMap::new()]),
+            ],
+        )) as Arc<dyn SegmentReader>
+    }
+
+    #[test]
+    fn sample_filter_pass_through_keeps_every_row() {
+        let reader = sample_reader();
+        let filter = Arc::new(
+            bqlite_storage::SampleFilter::new(1.0, 0, "entity_id", BqlType::String).unwrap(),
+        );
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.with_sample_filter(filter);
+        op.open().unwrap();
+        let ids = drain_entity_ids(&mut op);
+        assert_eq!(ids, vec!["u0", "u1", "u2", "u3"]);
+    }
+
+    #[test]
+    fn sample_filter_empty_set_short_circuits_to_none() {
+        let reader = sample_reader();
+        let filter = Arc::new(
+            bqlite_storage::SampleFilter::new(0.0, 0, "entity_id", BqlType::String).unwrap(),
+        );
+        let mut op = ScanOperator::full_scan(reader).unwrap();
+        op.with_sample_filter(filter);
+        op.open().unwrap();
+        // No batches expected, and the sticky exhaustion guarantees
+        // repeat calls also return None.
+        assert!(op.next_batch().unwrap().is_none());
+        assert!(op.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn sample_filter_half_fraction_returns_deterministic_subset() {
+        // At fraction 0.5 with seed 42 the 4-entity fixture reduces to
+        // whatever subset the xxhash64 threshold picks. The test asserts
+        // determinism (two runs match) and that the result is a strict
+        // subset of the pass-through output, not the exact membership —
+        // the hash function is pinned, so the membership is stable across
+        // versions, but listing it inline here would make the test depend
+        // on the precise u64 outputs of `twox_hash`.
+        let filter_spec = || {
+            Arc::new(
+                bqlite_storage::SampleFilter::new(0.5, 42, "entity_id", BqlType::String).unwrap(),
+            )
+        };
+
+        let mut op1 = ScanOperator::full_scan(sample_reader()).unwrap();
+        op1.with_sample_filter(filter_spec());
+        op1.open().unwrap();
+        let ids1 = drain_entity_ids(&mut op1);
+
+        let mut op2 = ScanOperator::full_scan(sample_reader()).unwrap();
+        op2.with_sample_filter(filter_spec());
+        op2.open().unwrap();
+        let ids2 = drain_entity_ids(&mut op2);
+
+        assert_eq!(ids1, ids2, "sample filter is not deterministic");
+        // Subset of full output.
+        let all = ["u0".to_string(), "u1".into(), "u2".into(), "u3".into()];
+        for id in &ids1 {
+            assert!(all.contains(id), "unexpected sampled id {id}");
+        }
+        // With 4 entities and fraction 0.5 the sampled set is strictly
+        // smaller than the input with high probability; assert it's not
+        // the pass-through set and not empty.
+        assert!(ids1.len() < all.len() && !ids1.is_empty());
+    }
+
+    #[test]
+    fn sample_filter_composes_with_post_filters() {
+        // `WHERE event_type == 'c'` leaves only the `u2` row; a
+        // fraction-0.5 sample that *does* include `u2` keeps the row;
+        // a sample that excludes `u2` produces empty output. Both
+        // orderings agree on that row because the entity-id is the
+        // only hash input, independent of the predicate's column.
+        let schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("event_type"), string_lit("c")),
+            &schema,
+        );
+
+        // First check without sample: exactly one row, entity u2.
+        let mut op = ScanOperator::new(
+            sample_reader(),
+            &[],
+            vec![pred.clone()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+        op.open().unwrap();
+        assert_eq!(drain_entity_ids(&mut op), vec!["u2"]);
+
+        // Now with a `fraction: 1.0` sample — must still match.
+        let filter = Arc::new(
+            bqlite_storage::SampleFilter::new(1.0, 0, "entity_id", BqlType::String).unwrap(),
+        );
+        let mut op = ScanOperator::new(
+            sample_reader(),
+            &[],
+            vec![pred.clone()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+        op.with_sample_filter(filter);
+        op.open().unwrap();
+        assert_eq!(drain_entity_ids(&mut op), vec!["u2"]);
+
+        // And with an `fraction: 0.0` sample — empty output.
+        let empty = Arc::new(
+            bqlite_storage::SampleFilter::new(0.0, 0, "entity_id", BqlType::String).unwrap(),
+        );
+        let mut op =
+            ScanOperator::new(sample_reader(), &[], vec![pred], CancellationToken::new()).unwrap();
+        op.with_sample_filter(empty);
+        op.open().unwrap();
+        assert!(op.next_batch().unwrap().is_none());
     }
 }

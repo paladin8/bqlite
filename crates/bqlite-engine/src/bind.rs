@@ -648,13 +648,31 @@ fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOpera
     // tombstone resolution.
     let tombstones = load_scan_tombstones(reader.as_ref(), &scan.table, db)?;
 
-    let op = ScanOperator::with_tombstones(
-        reader,
+    let mut op = ScanOperator::with_tombstones(
+        reader.clone(),
         &scan.projected_columns,
         scan_predicates,
         CancellationToken::new(),
         tombstones,
     )?;
+
+    // Entity-level SAMPLE pushdown (TASK-430). When the planner's
+    // sample-pushdown pass attaches a `SamplePushdown` to the scan,
+    // materialize the `SampleFilter` against the live table schema so
+    // the operator can evaluate the xxHash64 threshold per row. The
+    // fraction has already been validated in `[0.0, 1.0]` at lowering
+    // time (see `lower_sample`), so `from_pushdown` can only fail on
+    // an unsupported entity-id type — unreachable in the production
+    // pipeline.
+    if let Some(sample) = &scan.sample {
+        let filter = bqlite_storage::SampleFilter::from_pushdown(
+            sample.fraction,
+            sample.seed,
+            reader.schema(),
+        )?;
+        op.with_sample_filter(Arc::new(filter));
+    }
+
     Ok(Box::new(op))
 }
 

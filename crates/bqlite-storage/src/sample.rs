@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Int64Array, StringViewArray};
 use arrow::datatypes::DataType;
-use bqlite_core::{BqlType, BqliteError, PropertyValue, Result, ZoneMap};
+use bqlite_core::{BqlType, BqliteError, PropertyValue, Result, TableSchema, ZoneMap};
 use twox_hash::XxHash64;
 
 /// Entity-ID hash filter for the SAMPLE operator.
@@ -142,6 +142,23 @@ impl SampleFilter {
     /// Resolved query seed used for xxHash64.
     pub fn seed(&self) -> i64 {
         self.seed
+    }
+
+    /// Construct a filter from a `(fraction, seed)` pushdown
+    /// descriptor and the table schema. Resolves the entity-id
+    /// column and its [`BqlType`] from
+    /// [`TableSchema::entity_key_column`] so call sites at the
+    /// engine bind step do not need to duplicate the lookup.
+    ///
+    /// Returns the same errors as [`SampleFilter::new`]: out-of-range
+    /// fraction or unsupported entity-id type. The latter is
+    /// unreachable in the production pipeline (table schema
+    /// construction already rejects non-String/Int entity keys) but
+    /// kept here so synthetic fixtures get a typed error instead of a
+    /// silent wrong-hash result.
+    pub fn from_pushdown(fraction: f64, seed: i64, table: &TableSchema) -> Result<Self> {
+        let col = table.entity_key_column();
+        Self::new(fraction, seed, col.name.clone(), col.bql_type.clone())
     }
 
     /// Test a string entity-id against the threshold.
