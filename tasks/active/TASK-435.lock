@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-435",
+  "claimed_at": "2026-04-19T22:31:45Z",
+  "branch": "task/TASK-435",
+  "description": "Tombstone reclamation during compaction"
+}
