@@ -376,6 +376,20 @@ pub enum LogicalPlan {
         /// Fused downstream aggregate specification (Wave 5).
         /// Always `None` in v1.
         fused_downstream: Option<FusedDownstream>,
+        /// Original query time range `(start_ns, end_ns)`, captured at
+        /// logical-lowering time so the physical layer can apply the
+        /// extension-aware conversion-emission filter from
+        /// `operators/attribute.md` §12 ("only conversions whose
+        /// `conversion_ts` falls within this original range trigger
+        /// emission — touchpoints from the extended zone are deque
+        /// material only").
+        ///
+        /// `None` when the source is unbounded (no `LAST`/`BETWEEN`
+        /// clause) or when the range is a `LAST <dur>` form that needs
+        /// `now_ns` to resolve — the physical layer handles the latter
+        /// via a small fallback walk, since it is the first place
+        /// `now_ns` is in scope.
+        conversion_range: Option<(i64, i64)>,
         /// Child plan feeding this attribute operator.
         input: Box<LogicalPlan>,
         /// Output schema: `entity_id`, `conversion_ts`,
@@ -895,9 +909,22 @@ impl LogicalPlan {
                 Ok(())
             }
             LogicalPlan::Scan { .. } => Ok(()),
+            // Recurse through every wrapper that sits above the primary scan.
+            // Must stay in sync with `find_primary_scan` — otherwise a widening
+            // call can silently become a no-op for valid compositions such as
+            // `SESSIONIZE | ATTRIBUTE(window: ...)` (attribute.md §14.1).
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
-            | LogicalPlan::Limit { input, .. } => input.extend_scan_reader_backward(ns),
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sessionize { input, .. }
+            | LogicalPlan::EventSelect { input, .. }
+            | LogicalPlan::Sample { input, .. }
+            | LogicalPlan::SubqueryFilter { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::SequenceMatch { input, .. }
+            | LogicalPlan::Attribute { input, .. } => input.extend_scan_reader_backward(ns),
             _ => Ok(()),
         }
     }
@@ -920,9 +947,21 @@ impl LogicalPlan {
                 Ok(())
             }
             LogicalPlan::Scan { .. } => Ok(()),
+            // Match the wrapper set used by `extend_scan_reader_backward` so the
+            // forward-widening path is symmetric. MATCH / pattern windowing
+            // relies on this for pipelines like `SESSIONIZE | MATCH`.
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
-            | LogicalPlan::Limit { input, .. } => input.extend_scan_reader_forward(ns),
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sessionize { input, .. }
+            | LogicalPlan::EventSelect { input, .. }
+            | LogicalPlan::Sample { input, .. }
+            | LogicalPlan::SubqueryFilter { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::SequenceMatch { input, .. }
+            | LogicalPlan::Attribute { input, .. } => input.extend_scan_reader_forward(ns),
             _ => Ok(()),
         }
     }
@@ -1112,6 +1151,10 @@ fn fold_stage(
         PipelineStage::Sessionize(args) => lower_sessionize(args, acc, source_table),
 
         PipelineStage::Sample(args) => lower_sample(args, acc),
+
+        PipelineStage::EventSelect(args) => lower_event_select(args, acc, registry),
+
+        PipelineStage::Attribute(args) => lower_attribute(args, acc, registry, source_table),
 
         // ── Wave 3 desugaring ─────────────────────────────────────────
         // FUNNEL is syntactic sugar that expands into a MATCH (EMIT ALL)
@@ -2014,6 +2057,293 @@ fn lower_sample(args: bqlite_ast::Sample, acc: LogicalPlan) -> Result<LogicalPla
         input: Box::new(acc),
         output_schema,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4 EventSelect lowering — operators/event-select-sample.md §4–§11
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `| FIRST | LAST | NTH <events> [WHERE <predicate>] [lookback: <d>]`
+/// into an `EventSelect` logical node.
+///
+/// Validations:
+/// - `kind` passes through the AST mirror 1-for-1; `Nth(n)` enforces `n >= 1`
+///   defensively (the parser also enforces).
+/// - `events` is non-empty (parser-guaranteed; defensive check).
+/// - Duplicate event-type names in `events` are rejected (parser-guaranteed;
+///   defensive check).
+/// - Optional `predicate` is type-checked against the input schema; its
+///   `result_type` must be `BqlType::Bool`.
+/// - `lookback` is only valid for FIRST and NTH per §11 (the parser also
+///   rejects it on LAST; defensive check here).
+///
+/// Scan-range extension: when `lookback` is `Some(ns)` and `kind` is FIRST/NTH,
+/// the primary scan's reader window is widened backward by `ns` *after* all
+/// validations pass, so a rejected lowering never mutates `acc`.
+///
+/// Output schema equals the input schema (one row per surviving entity).
+fn lower_event_select(
+    args: bqlite_ast::EventSelect,
+    acc: LogicalPlan,
+    registry: &FunctionRegistry,
+) -> Result<LogicalPlan> {
+    // Narrow the AST kind to the planner mirror, validating the n >= 1
+    // invariant defensively (parser also enforces).
+    let kind = match args.kind {
+        bqlite_ast::EventSelectKind::First => EventSelectKind::First,
+        bqlite_ast::EventSelectKind::Last => EventSelectKind::Last,
+        bqlite_ast::EventSelectKind::Nth(n) => {
+            if n == 0 {
+                return Err(BqliteError::Plan(
+                    "NTH: position must be >= 1 — got 0".into(),
+                ));
+            }
+            EventSelectKind::Nth(n)
+        }
+    };
+
+    if args.events.is_empty() {
+        return Err(BqliteError::Plan(
+            "FIRST/LAST/NTH: event list must have at least one event type".into(),
+        ));
+    }
+
+    let mut event_types: Vec<String> = Vec::with_capacity(args.events.len());
+    for ev in &args.events {
+        let name = ev.event.text.clone();
+        if event_types.iter().any(|existing| existing == &name) {
+            return Err(BqliteError::Plan(format!(
+                "FIRST/LAST/NTH: duplicate event type `{name}`"
+            )));
+        }
+        event_types.push(name);
+    }
+
+    // lookback: FIRST/NTH only (§11). The parser rejects `lookback:` on LAST,
+    // but guard defensively in case a direct AST construction slips through.
+    if args.lookback.is_some() && matches!(kind, EventSelectKind::Last) {
+        return Err(BqliteError::Plan(
+            "LAST does not accept a `lookback:` parameter — use FIRST or NTH".into(),
+        ));
+    }
+
+    let input_schema = acc.output_schema().clone();
+
+    // Type-check the optional predicate against the input schema.
+    let typed_predicate = match args.predicate {
+        None => None,
+        Some(spanned_expr) => {
+            let t = TypedExpr::from_ast(&spanned_expr, &input_schema, registry)?;
+            if t.result_type != BqlType::Bool {
+                return Err(BqliteError::Plan(format!(
+                    "FIRST/LAST/NTH: WHERE predicate must be Bool, got `{}`",
+                    t.result_type
+                )));
+            }
+            Some(t)
+        }
+    };
+
+    // All validation complete — extend the scan backwards if requested.
+    let mut acc = acc;
+    if let Some(lookback_ns) = args.lookback {
+        if lookback_ns > 0 {
+            acc.extend_scan_reader_backward(lookback_ns)?;
+        }
+    }
+
+    Ok(LogicalPlan::EventSelect {
+        kind,
+        event_types,
+        predicate: typed_predicate,
+        lookback: args.lookback,
+        forwarded_columns: Vec::new(),
+        fused_downstream: None,
+        input: Box::new(acc),
+        output_schema: input_schema,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4 ATTRIBUTE lowering — operators/attribute.md §4–§12
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `| ATTRIBUTE conversion: <e> touchpoints: <e> window: <d>
+///   touchpoint_key: <expr>` into an `Attribute` logical node.
+///
+/// Validations:
+/// - `conversion` and `touchpoints` lists are non-empty and contain no
+///   duplicates (parser-guaranteed; defensive).
+/// - `window > 0`.
+/// - `touchpoint_key` expression type-checks against the input schema and
+///   produces `BqlType::String` (per the grammar note in query-language.md
+///   §14.3: "Use `CAST(… AS STRING)` if the source column isn't already a
+///   string").
+///
+/// Scan-range extension: the primary scan's reader window is widened backward
+/// by `window` (per `attribute.md` §12). This happens *after* validation so a
+/// rejected lowering never mutates `acc`.
+///
+/// The `conversion_range` field captures the pristine query range
+/// `(start_ns, end_ns)` when the primary scan carries a resolvable
+/// `BETWEEN <a> AND <b>` range. `LAST <dur>` ranges need `now_ns` to resolve
+/// and are handled in the physical layer (see `physical::lower_physical`).
+///
+/// Output schema (attribute.md §4.1):
+///   `entity_id: <entity_key_type> NOT NULL`
+///   `conversion_ts: Timestamp NOT NULL`
+///   `touchpoint_ts: Timestamp NULL`
+///   `touchpoint_key: String NULL`
+/// Forwarded conversion properties are added by demand analysis.
+fn lower_attribute(
+    args: bqlite_ast::Attribute,
+    acc: LogicalPlan,
+    registry: &FunctionRegistry,
+    source_table: &TableSchema,
+) -> Result<LogicalPlan> {
+    // window > 0.
+    if args.window <= 0 {
+        return Err(BqliteError::Plan(format!(
+            "ATTRIBUTE: window must be positive — got {}ns",
+            args.window
+        )));
+    }
+
+    // Validate conversion / touchpoint event lists (defensive — parser guarantees).
+    if args.conversion.is_empty() {
+        return Err(BqliteError::Plan(
+            "ATTRIBUTE: conversion must name at least one event type".into(),
+        ));
+    }
+    if args.touchpoints.is_empty() {
+        return Err(BqliteError::Plan(
+            "ATTRIBUTE: touchpoints must name at least one event type".into(),
+        ));
+    }
+    let mut conversion_events: Vec<String> = Vec::with_capacity(args.conversion.len());
+    for r in &args.conversion {
+        let n = r.event.text.clone();
+        if conversion_events.iter().any(|e| e == &n) {
+            return Err(BqliteError::Plan(format!(
+                "ATTRIBUTE: duplicate conversion event type `{n}`"
+            )));
+        }
+        conversion_events.push(n);
+    }
+    let mut touchpoint_events: Vec<String> = Vec::with_capacity(args.touchpoints.len());
+    for r in &args.touchpoints {
+        let n = r.event.text.clone();
+        if touchpoint_events.iter().any(|e| e == &n) {
+            return Err(BqliteError::Plan(format!(
+                "ATTRIBUTE: duplicate touchpoint event type `{n}`"
+            )));
+        }
+        touchpoint_events.push(n);
+    }
+
+    let input_schema = acc.output_schema().clone();
+
+    // Type-check touchpoint_key.
+    let typed_key = TypedExpr::from_ast(&args.touchpoint_key, &input_schema, registry)?;
+    if typed_key.result_type != BqlType::String {
+        return Err(BqliteError::Plan(format!(
+            "ATTRIBUTE: touchpoint_key must evaluate to String, got `{}`",
+            typed_key.result_type
+        )));
+    }
+
+    // Build the output schema per §4.1. `forwarded_conversion_columns` is
+    // empty at construction — demand analysis may later splice columns
+    // between `conversion_ts` and `touchpoint_ts`.
+    let entity_key_type = source_table.entity_key_column().bql_type.clone();
+    let entity_key_name = source_table.entity_key_column().name.clone();
+    let out_cols: Vec<ColumnDef> = vec![
+        ColumnDef {
+            name: entity_key_name,
+            bql_type: entity_key_type,
+            nullable: false,
+            default_value: None,
+        },
+        ColumnDef::required("conversion_ts", BqlType::Timestamp),
+        ColumnDef::nullable("touchpoint_ts", BqlType::Timestamp),
+        ColumnDef::nullable("touchpoint_key", BqlType::String),
+    ];
+    let output_schema = OperatorSchema::new(out_cols)?;
+
+    // Capture the pristine query range if it is a BETWEEN (LAST is resolved
+    // at physical-lowering time when now_ns is available).
+    let conversion_range = attribute_conversion_range(&acc);
+
+    // All validation passed — extend scan backward by window.
+    let mut acc = acc;
+    acc.extend_scan_reader_backward(args.window)?;
+
+    Ok(LogicalPlan::Attribute {
+        conversion_events,
+        touchpoint_events,
+        window: args.window,
+        touchpoint_key: typed_key,
+        forwarded_conversion_columns: Vec::new(),
+        fused_downstream: None,
+        conversion_range,
+        input: Box::new(acc),
+        output_schema,
+    })
+}
+
+/// Walk the logical plan until the primary `Scan` is found and return the
+/// pristine query range `(start_ns, end_ns)` when it carries a
+/// `BETWEEN <start> AND <end>` clause. Returns `None` for unbounded scans
+/// and for `LAST <dur>` ranges — the latter need `now_ns` and are resolved
+/// in the physical layer instead.
+fn attribute_conversion_range(plan: &LogicalPlan) -> Option<(i64, i64)> {
+    let scan = find_primary_scan(plan)?;
+    match scan {
+        LogicalPlan::Scan {
+            time_range: Some(TimeRange::Between { start, end }),
+            ..
+        } => {
+            // Reuse the helper in `physical.rs`'s lowering path by re-parsing
+            // the same RFC-3339 timestamps here. Duplicating a tiny parse call
+            // avoids a logical↔physical dependency inversion.
+            let start_ts = parse_time_range_timestamp(start, "ATTRIBUTE BETWEEN start").ok()?;
+            // The physical layer models `BETWEEN` as `[start, end+1)`.
+            let end_ts = parse_time_range_timestamp(end, "ATTRIBUTE BETWEEN end").ok()?;
+            let end_exclusive = end_ts
+                .checked_add_nanos(1)
+                .unwrap_or(bqlite_core::Timestamp::MAX);
+            Some((start_ts.as_nanos(), end_exclusive.as_nanos()))
+        }
+        _ => None,
+    }
+}
+
+/// Walk downward through pipeline wrappers to the primary `Scan` node, or
+/// return `None` if the plan is a DDL / DML shape with no scan under it.
+/// Visits the `input` child of every stateful/relational wrapper; does not
+/// descend into `SubqueryFilter.subquery` (that is a cohort, not the outer
+/// pipeline's primary source).
+///
+/// Shared with `crate::physical` so the scan-range extension walker and the
+/// `conversion_range` resolver agree on which wrappers are traversed.
+pub(crate) fn find_primary_scan(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+    match plan {
+        LogicalPlan::Scan { .. } => Some(plan),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sessionize { input, .. }
+        | LogicalPlan::EventSelect { input, .. }
+        | LogicalPlan::Sample { input, .. }
+        | LogicalPlan::SubqueryFilter { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::SequenceMatch { input, .. }
+        | LogicalPlan::Attribute { input, .. } => find_primary_scan(input),
+        LogicalPlan::Explain { plan: child, .. } => find_primary_scan(child),
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5496,6 +5826,519 @@ mod tests {
             },
             other => panic!("expected Sample on top, got {other:?}"),
         }
+    }
+
+    // ── Wave 4 CP2: EventSelect + Attribute lowering ───────────────────────
+
+    fn event_select_stage(
+        kind: bqlite_ast::EventSelectKind,
+        events: Vec<&str>,
+        lookback: Option<i64>,
+        predicate: Option<Spanned<Expr>>,
+    ) -> PipelineStage {
+        PipelineStage::EventSelect(bqlite_ast::EventSelect {
+            kind,
+            events: events.into_iter().map(event_ref).collect(),
+            predicate,
+            lookback,
+            span: Span::EMPTY,
+        })
+    }
+
+    #[test]
+    fn event_select_first_lowers_with_lookback_extends_scan() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_1d: i64 = 86_400 * 1_000_000_000;
+        let ns_2h: i64 = 2 * 3_600 * 1_000_000_000;
+        // Construct a pipeline whose source has `LAST 1d` + `| FIRST(purchase, lookback: 2h)`.
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.time_range = Some(TimeRange::Last(ns_1d));
+        pipeline.stages.push(event_select_stage(
+            bqlite_ast::EventSelectKind::First,
+            vec!["purchase"],
+            Some(ns_2h),
+            None,
+        ));
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::EventSelect {
+                kind,
+                event_types,
+                predicate,
+                lookback,
+                forwarded_columns,
+                fused_downstream,
+                input,
+                output_schema,
+            } => {
+                assert_eq!(kind, EventSelectKind::First);
+                assert_eq!(event_types, vec!["purchase"]);
+                assert!(predicate.is_none());
+                assert_eq!(lookback, Some(ns_2h));
+                assert!(forwarded_columns.is_empty());
+                assert!(fused_downstream.is_none());
+                match *input {
+                    LogicalPlan::Scan {
+                        time_range,
+                        reader_backward_ns,
+                        ..
+                    } => {
+                        assert_eq!(time_range, Some(TimeRange::Last(ns_1d)));
+                        assert_eq!(reader_backward_ns, ns_2h);
+                    }
+                    other => panic!("expected Scan under EventSelect, got {other:?}"),
+                }
+                assert_eq!(output_schema.columns().len(), 7);
+            }
+            other => panic!("expected EventSelect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_select_last_without_lookback_lowers_cleanly() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![event_select_stage(
+                bqlite_ast::EventSelectKind::Last,
+                vec!["logout"],
+                None,
+                None,
+            )],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::EventSelect {
+                kind,
+                event_types,
+                lookback,
+                input,
+                ..
+            } => {
+                assert_eq!(kind, EventSelectKind::Last);
+                assert_eq!(event_types, vec!["logout"]);
+                assert!(lookback.is_none());
+                if let LogicalPlan::Scan {
+                    reader_backward_ns, ..
+                } = *input
+                {
+                    assert_eq!(reader_backward_ns, 0);
+                }
+            }
+            other => panic!("expected EventSelect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_select_last_with_lookback_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![event_select_stage(
+                bqlite_ast::EventSelectKind::Last,
+                vec!["logout"],
+                Some(3_600_000_000_000),
+                None,
+            )],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(msg) if msg.contains("LAST does not accept a `lookback:`"))
+        );
+    }
+
+    #[test]
+    fn event_select_nth_zero_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![event_select_stage(
+                bqlite_ast::EventSelectKind::Nth(0),
+                vec!["purchase"],
+                None,
+                None,
+            )],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("must be >= 1")));
+    }
+
+    #[test]
+    fn event_select_nth_positive_lowers_cleanly() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![event_select_stage(
+                bqlite_ast::EventSelectKind::Nth(3),
+                vec!["purchase"],
+                None,
+                None,
+            )],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        assert!(matches!(
+            plan,
+            LogicalPlan::EventSelect {
+                kind: EventSelectKind::Nth(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn event_select_predicate_non_bool_rejected() {
+        // `FIRST(purchase WHERE amount)` — amount is Float, not Bool.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![event_select_stage(
+                bqlite_ast::EventSelectKind::First,
+                vec!["purchase"],
+                None,
+                Some(column_expr("amount")),
+            )],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("must be Bool")));
+    }
+
+    #[test]
+    fn event_select_duplicate_event_type_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![event_select_stage(
+                bqlite_ast::EventSelectKind::First,
+                vec!["purchase", "purchase"],
+                None,
+                None,
+            )],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("duplicate event type")));
+    }
+
+    #[test]
+    fn event_select_output_schema_equals_input() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![event_select_stage(
+                bqlite_ast::EventSelectKind::First,
+                vec!["purchase"],
+                None,
+                None,
+            )],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        let LogicalPlan::EventSelect {
+            input,
+            output_schema,
+            ..
+        } = plan
+        else {
+            panic!("expected EventSelect");
+        };
+        assert_eq!(&output_schema, input.output_schema());
+    }
+
+    fn attribute_stage(
+        window: i64,
+        conversion: Vec<&str>,
+        touchpoints: Vec<&str>,
+        key_column: &str,
+    ) -> PipelineStage {
+        PipelineStage::Attribute(bqlite_ast::Attribute {
+            conversion: conversion.into_iter().map(event_ref).collect(),
+            touchpoints: touchpoints.into_iter().map(event_ref).collect(),
+            window,
+            touchpoint_key: column_expr(key_column),
+            span: Span::EMPTY,
+        })
+    }
+
+    #[test]
+    fn attribute_lowers_with_window_extends_scan() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_1d: i64 = 86_400 * 1_000_000_000;
+        let ns_7d: i64 = 7 * ns_1d;
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.time_range = Some(TimeRange::Last(ns_1d));
+        pipeline.stages.push(attribute_stage(
+            ns_7d,
+            vec!["purchase"],
+            vec!["ad_click"],
+            "country",
+        ));
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::Attribute {
+                conversion_events,
+                touchpoint_events,
+                window,
+                forwarded_conversion_columns,
+                fused_downstream,
+                conversion_range,
+                input,
+                output_schema,
+                ..
+            } => {
+                assert_eq!(conversion_events, vec!["purchase"]);
+                assert_eq!(touchpoint_events, vec!["ad_click"]);
+                assert_eq!(window, ns_7d);
+                assert!(forwarded_conversion_columns.is_empty());
+                assert!(fused_downstream.is_none());
+                // `LAST` ranges are resolved at physical-lowering time, not here.
+                assert!(conversion_range.is_none());
+                // The underlying scan got widened backwards by the window.
+                if let LogicalPlan::Scan {
+                    reader_backward_ns, ..
+                } = *input
+                {
+                    assert_eq!(reader_backward_ns, ns_7d);
+                }
+                // Output schema: user_id, conversion_ts, touchpoint_ts, touchpoint_key.
+                let names: Vec<&str> = output_schema
+                    .columns()
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                assert_eq!(
+                    names,
+                    vec![
+                        "user_id",
+                        "conversion_ts",
+                        "touchpoint_ts",
+                        "touchpoint_key"
+                    ]
+                );
+            }
+            other => panic!("expected Attribute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_with_between_captures_conversion_range() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_7d: i64 = 7 * 86_400 * 1_000_000_000;
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.time_range = Some(TimeRange::Between {
+            start: "2024-01-01T00:00:00Z".into(),
+            end: "2024-01-31T23:59:59Z".into(),
+        });
+        pipeline.stages.push(attribute_stage(
+            ns_7d,
+            vec!["purchase"],
+            vec!["ad_click"],
+            "country",
+        ));
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::Attribute {
+                conversion_range, ..
+            } => {
+                // BETWEEN was captured at logical-lowering time.
+                let (start, end) = conversion_range.expect("conversion_range captured");
+                assert!(end > start, "end must be > start");
+            }
+            other => panic!("expected Attribute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_non_positive_window_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![attribute_stage(
+                0,
+                vec!["purchase"],
+                vec!["ad_click"],
+                "country",
+            )],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("window must be positive")));
+    }
+
+    #[test]
+    fn attribute_touchpoint_key_non_string_rejected() {
+        // `touchpoint_key: amount` — amount is Float, not String.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![attribute_stage(
+                60_000_000_000,
+                vec!["purchase"],
+                vec!["ad_click"],
+                "amount",
+            )],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("must evaluate to String")));
+    }
+
+    #[test]
+    fn attribute_duplicate_conversion_event_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![attribute_stage(
+                60_000_000_000,
+                vec!["purchase", "purchase"],
+                vec!["ad_click"],
+                "country",
+            )],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(msg) if msg.contains("duplicate conversion event type"))
+        );
+    }
+
+    #[test]
+    fn attribute_after_sessionize_extends_underlying_scan_backward() {
+        // Regression test: `extend_scan_reader_backward` must walk through
+        // `Sessionize` (and other Wave 4 wrappers) to reach the primary Scan.
+        // attribute.md §14.1 permits the `SESSIONIZE | ATTRIBUTE` composition;
+        // §12 requires the window widening to land on the underlying scan.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_30d: i64 = 30 * 86_400 * 1_000_000_000;
+        let ns_7d: i64 = 7 * 86_400 * 1_000_000_000;
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.time_range = Some(TimeRange::Last(ns_30d));
+        pipeline
+            .stages
+            .push(PipelineStage::Sessionize(bqlite_ast::Sessionize {
+                gap: 30 * 60 * 1_000_000_000,
+                end: None,
+                span: Span::EMPTY,
+            }));
+        pipeline.stages.push(attribute_stage(
+            ns_7d,
+            vec!["purchase"],
+            vec!["ad_click"],
+            "country",
+        ));
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        // Walk to the Scan and assert `reader_backward_ns == ns_7d` (the
+        // SESSIONIZE above ATTRIBUTE must not block the widening).
+        let LogicalPlan::Attribute { input, .. } = plan else {
+            panic!("expected Attribute on top");
+        };
+        let LogicalPlan::Sessionize { input, .. } = *input else {
+            panic!("expected Sessionize under Attribute");
+        };
+        match *input {
+            LogicalPlan::Scan {
+                reader_backward_ns, ..
+            } => {
+                assert_eq!(reader_backward_ns, ns_7d, "scan must be widened by window");
+            }
+            other => panic!("expected Scan under Sessionize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_with_lookback_after_sessionize_extends_scan_backward() {
+        // Same walker-regression test for EventSelect (FIRST) composed over
+        // SESSIONIZE with `lookback:`. event-select-sample.md §11 plus §7.1.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_30d: i64 = 30 * 86_400 * 1_000_000_000;
+        let ns_2h: i64 = 2 * 3_600 * 1_000_000_000;
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.time_range = Some(TimeRange::Last(ns_30d));
+        pipeline
+            .stages
+            .push(PipelineStage::Sessionize(bqlite_ast::Sessionize {
+                gap: 30 * 60 * 1_000_000_000,
+                end: None,
+                span: Span::EMPTY,
+            }));
+        pipeline.stages.push(event_select_stage(
+            bqlite_ast::EventSelectKind::First,
+            vec!["purchase"],
+            Some(ns_2h),
+            None,
+        ));
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        let LogicalPlan::EventSelect { input, .. } = plan else {
+            panic!("expected EventSelect on top");
+        };
+        let LogicalPlan::Sessionize { input, .. } = *input else {
+            panic!("expected Sessionize under EventSelect");
+        };
+        match *input {
+            LogicalPlan::Scan {
+                reader_backward_ns, ..
+            } => {
+                assert_eq!(reader_backward_ns, ns_2h);
+            }
+            other => panic!("expected Scan under Sessionize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attribute_between_and_last_use_same_exclusivity_convention() {
+        // Both BETWEEN-at-logical and LAST-at-physical resolution paths must
+        // produce ranges using the `end exclusive` convention.
+        // BETWEEN <s> AND <e> → [start_ns, end_ns + 1)
+        // LAST <dur>        → [now_ns - dur, now_ns)
+        // Spot-check by constructing one each and verifying the `end` side is
+        // non-inclusive (end > any value inside the window).
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_7d: i64 = 7 * 86_400 * 1_000_000_000;
+        // BETWEEN case
+        let mut p_between = bare_pipeline("purchases");
+        p_between.source.time_range = Some(TimeRange::Between {
+            start: "2024-01-01T00:00:00Z".into(),
+            end: "2024-01-31T23:59:59Z".into(),
+        });
+        p_between.stages.push(attribute_stage(
+            ns_7d,
+            vec!["purchase"],
+            vec!["ad_click"],
+            "country",
+        ));
+        let plan = lower_statement(Statement::Query(p_between), &cat).unwrap();
+        let LogicalPlan::Attribute {
+            conversion_range: Some((start, end)),
+            ..
+        } = plan
+        else {
+            panic!("expected Attribute with BETWEEN range captured");
+        };
+        assert!(end > start, "BETWEEN end must exceed start");
+        // Width should be approximately 31 days (Jan 1 .. Jan 31 inclusive).
+        // The `+ 1ns` exclusive-end convention (physical.rs: `resolve_ast_time_range`)
+        // means the width is (end - start) where `start` is Jan 1 00:00:00 and
+        // `end` is Jan 31 23:59:59 + 1ns. Check this is > 30 days and < 32 days.
+        let width_ns = end - start;
+        let ns_30d: i64 = 30 * 86_400 * 1_000_000_000;
+        let ns_32d: i64 = 32 * 86_400 * 1_000_000_000;
+        assert!(
+            width_ns > ns_30d && width_ns < ns_32d,
+            "expected BETWEEN range to span ~31 days, got {} ns",
+            width_ns
+        );
+    }
+
+    #[test]
+    fn attribute_duplicate_touchpoint_event_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![attribute_stage(
+                60_000_000_000,
+                vec!["purchase"],
+                vec!["ad_click", "ad_click"],
+                "country",
+            )],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(msg) if msg.contains("duplicate touchpoint event type"))
+        );
     }
 
     #[test]

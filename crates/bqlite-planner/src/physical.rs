@@ -905,6 +905,33 @@ fn parse_time_range_ts(raw: &str) -> bqlite_core::Result<bqlite_core::Timestamp>
     }
 }
 
+/// Walk downward through a [`LogicalPlan`] to find the primary `Scan`
+/// whose `time_range` is a `LAST <dur>` form, and resolve it into an
+/// absolute `(start_ns, end_ns)` pair using `now_ns`.
+///
+/// This is the physical-layer fallback for
+/// [`LogicalPlan::Attribute.conversion_range`] (operators/attribute.md §12):
+/// `BETWEEN` ranges are captured at logical-lowering time (they do not need
+/// a clock), but `LAST` ranges need `now_ns` which is only available here.
+///
+/// Returns `None` when:
+/// - no primary scan exists (DDL/DML shapes),
+/// - the scan carries no time range (unbounded),
+/// - the scan already carries a `BETWEEN` range (the logical layer should
+///   have captured it directly; we do not re-extract here).
+fn resolve_last_range_from_scan(plan: &LogicalPlan, now_ns: i64) -> Option<(i64, i64)> {
+    match crate::logical::find_primary_scan(plan)? {
+        LogicalPlan::Scan {
+            time_range: time_range @ Some(bqlite_ast::pipeline::TimeRange::Last(_)),
+            ..
+        } => {
+            let resolved = resolve_ast_time_range(time_range.as_ref(), now_ns).ok()??;
+            Some((resolved.start.as_nanos(), resolved.end.as_nanos()))
+        }
+        _ => None,
+    }
+}
+
 /// Apply reader extension to a base [`bqlite_core::TimeRange`], returning
 /// a widened range (or `None` when the base is `None`).
 fn apply_reader_extension(
@@ -1341,11 +1368,16 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
             touchpoint_key,
             forwarded_conversion_columns,
             fused_downstream,
+            conversion_range,
             input,
             output_schema,
         } => {
             let compiled_key = CompiledExpr::from_typed(&touchpoint_key);
             let fused_aggregate = fused_downstream.map(compile_fused_downstream);
+            // If the logical layer captured a BETWEEN range, use it verbatim.
+            // Otherwise, handle the LAST case that needs `now_ns` here.
+            let final_conversion_range =
+                conversion_range.or_else(|| resolve_last_range_from_scan(&input, now_ns));
             let child = lower_physical(*input, now_ns);
             PhysicalPlan::Attribute(AttributePhysical {
                 conversion_events,
@@ -1354,7 +1386,7 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                 touchpoint_key: compiled_key,
                 forwarded_conversion_columns,
                 fused_aggregate,
-                conversion_range: None, // populated by TASK-425 during AST→logical lowering
+                conversion_range: final_conversion_range,
                 input: Box::new(child),
                 output_schema,
             })
@@ -2272,6 +2304,7 @@ mod tests {
             touchpoint_key: key_expr,
             forwarded_conversion_columns: vec![],
             fused_downstream: None,
+            conversion_range: None,
             input: Box::new(scan),
             output_schema: os,
         };
@@ -2284,6 +2317,48 @@ mod tests {
         assert_eq!(attr.window_ns, 2_592_000_000_000_000);
         assert!(attr.fused_aggregate.is_none());
         assert!(attr.conversion_range.is_none());
+    }
+
+    #[test]
+    fn attribute_conversion_range_last_resolved_at_physical() {
+        // When the primary scan uses `LAST <dur>`, the logical layer stores
+        // `conversion_range: None` and the physical layer resolves it using
+        // `now_ns`. This test verifies the fallback path.
+        let ns_30d: i64 = 30 * 86_400 * 1_000_000_000;
+        let scan = LogicalPlan::scan_with_time_range(
+            events_schema(),
+            Some(bqlite_ast::pipeline::TimeRange::Last(ns_30d)),
+        );
+        let os = attribute_output_schema();
+        let key_expr = crate::expr::TypedExpr {
+            kind: crate::expr::TypedExprKind::Column {
+                column_index: 2,
+                name: "event_type".into(),
+            },
+            result_type: BqlType::String,
+            nullable: false,
+            span: Span::EMPTY,
+        };
+        let node = LogicalPlan::Attribute {
+            conversion_events: vec!["purchase".into()],
+            touchpoint_events: vec!["ad_click".into()],
+            window: ns_30d,
+            touchpoint_key: key_expr,
+            forwarded_conversion_columns: vec![],
+            fused_downstream: None,
+            conversion_range: None,
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        // Pick a fixed now_ns so the test is deterministic.
+        let now_ns: i64 = 1_700_000_000_000_000_000;
+        let physical = lower_physical(node, now_ns);
+        let PhysicalPlan::Attribute(attr) = physical else {
+            panic!("expected Attribute");
+        };
+        let (start, end) = attr.conversion_range.expect("resolved from LAST");
+        assert_eq!(end, now_ns);
+        assert_eq!(start, now_ns - ns_30d);
     }
 
     #[test]
