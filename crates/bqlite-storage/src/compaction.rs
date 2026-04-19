@@ -307,6 +307,24 @@ pub fn compact_one(
     let input_byte_size: u64 = shard_segments.iter().map(|s| s.byte_size).sum();
     let max_input_level = shard_segments.iter().map(|s| s.level).max().unwrap_or(0);
 
+    // ── 1b. Job-start tombstone snapshot (§12.1). ──────────────────
+    // Read the shard's tombstone file once; this snapshot is used for
+    // filtering throughout the job. DELETEs issued mid-compaction
+    // write a new file on disk that applies only to later queries —
+    // they never re-enter this job's filter. The snapshot also drives
+    // the post-publish reclamation rewrite in CP4.
+    //
+    // `shard_id` is u32 in the compact_one signature but every other
+    // shard API takes u16 (manifest::shard_count is u16). The earlier
+    // `shard.get(shard_id as usize)` validation guarantees shard_id
+    // fits in the manifest's shard_count, which itself fits in u16 —
+    // so the narrowing is infallible by construction.
+    debug_assert!(shard_id <= u32::from(u16::MAX));
+    let shard_id_u16 = shard_id as u16;
+    let tombstone_path =
+        crate::tombstone::tombstone_file_path(db.root(), table, window_id, shard_id_u16);
+    let tombstone_snapshot_at_start = crate::tombstone::read_tombstone_file(&tombstone_path)?;
+
     // ── 2. Build the canonical Arrow schema from the table schema. ──
     // Matches `writer::events_to_record_batch` and the reader's scan
     // plan, so every scan's output batch and the merger's output batch
@@ -319,6 +337,11 @@ pub fn compact_one(
     let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
 
     // ── 3. Open each input and build a SegmentScan. ─────────────────
+    // Every input scan is wrapped in a `CompactionTombstoneScan` so
+    // row/batch/entity/time-range tombstones drop matching rows before
+    // they reach the k-way merge. The wrapper short-circuits internally
+    // when the snapshot is empty, so this path adds essentially zero
+    // overhead to the no-deletes common case.
     let db_root = db.root().to_path_buf();
     let shared_schema = Arc::new(table_schema.clone());
     let mut scans: Vec<Box<dyn bqlite_core::storage::SegmentScan>> =
@@ -327,7 +350,16 @@ pub fn compact_one(
         let path = segment_path(&db_root, table, window_id, shard_id, seg.segment_id);
         let reader = SegmentFileReader::open_shared(&path, shared_schema.clone())?;
         let scan = reader.scan(&ColumnProjection::all(), None)?;
-        scans.push(Box::new(scan));
+        let wrapped: Box<dyn bqlite_core::storage::SegmentScan> =
+            Box::new(crate::tombstone_scan::CompactionTombstoneScan::new(
+                Box::new(scan),
+                tombstone_snapshot_at_start.clone(),
+                entity_key_name.clone(),
+                ts_name.clone(),
+                seg.seq_id_range.0,
+                seg.batch_id,
+            ));
+        scans.push(wrapped);
     }
 
     // ── 4. Resolve entity / ts key ordinals against the Arrow schema. ─
@@ -359,9 +391,23 @@ pub fn compact_one(
         }
     }
     if merged_batches.is_empty() {
-        return Err(BqliteError::Execution(
-            "compact_one: merged stream was empty — every input is zero-row".into(),
-        ));
+        // Every input row was tombstoned (or every input was already
+        // zero-row — an impossible state today, but handled uniformly).
+        // Publish a "remove-only" manifest update via the §6 atomic
+        // primitive, reap input files, and return an outcome with no
+        // output segments. Reclamation (CP4) will still run to clear
+        // the tombstone entries that just became no-ops.
+        db.remove_segments_atomic(table, window_id, shard_id, &input_ids)?;
+        for old_id in &input_ids {
+            let path = segment_path(&db_root, table, window_id, shard_id, *old_id);
+            let _ = std::fs::remove_file(&path);
+        }
+        return Ok(CompactionOutcome {
+            input_segment_ids: input_ids,
+            output_segment_ids: vec![],
+            input_byte_size,
+            output_byte_size: 0,
+        });
     }
     let merged = ::arrow::compute::concat_batches(&arrow_schema, &merged_batches)
         .map_err(|e| BqliteError::Execution(format!("compact_one: concat_batches: {e}")))?;
@@ -1992,5 +2038,200 @@ mod tests {
         };
         assert_eq!(segs_before, segs_after, "second notify must be a no-op");
         scheduler.shutdown();
+    }
+
+    // ── Tombstone-aware compaction (TASK-435 CP3) ───────────────────────────
+
+    use crate::tombstone::{
+        tombstone_file_path, write_tombstone_atomic, TimeRangeDelete, TombstoneFile,
+    };
+
+    #[test]
+    fn compact_one_drops_row_tombstoned_events() {
+        let scratch = ScratchDir::new("tombstone-row");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+
+        let s1 = ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[
+                make_event("alice", 100, "click"),
+                make_event("alice", 200, "view"),
+                make_event("bob", 150, "click"),
+            ],
+        );
+        let _s2 = ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[
+                make_event("bob", 250, "view"),
+                make_event("carol", 300, "click"),
+                make_event("carol", 400, "view"),
+            ],
+        );
+        // Tombstone the alice/200 row — it lands at s1 seq offset 1.
+        let doomed_seq = s1.seq_id_range.0 + 1;
+        let tf = TombstoneFile::for_rows([doomed_seq]);
+        let tp = tombstone_file_path(scratch.path(), "events", 0, 0);
+        write_tombstone_atomic(&tp, &tf).unwrap();
+
+        compact_one(&mut db, "events", 0, 0).unwrap();
+        let rows = read_all_rows(&db);
+        assert!(
+            !rows.iter().any(|(_, ts, _)| *ts == 200),
+            "alice/200 row must be physically removed by compaction"
+        );
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn compact_one_drops_batch_tombstoned_segments() {
+        let scratch = ScratchDir::new("tombstone-batch");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+
+        let s1 = ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[
+                make_event("alice", 100, "click"),
+                make_event("bob", 150, "click"),
+            ],
+        );
+        let _s2 = ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[make_event("carol", 200, "click")],
+        );
+        // Tombstone s1's batch id; the whole segment is dropped.
+        let tf = TombstoneFile::for_batches([s1.batch_id]);
+        let tp = tombstone_file_path(scratch.path(), "events", 0, 0);
+        write_tombstone_atomic(&tp, &tf).unwrap();
+
+        compact_one(&mut db, "events", 0, 0).unwrap();
+        let rows = read_all_rows(&db);
+        assert_eq!(
+            rows,
+            vec![("carol".to_string(), 200, "click".to_string())],
+            "only s2's row must survive the batch-level tombstone"
+        );
+    }
+
+    #[test]
+    fn compact_one_drops_entity_tombstoned_rows() {
+        let scratch = ScratchDir::new("tombstone-entity");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+
+        ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[
+                make_event("alice", 100, "click"),
+                make_event("alice", 200, "view"),
+                make_event("bob", 150, "click"),
+            ],
+        );
+        ingest_one_segment(&mut db, "events", 0, 0, &[make_event("bob", 250, "view")]);
+        let tf = TombstoneFile::for_entities([bqlite_core::ScalarValue::String("alice".into())]);
+        let tp = tombstone_file_path(scratch.path(), "events", 0, 0);
+        write_tombstone_atomic(&tp, &tf).unwrap();
+
+        compact_one(&mut db, "events", 0, 0).unwrap();
+        let rows = read_all_rows(&db);
+        assert!(
+            !rows.iter().any(|(e, _, _)| e == "alice"),
+            "every alice row must be physically removed"
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn compact_one_drops_time_range_tombstoned_rows() {
+        let scratch = ScratchDir::new("tombstone-time");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+
+        ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[
+                make_event("alice", 100, "click"),
+                make_event("alice", 500, "view"),
+            ],
+        );
+        ingest_one_segment(&mut db, "events", 0, 0, &[make_event("bob", 300, "click")]);
+        // Drop every row with ts < 400.
+        let tf = TombstoneFile::for_time_range(TimeRangeDelete {
+            min_ts: None,
+            min_inclusive: false,
+            max_ts: Some(400),
+            max_inclusive: false,
+        });
+        let tp = tombstone_file_path(scratch.path(), "events", 0, 0);
+        write_tombstone_atomic(&tp, &tf).unwrap();
+
+        compact_one(&mut db, "events", 0, 0).unwrap();
+        let rows = read_all_rows(&db);
+        assert_eq!(rows, vec![("alice".to_string(), 500, "view".to_string())]);
+    }
+
+    #[test]
+    fn compact_one_all_rows_tombstoned_removes_inputs_without_output() {
+        let scratch = ScratchDir::new("tombstone-allkill");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+
+        let s1 = ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[make_event("alice", 100, "click")],
+        );
+        let s2 = ingest_one_segment(&mut db, "events", 0, 0, &[make_event("alice", 200, "view")]);
+        let tf = TombstoneFile::for_entities([bqlite_core::ScalarValue::String("alice".into())]);
+        let tp = tombstone_file_path(scratch.path(), "events", 0, 0);
+        write_tombstone_atomic(&tp, &tf).unwrap();
+
+        let outcome = compact_one(&mut db, "events", 0, 0).unwrap();
+        assert!(
+            outcome.output_segment_ids.is_empty(),
+            "zero-row compaction must publish no output"
+        );
+        assert_eq!(
+            outcome.input_segment_ids,
+            vec![s1.segment_id, s2.segment_id]
+        );
+        let entry = db.manifest().tables.get("events").unwrap();
+        assert!(
+            entry.windows[0].shards[0].is_empty(),
+            "shard must be empty after removing every input segment"
+        );
+
+        // Input files reaped.
+        let p1 = scratch.path().join(format!(
+            "events/windows/w_000000/shard_00/segment_{}.seg",
+            s1.segment_id
+        ));
+        let p2 = scratch.path().join(format!(
+            "events/windows/w_000000/shard_00/segment_{}.seg",
+            s2.segment_id
+        ));
+        assert!(!p1.exists(), "s1 file must be removed");
+        assert!(!p2.exists(), "s2 file must be removed");
     }
 }

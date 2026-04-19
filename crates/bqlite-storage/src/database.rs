@@ -780,12 +780,6 @@ impl Database {
     /// to drop a single segment uses [`Self::remove_segment`].
     ///
     /// See [`Manifest::remove_segments`] for the full error taxonomy.
-    //
-    // Allowed-dead-code until TASK-435 CP3 wires this into `compact_one`'s
-    // zero-surviving-rows branch. The primitive ships in its own
-    // checkpoint so the manifest-mutation surface is reviewable in
-    // isolation from the compaction path changes.
-    #[allow(dead_code)]
     pub(crate) fn remove_segments_atomic(
         &mut self,
         table_name: &str,
