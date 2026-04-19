@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-451",
+  "claimed_at": "2026-04-19T19:30:50Z",
+  "branch": "task/TASK-451",
+  "description": "Parser `IN QUERY` and bare `IN alias` expressions"
+}
