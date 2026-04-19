@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-430",
+  "claimed_at": "2026-04-19T21:38:35Z",
+  "branch": "task/TASK-430",
+  "description": "SAMPLE pushdown path"
+}
