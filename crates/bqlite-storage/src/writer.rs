@@ -483,6 +483,7 @@ fn build_segment_meta(
         column_stats,
         created_at: created_at_ns,
         batch_id,
+        seq_id_range: prepared.request.seq_id_range,
     }
 }
 

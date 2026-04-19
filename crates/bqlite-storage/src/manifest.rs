@@ -265,6 +265,34 @@ pub struct SegmentMeta {
     /// batch-level deletes and debugging can trace rows back to the
     /// originating call.
     pub batch_id: u64,
+
+    /// Inclusive `(first, last)` `__seq_id` range covered by this
+    /// segment. Rows within the segment are stored in
+    /// `__seq_id`-monotonic order starting at `first` (storage-format.md
+    /// §6.2 / §12.3); a row at segment-relative offset `n` has
+    /// `__seq_id = first + n`.
+    ///
+    /// Mirrors the value already persisted in the segment footer
+    /// (`segment/writer.rs::FooterV1::seq_id_range`); copying it onto
+    /// `SegmentMeta` lets callers — notably the ALLOW SCAN DELETE path
+    /// (TASK-453) and any future `__seq_id`-projecting reader — derive
+    /// per-row `__seq_id` values from manifest metadata alone, without
+    /// opening the segment file.
+    ///
+    /// `#[serde(default)]` so manifests written before this field
+    /// existed deserialize cleanly with `(0, 0)`. The `(0, 0)`
+    /// sentinel is harmless for non-DELETE consumers (no other
+    /// reader inspects the field today). ALLOW SCAN DELETE
+    /// (TASK-453) refuses to operate on segments whose
+    /// `seq_id_range` width disagrees with `row_count` — the
+    /// mismatch catches both pre-TASK-453 segments (`(0, 0)` with
+    /// `row_count > 1`) and any future non-contiguous compaction
+    /// output (TASK-435 territory). Callers must re-ingest the
+    /// table to populate this field for existing data, or wait for
+    /// TASK-435's compaction-time materialization, before ALLOW
+    /// SCAN can run against pre-existing segments.
+    #[serde(default)]
+    pub seq_id_range: (u64, u64),
 }
 
 /// Per-column statistics carried on every [`SegmentMeta`].
@@ -580,6 +608,7 @@ mod tests {
             ],
             created_at: 1_700_000_000_000_000_000,
             batch_id,
+            seq_id_range: (0, 99),
         }
     }
 

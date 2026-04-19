@@ -55,6 +55,7 @@ use arrow::array::{Array, Int64Array, StringViewArray, TimestampNanosecondArray}
 use bqlite_core::error::{BqliteError, Result};
 use bqlite_core::storage::{ColumnProjection, SegmentHandle, SegmentReader};
 use bqlite_core::{EntityId, ScalarValue};
+use bqlite_planner::compiled::CompiledExpr;
 use bqlite_planner::{
     CheapDeleteSpec, DeletePhysical, EntityRole, PhysicalDeleteFilter, TimeRangeSpec,
 };
@@ -76,10 +77,8 @@ pub fn execute_delete_statement(
 ) -> Result<ExecutionResult> {
     let count = match &plan.filter {
         PhysicalDeleteFilter::Cheap(spec) => execute_cheap_delete(plan, spec, db)?,
-        PhysicalDeleteFilter::AllowScan { .. } => {
-            return Err(BqliteError::Execution(
-                "ALLOW SCAN DELETE execution is not yet implemented (TASK-453 C3)".into(),
-            ));
+        PhysicalDeleteFilter::AllowScan { predicate } => {
+            execute_allow_scan_delete(plan, predicate, db)?
         }
     };
     Ok(ExecutionResult {
@@ -87,6 +86,402 @@ pub fn execute_delete_statement(
         rows: Vec::new(),
         rows_affected: Some(count),
     })
+}
+
+/// Execute an `ALLOW SCAN` DELETE per `deletes.md` §4.1.
+///
+/// Walks every segment in the table, evaluates the predicate per
+/// row group, and materializes the `__seq_id` of each matching row
+/// from the segment's `SegmentMeta::seq_id_range.0 + segment_offset`
+/// (segments store rows in `__seq_id`-monotonic order — see
+/// `storage-format.md` §6.2 / §12.3). The materialized `__seq_id`s
+/// are then written as row-level tombstones to the affected shards
+/// per `deletes.md` §4.1.
+///
+/// **Why not the standard `ScanOperator`:** the Wave 4 scan operator
+/// does not expose `__seq_id` as a virtual column — its output is
+/// strictly `current_schema.columns()` (see `scan.rs` module doc).
+/// Walking segments directly from the manifest lets us combine
+/// `seq_id_range` from `SegmentMeta` with the segment-relative row
+/// offset to compute exact `__seq_id` values without changing the
+/// reader's output contract. The pre-existing tombstone snapshot is
+/// loaded once for the touched `(window, shard)` pairs and applied
+/// before predicate evaluation so previously tombstoned rows are not
+/// counted (preserving §8 DELETE-vs-INSERT semantics).
+///
+/// Returns the count of materialized rows.
+pub fn execute_allow_scan_delete(
+    plan: &DeletePhysical,
+    predicate: &CompiledExpr,
+    db: &mut Database,
+) -> Result<u64> {
+    use bqlite_core::storage::ColumnProjection;
+    use bqlite_core::OperatorSchema;
+    use bqlite_operators::eval::evaluate_bool;
+    use bqlite_storage::TombstoneSnapshot;
+
+    let table_name = plan.table_name.as_str();
+
+    let shard_count = db.manifest().shard_count;
+    if shard_count == 0 {
+        return Err(BqliteError::Execution(
+            "DELETE: shard_count must be at least 1".into(),
+        ));
+    }
+
+    let table_entry = db
+        .manifest()
+        .tables
+        .get(table_name)
+        .ok_or_else(|| bqlite_core::catalog::unknown_table_error(table_name))?
+        .clone();
+    let table_schema = table_entry.schema.clone();
+    let entity_col = table_schema.entity_key_column().name.clone();
+    let ts_col = table_schema.timestamp_column().name.clone();
+
+    // Index manifest segments by segment_id for seq_id_range lookup.
+    let seg_by_id: std::collections::HashMap<u64, SegmentMeta> = table_entry
+        .windows
+        .iter()
+        .flat_map(|w| {
+            let window_id = w.window_id;
+            w.shards
+                .iter()
+                .enumerate()
+                .flat_map(move |(shard_idx, segs)| {
+                    let shard_id = shard_idx as u16;
+                    segs.iter().map(move |s| (window_id, shard_id, s.clone()))
+                })
+        })
+        .map(|(_, _, s)| (s.segment_id, s))
+        .collect();
+
+    // Load the per-query tombstone snapshot once across every
+    // `(window, shard)` the table holds, mirroring §6 — so previously
+    // deleted rows are filtered out before the predicate runs.
+    let touched: Vec<(u32, u16)> = table_entry
+        .windows
+        .iter()
+        .flat_map(|w| (0..w.shards.len()).map(move |i| (w.window_id, i as u16)))
+        .collect();
+    let tombstones: TombstoneSnapshot = if touched.is_empty() {
+        TombstoneSnapshot::empty()
+    } else {
+        db.load_tombstone_snapshot(table_name, &touched)?
+    };
+
+    let reader = db.segment_reader(table_name)?;
+    let mut per_shard: std::collections::HashMap<u16, HashSet<u64>> =
+        std::collections::HashMap::new();
+    let mut total: u64 = 0;
+
+    for handle in reader.segments() {
+        let handle = handle?;
+        let Some(meta) = seg_by_id.get(&handle.segment_id) else {
+            continue;
+        };
+        let window_id = u32::try_from(handle.window_id).map_err(|_| {
+            BqliteError::Execution(format!(
+                "ALLOW SCAN DELETE: segment_id {} window_id {} overflows u32",
+                handle.segment_id, handle.window_id
+            ))
+        })?;
+        let shard_id = u16::try_from(handle.shard_id).map_err(|_| {
+            BqliteError::Execution(format!(
+                "ALLOW SCAN DELETE: segment_id {} shard_id {} overflows u16",
+                handle.segment_id, handle.shard_id
+            ))
+        })?;
+
+        // Per `storage-format.md` §6.2, rows within a freshly-ingested
+        // segment carry contiguous `__seq_id`s starting at
+        // `seq_id_range.0`. A segment whose `seq_id_range` width
+        // disagrees with `row_count` is either:
+        //
+        // - A pre-TASK-453 segment whose manifest entry deserialized
+        //   with the `(0, 0)` `#[serde(default)]` sentinel — we
+        //   cannot derive `__seq_id` from it without reading the
+        //   segment footer, which would silently use the wrong base.
+        // - A compaction output that interleaves rows from multiple
+        //   inputs and breaks `__seq_id` contiguity. Tombstone-aware
+        //   compaction (TASK-435) is the task that fixes this — until
+        //   it lands, ALLOW SCAN cannot safely run against compacted
+        //   segments.
+        //
+        // In either case we error rather than silently mis-tombstone.
+        let seq_span = meta
+            .seq_id_range
+            .1
+            .saturating_sub(meta.seq_id_range.0)
+            .saturating_add(1);
+        if seq_span != meta.row_count {
+            return Err(BqliteError::Execution(format!(
+                "ALLOW SCAN DELETE: segment {} has inconsistent `seq_id_range` \
+                 (range covers {} ids but row_count is {}). This indicates a \
+                 pre-TASK-453 segment manifest entry or a non-contiguous \
+                 compacted segment; row-level `__seq_id` materialization is \
+                 unsafe. Re-ingest this table or wait for TASK-435 \
+                 (tombstone-aware compaction) before re-running ALLOW SCAN.",
+                meta.segment_id, seq_span, meta.row_count
+            )));
+        }
+        let first_seq_id = meta.seq_id_range.0;
+
+        let mut scan = reader.open_segment(&handle, &ColumnProjection::all(), None)?;
+
+        // Track the segment-relative row offset across row groups.
+        // Each row group from a fresh segment scan returns its full
+        // unfiltered row count, so the running offset is exact.
+        let mut segment_offset: u64 = 0;
+        let shard_tombstones = tombstones.get(window_id, shard_id);
+        let entity_type = table_schema.entity_key_column().bql_type.clone();
+
+        while let Some(batch) = scan.next_row_group()? {
+            let group_rows = batch.num_rows() as u64;
+            if batch.num_rows() == 0 {
+                segment_offset = segment_offset.saturating_add(group_rows);
+                continue;
+            }
+
+            // Apply the pre-existing tombstone snapshot first so
+            // previously deleted rows do not survive into the
+            // predicate evaluator. We track which rows survived to
+            // map back to their original segment offsets.
+            //
+            // The segment's batch shape may not include `__seq_id`
+            // / `__batch_id` (the reader's all-projection covers
+            // declared columns only), so a TombstoneFilter that
+            // needs row/batch-level checks would error. We
+            // therefore narrow the snapshot to entity- and
+            // time-range deletes only — those are the granularities
+            // whose checks operate on declared columns. Row- and
+            // batch-level tombstones for this shard are still
+            // honoured below: we filter them out by `__seq_id`
+            // ourselves after computing the per-row `__seq_id`.
+            let alive_mask = compute_alive_mask(&batch, shard_tombstones, &entity_col, &ts_col)?;
+
+            // Evaluate the user predicate on the unfiltered batch.
+            // Indices in `predicate` are computed against
+            // `OperatorSchema::from_table(&table_schema)`, which
+            // begins with the declared columns in table-schema
+            // order (system columns appear after, but the classifier
+            // bans them from ALLOW SCAN paths). Declared columns
+            // appear in the same order in the segment's
+            // `ColumnProjection::all()` output.
+            let _full_schema = OperatorSchema::from_table(&table_schema);
+            let pred_mask = evaluate_bool(predicate, &batch).map_err(|e| {
+                BqliteError::Execution(format!(
+                    "ALLOW SCAN DELETE: predicate evaluation failed: {e}"
+                ))
+            })?;
+
+            // Compute __seq_id per surviving row.
+            let entity_arr = batch.column(
+                batch
+                    .schema()
+                    .index_of(&entity_col)
+                    .map_err(|_| {
+                        BqliteError::Execution(format!(
+                            "ALLOW SCAN DELETE: entity-key column '{entity_col}' missing from segment output"
+                        ))
+                    })?,
+            );
+
+            for (row, &alive) in alive_mask.iter().enumerate() {
+                if !alive {
+                    continue;
+                }
+                if !pred_mask.value(row) || pred_mask.is_null(row) {
+                    continue;
+                }
+                let seq_id = first_seq_id + (segment_offset + row as u64);
+
+                // Honour pre-existing row/batch tombstones for this
+                // shard by skipping `__seq_id`s already in the
+                // snapshot's row_deletes. (Adding them again is
+                // harmless via merge-dedup, but the count reflects
+                // visible rows only — matching SS11.2.)
+                if let Some(tf) = shard_tombstones {
+                    if tf.row_deletes.contains(&seq_id) {
+                        continue;
+                    }
+                    // Batch-level: the segment's whole batch_id can
+                    // be tombstoned. Skip every row in that case.
+                    if tf.batch_deletes.contains(&meta.batch_id) {
+                        continue;
+                    }
+                }
+
+                let entity = extract_entity_id(entity_arr, row, &entity_type)?;
+                let shard = shard_id_for(&entity, shard_count);
+                if per_shard.entry(shard).or_default().insert(seq_id) {
+                    total = total.saturating_add(1);
+                }
+            }
+            segment_offset = segment_offset.saturating_add(group_rows);
+        }
+    }
+
+    // ── Write row-level tombstones to every contributing shard ────
+    //
+    // The per-shard write distributes the materialized __seq_id set
+    // to every (window, shard) pair the table currently holds
+    // segments in. A `__seq_id` that landed in a different window
+    // is a harmless no-op for the tombstone filter (no matching row
+    // in that window).
+    for (shard_id, seq_ids) in per_shard {
+        if seq_ids.is_empty() {
+            continue;
+        }
+        let new_entries = TombstoneFile {
+            row_deletes: seq_ids,
+            ..Default::default()
+        };
+        for window in &table_entry.windows {
+            let shard_idx = shard_id as usize;
+            if shard_idx >= window.shards.len() {
+                continue;
+            }
+            if window.shards[shard_idx].is_empty() {
+                continue;
+            }
+            write_shard_tombstone(
+                db,
+                table_name,
+                window.window_id,
+                shard_id,
+                new_entries.clone(),
+            )?;
+        }
+    }
+
+    Ok(total)
+}
+
+/// Compute a per-row alive mask for the entity- and time-range
+/// granularities of the shard's tombstone state.
+///
+/// Row- and batch-level tombstones operate on `__seq_id` /
+/// `__batch_id` columns the segment's all-projection batch does
+/// not include, so they are applied separately by the caller from
+/// per-row computed `__seq_id` values. This helper handles only the
+/// granularities that need declared-column data.
+fn compute_alive_mask(
+    batch: &arrow::record_batch::RecordBatch,
+    tombstones: Option<&TombstoneFile>,
+    entity_col: &str,
+    ts_col: &str,
+) -> Result<Vec<bool>> {
+    let n = batch.num_rows();
+    let mut alive = vec![true; n];
+    let Some(tf) = tombstones else {
+        return Ok(alive);
+    };
+    if tf.entity_deletes.is_empty() && tf.time_range_deletes.is_empty() {
+        return Ok(alive);
+    }
+
+    if !tf.entity_deletes.is_empty() {
+        let col_idx = batch.schema().index_of(entity_col).map_err(|_| {
+            BqliteError::Execution(format!(
+                "ALLOW SCAN DELETE: entity column '{entity_col}' missing from segment batch"
+            ))
+        })?;
+        let col = batch.column(col_idx);
+        if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+            let str_set: HashSet<&str> = tf
+                .entity_deletes
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            for (i, alive_flag) in alive.iter_mut().enumerate() {
+                if *alive_flag && !arr.is_null(i) && str_set.contains(arr.value(i)) {
+                    *alive_flag = false;
+                }
+            }
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            let int_set: HashSet<i64> = tf
+                .entity_deletes
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::Int(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            for (i, alive_flag) in alive.iter_mut().enumerate() {
+                if *alive_flag && !arr.is_null(i) && int_set.contains(&arr.value(i)) {
+                    *alive_flag = false;
+                }
+            }
+        }
+    }
+
+    if !tf.time_range_deletes.is_empty() {
+        let col_idx = batch.schema().index_of(ts_col).map_err(|_| {
+            BqliteError::Execution(format!(
+                "ALLOW SCAN DELETE: timestamp column '{ts_col}' missing from segment batch"
+            ))
+        })?;
+        let col = batch.column(col_idx);
+        let arr = col
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| {
+                BqliteError::Execution(
+                    "ALLOW SCAN DELETE: ts column is not TimestampNanosecondArray".into(),
+                )
+            })?;
+        for (i, alive_flag) in alive.iter_mut().enumerate() {
+            if !*alive_flag {
+                continue;
+            }
+            if arr.is_null(i) {
+                continue;
+            }
+            let ts = arr.value(i);
+            for range in &tf.time_range_deletes {
+                if range.contains_timestamp(ts) {
+                    *alive_flag = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(alive)
+}
+
+fn extract_entity_id(
+    col: &arrow::array::ArrayRef,
+    row: usize,
+    entity_type: &bqlite_core::BqlType,
+) -> Result<EntityId> {
+    use bqlite_core::BqlType;
+    match entity_type {
+        BqlType::String => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    BqliteError::Execution(
+                        "ALLOW SCAN DELETE: entity column is not StringViewArray".into(),
+                    )
+                })?;
+            Ok(EntityId::String(arr.value(row).to_string()))
+        }
+        BqlType::Int => {
+            let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                BqliteError::Execution("ALLOW SCAN DELETE: entity column is not Int64Array".into())
+            })?;
+            Ok(EntityId::Int(arr.value(row)))
+        }
+        other => Err(BqliteError::Execution(format!(
+            "ALLOW SCAN DELETE: unsupported entity-key type {other:?}"
+        ))),
+    }
 }
 
 /// Execute a cheap-class DELETE by writing directly to per-shard
@@ -1017,6 +1412,138 @@ mod tests {
             }
         }
         assert_eq!(populated_shards, vec![alice_shard]);
+    }
+
+    // ── ALLOW SCAN execution (deletes.md §4.1) ─────────────────────
+
+    #[test]
+    fn allow_scan_deletes_matching_rows_only() {
+        // Predicate references a non-cheap column (`event_type`) so
+        // the planner routes through ALLOW SCAN. Only rows where
+        // `event_type = 'click'` should land in row-level
+        // tombstones; rows with other event types stay alive.
+        let scratch = Scratch::new("allow-scan");
+        let (mut db, engine) = create_db_with_events(scratch.path());
+        insert_three_entities(&mut db, &engine);
+
+        let result = engine
+            .query(
+                "DELETE FROM events WHERE event_type = 'click' ALLOW SCAN",
+                &mut db,
+            )
+            .expect("ALLOW SCAN must succeed");
+
+        // Three rows have event_type = 'click': alice's click, bob's
+        // click, ... wait — recheck the fixture: alice click, alice
+        // view, bob click, carol view. So 2 clicks → rows_affected = 2.
+        assert_eq!(result.rows_affected, Some(2));
+    }
+
+    #[test]
+    fn allow_scan_zero_match_returns_zero() {
+        let scratch = Scratch::new("allow-scan-zero");
+        let (mut db, engine) = create_db_with_events(scratch.path());
+        insert_three_entities(&mut db, &engine);
+
+        let result = engine
+            .query(
+                "DELETE FROM events WHERE event_type = 'spam' ALLOW SCAN",
+                &mut db,
+            )
+            .expect("ALLOW SCAN must succeed");
+        assert_eq!(result.rows_affected, Some(0));
+    }
+
+    #[test]
+    fn allow_scan_writes_row_level_tombstones() {
+        // Verify the `__seq_id`s actually land in `row_deletes` on
+        // the targeted shards' tombstone files. The scan tombstone
+        // filter is keyed on `__seq_id`, so this is the primary
+        // correctness check for ALLOW SCAN.
+        let scratch = Scratch::new("allow-scan-tombs");
+        let (mut db, engine) = create_db_with_events(scratch.path());
+        insert_three_entities(&mut db, &engine);
+
+        engine
+            .query(
+                "DELETE FROM events WHERE event_type = 'click' ALLOW SCAN",
+                &mut db,
+            )
+            .expect("ALLOW SCAN must succeed");
+
+        // Walk every (window, shard) and collect any non-empty
+        // row_deletes entries. Two clicks → at least one shard
+        // should have a non-empty row_deletes set (alice's and bob's
+        // clicks, possibly in different shards).
+        let table_entry = db.manifest().tables["events"].clone();
+        let mut total_row_deletes: usize = 0;
+        for window in &table_entry.windows {
+            for shard_idx in 0..window.shards.len() {
+                let path =
+                    tombstone_file_path(db.root(), "events", window.window_id, shard_idx as u16);
+                if !path.exists() {
+                    continue;
+                }
+                let tf = read_tombstone_file(&path).unwrap();
+                total_row_deletes += tf.row_deletes.len();
+            }
+        }
+        assert_eq!(
+            total_row_deletes, 2,
+            "ALLOW SCAN must materialize 2 __seq_ids as row tombstones"
+        );
+    }
+
+    #[test]
+    fn allow_scan_second_run_returns_zero_per_ss10_2() {
+        // Per `deletes.md` SS10.2, an ALLOW SCAN DELETE is idempotent
+        // over the tombstone set but the count may differ between
+        // runs. Specifically, the first run materializes N rows and
+        // tombstones them; a second run sees those rows already
+        // hidden by the tombstone snapshot and returns 0 (no new
+        // rows to tombstone). New ingest between runs would change
+        // this — but our test fixture has no mid-DELETE ingest.
+        let scratch = Scratch::new("allow-scan-retry");
+        let (mut db, engine) = create_db_with_events(scratch.path());
+        insert_three_entities(&mut db, &engine);
+
+        let r1 = engine
+            .query(
+                "DELETE FROM events WHERE event_type = 'click' ALLOW SCAN",
+                &mut db,
+            )
+            .expect("first ALLOW SCAN must succeed");
+        let r2 = engine
+            .query(
+                "DELETE FROM events WHERE event_type = 'click' ALLOW SCAN",
+                &mut db,
+            )
+            .expect("retry ALLOW SCAN must succeed");
+
+        assert_eq!(r1.rows_affected, Some(2));
+        assert_eq!(
+            r2.rows_affected,
+            Some(0),
+            "retry must skip already-tombstoned rows (SS10.2)"
+        );
+    }
+
+    #[test]
+    fn allow_scan_rejects_predicate_referencing_unknown_column() {
+        let scratch = Scratch::new("allow-scan-bad-col");
+        let (mut db, engine) = create_db_with_events(scratch.path());
+
+        let err = engine
+            .query(
+                "DELETE FROM events WHERE missing_column = 'x' ALLOW SCAN",
+                &mut db,
+            )
+            .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing_column") || msg.contains("missing"),
+            "got: {msg}"
+        );
     }
 
     // ── Time-range write skips windows outside the bounds ──────────

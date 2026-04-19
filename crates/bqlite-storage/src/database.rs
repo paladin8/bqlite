@@ -1603,6 +1603,7 @@ mod tests {
             }],
             created_at: 1_700_000_000_000_000_000,
             batch_id,
+            seq_id_range: (0, 9),
         }
     }
 
@@ -2080,6 +2081,7 @@ mod tests {
             }],
             created_at: 1_000_000,
             batch_id: 0,
+            seq_id_range: (0, 9),
         };
 
         let entry = m.tables.get_mut(table).unwrap();

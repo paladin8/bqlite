@@ -312,6 +312,7 @@ mod tests {
             }],
             created_at: 1_000_000,
             batch_id: 0,
+            seq_id_range: (0, 99),
         }
     }
 
