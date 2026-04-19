@@ -594,6 +594,13 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
         | PhysicalPlan::MergeSources(_) => Err(BqliteError::Execution(
             "Wave 4 operator binding is not yet implemented (TASK-438)".into(),
         )),
+
+        // DELETE execution lands in C2 / C3 of TASK-453. The
+        // planner already lowers the statement; this arm wires up
+        // execution.
+        PhysicalPlan::Delete(_) => Err(BqliteError::Execution(
+            "DELETE execution is not yet implemented (TASK-453 C2/C3)".into(),
+        )),
     }
 }
 

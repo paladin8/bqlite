@@ -40,7 +40,7 @@
 
 use std::collections::HashSet;
 
-use bqlite_ast::expr::{Expr, Literal, SortDir};
+use bqlite_ast::expr::{Expr, Literal, SortDir, Spanned};
 use bqlite_ast::pattern::{BracketSpec, MatchMode, MatchPattern, MatchWindow, StepEvent};
 use bqlite_ast::pipeline::{Pipeline, TimeRange};
 use bqlite_ast::{
@@ -50,7 +50,7 @@ use bqlite_ast::{
 };
 use bqlite_core::{
     AggFunction, BqlType, BqliteError, Catalog, ColumnDef, OperatorSchema, PropertyValue, Result,
-    TableSchema, Timestamp,
+    ScalarValue, TableSchema, Timestamp,
 };
 
 use crate::demand::{ColumnId, FusableAggregate, StepPropertyRef};
@@ -424,6 +424,36 @@ pub enum LogicalPlan {
         /// Identical to `input.output_schema()`.
         output_schema: OperatorSchema,
     },
+
+    /// `DELETE FROM <table> WHERE <predicate> [ALLOW SCAN]`. Wave 4.
+    ///
+    /// The single statement-level node that owns DELETE execution.
+    /// Carries the resolved table schema and a [`DeleteFilter`] that
+    /// classifies the predicate at plan time per
+    /// `docs/design/storage/deletes.md` §3 (cheap-class taxonomy) and
+    /// §4 (default-reject + `ALLOW SCAN` opt-in).
+    ///
+    /// Output schema is empty: DELETE produces no result rows; the
+    /// engine returns the `rows_affected` count out-of-band on
+    /// `ExecutionResult` per §11. See
+    /// `docs/design/storage/deletes.md` §15 for the full per-task
+    /// breakdown.
+    Delete {
+        /// Catalog-resolved target table.
+        table: TableSchema,
+        /// Classified delete filter (cheap-class entries vs. ALLOW SCAN).
+        filter: DeleteFilter,
+        /// Whether the source statement carried the `ALLOW SCAN`
+        /// suffix. Carried through for diagnostics and for the
+        /// engine's idempotence-caveat documentation (deletes.md
+        /// §10.2). The classifier already used this flag to decide
+        /// between `Cheap` and `AllowScan` variants, so the engine
+        /// does not branch on it again — the variant is the source
+        /// of truth.
+        allow_scan: bool,
+        /// Empty schema — DELETE produces no rows.
+        output_schema: OperatorSchema,
+    },
 }
 
 /// A single output item in a `LogicalPlan::Project`.
@@ -612,6 +642,102 @@ pub enum EventSelectKind {
     Nth(u32),
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE planner support types (deletes.md §3 / §4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Plan-time classification of a DELETE predicate.
+///
+/// Either a [`CheapDeleteSpec`] decomposition that the engine writes
+/// directly to per-shard tombstone files, or a full-scan path
+/// (`ALLOW SCAN`) where the engine drives a `Filter(Scan)` to
+/// materialize matching `__seq_id`s. See
+/// `docs/design/storage/deletes.md` §3 for the cheap-class taxonomy
+/// and §4 for the `ALLOW SCAN` opt-in semantics.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteFilter {
+    /// Cheap-class direct tombstone writes — no data scan required.
+    Cheap(CheapDeleteSpec),
+    /// `ALLOW SCAN` — engine scans the table, evaluates the
+    /// predicate, and tombstones every matching row by `__seq_id`.
+    AllowScan {
+        /// The full predicate, type-checked against the source
+        /// table's schema. Engine compiles this to a `CompiledExpr`
+        /// at bind time and feeds it to `ScanPhysical::scan_predicates`.
+        predicate: TypedExpr,
+    },
+}
+
+/// Decomposed cheap-class DELETE predicate.
+///
+/// Same-granularity terms are collapsed (multiple time-range
+/// comparisons → one [`TimeRangeDelete`] with both bounds; multiple
+/// entity equalities / IN-lists → one deduplicated `entity_keys` vec).
+/// Cross-granularity is rejected at the classifier with the SS3.2
+/// exception: entity equality / IN combined with `__seq_id` or
+/// `__batch_id` is accepted, with the entity terms playing the
+/// shard-targeting role (see [`EntityRole`]).
+///
+/// **Invariant:** at least one tombstone-producing field is non-empty:
+///
+/// - `entity_role == AsTombstone` and `entity_keys` non-empty, or
+/// - `seq_ids` non-empty, or
+/// - `batch_ids` non-empty, or
+/// - `time_range` is `Some`.
+///
+/// Furthermore, when `entity_role == AsShardTarget`, `entity_keys` is
+/// non-empty **and** at least one of `seq_ids` / `batch_ids` is
+/// non-empty (the shard-target role is meaningless on its own).
+/// Both invariants are checked by the classifier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheapDeleteSpec {
+    /// Entity-key values from the predicate. Plays one of two roles
+    /// per [`entity_role`](Self::entity_role).
+    pub entity_keys: Vec<ScalarValue>,
+    /// Whether `entity_keys` are themselves the tombstone or just
+    /// shard-targeting metadata for a paired row/batch tombstone.
+    pub entity_role: EntityRole,
+    /// `__seq_id` literals (for row-level tombstones).
+    pub seq_ids: Vec<u64>,
+    /// `__batch_id` literals (for batch-level tombstones).
+    pub batch_ids: Vec<u64>,
+    /// Time-range bounds, collapsed from one or two ts comparisons
+    /// or a single `BETWEEN`. `None` when no time-range term is
+    /// present.
+    pub time_range: Option<TimeRangeSpec>,
+}
+
+/// Plain-data view of a [`bqlite_storage::TimeRangeDelete`] held in
+/// the planner.
+///
+/// The planner cannot import `bqlite-storage` (it sits below in the
+/// crate graph), so the equivalent shape lives here and the engine
+/// converts to `TimeRangeDelete` at write time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeRangeSpec {
+    /// Lower bound (epoch nanoseconds). `None` = unbounded below.
+    pub min_ts: Option<i64>,
+    pub min_inclusive: bool,
+    /// Upper bound (epoch nanoseconds). `None` = unbounded above.
+    pub max_ts: Option<i64>,
+    pub max_inclusive: bool,
+}
+
+/// The role `entity_keys` play inside a [`CheapDeleteSpec`].
+///
+/// See `docs/design/storage/deletes.md` §3.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityRole {
+    /// Entity equality / IN-list is itself the tombstone — written as
+    /// entity-level entries to the targeted shards.
+    AsTombstone,
+    /// Entity equality / IN-list paired with `__seq_id` or
+    /// `__batch_id` terms — used only to narrow which shards the
+    /// engine writes the row/batch tombstones to. The entity values
+    /// are not written as entity-level tombstones.
+    AsShardTarget,
+}
+
 impl LogicalPlan {
     /// The cached output schema for this plan node.
     ///
@@ -640,7 +766,8 @@ impl LogicalPlan {
             | LogicalPlan::EventSelect { output_schema, .. }
             | LogicalPlan::Attribute { output_schema, .. }
             | LogicalPlan::SubqueryFilter { output_schema, .. }
-            | LogicalPlan::Sample { output_schema, .. } => output_schema,
+            | LogicalPlan::Sample { output_schema, .. }
+            | LogicalPlan::Delete { output_schema, .. } => output_schema,
         }
     }
 
@@ -872,9 +999,10 @@ fn explain_output_schema() -> OperatorSchema {
 ///
 /// Every Wave 2 depth variant from logical-plan-nodes.md §3 is
 /// covered: pipeline queries (+ EXPLAIN) landed in C1, DDL /
-/// Insert landed in C2. `Statement::Delete` and
-/// `Statement::DefineAlias` are explicitly rejected with forward-
-/// compat messages pointing at the Wave 4 tasks that own them.
+/// Insert landed in C2. `Statement::Delete` is lowered through
+/// [`lower_delete`] (TASK-453) into [`LogicalPlan::Delete`].
+/// `Statement::DefineAlias` is rejected with a forward-compat
+/// message pointing at TASK-407.
 pub fn lower_statement(statement: Statement, catalog: &dyn Catalog) -> Result<LogicalPlan> {
     match statement {
         Statement::Query(pipeline) => lower_query_pipeline(pipeline, catalog),
@@ -887,9 +1015,7 @@ pub fn lower_statement(statement: Statement, catalog: &dyn Catalog) -> Result<Lo
         Statement::AlterTable(stmt) => lower_alter_table(stmt, catalog),
         Statement::Describe(stmt) => lower_describe(stmt, catalog),
         Statement::Insert(stmt) => lower_insert(stmt, catalog),
-        Statement::Delete(_) => Err(BqliteError::Plan(
-            "DELETE is deferred to Wave 4 alongside tombstones (TASK-404)".into(),
-        )),
+        Statement::Delete(stmt) => lower_delete(stmt, catalog),
         Statement::DefineAlias { .. } => Err(BqliteError::Plan(
             "alias definitions are deferred to Wave 4 (TASK-407)".into(),
         )),
@@ -2316,6 +2442,500 @@ fn ast_column_to_core(ast: AstColumnDef) -> Result<ColumnDef> {
         nullable: !ast.not_null,
         default_value,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DML lowering — DELETE (TASK-453, deletes.md §3 / §4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `DELETE FROM <table> WHERE <pred> [ALLOW SCAN]`.
+///
+/// Resolves the target table, then runs the predicate through the
+/// cheap-class classifier. Non-cheap predicates without `ALLOW SCAN`
+/// surface as a `BqliteError::Plan` containing the SS4 suggestion
+/// text so users see the recommended fix.
+fn lower_delete(stmt: bqlite_ast::DeleteStmt, catalog: &dyn Catalog) -> Result<LogicalPlan> {
+    let table = catalog.resolve_table(&stmt.table.text)?;
+    let registry = FunctionRegistry::with_builtins();
+    let filter = classify_delete_predicate(&stmt.predicate, &table, stmt.allow_scan, &registry)?;
+    Ok(LogicalPlan::Delete {
+        table,
+        filter,
+        allow_scan: stmt.allow_scan,
+        output_schema: empty_output_schema(),
+    })
+}
+
+/// Classify a DELETE predicate per `deletes.md` §3.
+///
+/// Returns [`DeleteFilter::Cheap`] when the predicate is a
+/// conjunction of allowlisted terms (entity equality / IN, `__seq_id`
+/// equality / IN, `__batch_id` equality / IN, time-range
+/// comparisons, or `BETWEEN`). Returns
+/// [`DeleteFilter::AllowScan`] when the predicate is non-cheap and
+/// `allow_scan == true`. Returns `BqliteError::Plan` when the
+/// predicate is non-cheap and `allow_scan == false`.
+pub fn classify_delete_predicate(
+    predicate: &Spanned<Expr>,
+    table: &TableSchema,
+    allow_scan: bool,
+    registry: &FunctionRegistry,
+) -> Result<DeleteFilter> {
+    let entity_key_col = &table.entity_key_column().name;
+    let entity_key_type = table.entity_key_column().bql_type.clone();
+    let ts_col = &table.timestamp_column().name;
+
+    let mut spec = ClassifierState::default();
+    let mut conjuncts: Vec<&Spanned<Expr>> = Vec::new();
+    flatten_top_level_and(predicate, &mut conjuncts);
+
+    let mut all_cheap = true;
+    for conjunct in conjuncts {
+        match classify_conjunct(
+            conjunct,
+            entity_key_col,
+            &entity_key_type,
+            ts_col,
+            &mut spec,
+        ) {
+            Ok(()) => {}
+            Err(ClassifierError::NotCheap) => {
+                all_cheap = false;
+                break;
+            }
+            Err(ClassifierError::Plan(msg)) => return Err(BqliteError::Plan(msg)),
+        }
+    }
+
+    if all_cheap {
+        if let Some(spec) = spec.into_cheap_spec()? {
+            return Ok(DeleteFilter::Cheap(spec));
+        }
+        // Empty cheap-spec — predicate parsed but produced no
+        // tombstone-bearing terms (e.g. `WHERE 1 = 1` collapsed to
+        // nothing). Fall through to non-cheap rejection.
+    }
+
+    if !allow_scan {
+        return Err(BqliteError::Plan(format!(
+            "DELETE FROM `{}`: predicate is not in the cheap class and would \
+             require a full table scan. Use ALLOW SCAN at the end of the \
+             statement to opt in.",
+            table.name()
+        )));
+    }
+
+    let typed = TypedExpr::from_ast(predicate, &OperatorSchema::from_table(table), registry)?;
+    if typed.result_type != BqlType::Bool {
+        return Err(BqliteError::Plan(format!(
+            "DELETE FROM `{}`: WHERE predicate must have type `Bool`, got `{}`",
+            table.name(),
+            typed.result_type
+        )));
+    }
+    Ok(DeleteFilter::AllowScan { predicate: typed })
+}
+
+/// Working state for the cheap-class classifier.
+///
+/// Accumulates per-granularity terms across conjuncts; `into_cheap_spec`
+/// validates the cross-granularity rules (entity+row/batch is the
+/// only allowed mix) and emits the final [`CheapDeleteSpec`].
+#[derive(Debug, Default)]
+struct ClassifierState {
+    entity_keys: Vec<ScalarValue>,
+    seq_ids: Vec<u64>,
+    batch_ids: Vec<u64>,
+    /// Time-range partial bounds — collapsed into a single
+    /// `TimeRangeSpec` at the end. Tracks both lower and upper
+    /// bounds independently so multiple comparisons or `BETWEEN`
+    /// fold into one final range.
+    time_min: Option<(i64, bool)>, // (value, inclusive)
+    time_max: Option<(i64, bool)>,
+}
+
+#[derive(Debug)]
+enum ClassifierError {
+    /// Predicate term is outside the cheap-class allowlist; caller
+    /// decides whether to fall back to ALLOW SCAN or reject.
+    NotCheap,
+    /// Predicate term is structurally malformed in a way the
+    /// classifier can localize (e.g., `IN ()` empty list).
+    Plan(String),
+}
+
+impl ClassifierState {
+    fn into_cheap_spec(self) -> Result<Option<CheapDeleteSpec>> {
+        let has_entity = !self.entity_keys.is_empty();
+        let has_seq = !self.seq_ids.is_empty();
+        let has_batch = !self.batch_ids.is_empty();
+        let time_range = collapse_time_range(self.time_min, self.time_max);
+        let has_time = time_range.is_some();
+
+        // Cross-granularity rules:
+        // - time-range with anything else (not even entity-as-shard-target):
+        //   not cheap, since shard targeting is meaningless for time-range
+        //   tombstones (they apply to all shards in the file's window) and
+        //   the design doc only carves out entity+seq_id / entity+batch_id.
+        if has_time && (has_entity || has_seq || has_batch) {
+            return Err(BqliteError::Plan(
+                "DELETE: time-range predicate cannot be combined with other \
+                 granularities (entity, __seq_id, __batch_id) — see \
+                 docs/design/storage/deletes.md §3.2"
+                    .into(),
+            ));
+        }
+        if has_seq && has_batch {
+            return Err(BqliteError::Plan(
+                "DELETE: __seq_id and __batch_id predicates cannot be combined \
+                 in a single cheap-class DELETE — they live in different \
+                 tombstone granularities (deletes.md §3.2)"
+                    .into(),
+            ));
+        }
+
+        // Now classify the entity role.
+        let entity_role = if has_entity && (has_seq || has_batch) {
+            EntityRole::AsShardTarget
+        } else {
+            EntityRole::AsTombstone
+        };
+
+        let any_tombstone = (matches!(entity_role, EntityRole::AsTombstone) && has_entity)
+            || has_seq
+            || has_batch
+            || has_time;
+        if !any_tombstone {
+            return Ok(None);
+        }
+
+        Ok(Some(CheapDeleteSpec {
+            entity_keys: self.entity_keys,
+            entity_role,
+            seq_ids: self.seq_ids,
+            batch_ids: self.batch_ids,
+            time_range,
+        }))
+    }
+}
+
+/// Collapse independent (min, max) bound observations into a single
+/// `TimeRangeSpec`. Returns `None` when no bound was recorded.
+fn collapse_time_range(
+    min: Option<(i64, bool)>,
+    max: Option<(i64, bool)>,
+) -> Option<TimeRangeSpec> {
+    if min.is_none() && max.is_none() {
+        return None;
+    }
+    Some(TimeRangeSpec {
+        min_ts: min.map(|(v, _)| v),
+        min_inclusive: min.map(|(_, i)| i).unwrap_or(false),
+        max_ts: max.map(|(v, _)| v),
+        max_inclusive: max.map(|(_, i)| i).unwrap_or(false),
+    })
+}
+
+/// Flatten a top-level `Expr::And` chain into a flat conjunct list.
+///
+/// Recurses through nested `Expr::And` nodes; any non-`And`
+/// expression is appended as its own single conjunct. The output
+/// vec preserves the source-order of conjuncts.
+fn flatten_top_level_and<'a>(spanned: &'a Spanned<Expr>, out: &mut Vec<&'a Spanned<Expr>>) {
+    match &spanned.node {
+        Expr::And(items) => {
+            for item in items {
+                flatten_top_level_and(item, out);
+            }
+        }
+        _ => out.push(spanned),
+    }
+}
+
+/// Classify a single conjunct.
+fn classify_conjunct(
+    conjunct: &Spanned<Expr>,
+    entity_key_col: &str,
+    entity_key_type: &BqlType,
+    ts_col: &str,
+    spec: &mut ClassifierState,
+) -> std::result::Result<(), ClassifierError> {
+    let inner = unwrap_paren(&conjunct.node);
+    match inner {
+        Expr::Compare { op, left, right } => classify_compare(
+            *op,
+            left,
+            right,
+            entity_key_col,
+            entity_key_type,
+            ts_col,
+            spec,
+        ),
+        Expr::In {
+            lhs,
+            rhs,
+            negated: false,
+        } if lhs.len() == 1 => classify_in(&lhs[0], rhs, entity_key_col, entity_key_type, spec),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+        } => classify_between(expr, low, high, ts_col, spec),
+        _ => Err(ClassifierError::NotCheap),
+    }
+}
+
+/// Strip a single layer of `Expr::Paren` so `(foo = bar)` matches
+/// the same arms as `foo = bar`.
+fn unwrap_paren(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(inner) => unwrap_paren(&inner.node),
+        other => other,
+    }
+}
+
+fn classify_compare(
+    op: bqlite_ast::expr::CompareOp,
+    left: &Spanned<Expr>,
+    right: &Spanned<Expr>,
+    entity_key_col: &str,
+    entity_key_type: &BqlType,
+    ts_col: &str,
+    spec: &mut ClassifierState,
+) -> std::result::Result<(), ClassifierError> {
+    use bqlite_ast::expr::CompareOp as Op;
+
+    let (col_name, lit, op) = match (unwrap_paren(&left.node), unwrap_paren(&right.node)) {
+        (Expr::Column(name), Expr::Literal(lit)) => (name.text.as_str(), lit, op),
+        // Reverse direction: `<lit> <op> <col>` flips to `<col> flipped(op) <lit>`.
+        (Expr::Literal(lit), Expr::Column(name)) => (name.text.as_str(), lit, flip_compare(op)),
+        _ => return Err(ClassifierError::NotCheap),
+    };
+
+    if matches!(op, Op::NotEqual) {
+        return Err(ClassifierError::NotCheap);
+    }
+
+    if col_name == bqlite_core::SEQ_ID_COLUMN {
+        if !matches!(op, Op::Equal) {
+            return Err(ClassifierError::NotCheap);
+        }
+        let id = literal_as_u64(lit, "__seq_id")?;
+        spec.seq_ids.push(id);
+        return Ok(());
+    }
+    if col_name == bqlite_core::BATCH_ID_COLUMN {
+        if !matches!(op, Op::Equal) {
+            return Err(ClassifierError::NotCheap);
+        }
+        let id = literal_as_u64(lit, "__batch_id")?;
+        spec.batch_ids.push(id);
+        return Ok(());
+    }
+    if col_name == ts_col {
+        let ns = literal_as_timestamp(lit)?;
+        return record_time_bound(op, ns, spec);
+    }
+    if col_name == entity_key_col {
+        if !matches!(op, Op::Equal) {
+            return Err(ClassifierError::NotCheap);
+        }
+        let value = literal_as_entity_key(lit, entity_key_type)?;
+        spec.entity_keys.push(value);
+        return Ok(());
+    }
+    Err(ClassifierError::NotCheap)
+}
+
+fn classify_in(
+    lhs: &Spanned<Expr>,
+    rhs: &bqlite_ast::expr::InRhs,
+    entity_key_col: &str,
+    entity_key_type: &BqlType,
+    spec: &mut ClassifierState,
+) -> std::result::Result<(), ClassifierError> {
+    let col_name = match unwrap_paren(&lhs.node) {
+        Expr::Column(name) => name.text.as_str(),
+        _ => return Err(ClassifierError::NotCheap),
+    };
+    let items = match rhs {
+        bqlite_ast::expr::InRhs::List(items) => items,
+        // IN QUERY / IN <alias> are subqueries — not cheap.
+        _ => return Err(ClassifierError::NotCheap),
+    };
+    if items.is_empty() {
+        return Err(ClassifierError::Plan(format!(
+            "DELETE: empty IN-list for column `{col_name}` is not a valid \
+             cheap-class predicate"
+        )));
+    }
+
+    if col_name == bqlite_core::SEQ_ID_COLUMN {
+        for item in items {
+            let lit = literal_or_not_cheap(&item.node)?;
+            spec.seq_ids.push(literal_as_u64(lit, "__seq_id")?);
+        }
+        return Ok(());
+    }
+    if col_name == bqlite_core::BATCH_ID_COLUMN {
+        for item in items {
+            let lit = literal_or_not_cheap(&item.node)?;
+            spec.batch_ids.push(literal_as_u64(lit, "__batch_id")?);
+        }
+        return Ok(());
+    }
+    if col_name == entity_key_col {
+        for item in items {
+            let lit = literal_or_not_cheap(&item.node)?;
+            spec.entity_keys
+                .push(literal_as_entity_key(lit, entity_key_type)?);
+        }
+        return Ok(());
+    }
+    Err(ClassifierError::NotCheap)
+}
+
+fn classify_between(
+    expr: &Spanned<Expr>,
+    low: &Spanned<Expr>,
+    high: &Spanned<Expr>,
+    ts_col: &str,
+    spec: &mut ClassifierState,
+) -> std::result::Result<(), ClassifierError> {
+    let col_name = match unwrap_paren(&expr.node) {
+        Expr::Column(name) => name.text.as_str(),
+        _ => return Err(ClassifierError::NotCheap),
+    };
+    if col_name != ts_col {
+        return Err(ClassifierError::NotCheap);
+    }
+    let low_lit = literal_or_not_cheap(&low.node)?;
+    let high_lit = literal_or_not_cheap(&high.node)?;
+    let low_ns = literal_as_timestamp(low_lit)?;
+    let high_ns = literal_as_timestamp(high_lit)?;
+    record_time_bound(bqlite_ast::expr::CompareOp::GreaterOrEqual, low_ns, spec)?;
+    record_time_bound(bqlite_ast::expr::CompareOp::LessOrEqual, high_ns, spec)?;
+    Ok(())
+}
+
+fn record_time_bound(
+    op: bqlite_ast::expr::CompareOp,
+    ns: i64,
+    spec: &mut ClassifierState,
+) -> std::result::Result<(), ClassifierError> {
+    use bqlite_ast::expr::CompareOp as Op;
+    match op {
+        Op::Less => {
+            // ts < ns ⇒ upper bound exclusive at ns.
+            tighten_max(&mut spec.time_max, ns, false);
+        }
+        Op::LessOrEqual => {
+            tighten_max(&mut spec.time_max, ns, true);
+        }
+        Op::Greater => {
+            tighten_min(&mut spec.time_min, ns, false);
+        }
+        Op::GreaterOrEqual => {
+            tighten_min(&mut spec.time_min, ns, true);
+        }
+        Op::Equal | Op::NotEqual => return Err(ClassifierError::NotCheap),
+    }
+    Ok(())
+}
+
+/// Pick the tighter (larger) lower bound when two are observed.
+///
+/// `ts >= a AND ts >= b` collapses to `ts >= max(a, b)`. When the
+/// values are equal, the **exclusive** bound wins because conjunction
+/// takes the intersection — `ts > 100 AND ts >= 100` admits exactly
+/// the same rows as `ts > 100`, so the tighter (exclusive) form is
+/// the canonical representation.
+fn tighten_min(slot: &mut Option<(i64, bool)>, ns: i64, inclusive: bool) {
+    match slot {
+        None => *slot = Some((ns, inclusive)),
+        Some((cur, cur_inc)) => {
+            if ns > *cur || (ns == *cur && !inclusive && *cur_inc) {
+                *slot = Some((ns, inclusive));
+            }
+        }
+    }
+}
+
+/// Pick the tighter (smaller) upper bound when two are observed.
+///
+/// Symmetric to [`tighten_min`]: `ts <= a AND ts < a` collapses to
+/// `ts < a` (exclusive wins on equal values for the same intersection
+/// reason).
+fn tighten_max(slot: &mut Option<(i64, bool)>, ns: i64, inclusive: bool) {
+    match slot {
+        None => *slot = Some((ns, inclusive)),
+        Some((cur, cur_inc)) => {
+            if ns < *cur || (ns == *cur && !inclusive && *cur_inc) {
+                *slot = Some((ns, inclusive));
+            }
+        }
+    }
+}
+
+fn flip_compare(op: bqlite_ast::expr::CompareOp) -> bqlite_ast::expr::CompareOp {
+    use bqlite_ast::expr::CompareOp as Op;
+    match op {
+        Op::Equal => Op::Equal,
+        Op::NotEqual => Op::NotEqual,
+        Op::Less => Op::Greater,
+        Op::LessOrEqual => Op::GreaterOrEqual,
+        Op::Greater => Op::Less,
+        Op::GreaterOrEqual => Op::LessOrEqual,
+    }
+}
+
+fn literal_or_not_cheap(expr: &Expr) -> std::result::Result<&Literal, ClassifierError> {
+    match unwrap_paren(expr) {
+        Expr::Literal(lit) => Ok(lit),
+        _ => Err(ClassifierError::NotCheap),
+    }
+}
+
+fn literal_as_u64(lit: &Literal, column: &str) -> std::result::Result<u64, ClassifierError> {
+    match lit {
+        Literal::Int(n) if *n >= 0 => Ok(*n as u64),
+        Literal::Int(n) => Err(ClassifierError::Plan(format!(
+            "DELETE: `{column}` literal must be a non-negative integer, got {n}"
+        ))),
+        _ => Err(ClassifierError::Plan(format!(
+            "DELETE: `{column}` literal must be an integer, got {lit:?}"
+        ))),
+    }
+}
+
+fn literal_as_timestamp(lit: &Literal) -> std::result::Result<i64, ClassifierError> {
+    match lit {
+        Literal::Timestamp(ns) => Ok(*ns),
+        // Plain integer literals in nanoseconds are accepted for
+        // ergonomics — many test queries hand-code epoch-ns values.
+        // The parser preserves the type-tag through `Literal::Timestamp`
+        // when an `@<rfc3339>` literal is used; bare integers reach
+        // here as `Literal::Int`.
+        Literal::Int(ns) => Ok(*ns),
+        _ => Err(ClassifierError::Plan(format!(
+            "DELETE: timestamp literal expected for time-range predicate, got {lit:?}"
+        ))),
+    }
+}
+
+fn literal_as_entity_key(
+    lit: &Literal,
+    entity_key_type: &BqlType,
+) -> std::result::Result<ScalarValue, ClassifierError> {
+    match (lit, entity_key_type) {
+        (Literal::String(s), BqlType::String) => Ok(ScalarValue::String(s.clone())),
+        (Literal::Int(n), BqlType::Int) => Ok(ScalarValue::Int(*n)),
+        _ => Err(ClassifierError::Plan(format!(
+            "DELETE: entity-key literal type does not match column type \
+             ({entity_key_type:?})"
+        ))),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3835,7 +4455,10 @@ mod tests {
     // ── Deferred-statement rejections ───────────────────────────────────────
 
     #[test]
-    fn delete_is_deferred_to_wave_4() {
+    fn delete_unknown_table_via_lower_statement() {
+        // After TASK-453, DELETE is no longer deferred — `lower_statement`
+        // dispatches to `lower_delete`, which surfaces unknown-table
+        // errors via the catalog.
         use bqlite_ast::DeleteStmt;
         let cat = InMemoryCatalog::default();
         let stmt = Statement::Delete(DeleteStmt {
@@ -3846,7 +4469,7 @@ mod tests {
         });
         let err = lower_statement(stmt, &cat).unwrap_err();
         match err {
-            BqliteError::Plan(msg) => assert!(msg.contains("Wave 4")),
+            BqliteError::Plan(msg) => assert!(msg.contains("t"), "got: {msg}"),
             other => panic!("expected Plan error, got {other:?}"),
         }
     }
@@ -4907,6 +5530,451 @@ mod tests {
                 other => panic!("expected Scan under Filter, got {other:?}"),
             },
             _ => panic!("expected Filter, got {plan:?}"),
+        }
+    }
+
+    // ── DELETE classifier (TASK-453) ────────────────────────────────────────
+    //
+    // Each test exercises one shape from `docs/design/storage/deletes.md`
+    // §3 (cheap-class taxonomy) or §4 (ALLOW SCAN opt-in). Tests build
+    // AST `Spanned<Expr>` values directly and pass them through
+    // `classify_delete_predicate` so the test surface is independent
+    // of the parser.
+
+    use bqlite_ast::expr::{CompareOp, InRhs};
+
+    fn col(name: &str) -> Spanned<Expr> {
+        Spanned::new(Expr::Column(Name::synthetic(name)), Span::EMPTY)
+    }
+
+    fn lit(literal: Literal) -> Spanned<Expr> {
+        Spanned::new(Expr::Literal(literal), Span::EMPTY)
+    }
+
+    fn cmp(op: CompareOp, left: Spanned<Expr>, right: Spanned<Expr>) -> Spanned<Expr> {
+        Spanned::new(
+            Expr::Compare {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            Span::EMPTY,
+        )
+    }
+
+    fn classify(predicate: Spanned<Expr>, allow_scan: bool) -> Result<DeleteFilter> {
+        let table = purchases_schema();
+        let registry = FunctionRegistry::with_builtins();
+        classify_delete_predicate(&predicate, &table, allow_scan, &registry)
+    }
+
+    fn cheap(predicate: Spanned<Expr>) -> CheapDeleteSpec {
+        match classify(predicate, false).expect("must classify as cheap") {
+            DeleteFilter::Cheap(spec) => spec,
+            DeleteFilter::AllowScan { .. } => panic!("expected Cheap variant"),
+        }
+    }
+
+    #[test]
+    fn entity_equality_is_cheap_entity_tombstone() {
+        // user_id = 'alice'
+        let pred = cmp(
+            CompareOp::Equal,
+            col("user_id"),
+            lit(Literal::String("alice".into())),
+        );
+        let spec = cheap(pred);
+        assert_eq!(spec.entity_keys, vec![ScalarValue::String("alice".into())]);
+        assert!(matches!(spec.entity_role, EntityRole::AsTombstone));
+        assert!(spec.seq_ids.is_empty());
+        assert!(spec.batch_ids.is_empty());
+        assert!(spec.time_range.is_none());
+    }
+
+    #[test]
+    fn entity_in_list_is_cheap_entity_tombstone() {
+        // user_id IN ('alice', 'bob', 'carol')
+        let pred = Spanned::new(
+            Expr::In {
+                lhs: vec![col("user_id")],
+                rhs: InRhs::List(vec![
+                    lit(Literal::String("alice".into())),
+                    lit(Literal::String("bob".into())),
+                    lit(Literal::String("carol".into())),
+                ]),
+                negated: false,
+            },
+            Span::EMPTY,
+        );
+        let spec = cheap(pred);
+        assert_eq!(spec.entity_keys.len(), 3);
+        assert!(matches!(spec.entity_role, EntityRole::AsTombstone));
+    }
+
+    #[test]
+    fn seq_id_equality_is_cheap_row_level() {
+        let pred = cmp(CompareOp::Equal, col("__seq_id"), lit(Literal::Int(42)));
+        let spec = cheap(pred);
+        assert_eq!(spec.seq_ids, vec![42]);
+        assert!(spec.entity_keys.is_empty());
+        assert!(matches!(spec.entity_role, EntityRole::AsTombstone));
+    }
+
+    #[test]
+    fn seq_id_in_list_is_cheap_row_level() {
+        let pred = Spanned::new(
+            Expr::In {
+                lhs: vec![col("__seq_id")],
+                rhs: InRhs::List(vec![
+                    lit(Literal::Int(1)),
+                    lit(Literal::Int(2)),
+                    lit(Literal::Int(3)),
+                ]),
+                negated: false,
+            },
+            Span::EMPTY,
+        );
+        let spec = cheap(pred);
+        assert_eq!(spec.seq_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn batch_id_equality_is_cheap_batch_level() {
+        let pred = cmp(CompareOp::Equal, col("__batch_id"), lit(Literal::Int(7)));
+        let spec = cheap(pred);
+        assert_eq!(spec.batch_ids, vec![7]);
+    }
+
+    #[test]
+    fn time_range_lt_is_cheap_with_exclusive_max() {
+        // ts < 1_700_000_000_000_000_000
+        let pred = cmp(
+            CompareOp::Less,
+            col("ts"),
+            lit(Literal::Timestamp(1_700_000_000_000_000_000)),
+        );
+        let spec = cheap(pred);
+        let r = spec.time_range.expect("must have time_range");
+        assert_eq!(r.max_ts, Some(1_700_000_000_000_000_000));
+        assert!(!r.max_inclusive);
+        assert!(r.min_ts.is_none());
+    }
+
+    #[test]
+    fn time_range_le_is_cheap_with_inclusive_max() {
+        let pred = cmp(
+            CompareOp::LessOrEqual,
+            col("ts"),
+            lit(Literal::Timestamp(100)),
+        );
+        let r = cheap(pred).time_range.unwrap();
+        assert_eq!(r.max_ts, Some(100));
+        assert!(r.max_inclusive);
+    }
+
+    #[test]
+    fn time_range_gt_is_cheap_with_exclusive_min() {
+        let pred = cmp(CompareOp::Greater, col("ts"), lit(Literal::Timestamp(50)));
+        let r = cheap(pred).time_range.unwrap();
+        assert_eq!(r.min_ts, Some(50));
+        assert!(!r.min_inclusive);
+    }
+
+    #[test]
+    fn time_range_ge_is_cheap_with_inclusive_min() {
+        let pred = cmp(
+            CompareOp::GreaterOrEqual,
+            col("ts"),
+            lit(Literal::Timestamp(50)),
+        );
+        let r = cheap(pred).time_range.unwrap();
+        assert_eq!(r.min_ts, Some(50));
+        assert!(r.min_inclusive);
+    }
+
+    #[test]
+    fn time_range_between_collapses_to_inclusive_bounds() {
+        // ts BETWEEN 100 AND 200
+        let pred = Spanned::new(
+            Expr::Between {
+                expr: Box::new(col("ts")),
+                low: Box::new(lit(Literal::Timestamp(100))),
+                high: Box::new(lit(Literal::Timestamp(200))),
+                negated: false,
+            },
+            Span::EMPTY,
+        );
+        let r = cheap(pred).time_range.unwrap();
+        assert_eq!(r.min_ts, Some(100));
+        assert!(r.min_inclusive);
+        assert_eq!(r.max_ts, Some(200));
+        assert!(r.max_inclusive);
+    }
+
+    #[test]
+    fn time_range_two_bounds_collapse_via_and() {
+        // ts >= 100 AND ts < 200
+        let pred = Spanned::new(
+            Expr::And(vec![
+                cmp(
+                    CompareOp::GreaterOrEqual,
+                    col("ts"),
+                    lit(Literal::Timestamp(100)),
+                ),
+                cmp(CompareOp::Less, col("ts"), lit(Literal::Timestamp(200))),
+            ]),
+            Span::EMPTY,
+        );
+        let r = cheap(pred).time_range.unwrap();
+        assert_eq!(r.min_ts, Some(100));
+        assert!(r.min_inclusive);
+        assert_eq!(r.max_ts, Some(200));
+        assert!(!r.max_inclusive);
+    }
+
+    #[test]
+    fn time_range_reversed_compare_is_normalized() {
+        // 100 <= ts → ts >= 100
+        let pred = cmp(
+            CompareOp::LessOrEqual,
+            lit(Literal::Timestamp(100)),
+            col("ts"),
+        );
+        let r = cheap(pred).time_range.unwrap();
+        assert_eq!(r.min_ts, Some(100));
+        assert!(r.min_inclusive);
+    }
+
+    #[test]
+    fn entity_plus_seq_id_is_cheap_with_shard_target() {
+        // user_id = 'alice' AND __seq_id IN (10, 20)
+        let pred = Spanned::new(
+            Expr::And(vec![
+                cmp(
+                    CompareOp::Equal,
+                    col("user_id"),
+                    lit(Literal::String("alice".into())),
+                ),
+                Spanned::new(
+                    Expr::In {
+                        lhs: vec![col("__seq_id")],
+                        rhs: InRhs::List(vec![lit(Literal::Int(10)), lit(Literal::Int(20))]),
+                        negated: false,
+                    },
+                    Span::EMPTY,
+                ),
+            ]),
+            Span::EMPTY,
+        );
+        let spec = cheap(pred);
+        assert_eq!(spec.entity_keys, vec![ScalarValue::String("alice".into())]);
+        assert!(matches!(spec.entity_role, EntityRole::AsShardTarget));
+        assert_eq!(spec.seq_ids, vec![10, 20]);
+    }
+
+    #[test]
+    fn entity_plus_batch_id_is_cheap_with_shard_target() {
+        let pred = Spanned::new(
+            Expr::And(vec![
+                cmp(
+                    CompareOp::Equal,
+                    col("user_id"),
+                    lit(Literal::String("alice".into())),
+                ),
+                cmp(CompareOp::Equal, col("__batch_id"), lit(Literal::Int(7))),
+            ]),
+            Span::EMPTY,
+        );
+        let spec = cheap(pred);
+        assert!(matches!(spec.entity_role, EntityRole::AsShardTarget));
+        assert_eq!(spec.batch_ids, vec![7]);
+    }
+
+    #[test]
+    fn entity_plus_time_range_is_rejected_cross_granularity() {
+        // user_id = 'alice' AND ts < 100  — design doc §3.2: not cheap
+        let pred = Spanned::new(
+            Expr::And(vec![
+                cmp(
+                    CompareOp::Equal,
+                    col("user_id"),
+                    lit(Literal::String("alice".into())),
+                ),
+                cmp(CompareOp::Less, col("ts"), lit(Literal::Timestamp(100))),
+            ]),
+            Span::EMPTY,
+        );
+        let err = classify(pred, false).expect_err("cross-granularity must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cross") || msg.contains("granularit"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn seq_plus_batch_is_rejected_cross_granularity() {
+        let pred = Spanned::new(
+            Expr::And(vec![
+                cmp(CompareOp::Equal, col("__seq_id"), lit(Literal::Int(1))),
+                cmp(CompareOp::Equal, col("__batch_id"), lit(Literal::Int(2))),
+            ]),
+            Span::EMPTY,
+        );
+        let err = classify(pred, false).expect_err("seq+batch must reject");
+        assert!(err.to_string().contains("granular"), "got: {err}");
+    }
+
+    #[test]
+    fn or_is_not_cheap_and_rejected_without_allow_scan() {
+        // user_id = 'alice' OR user_id = 'bob' — top-level OR
+        let pred = Spanned::new(
+            Expr::Or(vec![
+                cmp(
+                    CompareOp::Equal,
+                    col("user_id"),
+                    lit(Literal::String("alice".into())),
+                ),
+                cmp(
+                    CompareOp::Equal,
+                    col("user_id"),
+                    lit(Literal::String("bob".into())),
+                ),
+            ]),
+            Span::EMPTY,
+        );
+        let err = classify(pred, false).expect_err("OR must reject");
+        assert!(err.to_string().contains("ALLOW SCAN"), "got: {err}");
+    }
+
+    #[test]
+    fn or_with_allow_scan_returns_allow_scan_variant() {
+        let pred = Spanned::new(
+            Expr::Or(vec![
+                cmp(
+                    CompareOp::Equal,
+                    col("user_id"),
+                    lit(Literal::String("alice".into())),
+                ),
+                cmp(
+                    CompareOp::Equal,
+                    col("user_id"),
+                    lit(Literal::String("bob".into())),
+                ),
+            ]),
+            Span::EMPTY,
+        );
+        match classify(pred, true).expect("ALLOW SCAN must accept") {
+            DeleteFilter::AllowScan { predicate } => {
+                assert_eq!(predicate.result_type, BqlType::Bool);
+            }
+            DeleteFilter::Cheap(_) => panic!("expected AllowScan variant"),
+        }
+    }
+
+    #[test]
+    fn not_equal_is_not_cheap() {
+        // event != 'spam'  (a non-system column — not cheap regardless)
+        let pred = cmp(
+            CompareOp::NotEqual,
+            col("event"),
+            lit(Literal::String("spam".into())),
+        );
+        let err = classify(pred, false).expect_err("must reject");
+        assert!(err.to_string().contains("ALLOW SCAN"), "got: {err}");
+    }
+
+    #[test]
+    fn arbitrary_user_column_predicate_is_not_cheap() {
+        // amount > 100 — not in the allowlist
+        let pred = cmp(CompareOp::Greater, col("amount"), lit(Literal::Int(100)));
+        let err = classify(pred, false).expect_err("must reject user-column compare");
+        assert!(err.to_string().contains("ALLOW SCAN"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_in_list_is_rejected() {
+        let pred = Spanned::new(
+            Expr::In {
+                lhs: vec![col("__seq_id")],
+                rhs: InRhs::List(vec![]),
+                negated: false,
+            },
+            Span::EMPTY,
+        );
+        let err = classify(pred, false).expect_err("empty IN list must error");
+        assert!(err.to_string().contains("empty IN-list"), "got: {err}");
+    }
+
+    #[test]
+    fn parenthesized_predicate_is_unwrapped() {
+        // ((user_id = 'alice'))
+        let inner = cmp(
+            CompareOp::Equal,
+            col("user_id"),
+            lit(Literal::String("alice".into())),
+        );
+        let pred = Spanned::new(
+            Expr::Paren(Box::new(Spanned::new(
+                Expr::Paren(Box::new(inner)),
+                Span::EMPTY,
+            ))),
+            Span::EMPTY,
+        );
+        let spec = cheap(pred);
+        assert_eq!(spec.entity_keys.len(), 1);
+    }
+
+    #[test]
+    fn negative_seq_id_literal_is_rejected() {
+        let pred = cmp(CompareOp::Equal, col("__seq_id"), lit(Literal::Int(-1)));
+        let err = classify(pred, false).expect_err("negative seq_id must error");
+        assert!(err.to_string().contains("non-negative"), "got: {err}");
+    }
+
+    #[test]
+    fn delete_unknown_table_returns_plan_error() {
+        let catalog = InMemoryCatalog::default();
+        let stmt = bqlite_ast::DeleteStmt {
+            table: Name::synthetic("ghost"),
+            predicate: cmp(
+                CompareOp::Equal,
+                col("user_id"),
+                lit(Literal::String("alice".into())),
+            ),
+            allow_scan: false,
+            span: Span::EMPTY,
+        };
+        let err = lower_delete(stmt, &catalog).expect_err("unknown table must error");
+        assert!(err.to_string().contains("ghost"), "got: {err}");
+    }
+
+    #[test]
+    fn lower_delete_produces_logical_delete_node() {
+        let catalog = InMemoryCatalog::default().with(purchases_schema());
+        let stmt = bqlite_ast::DeleteStmt {
+            table: Name::synthetic("purchases"),
+            predicate: cmp(
+                CompareOp::Equal,
+                col("user_id"),
+                lit(Literal::String("alice".into())),
+            ),
+            allow_scan: false,
+            span: Span::EMPTY,
+        };
+        let plan = lower_delete(stmt, &catalog).expect("lowering must succeed");
+        match plan {
+            LogicalPlan::Delete {
+                table,
+                filter,
+                allow_scan,
+                ..
+            } => {
+                assert_eq!(table.name(), "purchases");
+                assert!(!allow_scan);
+                assert!(matches!(filter, DeleteFilter::Cheap(_)));
+            }
+            other => panic!("expected Delete, got {other:?}"),
         }
     }
 }

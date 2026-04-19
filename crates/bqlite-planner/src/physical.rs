@@ -155,6 +155,15 @@ pub enum PhysicalPlan {
     /// Produced for source expressions with `JOIN` clauses. Single-table
     /// sources produce an ordinary `Scan` — no wrapping needed.
     MergeSources(MergeSourcesPhysical),
+
+    /// `DELETE FROM <table> WHERE <pred> [ALLOW SCAN]`. Wave 4
+    /// (TASK-453).
+    ///
+    /// Carries the same classified [`DeleteFilter`] the logical plan
+    /// produced — the engine consumes the variant directly without
+    /// re-walking the AST. See `docs/design/storage/deletes.md` §3 / §4
+    /// for the cheap-class taxonomy and the `ALLOW SCAN` opt-in.
+    Delete(DeletePhysical),
 }
 
 impl PhysicalPlan {
@@ -189,6 +198,7 @@ impl PhysicalPlan {
             PhysicalPlan::SubqueryFilter(n) => &n.output_schema,
             PhysicalPlan::Sample(n) => &n.output_schema,
             PhysicalPlan::MergeSources(n) => &n.output_schema,
+            PhysicalPlan::Delete(n) => &n.output_schema,
         }
     }
 }
@@ -807,6 +817,52 @@ pub struct MergeSourcesPhysical {
     pub output_schema: OperatorSchema,
 }
 
+/// Plain-data description of `DELETE FROM <table> WHERE <pred>
+/// [ALLOW SCAN]`. Wave 4 (TASK-453).
+///
+/// Carries the resolved table reference and the engine-ready filter:
+///
+/// - For [`PhysicalDeleteFilter::Cheap`] the engine writes per-shard
+///   tombstone files directly from the decomposed spec.
+/// - For [`PhysicalDeleteFilter::AllowScan`] the engine builds a
+///   `Filter(Scan)` driver, materializes matching `__seq_id`s, and
+///   writes row-level tombstones to the contributing shards.
+///
+/// `output_schema` is empty per `deletes.md` SS11 — DELETE produces
+/// no result rows; the count travels alongside the
+/// `ExecutionResult::rows_affected` field at engine level.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeletePhysical {
+    /// Catalog name of the target table — re-resolved against the
+    /// engine's manifest catalog at bind time so the operator sees
+    /// the manifest's current schema.
+    pub table_name: String,
+    /// Entity-key column name on the target table. Carried so the
+    /// engine does not need to re-resolve via the catalog for shard
+    /// targeting and entity-level row counting.
+    pub entity_key_col: String,
+    /// Timestamp column name on the target table.
+    pub timestamp_col: String,
+    /// Engine-ready filter description.
+    pub filter: PhysicalDeleteFilter,
+    /// `true` when the source statement carried `ALLOW SCAN`. Carried
+    /// for diagnostics; the engine branches on `filter`'s variant.
+    pub allow_scan: bool,
+    /// Empty schema — DELETE produces no rows.
+    pub output_schema: OperatorSchema,
+}
+
+/// Engine-ready DELETE filter, mirroring [`crate::logical::DeleteFilter`]
+/// with `TypedExpr` swapped for `CompiledExpr`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PhysicalDeleteFilter {
+    /// Cheap-class direct tombstone writes.
+    Cheap(crate::logical::CheapDeleteSpec),
+    /// `ALLOW SCAN` — engine drives a scan with this compiled
+    /// predicate to materialize matching `__seq_id`s.
+    AllowScan { predicate: CompiledExpr },
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Time-range resolution helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1333,6 +1389,33 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                 fraction,
                 seed: seed.unwrap_or(DEFAULT_SAMPLE_SEED),
                 input: Box::new(child),
+                output_schema,
+            })
+        }
+
+        LogicalPlan::Delete {
+            table,
+            filter,
+            allow_scan,
+            output_schema,
+        } => {
+            let entity_key_col = table.entity_key_column().name.clone();
+            let timestamp_col = table.timestamp_column().name.clone();
+            let table_name = table.name().to_string();
+            let physical_filter = match filter {
+                crate::logical::DeleteFilter::Cheap(spec) => PhysicalDeleteFilter::Cheap(spec),
+                crate::logical::DeleteFilter::AllowScan { predicate } => {
+                    PhysicalDeleteFilter::AllowScan {
+                        predicate: CompiledExpr::from_typed(&predicate),
+                    }
+                }
+            };
+            PhysicalPlan::Delete(DeletePhysical {
+                table_name,
+                entity_key_col,
+                timestamp_col,
+                filter: physical_filter,
+                allow_scan,
                 output_schema,
             })
         }

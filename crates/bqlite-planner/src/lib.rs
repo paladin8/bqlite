@@ -85,18 +85,19 @@ pub use demand::{
 pub use explain::{build_explain_node, format_explain, format_expr, ExplainNode};
 pub use expr::{FunctionRegistry, ScalarFunctionSig, TypedExpr, TypedExprKind};
 pub use logical::{
-    lower_statement, EventSelectKind, FusedDownstream, IngestFormat, InsertFromDescriptor,
-    InsertLogicalBody, LogicalPlan, MatchWindowSpec, ProjectItem, SequencePattern, SortDirection,
+    classify_delete_predicate, lower_statement, CheapDeleteSpec, DeleteFilter, EntityRole,
+    EventSelectKind, FusedDownstream, IngestFormat, InsertFromDescriptor, InsertLogicalBody,
+    LogicalPlan, MatchWindowSpec, ProjectItem, SequencePattern, SortDirection, TimeRangeSpec,
     TypedAggExpr,
 };
 pub use physical::{
     lower_physical, AggregatePhysical, AlterTableAddColumnPhysical, AttributePhysical, CompiledAgg,
-    CreateTablePhysical, DescribePhysical, DistinctPhysical, DropTablePhysical,
+    CreateTablePhysical, DeletePhysical, DescribePhysical, DistinctPhysical, DropTablePhysical,
     EventSelectPhysical, ExplainPhysical, FilterPhysical, InsertPhysical, LimitPhysical,
-    MergeSourcesPhysical, PhysicalPlan, ProjectPhysical, ProjectPhysicalItem, SamplePhysical,
-    ScanPhysical, SequenceMatchPhysical, SessionizePhysical, SortPhysical, SubqueryFilterPhysical,
-    DEFAULT_FILTER_TILE_SIZE, DEFAULT_MAX_GROUPS, DEFAULT_SAMPLE_SEED, DEFAULT_SORT_MAX_ROWS,
-    MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
+    MergeSourcesPhysical, PhysicalDeleteFilter, PhysicalPlan, ProjectPhysical, ProjectPhysicalItem,
+    SamplePhysical, ScanPhysical, SequenceMatchPhysical, SessionizePhysical, SortPhysical,
+    SubqueryFilterPhysical, DEFAULT_FILTER_TILE_SIZE, DEFAULT_MAX_GROUPS, DEFAULT_SAMPLE_SEED,
+    DEFAULT_SORT_MAX_ROWS, MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -341,8 +342,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delete_statement_pending_wave_4() {
+    fn rejects_non_cheap_delete_without_allow_scan() {
         let catalog = InMemoryCatalog::default().with(events_schema());
+        // `WHERE true` is not in the cheap-class allowlist; without
+        // ALLOW SCAN the planner must reject with the SS4 error
+        // message that mentions the suggested `ALLOW SCAN` fix.
         let stmt = Statement::Delete(DeleteStmt {
             table: Name::synthetic("events"),
             predicate: Spanned::new(Expr::Literal(Literal::Bool(true)), Span::EMPTY),
@@ -351,9 +355,54 @@ mod tests {
         });
         match plan(stmt, &catalog, 0) {
             Err(BqliteError::Plan(msg)) => {
-                assert!(msg.contains("DELETE"), "got: {msg}");
+                assert!(msg.contains("ALLOW SCAN"), "got: {msg}");
             }
-            other => panic!("expected Plan error for DELETE, got {other:?}"),
+            other => panic!("expected Plan error for non-cheap DELETE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_cheap_delete_to_physical_delete() {
+        // Entity equality is the simplest cheap-class shape. The
+        // resulting PhysicalPlan::Delete should carry the entity
+        // value with `EntityRole::AsTombstone`.
+        let catalog = InMemoryCatalog::default().with(events_schema());
+        let stmt = Statement::Delete(DeleteStmt {
+            table: Name::synthetic("events"),
+            predicate: Spanned::new(
+                Expr::Compare {
+                    op: bqlite_ast::expr::CompareOp::Equal,
+                    left: Box::new(Spanned::new(
+                        Expr::Column(Name::synthetic("entity_id")),
+                        Span::EMPTY,
+                    )),
+                    right: Box::new(Spanned::new(
+                        Expr::Literal(Literal::String("alice".into())),
+                        Span::EMPTY,
+                    )),
+                },
+                Span::EMPTY,
+            ),
+            allow_scan: false,
+            span: Span::EMPTY,
+        });
+        let physical = plan(stmt, &catalog, 0).expect("cheap DELETE must plan");
+        let PhysicalPlan::Delete(d) = physical else {
+            panic!("expected Delete, got something else");
+        };
+        assert_eq!(d.table_name, "events");
+        assert_eq!(d.entity_key_col, "entity_id");
+        assert_eq!(d.timestamp_col, "ts");
+        assert!(!d.allow_scan);
+        match d.filter {
+            PhysicalDeleteFilter::Cheap(spec) => {
+                assert_eq!(spec.entity_keys.len(), 1);
+                assert!(matches!(spec.entity_role, EntityRole::AsTombstone));
+                assert!(spec.seq_ids.is_empty());
+                assert!(spec.batch_ids.is_empty());
+                assert!(spec.time_range.is_none());
+            }
+            PhysicalDeleteFilter::AllowScan { .. } => panic!("expected Cheap variant"),
         }
     }
 
