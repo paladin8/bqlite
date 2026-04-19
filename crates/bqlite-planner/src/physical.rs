@@ -983,17 +983,6 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
             projected_columns,
             output_schema,
         } => {
-            // Joins are rejected upstream by `lower_query_pipeline`
-            // (Wave 4 — TASK-407). If a future change starts producing
-            // joined logical scans without adding a physical mirror,
-            // this assertion catches it loudly in debug builds rather
-            // than silently dropping the joined tables.
-            debug_assert!(
-                joined_tables.is_empty(),
-                "physical lowering does not yet handle joined source tables; \
-                 add a physical mirror in TASK-407 before lifting the upstream rejection"
-            );
-            let _ = joined_tables;
             // Compile any optimizer-populated scan predicates into
             // runtime form. Wave 2 lowering always sees an empty list
             // here (TASK-227 populates the *physical* scan_predicates
@@ -1012,16 +1001,87 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                 });
             let reader_range =
                 apply_reader_extension(query_range, reader_backward_ns, reader_forward_ns);
-            PhysicalPlan::Scan(ScanPhysical {
-                table: table.name().to_string(),
-                query_range,
-                reader_range,
-                scan_predicates: compiled_predicates,
-                projected_columns,
-                output_schema,
-                entity_key_col: table.entity_key_column().name.clone(),
-                timestamp_col: table.timestamp_column().name.clone(),
-            })
+
+            if joined_tables.is_empty() {
+                PhysicalPlan::Scan(ScanPhysical {
+                    table: table.name().to_string(),
+                    query_range,
+                    reader_range,
+                    scan_predicates: compiled_predicates,
+                    projected_columns,
+                    output_schema,
+                    entity_key_col: table.entity_key_column().name.clone(),
+                    timestamp_col: table.timestamp_column().name.clone(),
+                })
+            } else {
+                // Entity-aligned multi-table source (TASK-425 CP5b). Fan out
+                // to one ScanPhysical per table (primary + joined), sharing
+                // the same `query_range` / `reader_range`. Predicates and
+                // projection from the combined-schema logical Scan are not
+                // forwarded because they reference dotted column names that
+                // do not exist in per-table schemas; the joined-scan runtime
+                // in TASK-436 owns the qualified-to-bare rewrite.
+                //
+                // The debug_assert mirrors the "fail loud on unexpected
+                // shape" invariant the single-table path has held since
+                // Wave 2: if a future optimizer pass starts populating
+                // these fields against a joined scan before TASK-436 lands
+                // the rewrite, this assertion catches it in debug builds.
+                debug_assert!(
+                    compiled_predicates.is_empty() && projected_columns.is_empty(),
+                    "joined-source pushdown / pruning not yet implemented; \
+                     TASK-436 owns the qualified-to-bare rewrite"
+                );
+                let _ = compiled_predicates;
+                let _ = projected_columns;
+
+                let all_tables: Vec<&TableSchema> = std::iter::once(&table)
+                    .chain(joined_tables.iter())
+                    .collect();
+                let table_id_map: Vec<String> =
+                    all_tables.iter().map(|t| t.name().to_string()).collect();
+                let tables: Vec<ScanPhysical> = all_tables
+                    .iter()
+                    .map(|t| ScanPhysical {
+                        table: t.name().to_string(),
+                        query_range,
+                        reader_range,
+                        scan_predicates: Vec::new(),
+                        projected_columns: Vec::new(),
+                        output_schema: OperatorSchema::from_table(t),
+                        entity_key_col: t.entity_key_column().name.clone(),
+                        timestamp_col: t.timestamp_column().name.clone(),
+                    })
+                    .collect();
+                // Canonical merge order from cohorts-aliases-joins.md §3.2.
+                // These names refer to the **post-merge canonical output
+                // columns**, not per-sub-scan input column names:
+                // cohorts-aliases-joins.md line 366 declares "the output
+                // entity-key column is always named `entity_id` regardless
+                // of the underlying tables' entity-key column names", and
+                // the matching convention applies to `ts`. Each sub-scan
+                // still carries its own table-local `entity_key_col` /
+                // `timestamp_col` above.
+                // `__table_order` is a synthetic key the MergeSources
+                // operator interprets by sub-scan index (not a real column);
+                // it is stored explicitly so EXPLAIN can render the full
+                // merge-key shape.
+                let order = vec![
+                    ("entity_id".to_string(), SortDirection::Asc),
+                    ("ts".to_string(), SortDirection::Asc),
+                    ("__table_order".to_string(), SortDirection::Asc),
+                    (
+                        bqlite_core::schema::SEQ_ID_COLUMN.to_string(),
+                        SortDirection::Asc,
+                    ),
+                ];
+                PhysicalPlan::MergeSources(MergeSourcesPhysical {
+                    tables,
+                    order,
+                    table_id_map,
+                    output_schema,
+                })
+            }
         }
 
         LogicalPlan::Filter {
@@ -2426,6 +2486,245 @@ mod tests {
         };
         assert!((sample.fraction - 0.5).abs() < f64::EPSILON);
         assert_eq!(sample.seed, DEFAULT_SAMPLE_SEED);
+    }
+
+    // ── Wave 4 CP5b: joined Scan → MergeSources lowering ─────────────────
+
+    fn logins_schema_for_physical() -> TableSchema {
+        TableSchema::new(
+            "logins",
+            vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+                ColumnDef::nullable("device", BqlType::String),
+            ],
+            "entity_id",
+            "ts",
+            "event_type",
+        )
+        .expect("logins schema")
+    }
+
+    #[test]
+    fn single_table_scan_unchanged_post_cp5b() {
+        // Regression: single-table Scan continues to lower to a plain
+        // PhysicalPlan::Scan with the same shape as before.
+        let scan = LogicalPlan::scan(events_schema());
+        let physical = lower_physical(scan, 0);
+        assert!(matches!(physical, PhysicalPlan::Scan(_)));
+    }
+
+    #[test]
+    fn joined_scan_lowers_to_merge_sources() {
+        // Construct a joined logical Scan directly (matching what
+        // `lower_query_pipeline` produces in CP5a) and verify the physical
+        // lowering produces a MergeSources with the canonical shape.
+        let primary = events_schema();
+        let joined = logins_schema_for_physical();
+        // Build the combined output schema the way build_joined_scan does.
+        let mut cols: Vec<ColumnDef> = Vec::new();
+        for t in [&primary, &joined] {
+            for c in t.columns() {
+                if c.is_system() {
+                    continue;
+                }
+                cols.push(ColumnDef {
+                    name: format!("{}.{}", t.name(), c.name),
+                    bql_type: c.bql_type.clone(),
+                    nullable: c.nullable,
+                    default_value: c.default_value.clone(),
+                });
+            }
+        }
+        cols.push(ColumnDef::required(
+            crate::logical::SOURCE_TABLE_ID_COLUMN,
+            BqlType::Int,
+        ));
+        cols.push(ColumnDef::required(
+            bqlite_core::schema::SEQ_ID_COLUMN,
+            BqlType::Int,
+        ));
+        cols.push(ColumnDef::required(
+            bqlite_core::schema::BATCH_ID_COLUMN,
+            BqlType::Int,
+        ));
+        let output_schema = OperatorSchema::new(cols).unwrap();
+
+        let logical = LogicalPlan::Scan {
+            table: primary.clone(),
+            time_range: None,
+            reader_backward_ns: 0,
+            reader_forward_ns: 0,
+            joined_tables: vec![joined.clone()],
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: output_schema.clone(),
+        };
+        let physical = lower_physical(logical, 0);
+        let PhysicalPlan::MergeSources(ms) = physical else {
+            panic!("expected MergeSources, got {physical:?}");
+        };
+        assert_eq!(ms.tables.len(), 2);
+        assert_eq!(ms.tables[0].table, "events");
+        assert_eq!(ms.tables[1].table, "logins");
+        // Sub-scan output schemas are per-table (bare names), not the
+        // combined dotted schema.
+        let t0_names: Vec<&str> = ms.tables[0]
+            .output_schema
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(t0_names.contains(&"entity_id") && !t0_names.contains(&"events.entity_id"));
+        // table_id_map lists catalog names in JOIN order.
+        assert_eq!(ms.table_id_map, vec!["events", "logins"]);
+        // Canonical merge key shape.
+        let expected_order = vec![
+            ("entity_id".to_string(), SortDirection::Asc),
+            ("ts".to_string(), SortDirection::Asc),
+            ("__table_order".to_string(), SortDirection::Asc),
+            (
+                bqlite_core::schema::SEQ_ID_COLUMN.to_string(),
+                SortDirection::Asc,
+            ),
+        ];
+        assert_eq!(ms.order, expected_order);
+        // Combined output schema passes through.
+        assert_eq!(ms.output_schema, output_schema);
+    }
+
+    #[test]
+    fn joined_scan_three_tables_preserves_table_id_map_order() {
+        // A 3-table JOIN (primary + 2 joined) locks in that table_id_map
+        // indexing matches the chain order of `iter::once(primary).chain(joined)`.
+        let primary = events_schema();
+        let joined1 = logins_schema_for_physical();
+        let joined2 = TableSchema::new(
+            "clicks",
+            vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+                ColumnDef::nullable("url", BqlType::String),
+            ],
+            "entity_id",
+            "ts",
+            "event_type",
+        )
+        .expect("clicks schema");
+        let output_schema = OperatorSchema::from_table(&primary);
+        let logical = LogicalPlan::Scan {
+            table: primary.clone(),
+            time_range: None,
+            reader_backward_ns: 0,
+            reader_forward_ns: 0,
+            joined_tables: vec![joined1.clone(), joined2.clone()],
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema,
+        };
+        let PhysicalPlan::MergeSources(ms) = lower_physical(logical, 0) else {
+            panic!("expected MergeSources");
+        };
+        assert_eq!(ms.tables.len(), 3);
+        assert_eq!(ms.table_id_map, vec!["events", "logins", "clicks"]);
+        assert_eq!(ms.tables[0].table, "events");
+        assert_eq!(ms.tables[1].table, "logins");
+        assert_eq!(ms.tables[2].table, "clicks");
+    }
+
+    #[test]
+    fn joined_scan_carries_table_local_entity_key_and_timestamp_cols() {
+        // When joined tables declare differently-named entity-key / timestamp
+        // columns (cohorts-aliases-joins.md line 366 allows type-compat but
+        // not name-compat), each sub-scan's `entity_key_col` / `timestamp_col`
+        // must be the table-local name while the canonical `order` vec stays
+        // fixed at `entity_id` / `ts` (post-merge canonical names).
+        let primary = TableSchema::new(
+            "purchases",
+            vec![
+                ColumnDef::required("user_id", BqlType::String),
+                ColumnDef::required("event_ts", BqlType::Timestamp),
+                ColumnDef::required("event", BqlType::String),
+            ],
+            "user_id",
+            "event_ts",
+            "event",
+        )
+        .expect("purchases schema");
+        let joined = TableSchema::new(
+            "logins",
+            vec![
+                ColumnDef::required("uid", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("kind", BqlType::String),
+            ],
+            "uid",
+            "ts",
+            "kind",
+        )
+        .expect("logins schema");
+        let output_schema = OperatorSchema::from_table(&primary);
+        let logical = LogicalPlan::Scan {
+            table: primary.clone(),
+            time_range: None,
+            reader_backward_ns: 0,
+            reader_forward_ns: 0,
+            joined_tables: vec![joined.clone()],
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema,
+        };
+        let PhysicalPlan::MergeSources(ms) = lower_physical(logical, 0) else {
+            panic!("expected MergeSources");
+        };
+        // Per-sub-scan entity_key_col / timestamp_col are table-local.
+        assert_eq!(ms.tables[0].entity_key_col, "user_id");
+        assert_eq!(ms.tables[0].timestamp_col, "event_ts");
+        assert_eq!(ms.tables[1].entity_key_col, "uid");
+        assert_eq!(ms.tables[1].timestamp_col, "ts");
+        // The `order` vec uses the post-merge canonical names `entity_id`
+        // and `ts` regardless of table-local names.
+        assert_eq!(ms.order[0].0, "entity_id");
+        assert_eq!(ms.order[1].0, "ts");
+    }
+
+    #[test]
+    fn joined_scan_replicates_reader_range_across_sub_scans() {
+        use bqlite_ast::pipeline::TimeRange as AstTr;
+        let primary = events_schema();
+        let joined = logins_schema_for_physical();
+        let ns_1d: i64 = 86_400 * 1_000_000_000;
+        let ns_7d: i64 = 7 * ns_1d;
+        let now_ns: i64 = 1_700_000_000_000_000_000;
+        let output_schema = OperatorSchema::from_table(&primary);
+        let logical = LogicalPlan::Scan {
+            table: primary.clone(),
+            time_range: Some(AstTr::Last(ns_1d)),
+            reader_backward_ns: ns_7d,
+            reader_forward_ns: 0,
+            joined_tables: vec![joined.clone()],
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema,
+        };
+        let physical = lower_physical(logical, now_ns);
+        let PhysicalPlan::MergeSources(ms) = physical else {
+            panic!("expected MergeSources");
+        };
+        // Every sub-scan shares the same query_range / reader_range.
+        let r0_query = ms.tables[0].query_range;
+        let r1_query = ms.tables[1].query_range;
+        let r0_reader = ms.tables[0].reader_range;
+        let r1_reader = ms.tables[1].reader_range;
+        assert_eq!(r0_query, r1_query);
+        assert_eq!(r0_reader, r1_reader);
+        // Reader range widened backward by 7 days from the query range.
+        let qr = r0_query.expect("query range is Some");
+        let rr = r0_reader.expect("reader range is Some");
+        assert_eq!(rr.end, qr.end);
+        assert_eq!(rr.start.as_nanos(), qr.start.as_nanos() - ns_7d);
     }
 
     #[test]
