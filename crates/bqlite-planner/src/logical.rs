@@ -2080,7 +2080,8 @@ fn resolve_insert_values(
 /// catalog-checked but the file is not opened here.
 ///
 /// Wave 4 ships `IngestFormat::Csv` and `IngestFormat::JsonL`;
-/// `Parquet` is deferred to TASK-449 and is rejected here.
+/// All three formats (`Csv`, `JsonL`, `Parquet`) are accepted; the
+/// Parquet engine path was landed by TASK-449.
 fn resolve_insert_from(
     path: String,
     options: Vec<bqlite_ast::InsertOption>,
@@ -2116,13 +2117,6 @@ fn resolve_insert_from(
     // Default format = CSV when the option is absent. Inferring from
     // the path extension is a Wave 4 ergonomics improvement.
     let format = format_opt.unwrap_or(IngestFormat::Csv);
-    if format == IngestFormat::Parquet {
-        return Err(BqliteError::Plan(
-            "INSERT FROM: `parquet` ingest is deferred to Wave 4 (TASK-449); \
-             supported formats are `csv` and `jsonl`"
-                .into(),
-        ));
-    }
 
     // Resolve the column map against the target schema. Every
     // `target` must exist; duplicate targets error. Source-column
@@ -2165,7 +2159,7 @@ fn resolve_insert_from(
 /// Accepted values (case-insensitive):
 /// - `"csv"` → [`IngestFormat::Csv`]
 /// - `"jsonl"` or `"json"` → [`IngestFormat::JsonL`]
-/// - `"parquet"` → [`IngestFormat::Parquet`] (deferred to TASK-449)
+/// - `"parquet"` → [`IngestFormat::Parquet`] (TASK-449)
 fn parse_ingest_format(s: &str) -> Result<IngestFormat> {
     match s.to_ascii_lowercase().as_str() {
         "csv" => Ok(IngestFormat::Csv),
@@ -3626,10 +3620,10 @@ mod tests {
     }
 
     #[test]
-    fn insert_from_rejects_parquet_until_task_449() {
-        // TASK-449 lands Parquet; until then the planner must reject it.
+    fn insert_from_accepts_parquet_with_task_449() {
+        // TASK-449 landed Parquet support — the planner must now accept it.
         let cat = InMemoryCatalog::default().with(purchases_schema());
-        let err = lower_statement(
+        let plan = lower_statement(
             insert_from(
                 "purchases",
                 "data.parquet",
@@ -3638,15 +3632,13 @@ mod tests {
             ),
             &cat,
         )
-        .unwrap_err();
-        match err {
-            BqliteError::Plan(msg) => {
-                assert!(
-                    msg.contains("TASK-449") || msg.contains("parquet"),
-                    "got: {msg}"
-                );
-            }
-            other => panic!("expected Plan error, got {other:?}"),
+        .expect("parquet format must be accepted after TASK-449");
+        match plan {
+            LogicalPlan::Insert {
+                body: InsertLogicalBody::From(desc),
+                ..
+            } => assert_eq!(desc.format, IngestFormat::Parquet),
+            other => panic!("expected Insert::From, got {other:?}"),
         }
     }
 

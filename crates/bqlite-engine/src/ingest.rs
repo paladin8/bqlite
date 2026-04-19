@@ -11,7 +11,7 @@
 //!   drains sorted buckets through the [`SegmentWriter`].
 //!   - CSV: [`CsvEventReader`] (TASK-233)
 //!   - JSONL: [`JsonlEventReader`] (TASK-410)
-//!   - Parquet: deferred to TASK-449
+//!   - Parquet: [`ParquetEventReader`] (TASK-449)
 //! - **`Values`** — converts planner-coerced literal tuples into
 //!   [`Event`] records using the resolved `TableSchema` role indices,
 //!   then feeds them through the same partitioner + writer pipeline
@@ -31,6 +31,7 @@ use bqlite_planner::logical::{IngestFormat, InsertFromDescriptor, InsertLogicalB
 use bqlite_planner::InsertPhysical;
 use bqlite_storage::ingest::csv_reader::{CsvEventReader, CsvReaderOptions};
 use bqlite_storage::ingest::json::JsonlEventReader;
+use bqlite_storage::ingest::parquet::ParquetEventReader;
 use bqlite_storage::ingest::partitioner::Partitioner;
 use bqlite_storage::writer::SegmentWriter;
 use bqlite_storage::Database;
@@ -100,11 +101,8 @@ fn execute_insert_from(
             stream_reader_into_partitioner(&mut reader, &mut partitioner)?
         }
         IngestFormat::Parquet => {
-            // The planner rejects Parquet until TASK-449 lands; this
-            // branch is a defensive fallback.
-            return Err(BqliteError::Execution(
-                "INSERT FROM: `parquet` ingest is not yet implemented (TASK-449)".into(),
-            ));
+            let mut reader = ParquetEventReader::open(path, table, &descriptor.column_map)?;
+            stream_reader_into_partitioner(&mut reader, &mut partitioner)?
         }
     };
 
@@ -157,6 +155,12 @@ impl<R: std::io::BufRead> EventReader for CsvEventReader<R> {
 impl<R: std::io::BufRead> EventReader for JsonlEventReader<R> {
     fn next_event(&mut self) -> Result<Option<Event>> {
         JsonlEventReader::next_event(self)
+    }
+}
+
+impl EventReader for ParquetEventReader {
+    fn next_event(&mut self) -> Result<Option<Event>> {
+        ParquetEventReader::next_event(self)
     }
 }
 
@@ -909,6 +913,340 @@ mod tests {
             msg.contains("NULL") || msg.contains("NOT NULL"),
             "got: {msg}"
         );
+    }
+
+    // ── INSERT FROM Parquet: helpers ──────────────────────────────
+
+    /// Write a Parquet file from a single Arrow RecordBatch and return
+    /// the path. Uses `parquet::arrow::ArrowWriter`.
+    fn write_parquet_file(
+        scratch: &Scratch,
+        name: &str,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> PathBuf {
+        use parquet::arrow::ArrowWriter;
+        let path = scratch.path().join(name);
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    fn insert_from_parquet_plan(
+        table: TableSchema,
+        parquet_path: &Path,
+        column_map: Vec<(String, String)>,
+    ) -> InsertPhysical {
+        InsertPhysical {
+            table,
+            body: InsertLogicalBody::From(InsertFromDescriptor {
+                path: parquet_path.to_string_lossy().into_owned(),
+                format: IngestFormat::Parquet,
+                options: Vec::new(),
+                column_map,
+            }),
+            output_schema: empty_schema(),
+        }
+    }
+
+    // ── INSERT FROM Parquet: happy path ───────────────────────────
+
+    #[test]
+    fn insert_from_parquet_writes_segments_and_registers_in_manifest() {
+        use arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let scratch = Scratch::new("parquet-happy");
+        let mut db = create_db_with_events(scratch.path());
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("event_type", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["alice", "bob", "charlie"])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000_i64,
+                    1_700_000_000_100_000_000_i64,
+                    1_700_000_000_200_000_000_i64,
+                ])),
+                Arc::new(StringArray::from(vec!["click", "view", "purchase"])),
+                Arc::new(Int64Array::from(vec![Some(42), None, Some(10)])),
+            ],
+        )
+        .unwrap();
+
+        let parquet_path = write_parquet_file(&scratch, "data.parquet", batch);
+        let schema = events_table_schema(&db);
+        let plan = insert_from_parquet_plan(schema, &parquet_path, vec![]);
+        execute_insert(&plan, &mut db).expect("Parquet insert must succeed");
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 3);
+    }
+
+    // ── INSERT FROM Parquet: column mapping ───────────────────────
+
+    #[test]
+    fn insert_from_parquet_with_column_map_remaps_columns() {
+        use arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let scratch = Scratch::new("parquet-map");
+        let mut db = create_db_with_events(scratch.path());
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("uid", DataType::Utf8, false),
+            Field::new(
+                "time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("evt", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["alice"])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000_i64,
+                ])),
+                Arc::new(StringArray::from(vec!["click"])),
+                Arc::new(Int64Array::from(vec![Some(42)])),
+            ],
+        )
+        .unwrap();
+
+        let parquet_path = write_parquet_file(&scratch, "data.parquet", batch);
+        let schema = events_table_schema(&db);
+        let plan = insert_from_parquet_plan(
+            schema,
+            &parquet_path,
+            vec![
+                ("uid".into(), "user_id".into()),
+                ("time".into(), "ts".into()),
+                ("evt".into(), "event_type".into()),
+                ("val".into(), "amount".into()),
+            ],
+        );
+        execute_insert(&plan, &mut db).expect("Parquet insert with map must succeed");
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 1);
+    }
+
+    // ── INSERT FROM Parquet: empty file is no-op ──────────────────
+
+    #[test]
+    fn insert_from_empty_parquet_is_noop() {
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let scratch = Scratch::new("parquet-empty");
+        let mut db = create_db_with_events(scratch.path());
+
+        // Write a Parquet file with schema but zero rows.
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("event_type", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, true),
+        ]));
+        let empty_batch = RecordBatch::new_empty(arrow_schema);
+        let parquet_path = write_parquet_file(&scratch, "data.parquet", empty_batch);
+
+        let schema = events_table_schema(&db);
+        let plan = insert_from_parquet_plan(schema, &parquet_path, vec![]);
+        execute_insert(&plan, &mut db).expect("empty Parquet must succeed");
+
+        assert!(db.manifest().tables["events"].windows.is_empty());
+    }
+
+    // ── INSERT FROM Parquet: missing file errors ───────────────────
+
+    #[test]
+    fn insert_from_missing_parquet_errors() {
+        let scratch = Scratch::new("parquet-missing");
+        let mut db = create_db_with_events(scratch.path());
+        let parquet_path = scratch.path().join("nonexistent.parquet");
+
+        let schema = events_table_schema(&db);
+        let plan = insert_from_parquet_plan(schema, &parquet_path, vec![]);
+        let err = execute_insert(&plan, &mut db).expect_err("missing file must error");
+        assert!(matches!(err, BqliteError::Io(_)));
+    }
+
+    // ── End-to-end: INSERT FROM Parquet via Engine::query ─────────
+
+    #[test]
+    fn engine_query_insert_from_parquet_end_to_end() {
+        use arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let scratch = Scratch::new("parquet-e2e");
+        let mut db = create_db_with_events(scratch.path());
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("event_type", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["alice", "bob"])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000_i64,
+                    1_700_000_000_100_000_000_i64,
+                ])),
+                Arc::new(StringArray::from(vec!["click", "view"])),
+                Arc::new(Int64Array::from(vec![Some(42), None])),
+            ],
+        )
+        .unwrap();
+
+        let parquet_path = write_parquet_file(&scratch, "data.parquet", batch);
+
+        let engine = crate::Engine::new();
+        let insert_sql = format!(
+            "INSERT INTO events FROM '{}' WITH (format: 'parquet')",
+            parquet_path.display()
+        );
+        let result = engine
+            .query(&insert_sql, &mut db)
+            .expect("e2e Parquet insert");
+        assert!(result.is_empty());
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    // ── Width-consolidation: Int32 Parquet column → BQL Int ────────
+
+    #[test]
+    fn insert_from_parquet_int32_column_consolidates_to_i64() {
+        use arrow::array::{Int32Array, StringArray, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let scratch = Scratch::new("parquet-int32");
+        let mut db = create_db_with_events(scratch.path());
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("event_type", DataType::Utf8, false),
+            Field::new("amount", DataType::Int32, true), // Int32, not Int64
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["alice"])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000_i64,
+                ])),
+                Arc::new(StringArray::from(vec!["click"])),
+                Arc::new(Int32Array::from(vec![Some(99_i32)])),
+            ],
+        )
+        .unwrap();
+
+        let parquet_path = write_parquet_file(&scratch, "data.parquet", batch);
+        let schema = events_table_schema(&db);
+        let plan = insert_from_parquet_plan(schema, &parquet_path, vec![]);
+        // Int32 column must be accepted and consolidated to i64.
+        execute_insert(&plan, &mut db).expect("Int32 column must be accepted");
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 1);
+    }
+
+    // ── Timestamp normalization: microseconds → nanoseconds ────────
+
+    #[test]
+    fn insert_from_parquet_microsecond_timestamp_normalizes_to_nanos() {
+        use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let scratch = Scratch::new("parquet-micros");
+        let mut db = create_db_with_events(scratch.path());
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("event_type", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, true),
+        ]));
+        let micros = 1_700_000_000_000_000_i64;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["alice"])),
+                Arc::new(TimestampMicrosecondArray::from(vec![micros])),
+                Arc::new(StringArray::from(vec!["click"])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+            ],
+        )
+        .unwrap();
+
+        let parquet_path = write_parquet_file(&scratch, "data.parquet", batch);
+        let schema = events_table_schema(&db);
+        let plan = insert_from_parquet_plan(schema, &parquet_path, vec![]);
+        execute_insert(&plan, &mut db).expect("microsecond timestamp must be accepted");
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 1);
     }
 
     // ── End-to-end: INSERT FROM via Engine::query ──────────────────

@@ -24,4 +24,5 @@
 
 pub mod csv_reader;
 pub mod json;
+pub mod parquet;
 pub mod partitioner;

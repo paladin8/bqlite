@@ -14,3 +14,6 @@ bqlite-planner = { workspace = true }
 bqlite-operators = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+parquet = { workspace = true }

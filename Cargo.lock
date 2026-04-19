@@ -452,6 +452,7 @@ dependencies = [
  "bqlite-parser",
  "bqlite-planner",
  "bqlite-storage",
+ "parquet",
  "thiserror 2.0.18",
 ]
 
