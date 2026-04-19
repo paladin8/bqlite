@@ -1402,6 +1402,25 @@ fn fold_stage(
             )
         }
 
+        // ── Wave 4 desugaring ─────────────────────────────────────────
+        // RETENTION is syntactic sugar that expands into a two-step
+        // MATCH FIRST … BRACKETS … EMIT ALL followed by a STATS stage
+        // with AVG(CAST(step_reached >= 2 AS INT)) GROUP BY bracket.
+        // See opt::desugar_retention and query-language.md §6.3.
+        PipelineStage::Retention(r) => {
+            let (match_stage, stats_stage) = crate::opt::desugar_retention(r)?;
+            let after_match =
+                fold_stage(match_stage, acc, registry, catalog, source_table, aliases)?;
+            fold_stage(
+                stats_stage,
+                after_match,
+                registry,
+                catalog,
+                source_table,
+                aliases,
+            )
+        }
+
         // Everything else is a later-wave shape.
         other => Err(BqliteError::Plan(format!(
             "pipeline stage `{}` is not yet supported — see TASKS.md for the implementation wave",
@@ -1945,6 +1964,24 @@ fn lower_match(
     if emit_all {
         output_columns.push(ColumnDef {
             name: "step_reached".to_string(),
+            bql_type: BqlType::Int,
+            nullable: false,
+            default_value: None,
+        });
+    }
+
+    // 3a. bracket / bracket_end columns when BRACKETS is specified.
+    // query-language.md §4.12: one row per (entity, binding track, bracket).
+    // `bracket` is 0-indexed; `bracket_end` is the upper bound in nanos.
+    if pattern.brackets.is_some() {
+        output_columns.push(ColumnDef {
+            name: "bracket".to_string(),
+            bql_type: BqlType::Int,
+            nullable: false,
+            default_value: None,
+        });
+        output_columns.push(ColumnDef {
+            name: "bracket_end".to_string(),
             bql_type: BqlType::Int,
             nullable: false,
             default_value: None,
@@ -5851,6 +5888,143 @@ mod tests {
         assert!(
             msg.contains("signup"),
             "error must mention the colliding name; got: {msg}"
+        );
+    }
+
+    // ── Wave 4: RETENTION desugaring (integration through lower_statement) ──
+    //
+    // These tests verify that `PipelineStage::Retention` flowing through
+    // `fold_stage` → `desugar_retention` → `fold_stage(Match)` → `fold_stage(Stats)`
+    // produces the correct LogicalPlan tree.  Pure unit tests for the AST rewrite
+    // live in `opt::desugar_retention::tests`.
+
+    #[test]
+    fn retention_lowers_to_avg_aggregate_over_sequence_match_with_brackets() {
+        use bqlite_ast::pattern::BracketSpec;
+        use bqlite_ast::Retention;
+        use bqlite_core::AggFunction;
+
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+
+        let entry = bqlite_ast::pattern::EventRef {
+            table: None,
+            event: Name::synthetic("signup"),
+            span: Span::EMPTY,
+        };
+        let activity = bqlite_ast::pattern::EventRef {
+            table: None,
+            event: Name::synthetic("purchase"),
+            span: Span::EMPTY,
+        };
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Retention(Retention {
+                entry,
+                activity,
+                brackets: BracketSpec {
+                    durations: vec![
+                        86_400_000_000_000,      // 1d
+                        7 * 86_400_000_000_000,  // 7d
+                        30 * 86_400_000_000_000, // 30d
+                    ],
+                    cumulative: false,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            })],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+
+        // Outer node: Aggregate with GROUP BY bracket.
+        let LogicalPlan::Aggregate {
+            aggregates,
+            group_by,
+            input,
+            ..
+        } = plan
+        else {
+            panic!("expected Aggregate at top level, got {plan:?}");
+        };
+
+        // GROUP BY bracket (single key).
+        assert_eq!(group_by.len(), 1, "RETENTION must GROUP BY bracket");
+
+        // One aggregate: retention_rate = AVG(…).
+        assert_eq!(aggregates.len(), 1, "RETENTION produces one aggregate");
+        assert_eq!(aggregates[0].output_name, "retention_rate");
+        assert_eq!(aggregates[0].function, AggFunction::Avg);
+
+        // Inner node: SequenceMatch with emit_all=true and brackets set.
+        let LogicalPlan::SequenceMatch {
+            emit_all,
+            window,
+            brackets,
+            output_schema,
+            ..
+        } = *input
+        else {
+            panic!("expected SequenceMatch inside Aggregate, got {input:?}");
+        };
+        assert!(emit_all, "RETENTION MATCH must have emit_all = true");
+        assert!(
+            window.is_none(),
+            "BRACKETS and WITHIN are mutually exclusive"
+        );
+
+        let brackets = brackets.expect("brackets must be present on RETENTION match");
+        assert_eq!(brackets.durations.len(), 3);
+        assert!(!brackets.cumulative);
+
+        assert!(
+            output_schema.column("step_reached").is_some(),
+            "emit_all → step_reached column present"
+        );
+        assert!(
+            output_schema.column("bracket").is_some(),
+            "brackets → bracket column present"
+        );
+    }
+
+    #[test]
+    fn retention_cumulative_brackets_propagated() {
+        use bqlite_ast::pattern::BracketSpec;
+        use bqlite_ast::Retention;
+
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Retention(Retention {
+                entry: bqlite_ast::pattern::EventRef {
+                    table: None,
+                    event: Name::synthetic("signup"),
+                    span: Span::EMPTY,
+                },
+                activity: bqlite_ast::pattern::EventRef {
+                    table: None,
+                    event: Name::synthetic("purchase"),
+                    span: Span::EMPTY,
+                },
+                brackets: BracketSpec {
+                    durations: vec![86_400_000_000_000, 7 * 86_400_000_000_000],
+                    cumulative: true,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            })],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+
+        let LogicalPlan::Aggregate { input, .. } = plan else {
+            panic!("expected Aggregate");
+        };
+        let LogicalPlan::SequenceMatch { brackets, .. } = *input else {
+            panic!("expected SequenceMatch");
+        };
+        let brackets = brackets.expect("brackets must be set");
+        assert!(
+            brackets.cumulative,
+            "cumulative flag must propagate from Retention to SequenceMatch"
         );
     }
 

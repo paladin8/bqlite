@@ -25,13 +25,21 @@
 //! | Pass | Module | Task |
 //! |------|--------|------|
 //! | Match-aggregate fusion | [`fuse_match_aggregate`] | TASK-320 |
+//!
+//! ## Wave 4 lowering helpers
+//!
+//! | Helper | Module | Task |
+//! |--------|--------|------|
+//! | RETENTION desugaring | [`desugar_retention`] | TASK-426 |
 
 pub mod desugar_funnel;
+pub mod desugar_retention;
 pub mod fuse_match_aggregate;
 pub mod prune;
 pub mod pushdown;
 
 pub use desugar_funnel::desugar_funnel;
+pub use desugar_retention::desugar_retention;
 pub use fuse_match_aggregate::fuse_match_aggregate;
 pub use prune::prune_columns;
 pub use pushdown::pushdown_predicates;
