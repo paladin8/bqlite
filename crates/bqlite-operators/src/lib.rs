@@ -58,6 +58,7 @@ pub mod filter;
 pub mod filtered_batch;
 pub mod limit;
 pub mod matcher;
+pub mod materialize;
 pub mod operator;
 pub mod project;
 pub mod scan;
@@ -74,6 +75,7 @@ pub use filter::FilterOperator;
 pub use filtered_batch::FilteredBatch;
 pub use limit::LimitOperator;
 pub use matcher::SequenceMatchOperator;
+pub use materialize::materialize_selected;
 pub use operator::{
     CancellationToken, EntityOperator, PhysicalOperator, DEFAULT_OUTPUT_BATCH_SIZE,
 };
