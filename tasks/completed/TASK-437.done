@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-437",
   "claimed_at": "2026-04-19T21:54:27Z",
+  "completed_at": "2026-04-19T22:19:20Z",
   "branch": "task/TASK-437",
   "description": "Cohort subquery runtime + alias execution cache"
 }

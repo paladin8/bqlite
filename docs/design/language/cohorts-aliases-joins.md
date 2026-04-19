@@ -432,12 +432,67 @@ For `MergeSources`, the output entity-key column is always named `entity_id` reg
 
 **TASK-437 (cohort subquery runtime):**
 - Execute `SubqueryFilterPhysical` via hash-set probe (§ 4.1).
-- Cache alias results per submission (§ 2.5).
-- Detect alias cycles (§ 2.8).
-- Support single-column and tuple cohort keys (§ 4.1).
+  Implemented as `SubqueryFilterOperator` in
+  `crates/bqlite-operators/src/cohort.rs`; engine bind step
+  materializes the inner subquery at query start in
+  `crates/bqlite-engine/src/bind.rs::bind_subquery_filter`.
+- Cache alias results per submission (§ 2.5). Implemented as
+  `CohortCache` in the engine bind step; cohorts are keyed by
+  structural equality of the inner `PhysicalPlan` so two `IN alias`
+  references that resolve to the same alias body — and two
+  `IN QUERY (...)` whose inner pipelines lower to identical physical
+  plans — share one `Arc<CohortHashSet>` per top-level execution
+  (§ 2.11). Pinned by the
+  `cohort_cache_get_returns_arc_for_equal_plan` test.
+- Detect alias cycles (§ 2.8). Owned by the planner's
+  `resolve_alias` in `crates/bqlite-planner/src/logical.rs`; by the
+  time a `PhysicalPlan` reaches the engine bind step it is
+  guaranteed cycle-free, so the runtime walk does not re-check.
+- Support single-column and tuple cohort keys (§ 4.1). Single and
+  two-column tuple cases are pinned by `cohort.rs` unit tests and
+  by end-to-end tests in `bind.rs#tests`.
 - Shape-check at use site producing `TypeError::IncompatibleCohortShape` (§ 2.9).
-- Positional multi-column binding (§ 2.10).
-- Entity-id pushdown signaling to the scan layer (§ 4.3).
+  Owned by the planner (`apply_subquery_filter` in
+  `bqlite-planner/src/logical.rs`); the runtime asserts arity
+  consistency at construction as a defense-in-depth check.
+- Positional multi-column binding (§ 2.10). The runtime evaluates
+  LHS expressions in source order and probes the cohort tuple
+  positionally; column names in the cohort's output schema are
+  ignored by the probe.
+- ~~Entity-id pushdown signaling to the scan layer (§ 4.3).~~
+  **Deferred** — see § 6.3.1 for the rationale and follow-up
+  plan. The post-scan probe is correct without pushdown; the
+  pushdown is purely a performance optimization that requires
+  storage-layer scan-predicate vocabulary to grow a
+  `column IN literal_set` shape.
+
+#### 6.3.1 Entity-id pushdown deferral (post-TASK-437)
+
+The entity-id-component pushdown described in § 4.3 has not been
+wired into the scan layer in TASK-437. The cohort runtime is
+correct without it — every outer row is probed against the
+materialized hash set after the scan emits it — and the missing
+optimization affects throughput on large outer tables filtered by
+small cohorts, not correctness.
+
+The work involves:
+
+1. Extending the storage-layer `ScanPredicate` taxonomy
+   (`docs/design/storage/predicate-pushdown.md`) with a
+   `column IN <Arc<HashSet<EntityId>>>` shape that the scan can
+   evaluate cheaply.
+2. Teaching `bqlite-storage`'s shard / segment skip logic to
+   reject shards whose `(entity_min, entity_max)` zone-map
+   doesn't overlap the cohort.
+3. Having the engine bind step extract the entity-id component
+   from a multi-column cohort and attach it as a pushdown
+   predicate on the outer scan, after the cohort is materialized
+   but before scan binding.
+
+This crosses the operators ↔ storage boundary and is deliberately
+scoped as a follow-up rather than wedged into TASK-437. The
+follow-up should be filed against the same `cohorts-aliases-joins.md`
+spec; semantics are unchanged.
 
 ### 6.4 Other Tasks
 
