@@ -301,6 +301,55 @@ impl SelectionVector {
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }
+
+    /// Dense "every row selected" constructor.
+    ///
+    /// Produces `[0, 1, 2, …, row_count-1]`. Used as the initial
+    /// selection at the top of a filter conjunction.
+    pub fn all_rows(row_count: u32) -> Self {
+        Self {
+            indices: (0..row_count).collect(),
+        }
+    }
+
+    /// Intersection of two sorted selections. O(n + m) merge.
+    pub fn intersect(lhs: &Self, rhs: &Self) -> Self {
+        let (a, b) = (&lhs.indices, &rhs.indices);
+        let mut out = Vec::with_capacity(a.len().min(b.len()));
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    out.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        Self { indices: out }
+    }
+
+    /// Materialize a selection from a boolean mask (same length as the
+    /// source batch). `true` selects that row; `false` drops it.
+    pub fn from_bool_mask(mask: &[bool]) -> Self {
+        let mut out = Vec::with_capacity(mask.iter().filter(|b| **b).count());
+        for (i, keep) in mask.iter().enumerate() {
+            if *keep {
+                out.push(i as u32);
+            }
+        }
+        Self { indices: out }
+    }
+
+    /// Keep only the first `limit` selected rows. No-op when
+    /// `limit >= len()`.
+    pub fn truncate(&mut self, limit: usize) {
+        if limit < self.indices.len() {
+            self.indices.truncate(limit);
+        }
+    }
 }
 
 /// A contiguous run of rows in one source batch.
@@ -365,6 +414,100 @@ impl RowSelection {
             RowSelection::Runs(runs) => runs.is_empty() || runs.iter().all(|r| r.len == 0),
         }
     }
+
+    /// Expand runs (if any) into a flat [`SelectionVector`] without
+    /// consuming self.
+    pub fn as_indices(&self) -> SelectionVector {
+        match self {
+            RowSelection::Indices(sv) => sv.clone(),
+            RowSelection::Runs(runs) => {
+                let total: usize = runs.iter().map(|r| r.len as usize).sum();
+                let mut out = Vec::with_capacity(total);
+                for r in runs {
+                    for i in 0..r.len {
+                        out.push(r.start + i);
+                    }
+                }
+                SelectionVector { indices: out }
+            }
+        }
+    }
+
+    /// Consume and return a flat [`SelectionVector`].
+    pub fn into_indices(self) -> SelectionVector {
+        match self {
+            RowSelection::Indices(sv) => sv,
+            RowSelection::Runs(_) => self.as_indices(),
+        }
+    }
+
+    /// Intersect two selections. Preserves `Runs` when both sides are
+    /// runs; otherwise coerces to `Indices`.
+    pub fn intersect(lhs: &Self, rhs: &Self) -> Self {
+        match (lhs, rhs) {
+            (RowSelection::Runs(a), RowSelection::Runs(b)) => {
+                RowSelection::Runs(intersect_runs(a, b))
+            }
+            _ => RowSelection::Indices(SelectionVector::intersect(
+                &lhs.as_indices(),
+                &rhs.as_indices(),
+            )),
+        }
+    }
+
+    /// Truncate to at most `limit` logical rows. Preserves variant.
+    pub fn truncate(&mut self, limit: usize) {
+        if self.len() <= limit {
+            return;
+        }
+        match self {
+            RowSelection::Indices(sv) => sv.truncate(limit),
+            RowSelection::Runs(runs) => {
+                let mut remaining = limit;
+                let mut kept = Vec::with_capacity(runs.len());
+                for r in runs.iter() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if (r.len as usize) <= remaining {
+                        kept.push(*r);
+                        remaining -= r.len as usize;
+                    } else {
+                        kept.push(RowRun {
+                            start: r.start,
+                            len: remaining as u32,
+                        });
+                        remaining = 0;
+                    }
+                }
+                *runs = kept;
+            }
+        }
+    }
+}
+
+/// Intersect two sorted-ascending, non-overlapping run lists.
+fn intersect_runs(a: &[RowRun], b: &[RowRun]) -> Vec<RowRun> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        let (as_, ae) = (a[i].start, a[i].end());
+        let (bs, be) = (b[j].start, b[j].end());
+        let start = as_.max(bs);
+        let end = ae.min(be);
+        if start < end {
+            out.push(RowRun {
+                start,
+                len: end - start,
+            });
+        }
+        if ae <= be {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -612,6 +755,118 @@ mod tests {
             assert_eq!(v, runs);
         } else {
             panic!("expected Runs");
+        }
+    }
+
+    #[test]
+    fn selection_vector_all_rows_dense() {
+        let sv = SelectionVector::all_rows(4);
+        assert_eq!(sv.as_slice(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn selection_vector_intersect_sorted_merge() {
+        let a = SelectionVector::from_sorted(vec![0, 2, 4, 6]);
+        let b = SelectionVector::from_sorted(vec![1, 2, 3, 4, 5]);
+        let i = SelectionVector::intersect(&a, &b);
+        assert_eq!(i.as_slice(), &[2, 4]);
+    }
+
+    #[test]
+    fn selection_vector_from_bool_mask_preserves_order() {
+        let sv = SelectionVector::from_bool_mask(&[true, false, true, true, false]);
+        assert_eq!(sv.as_slice(), &[0, 2, 3]);
+    }
+
+    #[test]
+    fn selection_vector_truncate_caps_length() {
+        let mut sv = SelectionVector::from_sorted(vec![1, 3, 5, 7]);
+        sv.truncate(2);
+        assert_eq!(sv.as_slice(), &[1, 3]);
+        sv.truncate(10); // no-op
+        assert_eq!(sv.as_slice(), &[1, 3]);
+    }
+
+    #[test]
+    fn row_selection_intersect_runs_keeps_runs() {
+        let a = RowSelection::Runs(vec![
+            RowRun { start: 0, len: 5 },
+            RowRun { start: 10, len: 5 },
+        ]);
+        let b = RowSelection::Runs(vec![
+            RowRun { start: 3, len: 4 },
+            RowRun { start: 12, len: 6 },
+        ]);
+        match RowSelection::intersect(&a, &b) {
+            RowSelection::Runs(runs) => {
+                assert_eq!(
+                    runs,
+                    vec![
+                        RowRun { start: 3, len: 2 },
+                        RowRun { start: 12, len: 3 },
+                    ]
+                );
+            }
+            _ => panic!("expected Runs"),
+        }
+    }
+
+    #[test]
+    fn row_selection_intersect_mixed_coerces_to_indices() {
+        let a = RowSelection::Runs(vec![RowRun { start: 0, len: 4 }]);
+        let b = RowSelection::Indices(SelectionVector::from_sorted(vec![1, 2, 10]));
+        match RowSelection::intersect(&a, &b) {
+            RowSelection::Indices(sv) => assert_eq!(sv.as_slice(), &[1, 2]),
+            _ => panic!("expected Indices"),
+        }
+    }
+
+    #[test]
+    fn row_selection_as_indices_expands_runs() {
+        let sel = RowSelection::Runs(vec![
+            RowRun { start: 0, len: 2 },
+            RowRun { start: 5, len: 3 },
+        ]);
+        assert_eq!(sel.as_indices().as_slice(), &[0, 1, 5, 6, 7]);
+    }
+
+    #[test]
+    fn row_selection_into_indices_consumes_and_expands() {
+        let sel = RowSelection::Runs(vec![RowRun { start: 2, len: 3 }]);
+        assert_eq!(sel.into_indices().as_slice(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn row_selection_truncate_runs_trims_last() {
+        let mut sel = RowSelection::Runs(vec![
+            RowRun { start: 0, len: 3 },
+            RowRun { start: 10, len: 4 },
+        ]);
+        sel.truncate(5); // keep first run (3), then 2 from second
+        match &sel {
+            RowSelection::Runs(runs) => {
+                assert_eq!(
+                    runs,
+                    &vec![
+                        RowRun { start: 0, len: 3 },
+                        RowRun { start: 10, len: 2 },
+                    ]
+                );
+            }
+            _ => panic!("expected Runs"),
+        }
+        assert_eq!(sel.len(), 5);
+    }
+
+    #[test]
+    fn row_selection_truncate_indices_trims() {
+        let mut sel = RowSelection::Indices(SelectionVector::from_sorted(vec![1, 3, 5, 7, 9]));
+        sel.truncate(3);
+        assert_eq!(sel.len(), 3);
+        if let RowSelection::Indices(sv) = sel {
+            assert_eq!(sv.as_slice(), &[1, 3, 5]);
+        } else {
+            panic!("expected Indices");
         }
     }
 

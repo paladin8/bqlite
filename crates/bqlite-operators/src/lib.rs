@@ -52,6 +52,7 @@
 
 pub mod aggregate;
 pub mod distinct;
+pub mod encoded_filter;
 pub mod eval;
 pub mod filter;
 pub mod filtered_batch;
@@ -60,6 +61,7 @@ pub mod matcher;
 pub mod operator;
 pub mod project;
 pub mod scan;
+pub mod selection;
 pub mod sort;
 
 pub use aggregate::{
@@ -67,6 +69,7 @@ pub use aggregate::{
     DEFAULT_MAX_GROUPS,
 };
 pub use distinct::DistinctOperator;
+pub use encoded_filter::{ConstantEqKernel, EncodedPredicateKernel};
 pub use filter::FilterOperator;
 pub use filtered_batch::FilteredBatch;
 pub use limit::LimitOperator;
@@ -76,4 +79,5 @@ pub use operator::{
 };
 pub use project::ProjectOperator;
 pub use scan::{ScanOperator, ScanPath};
+pub use selection::{is_dense, selection_as_vector, selection_to_bool_array};
 pub use sort::SortOperator;

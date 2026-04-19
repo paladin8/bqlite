@@ -1,0 +1,274 @@
+//! Selection-first predicate kernels over [`EncodedColumn`].
+//!
+//! A predicate kernel consumes an [`EncodedColumnView`] and the current
+//! [`RowSelection`] for its batch, evaluates its predicate over just the
+//! selected rows, and returns a narrowed [`RowSelection`]. This is the
+//! "selection-first" contract from
+//! `docs/design/storage/zero-copy-scan-filter.md` §7: a kernel never
+//! materializes rows it has already been told to skip, and it never
+//! evaluates rows the column bitmap marks null.
+//!
+//! # Kernel surface landing in CP3
+//!
+//! - [`ConstantEqKernel`] — constant-encoded column compared against a
+//!   literal. Every live row collapses to either "all selected rows"
+//!   or "no rows" by a single pointer-equal scalar comparison.
+//!
+//! The remaining kernels (Dict eq/IN, plain-fixed range, bool eq, null
+//! checks on non-constant columns) land alongside the real
+//! [`ScanOperator`] integration in CP7. The trait defined here is the
+//! binding contract those kernels will also implement.
+//!
+//! # Non-goals for CP3
+//!
+//! This module is not yet wired into [`crate::scan::ScanOperator`]. The
+//! dispatch path (`ScanPath::Encoded` → read
+//! `next_encoded_row_group` → run kernels → materialize at boundary)
+//! lands in CP7.
+
+use bqlite_core::encoded::{
+    EncodedColumnView, EncodedKind, PinnedChunkRef, RowSelection, SelectionVector,
+};
+use bqlite_core::scalar::ScalarValue;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel trait
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Selection-first predicate kernel.
+///
+/// Implementors evaluate a single predicate shape (e.g. "column == literal"
+/// for a constant-encoded column) against the rows still live in
+/// `input`, and return a narrowed [`RowSelection`].
+///
+/// Contract:
+///
+/// - The returned selection is a subset of `input`. Kernels never
+///   widen the live row set.
+/// - A kernel with no live rows returns [`RowSelection::empty()`].
+/// - Null handling: the kernel consults `column`'s null bitmap. A null
+///   at row `i` makes that row fail the predicate (SQL `NULL = x` is
+///   `NULL`, which kernels treat as "not selected"). Null-specific
+///   kernels (`IS NULL`) have their own variant.
+pub trait EncodedPredicateKernel {
+    fn apply(&self, column: &EncodedColumnView<'_>, input: &RowSelection) -> RowSelection;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ConstantEqKernel
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Kernel for `constant_column = literal`.
+///
+/// This is the cheapest filter shape in the encoded path: the column
+/// already consists of exactly one logical value. The kernel performs
+/// one scalar comparison. If the pinned constant does not equal
+/// `literal`, every row fails and the kernel returns an empty
+/// selection. If it does, the input selection is returned unchanged
+/// (modulo null handling — nulls drop out of the live set).
+pub struct ConstantEqKernel {
+    pub literal: ScalarValue,
+}
+
+impl ConstantEqKernel {
+    pub fn new(literal: ScalarValue) -> Self {
+        Self { literal }
+    }
+}
+
+impl EncodedPredicateKernel for ConstantEqKernel {
+    fn apply(&self, column: &EncodedColumnView<'_>, input: &RowSelection) -> RowSelection {
+        let (chunk, kind, rows) = match column {
+            EncodedColumnView::Encoded { chunk, kind, rows } => (chunk, *kind, *rows),
+            EncodedColumnView::Materialized { .. } => {
+                // Materialized fallback is not this kernel's responsibility —
+                // when a column lands as Materialized, the ScanOperator
+                // dispatches to an Arrow-compute filter path instead.
+                // CP7 owns that dispatch; until then we return the input
+                // unchanged so callers can compose kernels independently.
+                return input.clone();
+            }
+        };
+        let pinned = match kind {
+            EncodedKind::Constant { value } => value.as_ref(),
+            _ => {
+                // Wrong kernel for this encoding; caller's dispatch is a
+                // bug. CP3 treats this defensively by passing input
+                // through unchanged (the outer filter will still drop
+                // non-matching rows at materialization). Future CPs may
+                // promote this to a debug_assert.
+                return input.clone();
+            }
+        };
+        if pinned != &self.literal {
+            return RowSelection::empty();
+        }
+        // Constant equals literal at every row. Null handling drops any
+        // row whose bit is unset in the column's null bitmap (if any).
+        apply_null_mask(chunk, rows, input)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Null-bitmap selection helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Narrow `input` by the column's null bitmap.
+///
+/// For encodings where "predicate satisfied" collapses to "row is not
+/// null" (e.g. constant-column equality when the constant matches), the
+/// live row set is `input ∩ valid-bits`. When the column has no nulls,
+/// the input passes through unchanged.
+fn apply_null_mask(
+    chunk: &PinnedChunkRef<'_>,
+    rows: u32,
+    input: &RowSelection,
+) -> RowSelection {
+    let Some(bitmap) = chunk.nulls else {
+        return input.clone();
+    };
+    // Iterate the input's row indices and keep those whose validity
+    // bit is set. Works uniformly over Runs and Indices inputs by
+    // expanding to indices first — the performance-sensitive
+    // Runs-preserving path lands in CP4 where RLE is the primary
+    // kernel shape.
+    let mut out = Vec::with_capacity(input.len());
+    let sv = input.as_indices();
+    for &idx in sv.as_slice() {
+        if idx >= rows {
+            continue;
+        }
+        if bit_is_set(bitmap, idx as usize) {
+            out.push(idx);
+        }
+    }
+    RowSelection::Indices(SelectionVector::from_sorted(out))
+}
+
+/// LSB-first bit lookup (matches the segment-format v1 validity
+/// bitmap layout).
+#[inline]
+fn bit_is_set(bitmap: &[u8], index: usize) -> bool {
+    let byte = index >> 3;
+    let bit = index & 7;
+    byte < bitmap.len() && (bitmap[byte] >> bit) & 1 != 0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bqlite_core::encoded::{
+        EncodedColumn, EncodedKind, PinnedChunk, RowRun, RowSelection, SelectionVector,
+    };
+
+    use super::*;
+
+    fn constant_column(value: ScalarValue, rows: u32, nulls: Option<Vec<u8>>) -> EncodedColumn {
+        EncodedColumn::Encoded {
+            chunk: PinnedChunk {
+                payload: Arc::from(Vec::<u8>::new()),
+                nulls: nulls.map(Arc::from),
+                params: Arc::from(Vec::<u8>::new()),
+            },
+            kind: EncodedKind::Constant {
+                value: Arc::new(value),
+            },
+            rows,
+        }
+    }
+
+    #[test]
+    fn constant_eq_matches_preserves_input_when_no_nulls() {
+        let col = constant_column(ScalarValue::Int(7), 4, None);
+        let kernel = ConstantEqKernel::new(ScalarValue::Int(7));
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 4 }]);
+        let out = kernel.apply(&col.view(), &input);
+        // With no nulls, the constant-matches case passes input through
+        // via the null-mask helper (which coerces to Indices). The
+        // logical row count must be equal.
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn constant_eq_mismatch_empties_selection() {
+        let col = constant_column(ScalarValue::Int(7), 4, None);
+        let kernel = ConstantEqKernel::new(ScalarValue::Int(8));
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1, 2, 3]));
+        let out = kernel.apply(&col.view(), &input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn constant_eq_drops_null_rows() {
+        // 4 rows, bitmap = 0b1010 → rows 1 and 3 are valid, rows 0
+        // and 2 are null.
+        let col = constant_column(ScalarValue::Int(7), 4, Some(vec![0b1010u8]));
+        let kernel = ConstantEqKernel::new(ScalarValue::Int(7));
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1, 2, 3]));
+        let out = kernel.apply(&col.view(), &input);
+        if let RowSelection::Indices(sv) = out {
+            assert_eq!(sv.as_slice(), &[1, 3]);
+        } else {
+            panic!("expected Indices output");
+        }
+    }
+
+    #[test]
+    fn constant_eq_respects_input_narrowing() {
+        let col = constant_column(ScalarValue::Int(7), 5, None);
+        let kernel = ConstantEqKernel::new(ScalarValue::Int(7));
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![1, 3]));
+        let out = kernel.apply(&col.view(), &input);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn constant_eq_string_literal() {
+        let col = constant_column(ScalarValue::String("u1".into()), 3, None);
+        let kernel = ConstantEqKernel::new(ScalarValue::String("u1".into()));
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1, 2]));
+        let out = kernel.apply(&col.view(), &input);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn wrong_encoding_passes_through_for_defense_in_depth() {
+        // The kernel is written against Constant encoding. When the
+        // dispatcher picks the wrong kernel, CP3 passes input through
+        // rather than producing silently wrong filtering.
+        let col = EncodedColumn::Encoded {
+            chunk: PinnedChunk {
+                payload: Arc::from(Vec::<u8>::new()),
+                nulls: None,
+                params: Arc::from(Vec::<u8>::new()),
+            },
+            kind: EncodedKind::PlainFixed { width: 8 },
+            rows: 2,
+        };
+        let kernel = ConstantEqKernel::new(ScalarValue::Int(1));
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1]));
+        let out = kernel.apply(&col.view(), &input);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn materialized_column_passes_through() {
+        use arrow::array::Int64Array;
+        use bqlite_core::encoded::EncodedColumn;
+        let col = EncodedColumn::Materialized {
+            array: Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+            rows: 3,
+        };
+        let kernel = ConstantEqKernel::new(ScalarValue::Int(1));
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1, 2]));
+        let out = kernel.apply(&col.view(), &input);
+        // CP3 path-through for materialized fallback — dispatcher
+        // handles this case in CP7.
+        assert_eq!(out.len(), 3);
+    }
+}
