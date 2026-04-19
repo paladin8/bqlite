@@ -1009,30 +1009,14 @@ impl<'s> Scanner<'s> {
         let b = self.peek_byte_at(1);
         // 2-char units first.
         match (a, b) {
-            (b'n', Some(b's')) => {
-                if !self.ident_continues_after(2) {
-                    return Some(2);
-                }
-            }
-            (b'u', Some(b's')) => {
-                if !self.ident_continues_after(2) {
-                    return Some(2);
-                }
-            }
-            (b'm', Some(b's')) => {
-                if !self.ident_continues_after(2) {
-                    return Some(2);
-                }
-            }
+            (b'n', Some(b's')) if !self.ident_continues_after(2) => return Some(2),
+            (b'u', Some(b's')) if !self.ident_continues_after(2) => return Some(2),
+            (b'm', Some(b's')) if !self.ident_continues_after(2) => return Some(2),
             _ => {}
         }
         // 1-char units.
         match a {
-            b's' | b'm' | b'h' | b'd' => {
-                if !self.ident_continues_after(1) {
-                    return Some(1);
-                }
-            }
+            b's' | b'm' | b'h' | b'd' if !self.ident_continues_after(1) => return Some(1),
             _ => {}
         }
         None

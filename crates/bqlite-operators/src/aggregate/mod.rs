@@ -728,7 +728,7 @@ impl Accumulator for HashAccumulator {
 
         // Collect groups in deterministic order for testing.
         let mut sorted_groups: Vec<(&GroupKey, &Vec<AggState>)> = self.groups.iter().collect();
-        sorted_groups.sort_by(|(a, _), (b, _)| a.cmp(b));
+        sorted_groups.sort_by_key(|(a, _)| *a);
 
         // Build group-by columns.
         for col_idx in 0..num_group_cols {
