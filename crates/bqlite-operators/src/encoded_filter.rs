@@ -261,6 +261,55 @@ fn select_runs_matching_i64(runs: &[(u32, i64)], literal: i64) -> Vec<RowRun> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Materialized-fallback filter (CP6 Step 2 / compressed-codec fallback)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Apply an Arrow-compute-produced boolean mask to an input selection.
+///
+/// The fallback path for compressed encodings that don't yet have a
+/// tile-scratch kernel (Delta, DoubleDelta, BitPacking, FOR, PFOR,
+/// ALP, FSST). CP2 pins those encodings as
+/// [`bqlite_core::encoded::EncodedColumn::Materialized`], so the kernel
+/// has a dense [`arrow::array::ArrayRef`] in hand and can call any
+/// arrow-compute kernel (`eq`, `gt`, `lt_eq`, …) to produce a boolean
+/// mask. This helper intersects that mask with the current selection.
+///
+/// Calling this on top of a per-tile decode is trivial: build the mask
+/// from the tile scratch (via the same compute kernels) and feed it
+/// here with the tile's global row offset — the mask indices are
+/// already global because the caller constructs them that way.
+///
+/// # Parameters
+///
+/// - `mask` — a length-`row_count` boolean array. `true` rows are kept.
+/// - `input` — the current [`RowSelection`].
+///
+/// # Semantics
+///
+/// Nulls in the mask are treated as `false` (SQL NULL filter semantics).
+pub fn apply_materialized_mask(
+    mask: &arrow::array::BooleanArray,
+    input: &RowSelection,
+) -> RowSelection {
+    use arrow::array::Array;
+    let mut out = Vec::with_capacity(input.len());
+    let sv = input.as_indices();
+    for &idx in sv.as_slice() {
+        let i = idx as usize;
+        if i >= mask.len() {
+            continue;
+        }
+        if !mask.is_valid(i) {
+            continue;
+        }
+        if mask.value(i) {
+            out.push(idx);
+        }
+    }
+    RowSelection::Indices(SelectionVector::from_sorted(out))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -478,6 +527,36 @@ mod tests {
         let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1]));
         let out = kernel.apply(&col.view(), &input);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn apply_materialized_mask_narrows_selection() {
+        use arrow::array::BooleanArray;
+        let mask = BooleanArray::from(vec![true, false, true, true, false]);
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1, 2, 3, 4]));
+        let out = apply_materialized_mask(&mask, &input);
+        let sv = out.as_indices();
+        assert_eq!(sv.as_slice(), &[0, 2, 3]);
+    }
+
+    #[test]
+    fn apply_materialized_mask_respects_input_narrowing() {
+        use arrow::array::BooleanArray;
+        let mask = BooleanArray::from(vec![true, true, true, true, true]);
+        // Input already restricts to rows 1 and 3.
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![1, 3]));
+        let out = apply_materialized_mask(&mask, &input);
+        assert_eq!(out.as_indices().as_slice(), &[1, 3]);
+    }
+
+    #[test]
+    fn apply_materialized_mask_drops_null_rows() {
+        use arrow::array::BooleanArray;
+        // Mask with a null in position 2.
+        let mask = BooleanArray::from(vec![Some(true), Some(true), None, Some(true)]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 4 }]);
+        let out = apply_materialized_mask(&mask, &input);
+        assert_eq!(out.as_indices().as_slice(), &[0, 1, 3]);
     }
 
     #[test]
