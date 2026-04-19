@@ -764,6 +764,38 @@ impl Database {
         })
     }
 
+    /// Atomically remove a set of compaction-input segments from
+    /// `(table_name, window_id, shard_id)`'s manifest inventory
+    /// without publishing a replacement.
+    ///
+    /// Used by the compaction reclamation path when every row in the
+    /// merged input was tombstoned — there is no output segment to
+    /// publish, but the inputs must still be removed in one
+    /// `manifest.json.tmp → fsync → rename` cycle so the
+    /// `docs/design/storage/compaction-concurrency.md` §6 all-or-nothing
+    /// publish guarantee still holds.
+    ///
+    /// `pub(crate)` because the only intended caller is
+    /// [`crate::compaction::compact_one`]; external code that wants
+    /// to drop a single segment uses [`Self::remove_segment`].
+    ///
+    /// See [`Manifest::remove_segments`] for the full error taxonomy.
+    //
+    // Allowed-dead-code until TASK-435 CP3 wires this into `compact_one`'s
+    // zero-surviving-rows branch. The primitive ships in its own
+    // checkpoint so the manifest-mutation surface is reviewable in
+    // isolation from the compaction path changes.
+    #[allow(dead_code)]
+    pub(crate) fn remove_segments_atomic(
+        &mut self,
+        table_name: &str,
+        window_id: u32,
+        shard_id: u32,
+        removed_ids: &[u64],
+    ) -> Result<()> {
+        self.update_manifest(|m| m.remove_segments(table_name, window_id, shard_id, removed_ids))
+    }
+
     /// Apply `f` to a mutable copy of the current manifest, persist
     /// the result atomically, then adopt it as the new in-memory
     /// state.

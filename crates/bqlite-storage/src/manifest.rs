@@ -586,6 +586,78 @@ impl Manifest {
         Ok(())
     }
 
+    /// Atomically remove a set of segments from `(table_name,
+    /// window_id, shard_id)` without publishing a replacement.
+    ///
+    /// Used by the compaction reclamation path when every row in the
+    /// input set was tombstoned: there is no output segment to publish,
+    /// but the inputs must still be removed in one
+    /// `manifest.json.tmp → fsync → rename` cycle so the §6 all-or-
+    /// nothing publish guarantee still holds. `removed_ids` must be
+    /// non-empty and every id must exist in the target shard; mirrors
+    /// [`Self::replace_segments`]'s error taxonomy minus the
+    /// duplicate-output check.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if `removed_ids` is empty.
+    /// - [`BqliteError::Execution`] if `table_name` is not registered.
+    /// - [`BqliteError::Execution`] if the target window does not exist.
+    /// - [`BqliteError::Execution`] if `shard_id >= shard_count`.
+    /// - [`BqliteError::Execution`] if any `removed_id` is missing from
+    ///   the target shard's segment list.
+    ///
+    /// On any error, the [`Manifest`] is unchanged.
+    pub fn remove_segments(
+        &mut self,
+        table_name: &str,
+        window_id: u32,
+        shard_id: u32,
+        removed_ids: &[u64],
+    ) -> Result<()> {
+        if removed_ids.is_empty() {
+            return Err(BqliteError::Execution(
+                "remove_segments: removed_ids must be non-empty".into(),
+            ));
+        }
+        if shard_id >= u32::from(self.shard_count) {
+            return Err(BqliteError::Execution(format!(
+                "remove_segments: shard_id {shard_id} out of range (shard_count = {})",
+                self.shard_count
+            )));
+        }
+        let entry = self.tables.get_mut(table_name).ok_or_else(|| {
+            BqliteError::Execution(format!("remove_segments: unknown table '{table_name}'"))
+        })?;
+        let win_idx = entry
+            .windows
+            .iter()
+            .position(|w| w.window_id == window_id)
+            .ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "remove_segments: window {window_id} not found in table '{table_name}'"
+                ))
+            })?;
+        let shard_segs = entry.windows[win_idx]
+            .shards
+            .get(shard_id as usize)
+            .ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "remove_segments: shard {shard_id} out of range for window {window_id}"
+                ))
+            })?;
+        for id in removed_ids {
+            if !shard_segs.iter().any(|s| s.segment_id == *id) {
+                return Err(BqliteError::Execution(format!(
+                    "remove_segments: segment_id {id} not found in table '{table_name}' window {window_id} shard {shard_id}"
+                )));
+            }
+        }
+        let shard_segs = &mut entry.windows[win_idx].shards[shard_id as usize];
+        shard_segs.retain(|s| !removed_ids.contains(&s.segment_id));
+        Ok(())
+    }
+
     /// Snapshot the active segments matching `(table_name, time_range,
     /// shard_id)` at this moment.
     ///
@@ -1522,5 +1594,137 @@ mod tests {
             .map(|s| s.segment_id)
             .collect();
         assert_eq!(shard, vec![3]);
+    }
+
+    #[test]
+    fn remove_segments_drops_every_listed_id() {
+        let mut m = manifest_with_events_table(2);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(2, 2, (10, 20)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(3, 3, (20, 30)))
+            .unwrap();
+        m.remove_segments("events", 0, 0, &[1, 3])
+            .expect("remove_segments must drop matching ids");
+        let shard: Vec<u64> = m.tables["events"].windows[0].shards[0]
+            .iter()
+            .map(|s| s.segment_id)
+            .collect();
+        assert_eq!(shard, vec![2]);
+    }
+
+    #[test]
+    fn remove_segments_empties_shard_when_all_removed() {
+        // The zero-row compaction path removes every input without
+        // publishing a replacement. The resulting empty shard vec is
+        // a valid manifest state.
+        let mut m = manifest_with_events_table(1);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(2, 2, (10, 20)))
+            .unwrap();
+        m.remove_segments("events", 0, 0, &[1, 2]).unwrap();
+        assert!(m.tables["events"].windows[0].shards[0].is_empty());
+    }
+
+    #[test]
+    fn remove_segments_rejects_empty_input() {
+        let mut m = manifest_with_events_table(1);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        let err = m.remove_segments("events", 0, 0, &[]).unwrap_err();
+        match err {
+            BqliteError::Execution(msg) => assert!(msg.contains("non-empty"), "got: {msg}"),
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_segments_rejects_missing_id() {
+        let mut m = manifest_with_events_table(1);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        let err = m.remove_segments("events", 0, 0, &[42]).unwrap_err();
+        assert!(matches!(err, BqliteError::Execution(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn remove_segments_rejects_unknown_table() {
+        let mut m = manifest_with_events_table(1);
+        let err = m.remove_segments("nope", 0, 0, &[1]).unwrap_err();
+        assert!(matches!(err, BqliteError::Execution(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn remove_segments_rejects_unknown_window() {
+        let mut m = manifest_with_events_table(1);
+        // events table exists but has no windows yet.
+        let err = m.remove_segments("events", 0, 0, &[1]).unwrap_err();
+        assert!(matches!(err, BqliteError::Execution(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn remove_segments_rejects_shard_out_of_range() {
+        let mut m = manifest_with_events_table(1);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        // shard_count = 1, so shard_id = 5 is out of range.
+        let err = m.remove_segments("events", 0, 5, &[1]).unwrap_err();
+        assert!(matches!(err, BqliteError::Execution(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn remove_segments_partial_match_leaves_manifest_untouched() {
+        // The load-bearing atomicity guarantee: a single missing id
+        // rejects the whole call and the existing segments stay put.
+        let mut m = manifest_with_events_table(1);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(2, 2, (10, 20)))
+            .unwrap();
+        let err = m.remove_segments("events", 0, 0, &[1, 999]).unwrap_err();
+        assert!(matches!(err, BqliteError::Execution(_)), "got {err:?}");
+        let ids: Vec<u64> = m.tables["events"].windows[0].shards[0]
+            .iter()
+            .map(|s| s.segment_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "partial match must leave the manifest untouched"
+        );
+    }
+
+    #[test]
+    fn remove_segments_tolerates_duplicate_removed_ids() {
+        // Matches the `replace_segments_tolerates_duplicate_removed_ids`
+        // sibling — compaction does not produce duplicates, but pinning
+        // the contract here prevents future "looks like a bug, let me
+        // fix it" churn from changing it under us.
+        let mut m = manifest_with_events_table(1);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        m.add_segment("events", 0, 0, sample_segment(2, 2, (10, 20)))
+            .unwrap();
+        m.remove_segments("events", 0, 0, &[1, 1, 2])
+            .expect("duplicate ids in removed_ids must not error");
+        assert!(m.tables["events"].windows[0].shards[0].is_empty());
+    }
+
+    #[test]
+    fn remove_segments_does_not_touch_other_shards() {
+        let mut m = manifest_with_events_table(2);
+        m.add_segment("events", 0, 0, sample_segment(1, 1, (0, 10)))
+            .unwrap();
+        m.add_segment("events", 0, 1, sample_segment(2, 2, (10, 20)))
+            .unwrap();
+        m.remove_segments("events", 0, 0, &[1]).unwrap();
+        assert!(m.tables["events"].windows[0].shards[0].is_empty());
+        let shard1_ids: Vec<u64> = m.tables["events"].windows[0].shards[1]
+            .iter()
+            .map(|s| s.segment_id)
+            .collect();
+        assert_eq!(shard1_ids, vec![2]);
     }
 }
