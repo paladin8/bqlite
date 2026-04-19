@@ -23,6 +23,7 @@ bqlite-planner = { workspace = true }
 bqlite-engine = { workspace = true }
 arrow = { workspace = true }
 criterion = { workspace = true }
+parquet = { workspace = true }
 pprof = { workspace = true }
 serde_json = { workspace = true }
 compact_str = { workspace = true }
@@ -141,4 +142,12 @@ harness = false
 [[bench]]
 name = "encoding_matrix"
 path = "wave4/encoding_matrix.rs"
+harness = false
+
+# Wave 4 ingest benches (TASK-441): JSONL + Parquet end-to-end
+# throughput. Named `wave4_ingest` to avoid colliding with the
+# Wave 2 `ingest` bench (CSV) registered above.
+[[bench]]
+name = "wave4_ingest"
+path = "wave4/ingest.rs"
 harness = false

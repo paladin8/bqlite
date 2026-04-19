@@ -418,6 +418,7 @@ dependencies = [
  "compact_str",
  "criterion",
  "fsst",
+ "parquet",
  "pprof",
  "serde_json",
 ]
