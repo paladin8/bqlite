@@ -18,3 +18,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 bqlite-ast = { workspace = true }
+proptest = { workspace = true }

@@ -107,3 +107,9 @@ harness = false
 [[example]]
 name = "funnel_profile"
 path = "wave3/funnel_profile.rs"
+
+# Wave 4 benchmarks.
+[[bench]]
+name = "sessionize"
+path = "wave4/sessionize.rs"
+harness = false

@@ -322,6 +322,13 @@ impl SessionizeOperator {
 /// Per-entity mutable state (sessionize.md §7.1).
 #[derive(Debug)]
 pub struct SessionizeState {
+    /// The entity this state was created for. Retained so that the
+    /// eventual `QueryWarning::SessionEventCapExceeded { entity_id, .. }`
+    /// (sessionize.md §11.3) carries the entity id when the
+    /// `EntityOperatorAdapter` surfaces it — the warning-channel plumbing
+    /// itself is deferred (§11.4).
+    entity_id: EntityId,
+
     /// Current session ID (starts at 1; increments at each session boundary).
     current_session_id: i64,
 
@@ -341,6 +348,12 @@ pub struct SessionizeState {
     /// Number of events in the currently-open session (for cap enforcement).
     session_event_count: usize,
 
+    /// Total events observed for the entity (including those skipped
+    /// after the cap fires). Populated so the eventual
+    /// `QueryWarning::SessionEventCapExceeded` can report an accurate
+    /// `event_count` (§11.3).
+    entity_event_count: u64,
+
     /// Completed, fully-annotated per-session output batches that have not
     /// yet been flushed to the adapter. `finish_entity` consumes them.
     completed: Vec<RecordBatch>,
@@ -355,9 +368,23 @@ pub struct SessionizeState {
 
 impl SessionizeState {
     /// Public accessor for the per-entity cap flag. Used by the
-    /// `EntityOperatorAdapter` (landing later) to surface a `QueryWarning`.
+    /// `EntityOperatorAdapter` (landing later) to surface a
+    /// `QueryWarning::SessionEventCapExceeded` (sessionize.md §11.3).
     pub fn cap_exceeded(&self) -> bool {
         self.cap_exceeded
+    }
+
+    /// Entity id captured at `create_state` time. Used by the
+    /// (future) diagnostic channel to attribute a cap-exceeded warning.
+    pub fn entity_id(&self) -> &EntityId {
+        &self.entity_id
+    }
+
+    /// Total number of events observed for this entity (includes any
+    /// skipped after the cap fired). Used by the (future) diagnostic
+    /// channel to populate `QueryWarning::SessionEventCapExceeded`.
+    pub fn entity_event_count(&self) -> u64 {
+        self.entity_event_count
     }
 }
 
@@ -459,13 +486,15 @@ impl<'a> EventTypeView<'a> {
 impl EntityOperator for SessionizeOperator {
     type State = SessionizeState;
 
-    fn create_state(&self, _entity_id: &EntityId) -> Self::State {
+    fn create_state(&self, entity_id: &EntityId) -> Self::State {
         SessionizeState {
+            entity_id: entity_id.clone(),
             current_session_id: 1,
             session_start_ts: i64::MIN,
             session_last_ts: i64::MIN,
             open_buffer: Vec::new(),
             session_event_count: 0,
+            entity_event_count: 0,
             completed: Vec::new(),
             cap_exceeded: false,
             skipping: false,
@@ -484,24 +513,21 @@ impl EntityOperator for SessionizeOperator {
             return;
         }
 
-        // Resolve timestamps — prefer `TimestampNanosecondArray`, fall back
-        // to `Int64Array` for ergonomic test construction. The indices are
-        // fixed at construction time, so downcast errors here are
-        // programming errors (schema drift in the child operator).
+        // Resolve timestamps. The canonical type is
+        // `TimestampNanosecondArray` (CLAUDE.md performance conventions
+        // — timestamps stay `Timestamp(Nanosecond, UTC)` through the
+        // pipeline). Downcast failure is a schema-contract violation.
         let ts_col = batch.column(self.input_columns.ts_idx);
-        let timestamps: &[i64] = if let Some(arr) = ts_col
+        let timestamps: &[i64] = ts_col
             .as_any()
-            .downcast_ref::<arrow::array::TimestampNanosecondArray>(
-        ) {
-            arr.values().as_ref()
-        } else if let Some(arr) = ts_col.as_any().downcast_ref::<Int64Array>() {
-            arr.values().as_ref()
-        } else {
-            panic!(
-                "SESSIONIZE: `ts` column has unexpected Arrow type {:?}",
-                ts_col.data_type()
-            );
-        };
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .map(|arr| arr.values().as_ref())
+            .unwrap_or_else(|| {
+                panic!(
+                    "SESSIONIZE: `ts` column has unexpected Arrow type {:?} (expected Timestamp(Nanosecond, UTC))",
+                    ts_col.data_type()
+                )
+            });
 
         // Resolve event_type view when end-events are configured.
         let event_type_view: Option<EventTypeView> = self.input_columns.event_type_idx.map(|idx| {
@@ -527,6 +553,7 @@ impl EntityOperator for SessionizeOperator {
         #[allow(clippy::needless_range_loop)]
         for row in 0..num_rows {
             let ts = timestamps[row];
+            state.entity_event_count += 1;
 
             // ── Initialization for the first event of the entity ─────
             if state.session_start_ts == i64::MIN {
@@ -723,31 +750,35 @@ impl SessionizeOperator {
             }
             match self.output_to_buffer_slot[out_idx] {
                 Some(buf_idx) => {
-                    // Buffered column — forward as-is, but adapt types if
-                    // the buffered array does not already match the output
-                    // Arrow field (e.g. Int64 → Timestamp). This can happen
-                    // in test fixtures that hand us a plain `Int64Array`
-                    // for `ts`; production pipelines always see the
-                    // canonical Arrow type.
+                    // Buffered column — forward as-is. The buffered
+                    // schema is derived from the input `OperatorSchema`
+                    // and the output schema from the same `BqlType` →
+                    // Arrow mapping, so the data types match by
+                    // construction. Assert for defence-in-depth.
                     let src = buffered.column(buf_idx);
-                    let target_dt = self.output_arrow_schema.field(out_idx).data_type();
-                    if src.data_type() == target_dt {
-                        out_columns.push(src.clone());
-                    } else {
-                        let adapted = cast(src.as_ref(), target_dt)
-                            .expect("buffered column must be castable to the output Arrow type");
-                        out_columns.push(adapted);
-                    }
+                    debug_assert_eq!(
+                        src.data_type(),
+                        self.output_arrow_schema.field(out_idx).data_type(),
+                        "buffered column `{}` Arrow type must match the output schema",
+                        coldef.name,
+                    );
+                    out_columns.push(src.clone());
                 }
                 None => {
-                    // Not buffered — emit a typed null array (§9.1).
+                    // Not buffered — emit a typed null array (§9.1). By
+                    // invariant (construction-time filter) only nullable
+                    // output columns land here.
+                    debug_assert!(
+                        coldef.nullable,
+                        "non-nullable output column `{}` was not buffered — planner drift",
+                        coldef.name,
+                    );
                     out_columns.push(arrow::array::new_null_array(
                         self.output_arrow_schema.field(out_idx).data_type(),
                         num_rows,
                     ));
                 }
             }
-            let _ = coldef; // silence unused warning; the `coldef` exists for doc intent.
         }
 
         let annotated = RecordBatch::try_new(self.output_arrow_schema.clone(), out_columns)
@@ -1458,5 +1489,312 @@ mod tests {
         assert_eq!(out.num_rows(), 5);
         let (sids, _) = read_session_columns(&out);
         assert_eq!(sids, vec![1, 2, 3, 4, 5]);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property tests (sessionize.md §14.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+
+    use arrow::array::{ArrayRef, Int64Array, StringViewArray, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+    use proptest::prelude::*;
+
+    use bqlite_core::{BqlType, ColumnDef, EntityId, OperatorSchema};
+    use bqlite_planner::logical::LogicalPlan;
+    use bqlite_planner::physical::{lower_physical, PhysicalPlan};
+
+    /// Strategy for a single ts-delta in [0, 200]. Gap will be 100, so
+    /// deltas in [0,100] are same-session and [101,200] start new sessions.
+    fn arb_delta() -> impl Strategy<Value = i64> {
+        0i64..=200
+    }
+
+    /// Strategy for a single event type drawn from a small closed set.
+    fn arb_event_type() -> impl Strategy<Value = &'static str> {
+        prop_oneof![Just("click"), Just("view"), Just("search"), Just("logout"),]
+    }
+
+    /// Strategy producing a non-empty sequence of `(delta, event_type)`
+    /// pairs of bounded length. 1..=64 keeps property shrinks readable.
+    fn arb_events() -> impl Strategy<Value = Vec<(i64, &'static str)>> {
+        prop::collection::vec((arb_delta(), arb_event_type()), 1..=64)
+    }
+
+    fn input_schema() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+        ])
+        .unwrap()
+    }
+
+    fn output_schema(input: &OperatorSchema) -> OperatorSchema {
+        let mut cols = input.columns().to_vec();
+        cols.push(ColumnDef::required("session_id", BqlType::Int));
+        cols.push(ColumnDef::required("session_duration", BqlType::Int));
+        OperatorSchema::new(cols).unwrap()
+    }
+
+    fn build_operator(gap_ns: i64, end_events: Vec<String>) -> (SessionizeOperator, i64) {
+        let input = input_schema();
+        let scan = LogicalPlan::scan(
+            bqlite_core::TableSchema::new(
+                "events",
+                input.columns().to_vec(),
+                "entity_id",
+                "ts",
+                "event_type",
+            )
+            .unwrap(),
+        );
+        let os = output_schema(&input);
+        let node = LogicalPlan::Sessionize {
+            gap: gap_ns,
+            end_events,
+            forwarded_columns: vec![],
+            fused_downstream: None,
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        let PhysicalPlan::Sessionize(sess) = lower_physical(node, 0) else {
+            unreachable!()
+        };
+        (SessionizeOperator::new(&sess), gap_ns)
+    }
+
+    fn build_batch(events: &[(i64, &'static str)]) -> RecordBatch {
+        // Build timestamps by cumulative-summing the deltas, starting from
+        // a non-MIN anchor so the sentinel trick still fires correctly.
+        let num = events.len();
+        let mut ts: Vec<i64> = Vec::with_capacity(num);
+        let mut cur: i64 = 1_000; // arbitrary non-zero anchor
+        for (d, _) in events {
+            cur = cur.saturating_add(*d);
+            ts.push(cur);
+        }
+        let et: Vec<&str> = events.iter().map(|(_, e)| *e).collect();
+
+        let fields = vec![
+            Field::new("entity_id", DataType::Utf8View, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("event_type", DataType::Utf8View, false),
+        ];
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(StringViewArray::from(vec!["e1"; num])),
+            Arc::new(TimestampNanosecondArray::from(ts).with_timezone("UTC")),
+            Arc::new(StringViewArray::from(et)),
+        ];
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    fn read_output(out: &RecordBatch) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<String>) {
+        let sid = out
+            .column_by_name("session_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let sdur = out
+            .column_by_name("session_duration")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ts = out
+            .column_by_name("ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        let et = out
+            .column_by_name("event_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        (
+            (0..sid.len()).map(|i| sid.value(i)).collect(),
+            (0..sdur.len()).map(|i| sdur.value(i)).collect(),
+            (0..ts.len()).map(|i| ts.value(i)).collect(),
+            (0..et.len()).map(|i| et.value(i).to_string()).collect(),
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+        /// §14.3 invariant (1) — session coverage: every input event
+        /// appears exactly once in the output in the same order.
+        #[test]
+        fn every_event_appears_exactly_once(events in arb_events()) {
+            let (op, _gap) = build_operator(100, vec![]);
+            let batch = build_batch(&events);
+            let mut state = op.create_state(&EntityId::from("e1"));
+            op.process_sub_batch(&mut state, &batch);
+            let out = op.finish_entity(state).unwrap();
+            prop_assert_eq!(out.num_rows(), events.len());
+            let (_sids, _sdurs, ts_out, et_out) = read_output(&out);
+            for (i, (_, et_in)) in events.iter().enumerate() {
+                prop_assert_eq!(&et_out[i], &(*et_in).to_string());
+            }
+            // ts monotonicity preserved.
+            for pair in ts_out.windows(2) {
+                prop_assert!(pair[0] <= pair[1]);
+            }
+        }
+
+        /// §14.3 invariants (2) and (3) — session_id strictly monotonic
+        /// per entity (1, 1, ..., 2, 2, ...); session_duration within a
+        /// session equals max_ts - min_ts across the session's events.
+        #[test]
+        fn session_id_monotone_and_duration_matches_range(
+            events in arb_events(),
+        ) {
+            let (op, gap) = build_operator(100, vec![]);
+            let batch = build_batch(&events);
+            let mut state = op.create_state(&EntityId::from("e1"));
+            op.process_sub_batch(&mut state, &batch);
+            let out = op.finish_entity(state).unwrap();
+            let (sids, sdurs, ts_out, _) = read_output(&out);
+
+            // Monotone non-decreasing, contiguous.
+            let mut expected: i64 = 1;
+            let mut last_id: i64 = 1;
+            for (i, &sid) in sids.iter().enumerate() {
+                if i == 0 {
+                    prop_assert_eq!(sid, 1);
+                    expected = 1;
+                    last_id = 1;
+                    continue;
+                }
+                if sid != last_id {
+                    prop_assert_eq!(sid, last_id + 1);
+                    expected = sid;
+                    last_id = sid;
+                }
+                prop_assert_eq!(sid, expected);
+            }
+
+            // For each contiguous run of same session_id, duration ==
+            // max_ts - min_ts across the run.
+            let mut i = 0;
+            while i < sids.len() {
+                let sid = sids[i];
+                let mut j = i;
+                while j < sids.len() && sids[j] == sid {
+                    j += 1;
+                }
+                let min_ts = ts_out[i];
+                let max_ts = ts_out[j - 1];
+                let expected_dur = max_ts - min_ts;
+                for dur in sdurs[i..j].iter() {
+                    prop_assert_eq!(*dur, expected_dur);
+                }
+                i = j;
+            }
+
+            // §14.3 invariant (4) — for any two consecutive events in
+            // the same session, delta <= gap; at session transitions,
+            // delta > gap.
+            for w in ts_out.windows(2).enumerate() {
+                let (i, pair) = w;
+                let delta = pair[1] - pair[0];
+                if sids[i] == sids[i + 1] {
+                    prop_assert!(delta <= gap);
+                } else {
+                    prop_assert!(delta > gap);
+                }
+            }
+        }
+
+        /// §14.3 invariant (5) — every `logout` event (end-event) is the
+        /// last event of its session.
+        #[test]
+        fn end_event_is_last_in_its_session(events in arb_events()) {
+            let (op, _gap) = build_operator(100, vec!["logout".into()]);
+            let batch = build_batch(&events);
+            let mut state = op.create_state(&EntityId::from("e1"));
+            op.process_sub_batch(&mut state, &batch);
+            let out = op.finish_entity(state).unwrap();
+            let (sids, _, _, et_out) = read_output(&out);
+            for i in 0..et_out.len() {
+                if et_out[i] == "logout" {
+                    // Either last row overall or next row has a different session.
+                    let is_last = i + 1 == et_out.len() || sids[i + 1] != sids[i];
+                    prop_assert!(is_last, "logout at {} must be last of its session", i);
+                }
+            }
+        }
+
+        /// §14.3 invariant (6) — entity isolation: with two entities fed
+        /// through separate state instances, session_id resets to 1 on
+        /// the second.
+        #[test]
+        fn entity_isolation_restarts_session_id(
+            a in arb_events(),
+            b in arb_events(),
+        ) {
+            let (op, _) = build_operator(100, vec![]);
+            let batch_a = build_batch(&a);
+            let mut sa = op.create_state(&EntityId::from("e1"));
+            op.process_sub_batch(&mut sa, &batch_a);
+            let _ = op.finish_entity(sa);
+
+            let batch_b = build_batch(&b);
+            let mut sb = op.create_state(&EntityId::from("e2"));
+            op.process_sub_batch(&mut sb, &batch_b);
+            let out_b = op.finish_entity(sb).unwrap();
+            let (sids_b, _, _, _) = read_output(&out_b);
+            prop_assert_eq!(sids_b[0], 1);
+        }
+
+        /// Streaming equivalence — splitting a batch in two sub-batches at
+        /// an arbitrary row must produce the same output as feeding a
+        /// single sub-batch (§8.3 sub-batch streaming contract).
+        #[test]
+        fn streaming_equivalent_to_single_batch(
+            events in arb_events(),
+            split in 0usize..64,
+        ) {
+            let n = events.len();
+            let split = split.min(n);
+            let (op, _) = build_operator(100, vec!["logout".into()]);
+
+            // Single-batch run.
+            let batch_full = build_batch(&events);
+            let mut state_full = op.create_state(&EntityId::from("e1"));
+            op.process_sub_batch(&mut state_full, &batch_full);
+            let out_full = op.finish_entity(state_full).unwrap();
+
+            // Two-batch run.
+            let batch_a = batch_full.slice(0, split);
+            let batch_b = batch_full.slice(split, n - split);
+            let mut state_split = op.create_state(&EntityId::from("e1"));
+            if split > 0 {
+                op.process_sub_batch(&mut state_split, &batch_a);
+            }
+            if n - split > 0 {
+                op.process_sub_batch(&mut state_split, &batch_b);
+            }
+            let out_split = op.finish_entity(state_split).unwrap();
+
+            let (sids_f, sdurs_f, ts_f, et_f) = read_output(&out_full);
+            let (sids_s, sdurs_s, ts_s, et_s) = read_output(&out_split);
+            prop_assert_eq!(sids_f, sids_s);
+            prop_assert_eq!(sdurs_f, sdurs_s);
+            prop_assert_eq!(ts_f, ts_s);
+            prop_assert_eq!(et_f, et_s);
+        }
     }
 }

@@ -248,6 +248,10 @@ Every input event belongs to exactly one session. Entities whose events are all 
 
 ```rust
 pub struct SessionizeState {
+    /// Entity id captured at `create_state` time — retained for the
+    /// `QueryWarning::SessionEventCapExceeded { entity_id, .. }` attribution.
+    entity_id: EntityId,
+
     /// Current session ID (starts at 1, incremented at each session boundary).
     current_session_id: i64,
 
@@ -260,13 +264,18 @@ pub struct SessionizeState {
     /// Buffered rows for the currently-open session.
     /// Each entry is a `RecordBatch` slice (or row-level buffer) containing
     /// only the demanded columns (§9).
-    session_buffer: SessionBuffer,
+    open_buffer: Vec<RecordBatch>,
 
     /// Number of events in the current open session (for cap enforcement).
     session_event_count: usize,
 
-    /// Total events processed for this entity (for cap enforcement).
-    entity_event_count: usize,
+    /// Total events processed for this entity (surfaced via
+    /// `QueryWarning::SessionEventCapExceeded::event_count`).
+    entity_event_count: u64,
+
+    /// Completed per-session output batches accumulated across sub-batches;
+    /// drained by `finish_entity`.
+    completed: Vec<RecordBatch>,
 
     /// Whether the per-entity event cap was exceeded.
     cap_exceeded: bool,
@@ -491,8 +500,10 @@ The physical planner propagates downstream `DemandSet` (planner-pipeline.md §9)
 
 1. Walk the downstream demand backward from the consumer.
 2. Strip `session_id` and `session_duration` (produced by SESSIONIZE, not needed from upstream).
-3. The remaining demanded columns plus `ts` (always needed for gap computation) and `event_type` (if end-events configured) form `forwarded_columns`.
+3. The remaining demanded columns plus `entity_id` and `ts` (always needed for routing and gap computation) and `event_type` (if end-events configured) form `forwarded_columns`.
 4. The scan layer decodes only these columns.
+
+**Implementation safety net (TASK-428 v1)**: the operator additionally treats every NOT NULL column that appears in both the input schema and the advertised output schema as implicitly buffered. A non-nullable output column cannot be satisfied by null-padding at emission time, so if demand propagation ever leaves such a column unforwarded the operator defensively buffers it rather than failing at `RecordBatch` construction. In a well-formed plan this rule never fires — `entity_id`, `ts`, and `event_type` are always demanded by a downstream consumer and `forwarded_columns` already contains them. The rule exists purely as a correctness fence against planner drift and does not widen the buffered set in production pipelines.
 
 ```
 Downstream demands: {entity_id, ts, event_type, page, session_id, session_duration}
@@ -566,6 +577,14 @@ The operator needs access to the per-query diagnostic channel (`WorkerContext::w
 3. File a follow-up for the shared plumbing.
 
 The preferred approach is option (2) — the same mechanism used by the entity event limit in the `EntityOperatorAdapter`.
+
+**TASK-428 v1 status**: neither the adapter nor a shared `QueryWarning` channel exists yet. The operator carries the cap signal on `SessionizeState`:
+
+- `SessionizeState::cap_exceeded() -> bool` — the cap flag.
+- `SessionizeState::entity_id() -> &EntityId` — the entity id captured at `create_state` time so the eventual warning can populate the `entity_id` field specified in §11.3.
+- `SessionizeState::entity_event_count() -> u64` — total events observed for the entity (including events skipped after the cap fires), for the `event_count` field.
+
+When the adapter and warning channel land (TASK-410 ecosystem), the adapter will read these accessors between sub-batches / at `finish_entity` and synthesise `QueryWarning::SessionEventCapExceeded { entity_id, event_count, cap }` without any further operator-side changes.
 
 ### 11.5 Memory Bound
 
