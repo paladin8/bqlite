@@ -709,6 +709,43 @@ impl Database {
         })
     }
 
+    /// Atomically swap a set of compaction inputs for one compacted
+    /// output in `(table, window_id, shard_id)`'s manifest inventory.
+    ///
+    /// One call to this method = one
+    /// `manifest.json.tmp → fsync → rename` cycle, so the on-disk
+    /// manifest never observes the half-state where inputs are gone
+    /// but the output is not yet present. This is the
+    /// `docs/design/storage/compaction-concurrency.md` §6 publish
+    /// primitive — the sole atomic mutation a compaction worker uses
+    /// to land its output.
+    ///
+    /// `pub(crate)` because the only intended caller is
+    /// [`crate::compaction::compact_one`]; external code that wants
+    /// segment-level mutation goes through [`Self::add_segment`] /
+    /// [`Self::remove_segment`].
+    ///
+    /// See [`Manifest::replace_segments`] for the full error taxonomy
+    /// (unknown table, unknown window, shard out of range, missing
+    /// input id, duplicate output id).
+    //
+    // CP2 of TASK-408 lands this primitive; CP3 wires `compact_one`
+    // to it. The non-test lib build has no caller yet, so silence
+    // dead_code until CP3 lands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn replace_segments(
+        &mut self,
+        table_name: &str,
+        window_id: u32,
+        shard_id: u32,
+        removed_ids: &[u64],
+        new_segment: SegmentMeta,
+    ) -> Result<()> {
+        self.update_manifest(|m| {
+            m.replace_segments(table_name, window_id, shard_id, removed_ids, new_segment)
+        })
+    }
+
     /// Apply `f` to a mutable copy of the current manifest, persist
     /// the result atomically, then adopt it as the new in-memory
     /// state.
@@ -717,16 +754,16 @@ impl Database {
     /// closure or a failing disk write leaves both the on-disk
     /// manifest and `self.manifest` untouched — callers only observe
     /// the mutation when every step succeeds. The clone cost is
-    /// insignificant at Wave 2 scale (a handful of tables with a
+    /// insignificant at Wave 2/4 scale (a handful of tables with a
     /// handful of segments each).
     ///
-    /// Private for now because the callers live inside this crate
-    /// ([`Database::add_segment`], [`Database::remove_segment`],
-    /// [`Database::allocate_batch_id`]). Future ingest and
-    /// compaction tasks that want to batch multiple mutations into
-    /// one fsync can promote this to `pub(crate)` — a later wave
-    /// concern.
-    fn update_manifest<R, F>(&mut self, f: F) -> Result<R>
+    /// `pub(crate)` so the compaction module can compose multi-step
+    /// mutations (specifically [`Manifest::replace_segments`] for the
+    /// §6 atomic publish protocol) into a single durable fsync. Other
+    /// crates still go through the typed entry points
+    /// ([`Self::add_segment`], [`Self::remove_segment`],
+    /// [`Self::replace_segments`], [`Self::allocate_batch_id`], etc.).
+    pub(crate) fn update_manifest<R, F>(&mut self, f: F) -> Result<R>
     where
         F: FnOnce(&mut Manifest) -> Result<R>,
     {
@@ -1657,6 +1694,45 @@ mod tests {
         let shard = &db.manifest().tables["events"].windows[0].shards[0];
         assert_eq!(shard.len(), 1);
         assert_eq!(shard[0].segment_id, 2);
+    }
+
+    #[test]
+    fn replace_segments_publish_is_atomic_across_reopen() {
+        // Mirrors the compaction publish path: three L0 inputs swap
+        // for one compacted output in a single fsync. After reopen,
+        // the manifest must reflect exactly the post-publish state —
+        // no half-state, no leftover inputs.
+        let scratch = Scratch::new("replace-persists");
+        let new_id = {
+            let mut db = create_db_with_events(scratch.path());
+            db.add_segment("events", 0, 0, sample_segment(1, 1, (0, 100)))
+                .unwrap();
+            db.add_segment("events", 0, 0, sample_segment(2, 1, (100, 200)))
+                .unwrap();
+            db.add_segment("events", 0, 0, sample_segment(3, 1, (200, 300)))
+                .unwrap();
+            // Allocate a fresh id for the compacted output, then
+            // publish in one durable mutation.
+            let new_id = db.allocate_segment_id("events").expect("alloc");
+            let mut new_seg = sample_segment(new_id, 99, (0, 300));
+            new_seg.level = 1;
+            db.replace_segments("events", 0, 0, &[1, 2, 3], new_seg)
+                .expect("replace_segments");
+            // In-memory snapshot reflects the swap immediately.
+            let shard = &db.manifest().tables["events"].windows[0].shards[0];
+            assert_eq!(shard.len(), 1);
+            assert_eq!(shard[0].segment_id, new_id);
+            new_id
+        };
+        let db = Database::open(scratch.path()).expect("reopen");
+        let shard = &db.manifest().tables["events"].windows[0].shards[0];
+        assert_eq!(
+            shard.len(),
+            1,
+            "post-reopen shard must contain only the compacted output"
+        );
+        assert_eq!(shard[0].segment_id, new_id);
+        assert_eq!(shard[0].level, 1, "level promotion preserved");
     }
 
     #[test]

@@ -333,12 +333,17 @@ struct PreparedSegment {
 /// Whole-segment per-column min/max/null-count, accumulated across
 /// every row group in the segment. Used to populate
 /// [`SegmentMeta::column_stats`] without re-reading the segment file.
+///
+/// `pub(crate)` so the compaction executor (TASK-408) can fold a
+/// stream of `PreparedColumnChunk`s into the same per-segment
+/// aggregates ingest produces — keeps the on-disk `column_stats`
+/// shape identical regardless of who wrote the segment.
 #[derive(Debug, Clone)]
-struct ColumnAggregate {
-    column_name: String,
-    min: Option<PropertyValue>,
-    max: Option<PropertyValue>,
-    null_count: u64,
+pub(crate) struct ColumnAggregate {
+    pub(crate) column_name: String,
+    pub(crate) min: Option<PropertyValue>,
+    pub(crate) max: Option<PropertyValue>,
+    pub(crate) null_count: u64,
 }
 
 /// Convert a sorted `[Event]` slice into a single segment ready for
@@ -851,7 +856,17 @@ fn type_mismatch(col: &ColumnDef, value: &PropertyValue) -> BqliteError {
 /// selector, hoists any segment-level dictionary the selector
 /// produced, computes inline zone-map extrema, and assembles the
 /// chunk struct the byte writer expects.
-fn build_column_chunk(
+/// Build one [`PreparedColumnChunk`] for a row group, applying the
+/// nullability validation, null-bitmap derivation, encoding selection,
+/// and dictionary / FSST symbol-table hoisting in one place.
+///
+/// `pub(crate)` so the compaction executor (TASK-408) can re-use the
+/// exact same encoding pipeline ingest uses, instead of re-deriving
+/// the bitmap or running its own selector. Re-derivation has been a
+/// repeat source of subtle bugs (off-by-one bitmap trailing bits,
+/// dictionary-vs-segment-dict-id mismatches); a single owner closes
+/// the door on those.
+pub(crate) fn build_column_chunk(
     column_ordinal: u32,
     col_def: &ColumnDef,
     array: &ArrayRef,
@@ -1113,7 +1128,10 @@ fn compute_zone_extrema(
 /// Fold a per-row-group `(min, max)` pair into the segment-level
 /// running aggregate. The aggregate is updated in place; either
 /// argument may be `None` (an all-null row group contributes nothing).
-fn merge_extrema(
+///
+/// `pub(crate)` so the compaction executor (TASK-408) folds chunks
+/// into segment aggregates with the same code path ingest uses.
+pub(crate) fn merge_extrema(
     agg_min: &mut Option<PropertyValue>,
     agg_max: &mut Option<PropertyValue>,
     chunk_min: &Option<PropertyValue>,
