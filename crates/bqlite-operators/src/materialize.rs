@@ -23,12 +23,16 @@
 
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, UInt32Array};
+use arrow::compute;
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::encoded::{EncodedBatch, RowSelection};
+use bqlite_core::encoded::{
+    EncodedBatch, RowSelection, StitchedBatch, StitchedRows,
+};
 use bqlite_core::{BqlType, BqliteError, Result};
-use bqlite_storage::materialize_encoded_column_selected;
+use bqlite_storage::{materialize_encoded_column, materialize_encoded_column_selected};
 
 use crate::filtered_batch::FilteredBatch;
 
@@ -80,6 +84,192 @@ pub fn materialize_selected(
     Ok(FilteredBatch::dense(record))
 }
 
+/// Materialize a [`StitchedBatch`] into a dense [`FilteredBatch`]
+/// (CP5 of the zero-copy scan/filter plan).
+///
+/// The k-way merge's output form: zero or more encoded source batches
+/// plus a [`StitchedRows`] reference describing merged row order. Three
+/// shapes:
+///
+/// - [`StitchedRows::SingleSource`]: the cheapest — the merge
+///   degenerated to pass-through of one source (common for
+///   single-shard scans). Delegates to [`materialize_selected`] on the
+///   single source.
+/// - [`StitchedRows::Runs`]: contiguous runs from specific sources.
+///   Each run decodes only its slice of the corresponding source.
+/// - [`StitchedRows::Indices`]: fully interleaved rows — rare in
+///   practice because entity locality is preserved at segment
+///   boundaries. This path is the fallback: decode each source to a
+///   dense column, then `take` the referenced indices per source and
+///   concatenate.
+///
+/// # Non-goal for CP5 in this commit
+///
+/// This helper is the **consumption** side of the stitched merge. The
+/// producer (a modified [`bqlite_storage::segment::merge::KWayMergeScan`]
+/// that emits `StitchedBatch` instead of materializing via
+/// `arrow::compute::interleave`) lands in a subsequent change because
+/// it touches production merge code used by every scan path. Landing
+/// the consumer first gives that change a stable target to write
+/// against and an acceptance test already in place.
+pub fn materialize_stitched(
+    stitched: &StitchedBatch,
+    types: &[BqlType],
+    schema: Arc<ArrowSchema>,
+) -> Result<FilteredBatch> {
+    if schema.fields().len() != types.len() {
+        return Err(BqliteError::Execution(format!(
+            "materialize_stitched: schema has {} fields but {} types provided",
+            schema.fields().len(),
+            types.len(),
+        )));
+    }
+    match &stitched.rows {
+        StitchedRows::SingleSource { source, selection } => {
+            let idx = *source as usize;
+            let src = stitched.sources.get(idx).ok_or_else(|| {
+                BqliteError::Execution(format!(
+                    "materialize_stitched: SingleSource references source {idx} out of {}",
+                    stitched.sources.len()
+                ))
+            })?;
+            materialize_selected(src, selection.as_ref(), types, schema)
+        }
+        StitchedRows::Runs(runs) => {
+            let arrays = materialize_stitched_runs(&stitched.sources, runs, types)?;
+            let batch = RecordBatch::try_new(schema, arrays).map_err(|e| {
+                BqliteError::Execution(format!(
+                    "materialize_stitched: record-batch build failed: {e}"
+                ))
+            })?;
+            Ok(FilteredBatch::dense(batch))
+        }
+        StitchedRows::Indices(refs) => {
+            let arrays = materialize_stitched_indices(&stitched.sources, refs, types)?;
+            let batch = RecordBatch::try_new(schema, arrays).map_err(|e| {
+                BqliteError::Execution(format!(
+                    "materialize_stitched: record-batch build failed: {e}"
+                ))
+            })?;
+            Ok(FilteredBatch::dense(batch))
+        }
+    }
+}
+
+fn materialize_stitched_runs(
+    sources: &[EncodedBatch],
+    runs: &[bqlite_core::encoded::SourceRun],
+    types: &[BqlType],
+) -> Result<Vec<ArrayRef>> {
+    let mut out: Vec<Vec<ArrayRef>> = (0..types.len()).map(|_| Vec::new()).collect();
+    for run in runs {
+        let src = sources.get(run.source as usize).ok_or_else(|| {
+            BqliteError::Execution(format!(
+                "materialize_stitched: run references source {}",
+                run.source
+            ))
+        })?;
+        if src.columns.len() != types.len() {
+            return Err(BqliteError::Execution(format!(
+                "materialize_stitched: source has {} columns but {} types provided",
+                src.columns.len(),
+                types.len(),
+            )));
+        }
+        let sel = RowSelection::from_runs(vec![bqlite_core::encoded::RowRun {
+            start: run.start,
+            len: run.len,
+        }]);
+        for (col_idx, (col, ty)) in src.columns.iter().zip(types.iter()).enumerate() {
+            let arr = materialize_encoded_column_selected(col, ty, Some(&sel))?;
+            out[col_idx].push(arr);
+        }
+    }
+    concat_chunks(out)
+}
+
+fn materialize_stitched_indices(
+    sources: &[EncodedBatch],
+    refs: &[bqlite_core::encoded::RowRef],
+    types: &[BqlType],
+) -> Result<Vec<ArrayRef>> {
+    // Decode every referenced source once, then `take` per index.
+    //
+    // Optimization opportunity: group refs by source to limit `take`
+    // calls. CP5 ships the correct but naive implementation; the merge
+    // producer chooses between Runs and Indices based on interleave
+    // density, so the bulk of workloads hit the Runs path first.
+    let mut dense_sources: Vec<Option<Vec<ArrayRef>>> = vec![None; sources.len()];
+    // Build the dense arrays for each unique source, once.
+    for r in refs {
+        let idx = r.source as usize;
+        if dense_sources[idx].is_some() {
+            continue;
+        }
+        let src = sources.get(idx).ok_or_else(|| {
+            BqliteError::Execution(format!(
+                "materialize_stitched: ref references source {idx}"
+            ))
+        })?;
+        if src.columns.len() != types.len() {
+            return Err(BqliteError::Execution(format!(
+                "materialize_stitched: source has {} columns but {} types provided",
+                src.columns.len(),
+                types.len(),
+            )));
+        }
+        let mut arrs = Vec::with_capacity(types.len());
+        for (col, ty) in src.columns.iter().zip(types.iter()) {
+            arrs.push(materialize_encoded_column(col, ty)?);
+        }
+        dense_sources[idx] = Some(arrs);
+    }
+    // Build per-column chunks by `take`-ing from each source block
+    // and concatenating in row order.
+    let mut chunks: Vec<Vec<ArrayRef>> = (0..types.len()).map(|_| Vec::new()).collect();
+    let mut cursor = 0usize;
+    while cursor < refs.len() {
+        // Gather the longest contiguous run of the same source.
+        let src_idx = refs[cursor].source;
+        let start = cursor;
+        while cursor < refs.len() && refs[cursor].source == src_idx {
+            cursor += 1;
+        }
+        let dense = dense_sources[src_idx as usize].as_ref().unwrap();
+        let indices: Vec<u32> = refs[start..cursor].iter().map(|r| r.row).collect();
+        let index_array = UInt32Array::from(indices);
+        for (col_idx, arr) in dense.iter().enumerate() {
+            let picked = compute::take(arr.as_ref(), &index_array, None).map_err(|e| {
+                BqliteError::Execution(format!(
+                    "materialize_stitched: arrow::compute::take failed: {e}"
+                ))
+            })?;
+            chunks[col_idx].push(picked);
+        }
+    }
+    concat_chunks(chunks)
+}
+
+fn concat_chunks(mut chunks: Vec<Vec<ArrayRef>>) -> Result<Vec<ArrayRef>> {
+    let mut out = Vec::with_capacity(chunks.len());
+    for col_chunks in chunks.iter_mut() {
+        if col_chunks.is_empty() {
+            return Err(BqliteError::Execution(
+                "materialize_stitched: column has no chunks to concatenate".into(),
+            ));
+        }
+        let refs: Vec<&dyn arrow::array::Array> =
+            col_chunks.iter().map(|a| a.as_ref() as &dyn arrow::array::Array).collect();
+        let concatenated = compute::concat(&refs).map_err(|e| {
+            BqliteError::Execution(format!(
+                "materialize_stitched: arrow::compute::concat failed: {e}"
+            ))
+        })?;
+        out.push(concatenated);
+    }
+    Ok(out)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -89,7 +279,7 @@ mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array};
     use arrow::datatypes::{DataType, Field};
-    use bqlite_core::encoded::{EncodedColumn, RowRun, SelectionVector};
+    use bqlite_core::encoded::{EncodedColumn, RowRef, RowRun, SelectionVector, SourceRun};
 
     fn i64_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![Field::new("x", DataType::Int64, true)]))
@@ -213,6 +403,94 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(ints.values(), &[1i64, 1, 1, 1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn stitched_single_source_delegates_to_materialize_selected() {
+        let col = materialized_column(vec![10, 20, 30]);
+        let source = EncodedBatch::new(3, vec![col]);
+        let stitched = StitchedBatch {
+            sources: vec![source],
+            rows: StitchedRows::SingleSource {
+                source: 0,
+                selection: Some(RowSelection::from_indices(SelectionVector::from_sorted(
+                    vec![0, 2],
+                ))),
+            },
+        };
+        let fb = materialize_stitched(&stitched, &[BqlType::Int], i64_schema()).unwrap();
+        assert_eq!(fb.batch.num_rows(), 2);
+        let ints = fb
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ints.values(), &[10i64, 30]);
+    }
+
+    #[test]
+    fn stitched_runs_concatenates_source_slices() {
+        // Two sources: [1,2,3] and [10,20,30,40].
+        // Runs: source 0 rows [1..3), source 1 rows [0..2), source 0 rows [0..1)
+        // Expected output rows: [2, 3, 10, 20, 1]
+        let s0 = EncodedBatch::new(3, vec![materialized_column(vec![1, 2, 3])]);
+        let s1 = EncodedBatch::new(4, vec![materialized_column(vec![10, 20, 30, 40])]);
+        let stitched = StitchedBatch {
+            sources: vec![s0, s1],
+            rows: StitchedRows::Runs(vec![
+                SourceRun {
+                    source: 0,
+                    start: 1,
+                    len: 2,
+                },
+                SourceRun {
+                    source: 1,
+                    start: 0,
+                    len: 2,
+                },
+                SourceRun {
+                    source: 0,
+                    start: 0,
+                    len: 1,
+                },
+            ]),
+        };
+        let fb = materialize_stitched(&stitched, &[BqlType::Int], i64_schema()).unwrap();
+        let ints = fb
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ints.values(), &[2i64, 3, 10, 20, 1]);
+    }
+
+    #[test]
+    fn stitched_indices_interleaves_rows() {
+        // Two sources: [100, 200, 300], [1000, 2000].
+        // Refs in merge order: (src0, 2), (src1, 0), (src0, 0), (src1, 1), (src0, 1)
+        // Expected rows: [300, 1000, 100, 2000, 200]
+        let s0 = EncodedBatch::new(3, vec![materialized_column(vec![100, 200, 300])]);
+        let s1 = EncodedBatch::new(2, vec![materialized_column(vec![1000, 2000])]);
+        let stitched = StitchedBatch {
+            sources: vec![s0, s1],
+            rows: StitchedRows::Indices(vec![
+                RowRef { source: 0, row: 2 },
+                RowRef { source: 1, row: 0 },
+                RowRef { source: 0, row: 0 },
+                RowRef { source: 1, row: 1 },
+                RowRef { source: 0, row: 1 },
+            ]),
+        };
+        let fb = materialize_stitched(&stitched, &[BqlType::Int], i64_schema()).unwrap();
+        let ints = fb
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ints.values(), &[300i64, 1000, 100, 2000, 200]);
     }
 
     #[test]
