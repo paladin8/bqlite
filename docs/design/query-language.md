@@ -627,7 +627,11 @@ Output: passes through all input columns and adds `session_id` (Int) and `sessio
 
 At exactly `delta == gap`, two adjacent events remain in the same session; a new session opens only when the inactivity gap is strictly greater than `gap`. An `end:` event belongs to the session it closes rather than starting the next one.
 
-`session_id` starts at `1` for each entity and is not globally unique. `COUNT_DISTINCT(session_id)` without `GROUP BY entity_id` therefore almost never means what a user wants.
+`session_id` starts at `1` for each entity and is not globally unique. `COUNT_DISTINCT(session_id)` without `GROUP BY entity_id` therefore almost never means what a user wants — the correct idiom is `COUNT_DISTINCT(session_id) GROUP BY entity_id`.
+
+`session_duration` is reported in **nanoseconds**. Use `/1e9` or `/ 1000000000` to convert to seconds in downstream expressions.
+
+**Per-entity event cap.** If a single open session accumulates more than 1,000,000 events, the partial session is flushed and the remaining events for that entity are silently dropped. The query still succeeds; a `QueryWarning` is attached to the result identifying the affected entity. To surface these warnings, check the result metadata after execution.
 
 ### 8.1 Sessions as MATCH Context
 
@@ -849,13 +853,35 @@ The event argument may be either a single event type identifier or a parenthesiz
 events | FIRST(purchase WHERE amount > 100)            -- first high-value purchase per entity
 events | LAST(page_view WHERE url LIKE '/checkout%')
 events | NTH(purchase WHERE amount > 100, 3)           -- third high-value purchase per entity
+
+-- List of event types: pick from any listed type
+events | FIRST((login, sso_login, mobile_login))
+events | NTH((purchase, subscription) WHERE amount > 0, 3)
 ```
 
 All three operators (FIRST, LAST, NTH) accept an optional WHERE clause. The predicate is applied per-event before the position selection, so `NTH(e WHERE p, 3)` returns the third event that satisfies `p`, not the third event overall if it happens to satisfy `p`.
 
-`FIRST` and `NTH` also accept an optional `lookback: <duration>` parameter. This widens the scan backward from the outer time range's start so the operator can pick a qualifying event that occurred before the nominal range. `LAST` does not accept `lookback:`.
+When a parenthesized event-type list is provided, the WHERE predicate is evaluated once per candidate event across all listed types. Columns are resolved against the source schema; if some listed event types carry a column and others do not, missing columns evaluate to NULL for events of those types.
 
-If an entity has fewer than `n` qualifying events for `NTH`, it emits no row. When multiple qualifying events share the same timestamp, bqlite breaks ties deterministically by `__seq_id`.
+**`lookback:` — scan-range widening for FIRST and NTH.** Without `lookback:`, both operators only see events inside the outer time range. This is often not what you want for onboarding analysis: `events LAST 30d | FIRST(signup)` returns the first signup in the *last 30 days*, which is not the same as the user's actual first signup.
+
+```bql
+-- True first signup ever per user — omit the outer range entirely
+events | FIRST(signup)
+
+-- First signup within a 90-day lookback window, applied to
+-- users active in the last 30 days
+events LAST 30d | FIRST(signup, lookback: 90d)
+
+-- Works with WHERE and event-type lists too
+events LAST 30d | FIRST((login, sso_login) WHERE plan = 'pro', lookback: 180d)
+```
+
+`lookback:` widens the scan backward from the outer range's start so the operator can select an event that predates the stated range. The selected event's actual timestamp is returned as-is (it may be before the outer range's start). `LAST` does not accept `lookback:` — to bound "last" to a historical period, restrict the outer range with `BETWEEN`.
+
+There is **no hidden default lookback**: FIRST/NTH without `lookback:` always operates strictly within the outer time range. If your query needs the user's true first event ever, drop the outer range (`events | FIRST(signup)`) rather than guessing a widening duration.
+
+If an entity has fewer than `n` qualifying events for `NTH`, it emits no row. When multiple qualifying events share the same timestamp, bqlite breaks ties deterministically by `__seq_id` ascending (FIRST/NTH take the smallest `__seq_id`; LAST takes the largest).
 
 ### 14.2 SAMPLE
 
@@ -872,9 +898,28 @@ Output: passes through input schema unchanged. SAMPLE is a scan-level operator t
 
 Sampling is entity-level, not event-level. A sampled entity's full event stream is included; non-sampled entities contribute zero events.
 
-**Determinism.** SAMPLE hashes the canonical byte representation of the entity ID with `xxHash64`, making results deterministic across runs with the same seed. An optional `seed: <int>` parameter fixes the seed for reproducibility; without it, the seed is derived from the database identity so repeat queries on the same database produce the same sample indefinitely.
+**Determinism.** SAMPLE hashes the canonical byte representation of the entity ID with `xxHash64`, making results deterministic across runs with the same seed. An optional `seed: <int>` parameter fixes the seed for reproducibility; without it, the seed is derived from the database identity so repeat queries on the same database produce the same sample indefinitely. This hash function selection is stable — changing it would be a major-version breaking change. (`String` entity IDs are hashed as UTF-8 bytes; `Int` entity IDs as little-endian 8-byte values.)
 
-SAMPLE's population is the source table's entity set, not "whatever rows survive upstream stateless filters." A query like `events | WHERE p | SAMPLE(fraction: 0.1)` selects the same entity set as `events | SAMPLE(fraction: 0.1) | WHERE p`; the only difference is which sampled entities still have rows after the filter.
+**Population invariance.** SAMPLE's population is the source table's entity set, independent of any upstream stateless filters. For any predicate `P` that does not reference the entity key:
+
+```bql
+events | WHERE P | SAMPLE(fraction: 0.1)
+-- is equivalent to:
+events | SAMPLE(fraction: 0.1) | WHERE P
+```
+
+The same entity set is sampled in both cases. The only difference is which sampled entities still have rows after the filter. Output rows = `sampled_entities ∩ matching_events`: a sampled entity with no events satisfying `P` contributes zero output rows but is still "in" the sample.
+
+This matters when combining SAMPLE with cohort filters. SAMPLE must appear before any aggregation (it is a scan-level operator); place it early in the pipeline and use WHERE after it for additional filtering:
+
+```bql
+-- Sample entities, then filter to churned ones (~10% × |churned| entities)
+churned = events LAST 90d | WHERE event_type = 'churn' | SELECT entity_id
+
+events | SAMPLE(fraction: 0.1) | WHERE entity_id IN churned
+```
+
+Because SAMPLE hashes entity IDs independently of their event history, the sampled entity set is the same as if you had filtered first and sampled second — the output is always `sampled_entities ∩ filtered_entities`.
 
 ### 14.3 ATTRIBUTE
 
@@ -1056,7 +1101,25 @@ events | WHERE (user_id, day) IN QUERY (
 )
 ```
 
-Multi-column IN uses a parenthesized tuple on the left. The tuple arity and column types must match the subquery output.
+Multi-column IN uses a parenthesized tuple on the left. The tuple elements bind to the subquery output **positionally**: the first LHS element matches the first output column, the second matches the second, and so on. **Column names in the subquery output are ignored for matching purposes** — only position and type matter.
+
+This means you can write LHS expressions with names that differ from the subquery's output column names:
+
+```bql
+-- "active_days" subquery outputs columns named "entity_id" and "day".
+-- LHS uses "user_id" (the source table's entity key name) and QUANTIZE(...).
+-- Binding is positional: user_id → entity_id (1st), QUANTIZE(ts,1d) → day (2nd).
+active_days = events LAST 30d
+            | STATS n = COUNT(*) GROUP BY entity_id, QUANTIZE(ts, 1d) AS day
+            | WHERE n > 50
+            | SELECT entity_id, day
+
+events LAST 30d
+| WHERE (user_id, QUANTIZE(ts, 1d)) IN active_days
+| MATCH FIRST SEQUENCE(page_view THEN purchase) WITHIN 1d
+```
+
+Multi-column IN arity is validated at plan time: `(a, b) IN QUERY (pipeline_with_one_col)` is a planner error. Types are also validated positionally.
 
 Type rules: see type-system.md Section 6.9.
 
@@ -1954,6 +2017,193 @@ events LAST 30d
     viewed_product = SUM(CAST(step_reached >= 2 AS INT)),
     added_to_cart = SUM(CAST(step_reached >= 3 AS INT))
 ```
+
+### 28.12 FIRST / LAST / NTH — Entity Milestone Analysis
+
+```bql
+-- True first signup per user (scan all time — drop the outer range)
+events | FIRST(signup)
+
+-- First signup within a 90-day lookback, for users active in the last 30 days
+-- Useful for onboarding cohort analysis without missing early adopters
+events LAST 30d
+| FIRST(signup, lookback: 90d)
+| SELECT entity_id, ts AS first_signup_ts, plan
+
+-- Third purchase per user: identify users who have bought at least three times
+events LAST 90d
+| NTH(purchase WHERE amount > 0, 3)
+| STATS power_buyers = COUNT(*) GROUP BY plan
+| ORDER BY power_buyers DESC
+
+-- First of any login-family event — pick whichever method the user first used
+events LAST 30d
+| FIRST((login, sso_login, mobile_login))
+| STATS first_login_method = COUNT(*) GROUP BY event_type
+```
+
+**Note:** `FIRST/NTH` without `lookback:` operate only within the outer time range. Use `events | FIRST(signup)` (no outer range) for the user's true first event ever.
+
+### 28.13 Deterministic SAMPLE — A/B Experiment Analysis
+
+```bql
+-- Stable 10% entity sample — same entities every run against this database
+events LAST 30d
+| SAMPLE(fraction: 0.1)
+| MATCH FIRST SEQUENCE(signup THEN purchase) WITHIN 7d EMIT ALL
+| STATS conversion_rate = AVG(CAST(step_reached >= 2 AS INT))
+
+-- Reproducible sample with explicit seed — useful for sharing results across teams
+events LAST 30d
+| SAMPLE(fraction: 0.05, seed: 42)
+| STATS purchases = COUNT(*), revenue = SUM(amount) GROUP BY plan
+
+-- SAMPLE combined with a cohort: analyze ~10% of churned users.
+-- SAMPLE goes before WHERE; the result entity set is sampled_entities ∩ churned.
+churned = events LAST 90d | WHERE event_type = 'churn' | SELECT entity_id
+events LAST 90d
+| SAMPLE(fraction: 0.1)
+| WHERE entity_id IN churned
+| STATS total_events = COUNT(*), entities = COUNT_DISTINCT(entity_id) GROUP BY plan
+```
+
+**Tip:** Place SAMPLE early in the pipeline — right after the source or after any `WHERE` pre-filters — so the storage layer can skip segments for non-sampled entities. The hash function (`xxHash64` over canonical entity-id bytes) is stable across bqlite versions — the same `seed:` always produces the same sample.
+
+### 28.14 ATTRIBUTE — Multi-Touch Attribution
+
+```bql
+-- Last-touch attribution: which ad channel drove the most revenue?
+events LAST 60d
+| ATTRIBUTE(
+    conversion: purchase,
+    touchpoints: ad_click,
+    window: 30d,
+    touchpoint_key: channel
+)
+| LET rn = ROW_NUMBER() OVER (PARTITION BY entity_id, conversion_ts ORDER BY touchpoint_ts DESC)
+| WHERE rn = 1                                -- keep only last touchpoint per conversion
+| STATS revenue = SUM(purchase.amount) GROUP BY touchpoint_key
+| ORDER BY revenue DESC
+
+-- Equal-weight attribution: every touchpoint gets one count
+events LAST 60d
+| ATTRIBUTE(
+    conversion: purchase,
+    touchpoints: (ad_click, email_open),
+    window: 30d,
+    touchpoint_key: CONCAT(channel, ':', campaign)
+)
+| WHERE touchpoint_ts IS NOT NULL             -- drop un-attributed conversions
+| STATS attributions = COUNT(*) GROUP BY touchpoint_key
+| ORDER BY attributions DESC
+
+-- Measure un-attributed conversions (LEFT-UNNEST: no touchpoint found in window)
+-- Each un-attributed conversion emits exactly one row with touchpoint_ts = NULL
+events LAST 60d
+| ATTRIBUTE(
+    conversion: purchase,
+    touchpoints: ad_click,
+    window: 30d,
+    touchpoint_key: channel
+)
+| WHERE touchpoint_ts IS NULL
+| STATS
+    unattributed_conversions = COUNT(*),
+    unattributed_users = COUNT_DISTINCT(entity_id)
+```
+
+**Note:** ATTRIBUTE auto-unnests — a conversion with N qualifying touchpoints produces N rows. A conversion with zero touchpoints still produces one row with `touchpoint_ts = NULL` (LEFT-UNNEST semantics). Append `| WHERE touchpoint_ts IS NOT NULL` for INNER-join semantics.
+
+### 28.15 Multi-Column Cohort with Positional Binding
+
+```bql
+-- (user, day) pairs that had more than 50 events — "busy days" cohort
+busy_days = events LAST 30d
+          | STATS n = COUNT(*) GROUP BY entity_id, QUANTIZE(ts, 1d) AS day
+          | WHERE n > 50
+          | SELECT entity_id, day
+
+-- Find purchases made on those (user, day) pairs.
+-- LHS columns (user_id, QUANTIZE(ts,1d)) bind positionally to the subquery
+-- output (entity_id, day) — column names don't matter, only position and type.
+events LAST 30d
+| WHERE event_type = 'purchase'
+| WHERE (user_id, QUANTIZE(ts, 1d)) IN busy_days
+| STATS purchases = COUNT(*), revenue = SUM(amount) GROUP BY entity_id
+| ORDER BY revenue DESC
+| LIMIT 100
+```
+
+### 28.16 Live DELETE — GDPR Erasure and Batch Cleanup
+
+```bql
+-- GDPR right-to-erasure: delete all events for a specific user
+DELETE FROM events WHERE user_id = 'user_to_erase'
+
+-- Delete multiple users in one statement
+DELETE FROM events WHERE user_id IN ('alice', 'bob', 'charlie')
+
+-- Undo a bad ingest batch by batch ID
+DELETE FROM events WHERE __batch_id = 99
+
+-- Time-range retention cutoff: remove data older than two years
+DELETE FROM events WHERE ts < '2024-01-01'
+
+-- Delete events for users listed in a GDPR erasure table.
+-- IN QUERY is not a cheap-class predicate (only literal IN lists are cheap),
+-- so ALLOW SCAN is required.
+DELETE FROM events
+WHERE user_id IN QUERY (
+    gdpr_requests LAST 7d
+    | WHERE request_status = 'approved'
+    | SELECT user_id
+)
+ALLOW SCAN
+
+-- Cannot use DELETE FROM ... JOIN ...; express cross-table deletes as
+-- sequential single-table DELETEs using IN QUERY:
+DELETE FROM purchases
+WHERE user_id IN QUERY (
+    events LAST 90d
+    | WHERE event_type = 'churn'
+    | SELECT entity_id
+)
+ALLOW SCAN
+```
+
+**Note:** Cheap predicates (entity key equality/IN with literals, time range, `__seq_id`, `__batch_id`) write tombstones directly without scanning data. All other predicates require `ALLOW SCAN` which first materializes matching `__seq_id`s. Deletes are visible immediately to new queries; physical row removal happens at compaction time.
+
+### 28.17 RETENTION Across Tables with Source JOIN
+
+```bql
+-- Signup-to-first-purchase retention using events and purchases tables
+events LAST 180d JOIN purchases
+| RETENTION(
+    entry: events.signup,
+    activity: purchases.purchase,
+    brackets: [1d, 7d, 14d, 30d]
+  )
+
+-- Same analysis broken out by signup cohort week (requires explicit primitives)
+events LAST 180d JOIN purchases
+| MATCH FIRST SEQUENCE(
+    s: events.signup
+    THEN purchases.purchase WHERE purchases.amount > 0
+  ) BRACKETS [1d, 7d, 14d, 30d] EMIT ALL
+| STATS retention_rate = AVG(CAST(step_reached >= 2 AS INT))
+  GROUP BY QUANTIZE(s.ts, 7d) AS cohort_week, bracket
+| ORDER BY cohort_week, bracket
+
+-- Cross-table funnel with table-qualified references
+events LAST 30d JOIN purchases JOIN support_tickets
+| FUNNEL(
+    events.signup
+    THEN purchases.purchase WHERE purchases.amount > 50
+    THEN support_tickets.ticket WHERE support_tickets.priority = 'high'
+  ) WITHIN 30d
+```
+
+**Note:** In multi-table queries all event-type and column references must be table-qualified (`events.signup`, `purchases.amount`). Bare references are planner errors even when they would be unambiguous.
 
 ---
 
