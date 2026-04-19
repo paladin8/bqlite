@@ -1143,6 +1143,20 @@ This task should be retired with a note linking to this document's
 Builds on FOR (TASK-415). The patch list mechanism is the new code;
 the block structure is inherited.
 
+**Implementation (landed):**
+`crates/bqlite-storage/src/encoding/pfor.rs` implements the `Pfor`
+`Encoding` impl against the §5.5 byte layout, reusing the
+`bitpacking` crate's `BitPacker4x` fast path that FOR already uses.
+The TASKS.md guideline ("Use the fastpfor crate instead of implementing
+manually") is superseded by the pinned on-disk format in
+segment-format-v2.md §5.5 — the Rust `fastpfor` crate implements
+FastPFOR (Lemire 2015), a different block/exception scheme than the
+Zukowski 2006 PFOR this design doc specifies. Selector integration
+(including the 1–10% outlier-fraction guard from §6.7) is deferred to
+TASK-419 per the selector-ownership convention; `Pfor::estimate_size`
+returns the exact payload size so TASK-419 can rank PFOR against FOR
+and BitPacking with byte-accurate comparisons.
+
 ---
 
 ## 12. References

@@ -63,7 +63,7 @@ use bqlite_core::{BqlType, BqliteError, Result};
 
 use super::{
     compress_lz4, require_dense, Alp, BitPacking, CompressionType, Constant, Delta, Dictionary,
-    DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Plain, Rle,
+    DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Pfor, Plain, Rle,
 };
 
 /// LZ4 minimum compression threshold per `storage-format.md` §10.7
@@ -306,9 +306,11 @@ fn encode_with(encoding: EncodingType, array: &dyn Array) -> Result<EncodedChunk
         EncodingType::DoubleDelta => DoubleDelta.encode(array),
         EncodingType::For => ForEncoding.encode(array),
         EncodingType::Alp => Alp.encode(array),
-        // v2 encodings — implementations land in TASK-450.
-        // The selector never picks these; this arm exists only for exhaustiveness.
-        EncodingType::Fsst | EncodingType::PFor => Err(BqliteError::Execution(format!(
+        EncodingType::PFor => Pfor.encode(array),
+        // Fsst encode is wired by TASK-416 through a dedicated path
+        // (segment-level symbol table), not the selector; the arm exists
+        // here only for exhaustiveness until that wiring lands.
+        EncodingType::Fsst => Err(BqliteError::Execution(format!(
             "v2 encoding {encoding:?} encode not yet implemented"
         ))),
     }

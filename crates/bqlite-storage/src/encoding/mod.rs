@@ -54,6 +54,7 @@ pub mod for_encoding;
 pub mod frequency;
 pub mod fsst;
 pub mod lz4;
+pub mod pfor;
 pub mod plain;
 pub mod rle;
 pub mod selector;
@@ -67,6 +68,7 @@ pub use double_delta::DoubleDelta;
 pub use for_encoding::ForEncoding;
 pub use fsst::Fsst;
 pub use lz4::{compress_lz4, decompress_lz4, CompressionType};
+pub use pfor::Pfor;
 pub use plain::Plain;
 pub use rle::Rle;
 pub use selector::{decode_cost, select_encoding, select_encoding_type, SelectedEncoding};
@@ -78,8 +80,8 @@ pub use selector::{decode_cost, select_encoding, select_encoding_type, SelectedE
 /// `storage-format.md` §10.2 and `advanced-encodings.md` §1.2.
 /// v1 discriminants (Plain, Dictionary, Delta, BitPacking, Constant)
 /// are unchanged. Wave 4 adds Rle (TASK-413), DoubleDelta (TASK-414),
-/// For (TASK-415), Fsst (TASK-416), and further variants in later
-/// tasks. Existing discriminants never change.
+/// For (TASK-415), Fsst (TASK-416), PFor (TASK-450), and further
+/// variants in later tasks. Existing discriminants never change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum EncodingType {

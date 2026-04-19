@@ -126,3 +126,10 @@ harness = false
 [[bench]]
 name = "event_select"
 harness = false
+
+# PFOR codec (TASK-450) — encode/decode throughput and payload-size
+# ratio evidence per advanced-encodings.md §6.
+[[bench]]
+name = "pfor"
+path = "wave4/pfor.rs"
+harness = false

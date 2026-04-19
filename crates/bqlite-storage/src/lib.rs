@@ -61,8 +61,8 @@ pub use database::{
 };
 pub use encoding::{
     select_encoding, select_encoding_type, Alp, BitPacking, CompressionType, Constant, Delta,
-    Dictionary, DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Fsst, Plain, Rle,
-    SelectedEncoding,
+    Dictionary, DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Fsst, Pfor, Plain,
+    Rle, SelectedEncoding,
 };
 pub use manifest::{
     ColumnStats, Manifest, SegmentMeta, TableEntry, WindowManifest, DEFAULT_SHARD_COUNT,

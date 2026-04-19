@@ -66,7 +66,7 @@ use crate::encoding::dictionary::{
 };
 use crate::encoding::{
     decompress_lz4, Alp, BitPacking, BorrowedEncodedChunk, Constant, Delta, DoubleDelta, Encoding,
-    EncodingType, ForEncoding, Plain, Rle,
+    EncodingType, ForEncoding, Pfor, Plain, Rle,
 };
 use crate::segment::layout::{
     ColumnChunkMeta, CompressionType, FooterV1, FooterV2, SegmentFooter, CHECKSUM_LEN,
@@ -1125,9 +1125,12 @@ fn dispatch_decode(
         EncodingType::Rle => Rle.decode_borrowed(chunk, ty),
         EncodingType::For => ForEncoding.decode_borrowed(chunk, ty),
         EncodingType::Alp => Alp.decode_borrowed(chunk, ty),
-        // v2 encodings — decode implementations land in TASK-450.
-        EncodingType::Fsst | EncodingType::PFor => Err(BqliteError::Execution(format!(
-            "v2 encoding {encoding:?} decode not yet implemented (TASK-450)"
+        EncodingType::PFor => Pfor.decode_borrowed(chunk, ty),
+        // Fsst decode is wired by TASK-416 through a dedicated path that
+        // needs the segment-level symbol table; the reader arm above this
+        // dispatch already carries a TODO pointing there.
+        EncodingType::Fsst => Err(BqliteError::Execution(format!(
+            "v2 encoding {encoding:?} decode not yet implemented (TASK-416)"
         ))),
     }
 }
