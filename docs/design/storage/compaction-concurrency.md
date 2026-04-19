@@ -458,9 +458,16 @@ SS6 all-or-nothing publish guarantee is preserved.
   succeeds. The `retired_versions` hook is intentionally absent -- it
   would have nothing to track.
 - SS9 tombstone snapshot at job start and the manifest-first
-  reclamation ordering land in TASK-434 (tombstone-aware scan) and
-  TASK-435 (tombstone reclamation during compaction). The compaction
-  executor in TASK-408 does not consult `tombstones.json`.
+  reclamation ordering are implemented by TASK-435 inside
+  `compact_one` (`crates/bqlite-storage/src/compaction.rs`): the job
+  reads `tombstones.json` once, wraps every input scan in
+  `CompactionTombstoneScan` to drop row/batch/entity/time-range
+  matches during the merge, and rewrites the tombstone file under
+  the per-shard mutex after publish. The zero-surviving-rows path
+  publishes a "remove-only" manifest update via
+  `Database::remove_segments_atomic` and still runs reclamation to
+  clear the entries that caused the full drop. Query-time
+  scan-wrapping is TASK-434.
 - SS4 query-side permit acquisition is TASK-438's job. TASK-408 ships
   the `CoreBudget` type and the per-job acquire/release inside the
   worker; until TASK-438 wires query workers into the same semaphore,

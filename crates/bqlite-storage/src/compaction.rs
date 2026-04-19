@@ -402,6 +402,17 @@ pub fn compact_one(
             let path = segment_path(&db_root, table, window_id, shard_id, *old_id);
             let _ = std::fs::remove_file(&path);
         }
+        // §12.2 reclamation still runs on the zero-row path — every
+        // tombstone entry that triggered the full drop is itself now
+        // redundant.
+        reclaim_tombstones_after_compaction(
+            db,
+            table,
+            window_id,
+            shard_id,
+            &tombstone_snapshot_at_start,
+            &shard_segments,
+        )?;
         return Ok(CompactionOutcome {
             input_segment_ids: input_ids,
             output_segment_ids: vec![],
@@ -562,6 +573,20 @@ pub fn compact_one(
         let _ = std::fs::remove_file(&path);
     }
 
+    // ── 13. Tombstone reclamation (§12.2). ─────────────────────────
+    // Manifest-first ordering: the publish above is durable; a crash
+    // between publish and the rewrite below leaves stale tombstones
+    // that §12.3 guarantees are harmless no-ops against the new
+    // output segment.
+    reclaim_tombstones_after_compaction(
+        db,
+        table,
+        window_id,
+        shard_id,
+        &tombstone_snapshot_at_start,
+        &shard_segments,
+    )?;
+
     Ok(CompactionOutcome {
         input_segment_ids: input_ids,
         output_segment_ids: vec![new_segment_id],
@@ -571,6 +596,127 @@ pub fn compact_one(
 }
 
 // ── compact_one helpers ─────────────────────────────────────────────────────
+
+/// Rewrite the shard's tombstone file after a successful compaction
+/// publish to drop every entry that is now physically reclaimed.
+///
+/// Implements `docs/design/storage/deletes.md` §12.2 manifest-first
+/// reclamation. Called only after the §6 publish (either
+/// [`Database::replace_segments`] for the happy path or
+/// [`Database::remove_segments_atomic`] for the zero-row path) has
+/// succeeded — a crash before this point leaves the tombstone file
+/// intact, which is correct per §12.3 "stale tombstone safety".
+///
+/// `snapshot_at_start` is the snapshot taken at job start (§12.1);
+/// `input_segments` lists the segment metas that were consumed by
+/// the merge so we can compute row- and batch-level reclamation. The
+/// file rewrite is serialised against concurrent DELETEs via the
+/// per-shard tombstone mutex (§9).
+///
+/// # Concurrency assumption
+///
+/// Entity- and time-range reclamation assume the new output segment
+/// is the only remaining segment in `(window, shard)` after publish.
+/// `compact_one` takes `&mut Database` today, so no concurrent ingest
+/// can add segments between job-start and this call. If a future
+/// per-shard concurrent writer changes that, this function must
+/// re-snapshot the manifest under the publish lock and narrow the
+/// entity/time-range rules accordingly — §12.3 keeps correctness
+/// either way, so the change would be a pruning tightening, not a
+/// bug fix.
+///
+/// # Read-modify-write window
+///
+/// Between publish and the `write_tombstone_atomic` call below, a
+/// concurrent query that loads the tombstone snapshot will see both
+/// the new output segment AND the reclaimable entries from the old
+/// snapshot. Per §12.3 these are harmless no-ops on the new output —
+/// no row in the new segment matches any reclaimable entry because
+/// the merge filter already dropped them.
+fn reclaim_tombstones_after_compaction(
+    db: &Database,
+    table: &str,
+    window_id: u32,
+    shard_id: u32,
+    snapshot_at_start: &crate::tombstone::TombstoneFile,
+    input_segments: &[crate::manifest::SegmentMeta],
+) -> Result<()> {
+    if snapshot_at_start.is_empty() {
+        return Ok(());
+    }
+    // Same narrowing rationale as in `compact_one`: shard_id is
+    // already bounded by manifest.shard_count, which itself is u16.
+    debug_assert!(shard_id <= u32::from(u16::MAX));
+    let shard_id_u16 = shard_id as u16;
+    let lock = db.tombstone_shard_lock(table, window_id, shard_id_u16);
+    let _guard = lock
+        .lock()
+        .expect("tombstone shard lock poisoned by a panicking writer");
+
+    let path = crate::tombstone::tombstone_file_path(db.root(), table, window_id, shard_id_u16);
+    let mut current = crate::tombstone::read_tombstone_file(&path)?;
+
+    // Row-level (§12.4): reclaim any __seq_id in snapshot.row_deletes
+    // whose value fell within any compacted input's seq_id_range.
+    // The `in_snapshot` gate ensures mid-compaction row-delete entries
+    // (that didn't exist when the snapshot was taken) survive the
+    // rewrite even if their __seq_id happens to fall within an input
+    // segment's range — §12.3 keeps those harmless, but our contract
+    // is "only reclaim what we know the merge filter applied".
+    if !snapshot_at_start.row_deletes.is_empty() {
+        current.row_deletes.retain(|seq_id| {
+            let in_snapshot = snapshot_at_start.row_deletes.contains(seq_id);
+            if !in_snapshot {
+                return true;
+            }
+            let covered = input_segments.iter().any(|seg| {
+                let (lo, hi) = seg.seq_id_range;
+                *seq_id >= lo && *seq_id <= hi
+            });
+            !covered
+        });
+    }
+    // Batch-level (§12.4): reclaim any batch_id in
+    // snapshot.batch_deletes matched by any compacted input.
+    if !snapshot_at_start.batch_deletes.is_empty() {
+        current.batch_deletes.retain(|batch_id| {
+            let in_snapshot = snapshot_at_start.batch_deletes.contains(batch_id);
+            if !in_snapshot {
+                return true;
+            }
+            let covered = input_segments.iter().any(|seg| seg.batch_id == *batch_id);
+            !covered
+        });
+    }
+    // Entity-level (§12.4): every entry present in the snapshot is
+    // reclaimable — the merge filter guaranteed the new output has
+    // no row for any tombstoned entity, and the new output is the
+    // only remaining segment in the shard (see "Concurrency
+    // assumption" above).
+    if !snapshot_at_start.entity_deletes.is_empty() {
+        current
+            .entity_deletes
+            .retain(|e| !snapshot_at_start.entity_deletes.contains(e));
+    }
+    // Time-range (§12.4): same rationale as entity-level. Compare by
+    // equality; TimeRangeDelete is PartialEq and the expected cardinality
+    // is 1-3 entries per §5.2, so a linear scan is optimal.
+    if !snapshot_at_start.time_range_deletes.is_empty() {
+        current
+            .time_range_deletes
+            .retain(|r| !snapshot_at_start.time_range_deletes.contains(r));
+    }
+
+    if current.is_empty() {
+        // Best-effort removal keeps the shard directory clean; a
+        // transient failure is fine because an empty file is also a
+        // valid representation of "no tombstones".
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    } else {
+        crate::tombstone::write_tombstone_atomic(&path, &current)
+    }
+}
 
 fn segment_path(
     db_root: &std::path::Path,
@@ -2190,6 +2336,111 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_removes_applied_row_entity_time_range_and_batch() {
+        let scratch = ScratchDir::new("reclaim-all");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+
+        let s1 = ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[
+                make_event("alice", 100, "click"),
+                make_event("alice", 150, "view"),
+                make_event("bob", 200, "click"),
+            ],
+        );
+        let _s2 = ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[
+                make_event("carol", 300, "click"),
+                make_event("dave", 400, "view"),
+            ],
+        );
+
+        // One entry per granularity: row in s1, batch for s1, entity
+        // "dave", time range covering 200..=250.
+        let tf = TombstoneFile {
+            row_deletes: [s1.seq_id_range.0 + 1].into_iter().collect(),
+            batch_deletes: [s1.batch_id].into_iter().collect(),
+            entity_deletes: [bqlite_core::ScalarValue::String("dave".into())]
+                .into_iter()
+                .collect(),
+            time_range_deletes: vec![TimeRangeDelete {
+                min_ts: Some(200),
+                min_inclusive: true,
+                max_ts: Some(250),
+                max_inclusive: true,
+            }],
+        };
+        let tp = tombstone_file_path(scratch.path(), "events", 0, 0);
+        write_tombstone_atomic(&tp, &tf).unwrap();
+
+        compact_one(&mut db, "events", 0, 0).unwrap();
+
+        // Every snapshot entry was applied by the merge filter, so
+        // every entry is reclaimable. The rewrite leaves an empty
+        // file, which the reclaimer removes from disk.
+        let after = crate::tombstone::read_tombstone_file(&tp).unwrap();
+        assert!(
+            after.is_empty(),
+            "every snapshot entry should be reclaimed after compaction"
+        );
+    }
+
+    #[test]
+    fn reclaim_preserves_unmatched_tombstone_entries() {
+        // §12.3 stale-tombstone safety: a tombstone entry whose
+        // target is not present in any compacted input must survive
+        // reclamation. `&mut Database` means mid-compaction DELETEs
+        // cannot race today, but a row tombstone targeting a __seq_id
+        // that no input covers exercises the same retention logic.
+        let scratch = ScratchDir::new("reclaim-stale-safety");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+
+        let s1 = ingest_one_segment(
+            &mut db,
+            "events",
+            0,
+            0,
+            &[make_event("alice", 100, "click")],
+        );
+        let _s2 = ingest_one_segment(&mut db, "events", 0, 0, &[make_event("bob", 200, "view")]);
+
+        // Pre-populate a row tombstone outside any segment's seq range
+        // (simulates either a pre-existing stale tombstone or a
+        // mid-compaction DELETE that the snapshot did not include).
+        let unreachable_seq = s1.seq_id_range.0 + 10_000;
+        let combined = TombstoneFile {
+            entity_deletes: [bqlite_core::ScalarValue::String("alice".into())]
+                .into_iter()
+                .collect(),
+            row_deletes: [unreachable_seq].into_iter().collect(),
+            ..Default::default()
+        };
+        let tp = tombstone_file_path(scratch.path(), "events", 0, 0);
+        write_tombstone_atomic(&tp, &combined).unwrap();
+
+        compact_one(&mut db, "events", 0, 0).unwrap();
+
+        let after = crate::tombstone::read_tombstone_file(&tp).unwrap();
+        assert!(
+            after.entity_deletes.is_empty(),
+            "entity entry must be reclaimed"
+        );
+        assert!(
+            after.row_deletes.contains(&unreachable_seq),
+            "unreachable row tombstone must be preserved (§12.3 stale-tombstone safety)"
+        );
+    }
+
+    #[test]
     fn compact_one_all_rows_tombstoned_removes_inputs_without_output() {
         let scratch = ScratchDir::new("tombstone-allkill");
         let mut db = Database::create(scratch.path()).unwrap();
@@ -2233,5 +2484,15 @@ mod tests {
         ));
         assert!(!p1.exists(), "s1 file must be removed");
         assert!(!p2.exists(), "s2 file must be removed");
+
+        // The entity tombstone that triggered the full drop must also
+        // have been reclaimed (§12.2 manifest-first reclamation fires
+        // on the zero-row path too).
+        let tp = tombstone_file_path(scratch.path(), "events", 0, 0);
+        let after = crate::tombstone::read_tombstone_file(&tp).unwrap();
+        assert!(
+            after.entity_deletes.is_empty(),
+            "entity tombstone must be reclaimed on the zero-row path"
+        );
     }
 }

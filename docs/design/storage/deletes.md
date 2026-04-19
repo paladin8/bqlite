@@ -565,10 +565,14 @@ from this design:
   from the query context per SS6.3. Implements the scan-time filtering
   order from SS7. Must never re-read tombstone files from disk during
   query execution.
-- **TASK-435 (tombstone reclamation during compaction)** -- implements
-  the manifest-first reclamation ordering from SS12.2, the per-
-  granularity reclamation rules from SS12.4, and the optional time-range
-  merge from SS12.5.
+- **TASK-435 (tombstone reclamation during compaction)** -- implemented
+  by `compact_one` and `reclaim_tombstones_after_compaction` in
+  `crates/bqlite-storage/src/compaction.rs`, using the
+  `CompactionTombstoneScan` wrapper in
+  `crates/bqlite-storage/src/tombstone_scan.rs`. Manifest-first
+  reclamation order (SS12.2) and per-granularity reclamation rules
+  (SS12.4) are covered; optional time-range merge (SS12.5) is deferred
+  to a follow-on task once bench data justifies it.
 - **TASK-453 (DELETE planner + engine)** -- enforces cheap-class
   rejection (SS4), implements exact `rows_affected` (SS11), owns the
   per-shard mutex lifecycle (SS9), and the idempotent retry contract
