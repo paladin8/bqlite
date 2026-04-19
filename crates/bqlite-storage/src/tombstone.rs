@@ -420,7 +420,11 @@ impl<'a> TombstoneFilter<'a> {
         })
     }
 
-    fn apply_batch_deletes(&self, batch: &RecordBatch, alive: &mut [bool]) -> Result<()> {
+    pub(crate) fn apply_batch_deletes(
+        &self,
+        batch: &RecordBatch,
+        alive: &mut [bool],
+    ) -> Result<()> {
         if self.tombstones.batch_deletes.is_empty() {
             return Ok(());
         }
@@ -453,7 +457,11 @@ impl<'a> TombstoneFilter<'a> {
         Ok(())
     }
 
-    fn apply_entity_deletes(&self, batch: &RecordBatch, alive: &mut [bool]) -> Result<()> {
+    pub(crate) fn apply_entity_deletes(
+        &self,
+        batch: &RecordBatch,
+        alive: &mut [bool],
+    ) -> Result<()> {
         if self.tombstones.entity_deletes.is_empty() {
             return Ok(());
         }
@@ -507,7 +515,7 @@ impl<'a> TombstoneFilter<'a> {
         Ok(())
     }
 
-    fn apply_row_deletes(&self, batch: &RecordBatch, alive: &mut [bool]) -> Result<()> {
+    pub(crate) fn apply_row_deletes(&self, batch: &RecordBatch, alive: &mut [bool]) -> Result<()> {
         if self.tombstones.row_deletes.is_empty() {
             return Ok(());
         }
@@ -535,7 +543,11 @@ impl<'a> TombstoneFilter<'a> {
         Ok(())
     }
 
-    fn apply_time_range_deletes(&self, batch: &RecordBatch, alive: &mut [bool]) -> Result<()> {
+    pub(crate) fn apply_time_range_deletes(
+        &self,
+        batch: &RecordBatch,
+        alive: &mut [bool],
+    ) -> Result<()> {
         if self.tombstones.time_range_deletes.is_empty() {
             return Ok(());
         }

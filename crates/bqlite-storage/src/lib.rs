@@ -80,7 +80,7 @@ pub use tombstone::{
     TimeRangeDelete, TombstoneFile, TombstoneFilter, TombstoneSnapshot, TOMBSTONE_FILE_NAME,
     TOMBSTONE_TMP_FILE_NAME,
 };
-pub use tombstone_scan::TombstoneScanWrapper;
+pub use tombstone_scan::{CompactionTombstoneScan, TombstoneScanWrapper};
 pub use writer::{SegmentWriter, WriterConfig, DEFAULT_ROW_GROUP_SIZE};
 
 // Zero-copy scan/filter (CP2): encoded read-path helpers.
