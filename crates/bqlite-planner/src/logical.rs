@@ -982,6 +982,11 @@ fn fold_stage(
 
         PipelineStage::OrderBy { items, .. } => lower_order_by(items, acc, registry),
 
+        // ── Wave 4 stages ────────────────────────────────────────────
+        PipelineStage::Sessionize(args) => lower_sessionize(args, acc, source_table),
+
+        PipelineStage::Sample(args) => lower_sample(args, acc),
+
         // ── Wave 3 desugaring ─────────────────────────────────────────
         // FUNNEL is syntactic sugar that expands into a MATCH (EMIT ALL)
         // followed by a STATS stage. Desugaring is deferred to the
@@ -1773,6 +1778,113 @@ fn lower_order_by(
 
     Ok(LogicalPlan::Sort {
         keys,
+        input: Box::new(acc),
+        output_schema,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4 SESSIONIZE lowering — operators/sessionize.md §4–§6
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `| SESSIONIZE gap: <d> [end: <events>]` into a `Sessionize` logical
+/// node.
+///
+/// Validations:
+/// - `gap > 0` (per sessionize.md §5.1 — boundary is exclusive, `delta > gap`).
+/// - `end` event-type list contains no duplicates (parser guarantees this but
+///   we guard defensively; sessionize.md §5.4).
+/// - The input must expose the source table's event-type column so the operator
+///   can dispatch per-event tests against `end_events`.
+///
+/// Output schema = input columns followed by `session_id: Int NOT NULL` and
+/// `session_duration: Int NOT NULL` (per §6.1–§6.2).
+fn lower_sessionize(
+    args: bqlite_ast::Sessionize,
+    acc: LogicalPlan,
+    source_table: &TableSchema,
+) -> Result<LogicalPlan> {
+    if args.gap <= 0 {
+        return Err(BqliteError::Plan(format!(
+            "SESSIONIZE: gap must be positive — got {}ns",
+            args.gap
+        )));
+    }
+
+    let input_schema = acc.output_schema();
+
+    let end_events: Vec<String> = match args.end {
+        None => Vec::new(),
+        Some(refs) => {
+            let mut out: Vec<String> = Vec::with_capacity(refs.len());
+            for r in refs {
+                let name = r.event.text;
+                if out.iter().any(|existing| existing == &name) {
+                    return Err(BqliteError::Plan(format!(
+                        "SESSIONIZE: duplicate end-event type `{name}`"
+                    )));
+                }
+                out.push(name);
+            }
+            out
+        }
+    };
+
+    // Per sessionize.md §4: the operator only inspects event types when
+    // `end_events` is non-empty ("`event_type_idx` is `Some` only when
+    // `end_events` is non-empty. In gap-only mode, the operator never
+    // inspects event types and does not require the `event_type` column.")
+    // Only require the event-type column on the input schema when we'll
+    // actually need it.
+    if !end_events.is_empty() {
+        let event_type_col = &source_table.event_type_column().name;
+        if input_schema.column(event_type_col).is_none() {
+            return Err(BqliteError::Plan(format!(
+                "SESSIONIZE with explicit end events requires the input to expose \
+                 event type column `{event_type_col}`"
+            )));
+        }
+    }
+
+    let mut cols = input_schema.columns().to_vec();
+    cols.push(ColumnDef::required("session_id", BqlType::Int));
+    cols.push(ColumnDef::required("session_duration", BqlType::Int));
+    let output_schema = OperatorSchema::new(cols)?;
+
+    Ok(LogicalPlan::Sessionize {
+        gap: args.gap,
+        end_events,
+        forwarded_columns: Vec::new(),
+        fused_downstream: None,
+        input: Box::new(acc),
+        output_schema,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4 SAMPLE lowering — operators/event-select-sample.md §15–§17
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lower `| SAMPLE(fraction: <f> [seed: <s>])` into a `Sample` logical node.
+///
+/// The parser already rejects out-of-range fractions, but we re-check
+/// defensively so the planner layer can be audited independently (it is the
+/// last place an out-of-range value could slip through before the operator
+/// assumes `fraction ∈ [0, 1]`). NaN / infinity are also rejected.
+///
+/// Output schema equals the input schema: SAMPLE never reshapes.
+fn lower_sample(args: bqlite_ast::Sample, acc: LogicalPlan) -> Result<LogicalPlan> {
+    if !args.fraction.is_finite() || !(0.0..=1.0).contains(&args.fraction) {
+        return Err(BqliteError::Plan(format!(
+            "SAMPLE: fraction must be in [0.0, 1.0] — got {}",
+            args.fraction
+        )));
+    }
+
+    let output_schema = acc.output_schema().clone();
+    Ok(LogicalPlan::Sample {
+        fraction: args.fraction,
+        seed: args.seed,
         input: Box::new(acc),
         output_schema,
     })
@@ -4497,6 +4609,269 @@ mod tests {
                 other => panic!("expected Scan under SequenceMatch, got {other:?}"),
             },
             _ => panic!("expected SequenceMatch, got {plan:?}"),
+        }
+    }
+
+    // ── Wave 4 CP1: SESSIONIZE + SAMPLE lowering ───────────────────────────
+
+    fn event_ref(name: &str) -> bqlite_ast::pattern::EventRef {
+        bqlite_ast::pattern::EventRef {
+            table: None,
+            event: Name::synthetic(name),
+            span: Span::EMPTY,
+        }
+    }
+
+    #[test]
+    fn sessionize_default_end_events_lowers_cleanly() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sessionize(bqlite_ast::Sessionize {
+                gap: 30 * 60 * 1_000_000_000, // 30 min
+                end: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::Sessionize {
+                gap,
+                end_events,
+                forwarded_columns,
+                fused_downstream,
+                input,
+                output_schema,
+            } => {
+                assert_eq!(gap, 30 * 60 * 1_000_000_000);
+                assert!(end_events.is_empty());
+                assert!(forwarded_columns.is_empty());
+                assert!(fused_downstream.is_none());
+                assert!(matches!(*input, LogicalPlan::Scan { .. }));
+                let names: Vec<&str> = output_schema
+                    .columns()
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                // Input columns + session_id + session_duration at the end.
+                assert_eq!(
+                    names,
+                    vec![
+                        "user_id",
+                        "ts",
+                        "event",
+                        "amount",
+                        "country",
+                        "__seq_id",
+                        "__batch_id",
+                        "session_id",
+                        "session_duration"
+                    ]
+                );
+                let sid = output_schema.column("session_id").unwrap().1;
+                assert_eq!(sid.bql_type, BqlType::Int);
+                assert!(!sid.nullable);
+                let sdur = output_schema.column("session_duration").unwrap().1;
+                assert_eq!(sdur.bql_type, BqlType::Int);
+                assert!(!sdur.nullable);
+            }
+            other => panic!("expected Sessionize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sessionize_with_end_events_keeps_order() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sessionize(bqlite_ast::Sessionize {
+                gap: 60_000_000_000,
+                end: Some(vec![event_ref("logout"), event_ref("tab_close")]),
+                span: Span::EMPTY,
+            })],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::Sessionize { end_events, .. } => {
+                assert_eq!(end_events, vec!["logout", "tab_close"]);
+            }
+            other => panic!("expected Sessionize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sessionize_duplicate_end_event_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sessionize(bqlite_ast::Sessionize {
+                gap: 60_000_000_000,
+                end: Some(vec![event_ref("logout"), event_ref("logout")]),
+                span: Span::EMPTY,
+            })],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        match err {
+            BqliteError::Plan(msg) => {
+                assert!(msg.contains("duplicate end-event type"));
+                assert!(msg.contains("logout"));
+            }
+            other => panic!("expected Plan error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sessionize_zero_gap_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sessionize(bqlite_ast::Sessionize {
+                gap: 0,
+                end: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("must be positive")));
+    }
+
+    #[test]
+    fn sessionize_negative_gap_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sessionize(bqlite_ast::Sessionize {
+                gap: -1,
+                end: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("must be positive")));
+    }
+
+    #[test]
+    fn sample_fraction_valid_lowers_cleanly() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sample(bqlite_ast::Sample {
+                fraction: 0.25,
+                seed: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::Sample {
+                fraction,
+                seed,
+                input,
+                output_schema,
+            } => {
+                assert_eq!(fraction, 0.25);
+                assert!(seed.is_none());
+                // Output schema matches the input (Scan) schema exactly.
+                assert_eq!(&output_schema, input.output_schema());
+                assert!(matches!(*input, LogicalPlan::Scan { .. }));
+            }
+            other => panic!("expected Sample, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_with_seed_preserves_seed() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sample(bqlite_ast::Sample {
+                fraction: 1.0,
+                seed: Some(42),
+                span: Span::EMPTY,
+            })],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::Sample { fraction, seed, .. } => {
+                assert_eq!(fraction, 1.0);
+                assert_eq!(seed, Some(42));
+            }
+            other => panic!("expected Sample, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_fraction_above_one_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sample(bqlite_ast::Sample {
+                fraction: 1.5,
+                seed: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("must be in [0.0, 1.0]")));
+    }
+
+    #[test]
+    fn sample_negative_fraction_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sample(bqlite_ast::Sample {
+                fraction: -0.1,
+                seed: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("must be in [0.0, 1.0]")));
+    }
+
+    #[test]
+    fn sample_nan_fraction_rejected() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Sample(bqlite_ast::Sample {
+                fraction: f64::NAN,
+                seed: None,
+                span: Span::EMPTY,
+            })],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("must be in [0.0, 1.0]")));
+    }
+
+    #[test]
+    fn sessionize_then_sample_composes() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![
+                PipelineStage::Sessionize(bqlite_ast::Sessionize {
+                    gap: 60_000_000_000,
+                    end: None,
+                    span: Span::EMPTY,
+                }),
+                PipelineStage::Sample(bqlite_ast::Sample {
+                    fraction: 0.5,
+                    seed: Some(7),
+                    span: Span::EMPTY,
+                }),
+            ],
+        );
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        match plan {
+            LogicalPlan::Sample { input, .. } => match *input {
+                LogicalPlan::Sessionize { input: inner, .. } => {
+                    assert!(matches!(*inner, LogicalPlan::Scan { .. }));
+                }
+                other => panic!("expected Sessionize under Sample, got {other:?}"),
+            },
+            other => panic!("expected Sample on top, got {other:?}"),
         }
     }
 

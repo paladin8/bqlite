@@ -307,22 +307,23 @@ mod tests {
 
     #[test]
     fn propagates_unsupported_pipeline_stage_error() {
-        // SESSIONIZE is deferred to Wave 4 — logical lowering rejects it
-        // and `plan` must propagate that error verbatim.
+        // PIVOT is a later-wave stage (not Wave 4); logical lowering rejects it
+        // and `plan` must propagate that error verbatim. SESSIONIZE used to be
+        // the canary here, but TASK-425 brought SESSIONIZE online as part of
+        // Wave 4 — PIVOT is the next still-deferred shape.
         let catalog = InMemoryCatalog::default().with(events_schema());
         let mut pipeline = bare_pipeline("events");
-        pipeline
-            .stages
-            .push(PipelineStage::Sessionize(bqlite_ast::Sessionize {
-                gap: 1_000_000_000,
-                end: None,
-                span: Span::EMPTY,
-            }));
+        pipeline.stages.push(PipelineStage::Pivot {
+            pivot_column: Name::synthetic("event_type"),
+            value_column: Name::synthetic("ts"),
+            values: None,
+            span: Span::EMPTY,
+        });
         match plan(Statement::Query(pipeline), &catalog, 0) {
             Err(BqliteError::Plan(msg)) => {
-                assert!(msg.contains("SESSIONIZE"), "got: {msg}");
+                assert!(msg.contains("PIVOT"), "got: {msg}");
             }
-            other => panic!("expected Plan error for SESSIONIZE, got {other:?}"),
+            other => panic!("expected Plan error for PIVOT, got {other:?}"),
         }
     }
 
