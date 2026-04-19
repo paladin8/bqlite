@@ -553,7 +553,7 @@ class AgentWrapperMainLoopTests(unittest.TestCase):
             sleep=lambda seconds: sleeps.append(seconds),
         )
         self.assertEqual(outcome, "batch_complete")
-        self.assertEqual(sleeps, [120])  # first step of 2/5/10/20/60-min ladder
+        self.assertEqual(sleeps, [120])  # first step of 2/5/10-min ladder
 
     def test_run_fleet_loop_recovers_from_called_process_error(self) -> None:
         """A git command exploding under claim_next must not crash the
