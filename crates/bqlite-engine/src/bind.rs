@@ -53,14 +53,14 @@ use bqlite_core::{
 use bqlite_operators::matcher::SequenceMatchState;
 use bqlite_operators::operator::EntityOperator;
 use bqlite_operators::{
-    Accumulator, CancellationToken, DistinctOperator, FilterOperator, HashAccumulator,
-    HashAggregateOperator, LimitOperator, PhysicalOperator, ProjectOperator, ScanOperator,
-    SequenceMatchOperator, SortOperator,
+    Accumulator, CancellationToken, CohortHashSet, DistinctOperator, FilterOperator,
+    HashAccumulator, HashAggregateOperator, LimitOperator, PhysicalOperator, ProjectOperator,
+    ScanOperator, SequenceMatchOperator, SortOperator, SubqueryFilterOperator,
 };
 use bqlite_planner::compiled::{
     ArrowKernelId, CompareKernel, CompareOp, CompiledExpr, CompiledNode,
 };
-use bqlite_planner::{PhysicalPlan, ScanPhysical, SequenceMatchPhysical};
+use bqlite_planner::{PhysicalPlan, ScanPhysical, SequenceMatchPhysical, SubqueryFilterPhysical};
 use bqlite_storage::Database;
 
 use crate::ddl::{
@@ -477,12 +477,29 @@ fn fill_entity_id(batch: RecordBatch, entity: &EntityId) -> Result<RecordBatch> 
 /// Propagates any error from operator construction, DDL execution,
 /// or catalog lookup.
 pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn PhysicalOperator>> {
+    let mut cohorts = CohortCache::default();
+    bind_physical_with_cache(plan, db, &mut cohorts)
+}
+
+/// Bind a `PhysicalPlan` while threading a [`CohortCache`] through every
+/// recursive call so that identical cohort subqueries — produced by
+/// repeated `IN alias` references or duplicate `IN QUERY (...)` shapes —
+/// materialize exactly once per top-level [`Engine::query`] invocation.
+///
+/// See `docs/design/language/cohorts-aliases-joins.md` §2.5 + §2.11
+/// (caching), §4.1 (hash-set probe), §4.2 (cohort materialization at
+/// query start).
+fn bind_physical_with_cache(
+    plan: &PhysicalPlan,
+    db: &mut Database,
+    cohorts: &mut CohortCache,
+) -> Result<Box<dyn PhysicalOperator>> {
     match plan {
         // ── Data-plane operators ─────────────────────────────────
         PhysicalPlan::Scan(scan) => bind_scan(scan, db),
 
         PhysicalPlan::Filter(filter) => {
-            let child = bind_physical(&filter.input, db)?;
+            let child = bind_physical_with_cache(&filter.input, db, cohorts)?;
             Ok(Box::new(FilterOperator::new(
                 child,
                 filter.predicate.clone(),
@@ -491,7 +508,7 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
         }
 
         PhysicalPlan::Project(project) => {
-            let child = bind_physical(&project.input, db)?;
+            let child = bind_physical_with_cache(&project.input, db, cohorts)?;
             Ok(Box::new(ProjectOperator::from_physical_items(
                 child,
                 project.expressions.clone(),
@@ -500,13 +517,13 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
         }
 
         PhysicalPlan::Limit(limit) => {
-            let child = bind_physical(&limit.input, db)?;
+            let child = bind_physical_with_cache(&limit.input, db, cohorts)?;
             Ok(Box::new(LimitOperator::new(child, limit.count)))
         }
 
         // ── Wave 3 operators (TASK-323) ───────────────────────────
         PhysicalPlan::Sort(sort) => {
-            let child = bind_physical(&sort.input, db)?;
+            let child = bind_physical_with_cache(&sort.input, db, cohorts)?;
             Ok(Box::new(SortOperator::new(
                 child,
                 sort.keys.clone(),
@@ -516,7 +533,7 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
         }
 
         PhysicalPlan::Distinct(distinct) => {
-            let child = bind_physical(&distinct.input, db)?;
+            let child = bind_physical_with_cache(&distinct.input, db, cohorts)?;
             Ok(Box::new(DistinctOperator::new(
                 child,
                 distinct.max_groups,
@@ -525,7 +542,7 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
         }
 
         PhysicalPlan::Aggregate(agg) => {
-            let child = bind_physical(&agg.input, db)?;
+            let child = bind_physical_with_cache(&agg.input, db, cohorts)?;
             Ok(Box::new(HashAggregateOperator::new(
                 child,
                 agg.aggregates.clone(),
@@ -536,9 +553,12 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
         }
 
         PhysicalPlan::SequenceMatch(seq) => {
-            let child = bind_physical(&seq.input, db)?;
+            let child = bind_physical_with_cache(&seq.input, db, cohorts)?;
             Ok(Box::new(SequenceMatchAdapter::new(seq, child)?))
         }
+
+        // ── Wave 4 cohort runtime (TASK-437) ──────────────────────
+        PhysicalPlan::SubqueryFilter(sqf) => bind_subquery_filter(sqf, db, cohorts),
 
         // ── DDL ──────────────────────────────────────────────────
         PhysicalPlan::CreateTable(ct) => {
@@ -589,7 +609,6 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
         PhysicalPlan::Sessionize(_)
         | PhysicalPlan::EventSelect(_)
         | PhysicalPlan::Attribute(_)
-        | PhysicalPlan::SubqueryFilter(_)
         | PhysicalPlan::Sample(_)
         | PhysicalPlan::MergeSources(_) => Err(BqliteError::Execution(
             "Wave 4 operator binding is not yet implemented (TASK-438)".into(),
@@ -607,6 +626,102 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
                 .into(),
         )),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cohort materialization for SubqueryFilter (TASK-437)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-`bind_physical` cache of materialized cohorts.
+///
+/// Keyed by the inner subquery [`PhysicalPlan`]; identical inner plans
+/// share one `Arc<CohortHashSet>` per top-level execution. Two `IN alias`
+/// references that point at the same alias body — and two `IN QUERY (...)`
+/// expressions whose inner pipelines lower to structurally equal physical
+/// plans — therefore both materialize exactly once
+/// (cohorts-aliases-joins.md §2.5 + §2.11).
+///
+/// Stored as a `Vec` of `(plan, cohort)` pairs and looked up by linear
+/// scan with [`PhysicalPlan`]'s derived `PartialEq`. Realistic queries
+/// reference at most a handful of cohorts, so the linear scan is cheaper
+/// than hashing entire plan trees. If a future workload makes this a hot
+/// path, a structural-hash key for `PhysicalPlan` is a Wave 5 follow-up.
+#[derive(Default)]
+struct CohortCache {
+    entries: Vec<(PhysicalPlan, Arc<CohortHashSet>)>,
+}
+
+impl CohortCache {
+    /// Return the cached cohort for `subquery` if one is present.
+    fn get(&self, subquery: &PhysicalPlan) -> Option<Arc<CohortHashSet>> {
+        self.entries
+            .iter()
+            .find(|(plan, _)| plan == subquery)
+            .map(|(_, c)| Arc::clone(c))
+    }
+
+    /// Install a freshly materialized cohort under `subquery`'s key.
+    fn insert(&mut self, subquery: PhysicalPlan, cohort: Arc<CohortHashSet>) {
+        self.entries.push((subquery, cohort));
+    }
+}
+
+/// Bind a [`SubqueryFilterPhysical`] — materialize its inner subquery
+/// at query start (cohorts-aliases-joins.md §4.2), wire the resulting
+/// `Arc<CohortHashSet>` into a [`SubqueryFilterOperator`], and recurse
+/// into the outer input.
+///
+/// Cycle detection is handled at plan time by `resolve_alias` in
+/// `crates/bqlite-planner/src/logical.rs`; by the time a `PhysicalPlan`
+/// reaches the engine bind step it is guaranteed cycle-free, so the
+/// runtime walk does not need to defend against infinite recursion.
+fn bind_subquery_filter(
+    sqf: &SubqueryFilterPhysical,
+    db: &mut Database,
+    cohorts: &mut CohortCache,
+) -> Result<Box<dyn PhysicalOperator>> {
+    let cohort = match cohorts.get(&sqf.subquery) {
+        Some(existing) => existing,
+        None => {
+            // Materialize: bind the inner subquery (which may itself
+            // contain SubqueryFilter — those recursive cohort lookups
+            // share the same cache, so nested cohorts also materialize
+            // once per top-level execution).
+            let mut op = bind_physical_with_cache(&sqf.subquery, db, cohorts)?;
+            let drive_result = drive_cohort_subquery(op.as_mut());
+            // Match `Engine::query`'s "primary error wins" cleanup
+            // convention: close the inner operator on both happy and
+            // sad paths so file handles release promptly.
+            let close_result = op.close();
+            let batches = drive_result?;
+            close_result?;
+            let cohort = Arc::new(CohortHashSet::from_batches(
+                sqf.subquery.output_schema(),
+                batches,
+            )?);
+            cohorts.insert((*sqf.subquery).clone(), Arc::clone(&cohort));
+            cohort
+        }
+    };
+
+    let child = bind_physical_with_cache(&sqf.input, db, cohorts)?;
+    Ok(Box::new(SubqueryFilterOperator::new(
+        child,
+        sqf.lhs_columns.clone(),
+        cohort,
+    )?))
+}
+
+/// Open a freshly bound subquery operator and pull every batch into a
+/// `Vec<RecordBatch>`. The caller is responsible for `close` on both
+/// the happy and sad paths.
+fn drive_cohort_subquery(op: &mut dyn PhysicalOperator) -> Result<Vec<RecordBatch>> {
+    op.open()?;
+    let mut batches = Vec::new();
+    while let Some(b) = op.next_batch()? {
+        batches.push(b);
+    }
+    Ok(batches)
 }
 
 fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOperator>> {
@@ -1312,5 +1427,255 @@ mod tests {
             total_count, 2,
             "COUNT(*) of matched entities must equal 2 (alice + carol)"
         );
+    }
+
+    // ── TASK-437: cohort SubqueryFilter end-to-end through Engine::query ──
+
+    /// Helper: collect every value from the leftmost column of the
+    /// result, downcast to `StringViewArray`.
+    fn collect_first_string_col(result: &crate::ExecutionResult) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for batch in &result.rows {
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .expect("first column must be StringView");
+            for i in 0..arr.len() {
+                out.push(arr.value(i).to_owned());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn cohort_in_query_single_column_filters_outer_rows() {
+        // Inner cohort: entities that ever performed a 'click'.
+        // Outer: every event whose entity_id is in the cohort.
+        // Expected entities: alice + carol (bob never clicks).
+        let scratch = Scratch::new("cohort-single-col");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 1), \
+                 ('alice', 1700000000050000000, 'view',  2), \
+                 ('bob',   1700000000100000000, 'view',  3), \
+                 ('carol', 1700000000200000000, 'click', 4), \
+                 ('dave',  1700000000300000000, 'view',  5)",
+                &mut db,
+            )
+            .expect("insert");
+
+        let result = engine
+            .query(
+                "events | where user_id in query (\
+                     events | where event_type = 'click' | select user_id\
+                 )",
+                &mut db,
+            )
+            .expect("cohort query");
+
+        let entities = collect_first_string_col(&result);
+        // alice (2 events) + carol (1 event) — sorted+deduped vector
+        // contains the unique surviving entity ids.
+        let mut unique: Vec<String> = entities.clone();
+        unique.dedup();
+        assert_eq!(unique, vec!["alice".to_string(), "carol".to_string()]);
+        // Total surviving rows: alice has 2, carol has 1 → 3 rows.
+        assert_eq!(result.row_count(), 3);
+    }
+
+    #[test]
+    fn cohort_in_query_two_column_tuple_filters_outer_rows() {
+        // Inner cohort: (user_id, event_type) tuples where amount >= 3.
+        // Outer: only rows whose (user_id, event_type) tuple appears in
+        // that cohort.
+        let scratch = Scratch::new("cohort-tuple");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 1), \
+                 ('alice', 1700000000050000000, 'view',  5), \
+                 ('bob',   1700000000100000000, 'view',  2), \
+                 ('carol', 1700000000200000000, 'click', 4), \
+                 ('carol', 1700000000300000000, 'view',  1)",
+                &mut db,
+            )
+            .expect("insert");
+
+        let result = engine
+            .query(
+                "events | where (user_id, event_type) in query (\
+                     events | where amount >= 3 | select user_id, event_type\
+                 )",
+                &mut db,
+            )
+            .expect("tuple cohort query");
+
+        // Cohort contains (alice, view) and (carol, click).
+        // alice's 'view' row survives; carol's 'click' row survives;
+        // alice's 'click', bob's 'view', carol's 'view' do not.
+        let entities = collect_first_string_col(&result);
+        assert_eq!(entities, vec!["alice".to_string(), "carol".to_string()]);
+    }
+
+    #[test]
+    fn cohort_in_alias_resolves_and_filters() {
+        // Same semantics as the single-column IN QUERY case, but
+        // expressed via an alias definition (cohorts-aliases-joins.md
+        // §2.1, §2.11).
+        let scratch = Scratch::new("cohort-alias");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 1), \
+                 ('bob',   1700000000100000000, 'view',  2), \
+                 ('carol', 1700000000200000000, 'click', 3)",
+                &mut db,
+            )
+            .expect("insert");
+
+        let result = engine
+            .query(
+                "clickers = events | where event_type = 'click' | select user_id\n\
+                 events | where user_id in clickers",
+                &mut db,
+            )
+            .expect("alias query");
+
+        let mut entities = collect_first_string_col(&result);
+        entities.dedup();
+        assert_eq!(entities, vec!["alice".to_string(), "carol".to_string()]);
+    }
+
+    #[test]
+    fn cohort_empty_inner_subquery_filters_everything_out() {
+        // Inner cohort matches zero rows → outer must be empty (the
+        // empty-cohort short-circuit in `SubqueryFilterOperator`).
+        let scratch = Scratch::new("cohort-empty");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 1), \
+                 ('bob',   1700000000100000000, 'view',  2)",
+                &mut db,
+            )
+            .expect("insert");
+
+        let result = engine
+            .query(
+                "events | where user_id in query (\
+                     events | where event_type = 'never_seen' | select user_id\
+                 )",
+                &mut db,
+            )
+            .expect("empty cohort query");
+
+        assert_eq!(result.row_count(), 0);
+    }
+
+    #[test]
+    fn cohort_unknown_alias_errors_at_plan_time() {
+        // `IN <alias>` references must resolve at plan time
+        // (cohorts-aliases-joins.md §2.3) — undefined alias surfaces as
+        // a Plan error before the engine starts execution.
+        let scratch = Scratch::new("cohort-undef-alias");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        match engine.query("events | where user_id in ghost", &mut db) {
+            Err(BqliteError::Plan(msg)) => {
+                assert!(
+                    msg.contains("ghost"),
+                    "error should name the unknown alias: {msg}"
+                );
+            }
+            other => panic!("expected Plan error for undefined alias, got {other:?}"),
+        }
+    }
+
+    /// Direct unit test of the cache hit path: install one cohort,
+    /// then look it up via a *separate, structurally equal* clone of
+    /// the same `PhysicalPlan`. The cache must return `Some` and the
+    /// returned `Arc` must point at the same allocation as the one
+    /// installed (Arc::ptr_eq) — proving the two references collapse
+    /// to one materialization, not two separate but equal sets.
+    #[test]
+    fn cohort_cache_get_returns_arc_for_equal_plan() {
+        let scratch = Scratch::new("cohort-cache-direct");
+        let db = create_db_with_bootstrap(scratch.path());
+
+        // Build a trivial PhysicalPlan: a `Scan` of the bootstrap
+        // events table. `PhysicalPlan` derives `PartialEq`, so two
+        // independently constructed `Scan` descriptors with the same
+        // table name compare equal.
+        let mut stmts = bqlite_parser::parse("events").expect("parse events");
+        let stmt = stmts.remove(0);
+        let plan_a = {
+            let cat = db.catalog();
+            plan(stmt, &cat, 0).expect("plan A")
+        };
+        let mut stmts2 = bqlite_parser::parse("events").expect("parse events");
+        let stmt2 = stmts2.remove(0);
+        let plan_b = {
+            let cat = db.catalog();
+            plan(stmt2, &cat, 0).expect("plan B")
+        };
+        assert_eq!(
+            plan_a, plan_b,
+            "two `events` scans must be structurally equal for the cache test"
+        );
+
+        let cohort = Arc::new(CohortHashSet::empty(1));
+        let mut cache = CohortCache::default();
+        cache.insert(plan_a, Arc::clone(&cohort));
+
+        let fetched = cache.get(&plan_b).expect("equal plan must hit the cache");
+        assert!(
+            Arc::ptr_eq(&fetched, &cohort),
+            "cache hit must return the same Arc allocation, not a fresh one"
+        );
+    }
+
+    /// Validate that two `IN alias` references against the same alias
+    /// behave identically. End-to-end correctness leg of the cache; the
+    /// `Arc::ptr_eq` guarantee is pinned by
+    /// `cohort_cache_get_returns_arc_for_equal_plan` above.
+    #[test]
+    fn cohort_alias_referenced_twice_produces_consistent_results() {
+        let scratch = Scratch::new("cohort-alias-twice");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice', 1700000000000000000, 'click', 1), \
+                 ('bob',   1700000000100000000, 'view',  2), \
+                 ('carol', 1700000000200000000, 'click', 3)",
+                &mut db,
+            )
+            .expect("insert");
+
+        // The terminal pipeline references the alias twice via an
+        // AND'd predicate so the same cohort must be probed twice.
+        let result = engine
+            .query(
+                "clickers = events | where event_type = 'click' | select user_id\n\
+                 events | where user_id in clickers and user_id in clickers",
+                &mut db,
+            )
+            .expect("alias-twice query");
+
+        let mut entities = collect_first_string_col(&result);
+        entities.dedup();
+        assert_eq!(entities, vec!["alice".to_string(), "carol".to_string()]);
     }
 }
