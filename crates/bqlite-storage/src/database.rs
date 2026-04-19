@@ -728,11 +728,6 @@ impl Database {
     /// See [`Manifest::replace_segments`] for the full error taxonomy
     /// (unknown table, unknown window, shard out of range, missing
     /// input id, duplicate output id).
-    //
-    // CP2 of TASK-408 lands this primitive; CP3 wires `compact_one`
-    // to it. The non-test lib build has no caller yet, so silence
-    // dead_code until CP3 lands.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn replace_segments(
         &mut self,
         table_name: &str,
