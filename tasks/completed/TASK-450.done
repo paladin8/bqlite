@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-450",
   "claimed_at": "2026-04-19T19:21:38Z",
+  "completed_at": "2026-04-19T19:46:23Z",
   "branch": "task/TASK-450",
   "description": "PFOR encoding"
 }
