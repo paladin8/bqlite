@@ -1,7 +1,0 @@
-{
-  "agent_id": "agent-1",
-  "task_id": "TASK-449",
-  "claimed_at": "2026-04-13T04:49:24Z",
-  "branch": "task/TASK-449",
-  "description": "Parquet ingest path"
-}
