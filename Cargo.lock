@@ -472,6 +472,7 @@ dependencies = [
  "bqlite-core",
  "bqlite-planner",
  "bqlite-storage",
+ "compact_str",
  "smallvec",
  "thiserror 2.0.18",
 ]

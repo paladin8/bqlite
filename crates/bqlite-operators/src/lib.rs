@@ -51,6 +51,7 @@
 //! [`bqlite_planner::compiled::CompiledExpr`].
 
 pub mod aggregate;
+pub mod attribute;
 pub mod distinct;
 pub mod encoded_filter;
 pub mod eval;
@@ -69,6 +70,10 @@ pub mod sort;
 pub use aggregate::{
     Accumulator, AggState, GroupKey, HashAccumulator, HashAggregateOperator, SumState,
     DEFAULT_MAX_GROUPS,
+};
+pub use attribute::{
+    AttributeOperator, AttributeState, EntityCapDiagnostic, ATTRIBUTE_OP_NAME,
+    DEFAULT_ATTRIBUTE_DEQUE_CAP,
 };
 pub use distinct::DistinctOperator;
 pub use encoded_filter::{

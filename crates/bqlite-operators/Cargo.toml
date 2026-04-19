@@ -12,6 +12,7 @@ bqlite-storage = { workspace = true }
 bqlite-planner = { workspace = true }
 ahash = { workspace = true }
 arrow = { workspace = true }
+compact_str = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 
