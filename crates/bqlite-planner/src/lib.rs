@@ -349,15 +349,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_joins_on_source() {
+    fn rejects_joins_on_unknown_table() {
+        // With TASK-425 CP5a, source JOINs are supported — but only against
+        // tables that exist in the catalog. A JOIN against a non-existent
+        // table surfaces the catalog's unknown-table error, which is the
+        // right shape for this test post-Wave-4.
         let catalog = InMemoryCatalog::default().with(events_schema());
         let mut pipeline = bare_pipeline("events");
         pipeline.source.joins.push(table_ref("other"));
         match plan(Statement::Query(pipeline), &catalog, 0) {
             Err(BqliteError::Plan(msg)) => {
-                assert!(msg.contains("JOIN"), "got: {msg}");
+                assert!(msg.contains("other"), "got: {msg}");
+                assert!(msg.contains("unknown table"), "got: {msg}");
             }
-            other => panic!("expected Plan error for joins, got {other:?}"),
+            other => panic!("expected Plan error for unknown JOIN target, got {other:?}"),
         }
     }
 

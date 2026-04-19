@@ -1184,27 +1184,61 @@ fn lower_statement_with_aliases(
 /// then fold pipeline stages left-to-right so the deepest node in
 /// the final tree is the scan and the shallowest node is the last
 /// stage.
+/// Name of the planner-injected discriminator column that tags rows emitted
+/// by a joined-source scan with the ordinal position of the table they came
+/// from (0 = primary, 1..N = joined tables in source order). Per
+/// `docs/design/language/cohorts-aliases-joins.md` §3.8. The spec names the
+/// type `Int8`; `BqlType` has no `Int8` so we use `Int` here (the Arrow
+/// layer may narrow when materializing).
+pub const SOURCE_TABLE_ID_COLUMN: &str = "__source_table_id";
+
 fn lower_query_pipeline(
     pipeline: Pipeline,
     catalog: &dyn Catalog,
     aliases: &AliasTable,
 ) -> Result<LogicalPlan> {
-    if !pipeline.source.joins.is_empty() {
-        return Err(BqliteError::Plan(
-            "JOIN clauses are deferred to Wave 4 (TASK-407 cohorts / entity-joins)".into(),
-        ));
-    }
+    // Resolve the primary table against the catalog.
+    let primary_name = pipeline.source.primary.name.text.as_str();
+    let primary_schema = catalog.resolve_table(primary_name)?;
 
-    // Resolve the source table against the catalog.
-    let table_name = pipeline.source.primary.name.text.as_str();
-    let table_schema = catalog.resolve_table(table_name)?;
+    // Resolve each joined table and validate entity-key type compatibility
+    // per cohorts-aliases-joins.md §3.11. Self-joins are rejected at the
+    // parser (TASK-452) and re-guarded here defensively.
+    let mut joined_schemas: Vec<TableSchema> = Vec::with_capacity(pipeline.source.joins.len());
+    for joined_ref in &pipeline.source.joins {
+        let joined_name = joined_ref.name.text.as_str();
+        if joined_name == primary_name || joined_schemas.iter().any(|t| t.name() == joined_name) {
+            return Err(BqliteError::Plan(format!(
+                "JOIN `{joined_name}` is a self-join — self-joins are forbidden \
+                 (query-language.md §19.2)"
+            )));
+        }
+        let joined = catalog.resolve_table(joined_name)?;
+        let primary_ek = &primary_schema.entity_key_column().bql_type;
+        let joined_ek = &joined.entity_key_column().bql_type;
+        if primary_ek != joined_ek {
+            return Err(BqliteError::Plan(format!(
+                "JOIN entity-key type mismatch: primary `{primary_name}` has \
+                 `{primary_ek}`, joined `{joined_name}` has `{joined_ek}` \
+                 (cohorts-aliases-joins.md §3.11)"
+            )));
+        }
+        joined_schemas.push(joined);
+    }
 
     // Build the initial Scan. Time range carries through from the
     // AST's `source.time_range` field — the parser already decodes
     // `LAST <duration>` into nanoseconds and `BETWEEN ... AND ...`
     // into `(String, String)` (query-language.md §16).
-    let mut plan =
-        LogicalPlan::scan_with_time_range(table_schema.clone(), pipeline.source.time_range);
+    let mut plan = if joined_schemas.is_empty() {
+        LogicalPlan::scan_with_time_range(primary_schema.clone(), pipeline.source.time_range)
+    } else {
+        build_joined_scan(
+            primary_schema.clone(),
+            joined_schemas,
+            pipeline.source.time_range,
+        )?
+    };
 
     // Function registry for expression-level type checking. Wave 2
     // ships the built-in set (`like`, `regex`); later waves extend
@@ -1214,10 +1248,82 @@ fn lower_query_pipeline(
     // Fold pipeline stages in order. Each stage wraps `plan` in a
     // new logical node whose input is the previous `plan`.
     for stage in pipeline.stages {
-        plan = fold_stage(stage, plan, &registry, catalog, &table_schema, aliases)?;
+        plan = fold_stage(stage, plan, &registry, catalog, &primary_schema, aliases)?;
     }
 
     Ok(plan)
+}
+
+/// Build a [`LogicalPlan::Scan`] for an entity-aligned multi-table source.
+///
+/// Combined output schema (cohorts-aliases-joins.md §3.8):
+/// - Each user column from every joined table (primary first, then joins in
+///   source order) is named `<table>.<column>`. Bare references
+///   (`Expr::Column("user_id")`) therefore cannot resolve in joined contexts —
+///   users must write `purchases.user_id` / `logins.user_id`, matching the
+///   mandatory-qualification rule of §3.11.
+/// - A `__source_table_id: Int NOT NULL` discriminator is appended so
+///   downstream operators can route rows back to their originating table.
+/// - System columns (`__seq_id`, `__batch_id`) keep their bare names — they
+///   are shared across all joined rows.
+///
+/// Entity-key type compatibility is verified by the caller.
+fn build_joined_scan(
+    primary: TableSchema,
+    joined: Vec<TableSchema>,
+    time_range: Option<TimeRange>,
+) -> Result<LogicalPlan> {
+    let mut cols: Vec<ColumnDef> = Vec::new();
+
+    // Per-table non-system columns, qualified with `<table>.<column>`.
+    for col in primary.columns() {
+        if col.is_system() {
+            continue;
+        }
+        cols.push(ColumnDef {
+            name: format!("{}.{}", primary.name(), col.name),
+            bql_type: col.bql_type.clone(),
+            nullable: col.nullable,
+            default_value: col.default_value.clone(),
+        });
+    }
+    for t in &joined {
+        for col in t.columns() {
+            if col.is_system() {
+                continue;
+            }
+            cols.push(ColumnDef {
+                name: format!("{}.{}", t.name(), col.name),
+                bql_type: col.bql_type.clone(),
+                nullable: col.nullable,
+                default_value: col.default_value.clone(),
+            });
+        }
+    }
+
+    // Discriminator + shared system columns.
+    cols.push(ColumnDef::required(SOURCE_TABLE_ID_COLUMN, BqlType::Int));
+    cols.push(ColumnDef::required(
+        bqlite_core::schema::SEQ_ID_COLUMN,
+        BqlType::Int,
+    ));
+    cols.push(ColumnDef::required(
+        bqlite_core::schema::BATCH_ID_COLUMN,
+        BqlType::Int,
+    ));
+
+    let output_schema = OperatorSchema::new(cols)?;
+
+    Ok(LogicalPlan::Scan {
+        table: primary,
+        time_range,
+        reader_backward_ns: 0,
+        reader_forward_ns: 0,
+        joined_tables: joined,
+        scan_predicates: Vec::new(),
+        projected_columns: Vec::new(),
+        output_schema,
+    })
 }
 
 /// Fold a single AST pipeline stage into the accumulated plan.
@@ -1636,10 +1742,33 @@ fn lower_select(
                 }
             }
 
-            SelectItemKind::QualifiedWildcard(_) => {
-                return Err(BqliteError::Plan(
-                    "qualified wildcards `table.*` are deferred to Wave 4 joins (TASK-407)".into(),
-                ));
+            SelectItemKind::QualifiedWildcard(table) => {
+                // Expand `table.*` by emitting one ProjectItem per column
+                // in the combined schema whose name starts with `<table>.`.
+                // Only meaningful in joined-source pipelines; in a single-
+                // table pipeline the schema has bare names and no matches
+                // exist — we surface that as a clear error.
+                let prefix = format!("{}.", table.text);
+                let mut any_matched = false;
+                for (column_index, col) in input_schema.columns().iter().enumerate() {
+                    if col.is_system() {
+                        continue;
+                    }
+                    if col.name.starts_with(&prefix) {
+                        any_matched = true;
+                        project_items.push(ProjectItem {
+                            expr: TypedExpr::column(column_index, col, item.span),
+                            output_name: col.name.clone(),
+                        });
+                    }
+                }
+                if !any_matched {
+                    return Err(BqliteError::Plan(format!(
+                        "qualified wildcard `{prefix}*` did not match any columns — \
+                         `{table_name}` is not a joined source table, or it exposes no user columns",
+                        table_name = table.text
+                    )));
+                }
             }
 
             SelectItemKind::Expr(expr) => {
@@ -3836,7 +3965,10 @@ mod tests {
     }
 
     #[test]
-    fn join_clauses_rejected_until_wave_4() {
+    fn join_unknown_table_rejected_via_catalog() {
+        // Post-CP5a: source JOINs are supported, but each joined table must
+        // exist in the catalog. An unknown target surfaces the standard
+        // unknown-table error rather than a blanket "JOINs deferred" message.
         let cat = InMemoryCatalog::default().with(purchases_schema());
         let mut pipeline = bare_pipeline("purchases");
         pipeline.source.joins.push(TableRef {
@@ -3845,7 +3977,10 @@ mod tests {
         });
         let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
         match err {
-            BqliteError::Plan(msg) => assert!(msg.contains("JOIN")),
+            BqliteError::Plan(msg) => {
+                assert!(msg.contains("other"), "got: {msg}");
+                assert!(msg.contains("unknown table"), "got: {msg}");
+            }
             other => panic!("expected Plan error, got {other:?}"),
         }
     }
@@ -7448,6 +7583,280 @@ mod tests {
         let cat = InMemoryCatalog::default().with(purchases_schema());
         let err = lower_statements(vec![define_alias("vip", vip_alias_body())], &cat).unwrap_err();
         assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("terminal")));
+    }
+
+    // ── Wave 4 CP5a: Entity-aligned source JOIN logical path ──────────────
+
+    fn logins_schema() -> TableSchema {
+        TableSchema::new(
+            "logins",
+            vec![
+                CoreColumnDef::required("user_id", BqlType::String),
+                CoreColumnDef::required("ts", BqlType::Timestamp),
+                CoreColumnDef::required("event", BqlType::String),
+                CoreColumnDef::nullable("device", BqlType::String),
+            ],
+            "user_id",
+            "ts",
+            "event",
+        )
+        .unwrap()
+    }
+
+    fn clicks_schema_int_entity_key() -> TableSchema {
+        TableSchema::new(
+            "clicks",
+            vec![
+                CoreColumnDef::required("user_id", BqlType::Int), // different entity-key type
+                CoreColumnDef::required("ts", BqlType::Timestamp),
+                CoreColumnDef::required("event", BqlType::String),
+            ],
+            "user_id",
+            "ts",
+            "event",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bare_pipeline_without_joins_still_lowers_to_plain_scan() {
+        // Regression: the single-table path must remain unchanged in both
+        // schema shape and `joined_tables` emptiness.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let plan = lower_statement(Statement::Query(bare_pipeline("purchases")), &cat).unwrap();
+        let LogicalPlan::Scan {
+            joined_tables,
+            output_schema,
+            ..
+        } = plan
+        else {
+            panic!("expected Scan");
+        };
+        assert!(joined_tables.is_empty());
+        // Column names are bare — not dotted.
+        let names: Vec<&str> = output_schema
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(names.contains(&"user_id"));
+        assert!(names.contains(&"amount"));
+    }
+
+    #[test]
+    fn joined_pipeline_lowers_with_combined_schema_and_discriminator() {
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(logins_schema());
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.joins.push(TableRef {
+            name: Name::synthetic("logins"),
+            span: Span::EMPTY,
+        });
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        let LogicalPlan::Scan {
+            joined_tables,
+            output_schema,
+            ..
+        } = plan
+        else {
+            panic!("expected Scan");
+        };
+        assert_eq!(joined_tables.len(), 1);
+        assert_eq!(joined_tables[0].name(), "logins");
+        // Column names are dotted; __source_table_id is present.
+        let names: Vec<&str> = output_schema
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(names.contains(&"purchases.user_id"));
+        assert!(names.contains(&"purchases.amount"));
+        assert!(names.contains(&"logins.user_id"));
+        assert!(names.contains(&"logins.device"));
+        assert!(names.contains(&SOURCE_TABLE_ID_COLUMN));
+        // __source_table_id is NOT NULL and Int.
+        let (_, stid) = output_schema.column(SOURCE_TABLE_ID_COLUMN).unwrap();
+        assert_eq!(stid.bql_type, BqlType::Int);
+        assert!(!stid.nullable);
+    }
+
+    #[test]
+    fn joined_pipeline_entity_key_type_mismatch_rejected() {
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(clicks_schema_int_entity_key());
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.joins.push(TableRef {
+            name: Name::synthetic("clicks"),
+            span: Span::EMPTY,
+        });
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("entity-key type mismatch")));
+    }
+
+    #[test]
+    fn joined_pipeline_self_join_rejected_at_logical() {
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.joins.push(TableRef {
+            name: Name::synthetic("purchases"),
+            span: Span::EMPTY,
+        });
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("self-join")));
+    }
+
+    #[test]
+    fn joined_pipeline_qualified_reference_resolves() {
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(logins_schema());
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.joins.push(TableRef {
+            name: Name::synthetic("logins"),
+            span: Span::EMPTY,
+        });
+        // `| WHERE purchases.amount > 100` — qualified reference resolves
+        // via the dotted column in the combined schema.
+        let predicate = Spanned::new(
+            Expr::Compare {
+                op: bqlite_ast::CompareOp::Greater,
+                left: Box::new(Spanned::new(
+                    Expr::Qualified {
+                        table: Name::synthetic("purchases"),
+                        column: Name::synthetic("amount"),
+                    },
+                    Span::EMPTY,
+                )),
+                right: Box::new(Spanned::new(Expr::Literal(Literal::Int(100)), Span::EMPTY)),
+            },
+            Span::EMPTY,
+        );
+        pipeline.stages.push(PipelineStage::Where {
+            predicate,
+            span: Span::EMPTY,
+        });
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        assert!(matches!(plan, LogicalPlan::Filter { .. }));
+    }
+
+    #[test]
+    fn joined_pipeline_bare_reference_fails_with_unknown_column() {
+        // In a joined pipeline, bare `Expr::Column("amount")` does not
+        // resolve because the combined schema only exposes `purchases.amount`.
+        // This enforces the mandatory-qualification rule (cohorts-aliases-
+        // joins.md §3.11) via the existing unknown-column error.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(logins_schema());
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.joins.push(TableRef {
+            name: Name::synthetic("logins"),
+            span: Span::EMPTY,
+        });
+        let predicate = Spanned::new(
+            Expr::Compare {
+                op: bqlite_ast::CompareOp::Greater,
+                left: Box::new(column_expr("amount")),
+                right: Box::new(Spanned::new(Expr::Literal(Literal::Int(100)), Span::EMPTY)),
+            },
+            Span::EMPTY,
+        );
+        pipeline.stages.push(PipelineStage::Where {
+            predicate,
+            span: Span::EMPTY,
+        });
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(msg) if msg.contains("unknown column") && msg.contains("amount"))
+        );
+    }
+
+    #[test]
+    fn joined_pipeline_qualified_wildcard_expands() {
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(logins_schema());
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.joins.push(TableRef {
+            name: Name::synthetic("logins"),
+            span: Span::EMPTY,
+        });
+        pipeline.stages.push(PipelineStage::Select {
+            distinct: false,
+            items: vec![SelectItem {
+                kind: SelectItemKind::QualifiedWildcard(Name::synthetic("logins")),
+                alias: None,
+                span: Span::EMPTY,
+            }],
+            span: Span::EMPTY,
+        });
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        let LogicalPlan::Project { expressions, .. } = plan else {
+            panic!("expected Project");
+        };
+        let names: Vec<&str> = expressions.iter().map(|i| i.output_name.as_str()).collect();
+        // logins has user_id, ts, event, device (all non-system).
+        assert_eq!(
+            names,
+            vec![
+                "logins.user_id",
+                "logins.ts",
+                "logins.event",
+                "logins.device"
+            ]
+        );
+    }
+
+    #[test]
+    fn joined_pipeline_attribute_widens_reader_on_joined_scan() {
+        // `purchases JOIN logins LAST 1d | ATTRIBUTE ... window: 7d` — the
+        // ATTRIBUTE stage applies window extension to the combined scan.
+        // The single `reader_backward_ns` field on Scan applies uniformly to
+        // every joined sub-scan when CP5b fans it out.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(logins_schema());
+        let ns_1d: i64 = 86_400 * 1_000_000_000;
+        let ns_7d: i64 = 7 * ns_1d;
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.joins.push(TableRef {
+            name: Name::synthetic("logins"),
+            span: Span::EMPTY,
+        });
+        pipeline.source.time_range = Some(TimeRange::Last(ns_1d));
+        // touchpoint_key references a qualified column from the joined table.
+        pipeline
+            .stages
+            .push(PipelineStage::Attribute(bqlite_ast::Attribute {
+                conversion: vec![event_ref("purchase")],
+                touchpoints: vec![event_ref("login")],
+                window: ns_7d,
+                touchpoint_key: Spanned::new(
+                    Expr::Qualified {
+                        table: Name::synthetic("logins"),
+                        column: Name::synthetic("device"),
+                    },
+                    Span::EMPTY,
+                ),
+                span: Span::EMPTY,
+            }));
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        let LogicalPlan::Attribute { input, .. } = plan else {
+            panic!("expected Attribute");
+        };
+        match *input {
+            LogicalPlan::Scan {
+                reader_backward_ns,
+                joined_tables,
+                ..
+            } => {
+                assert_eq!(reader_backward_ns, ns_7d);
+                assert_eq!(joined_tables.len(), 1);
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
     }
 
     #[test]
