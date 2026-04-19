@@ -110,7 +110,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::BooleanArray;
+use arrow::array::{ArrayRef, BooleanArray};
 use arrow::compute::{self, kernels::boolean};
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
@@ -1225,6 +1225,636 @@ fn column_name(expr: &CompiledExpr) -> Option<String> {
     match &expr.node {
         CompiledNode::Column { name, .. } => Some(name.clone()),
         _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MergeSourcesOperator — joined-source scan runtime (TASK-436)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Runtime operator for `PhysicalPlan::MergeSources`.
+///
+/// Owns `N` child [`PhysicalOperator`]s (one per joined sub-table,
+/// typically each a [`ScanOperator`]), performs a k-way merge over
+/// their `(entity_key, ts)`-ordered outputs, and emits rows in the
+/// combined schema declared by
+/// `bqlite_planner::physical::MergeSourcesPhysical`.
+///
+/// ## Order
+///
+/// Rows are emitted in `(entity_key_value, ts, scan_idx)` order. The
+/// `scan_idx` tiebreaker realises the `table_order` position in the
+/// canonical `(entity_id, ts, table_order, __seq_id)` key from
+/// `cohorts-aliases-joins.md` §3.2; the final `__seq_id` component is
+/// preserved implicitly by each sub-scan's own internal ordering.
+///
+/// ## Output shape
+///
+/// The combined schema (`cohorts-aliases-joins.md` §3.8) carries
+/// qualified column names `<table>.<col>` for every non-system column
+/// of every sub-table, plus a non-nullable `__source_table_id: Int64`
+/// discriminator and (when any sub-scan emits them) the shared system
+/// columns `__seq_id` / `__batch_id`. For a given output row picked
+/// from sub-scan `i`, columns contributed by sub-scan `i` carry the
+/// picked row's values and every other column is null.
+///
+/// ## SAMPLE
+///
+/// Entity-level SAMPLE is applied inside each sub-scan's own
+/// [`ScanOperator`] (via `SampleFilter` pushed down by the planner's
+/// `pushdown_sample` pass — TASK-430 + TASK-436 CP1). The merged
+/// output is therefore correctly restricted to sampled entities by
+/// composition: each sub-scan already drops non-sampled rows before
+/// this operator sees them, and §3.4 guarantees the atomic
+/// cross-table entity set (identical entity-id bytes → identical
+/// xxHash64 → identical threshold result across tables).
+pub struct MergeSourcesOperator {
+    /// Per-sub-scan state: child op + current batch + cursor + exhaustion flag.
+    subs: Vec<SubSource>,
+    /// Combined output schema.
+    output_schema: OperatorSchema,
+    /// Arrow form of `output_schema`, used for building output batches.
+    arrow_schema: Arc<ArrowSchema>,
+    /// Per-sub-scan descriptor: column indices + col_map + reverse_col_map.
+    descriptors: Vec<SubSourceDesc>,
+    /// Table id values, indexed by `scan_idx`. `__source_table_id` is
+    /// constructed from picked (`scan_idx`) values via this array.
+    table_id_values: Vec<i64>,
+    /// Index in `arrow_schema` of the `__source_table_id` column, or
+    /// `None` if the combined schema has no such column (degenerate
+    /// test fixtures for simpler combined schemas may omit it; the
+    /// planner always includes it for real queries per §3.8).
+    source_table_id_col: Option<usize>,
+    /// Heap entries sorted by `(entity_key, ts, scan_idx)`.
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<JoinedHeapEntry>>,
+    /// Target row count per emitted output batch.
+    batch_target_rows: usize,
+    /// Latched once every sub-scan is drained.
+    exhausted: bool,
+    /// Cancellation token checked at the top of each `next_batch`.
+    cancel: CancellationToken,
+    /// True once `open()` has been called. Resets on `close()`.
+    opened: bool,
+}
+
+/// Default output batch size for [`MergeSourcesOperator`].
+///
+/// Matches [`bqlite_storage::segment::merge::DEFAULT_MERGE_BATCH_ROWS`]
+/// so downstream consumers see the same row cadence a single-table
+/// merge produces.
+pub const MERGE_SOURCES_BATCH_ROWS: usize = 65_536;
+
+/// Per-sub-scan descriptor — resolved once at construction.
+#[derive(Debug, Clone)]
+struct SubSourceDesc {
+    /// Column index of this sub-scan's entity-key column in its own
+    /// output batch.
+    entity_key_col: usize,
+    /// Column index of this sub-scan's timestamp column in its own
+    /// output batch.
+    ts_col: usize,
+    /// Forward mapping: for each column `j` of this sub-scan's output
+    /// schema, `col_map[j]` is the index of the corresponding column
+    /// in the combined output schema, or `None` when the sub-scan
+    /// column does not appear in the combined schema.
+    #[allow(dead_code)]
+    col_map: Vec<Option<usize>>,
+    /// Reverse mapping: for each output column `c` in the combined
+    /// schema, `reverse_col_map[c]` is the sub-scan's column index
+    /// that feeds it, or `None` when this sub-scan does not
+    /// contribute to `c`. Precomputed in `new()` to keep the
+    /// `build_output_batch` loop O(n_sub × n_out_cols) instead of
+    /// O(n_sub × n_out_cols × sub_cols).
+    reverse_col_map: Vec<Option<usize>>,
+}
+
+/// Per-sub-scan mutable state.
+struct SubSource {
+    /// Child operator. Emits rows in `(entity_key, ts, __seq_id)` order.
+    op: Box<dyn PhysicalOperator>,
+    /// Currently-loaded batch from the child. `None` means we need to
+    /// pull a new batch, or the child is exhausted.
+    batch: Option<RecordBatch>,
+    /// Row index into `batch` for the next pick.
+    cursor: usize,
+    /// True once `op.next_batch()` has returned `Ok(None)`.
+    exhausted: bool,
+}
+
+/// Heap entry: one row from one sub-scan, ready to be picked.
+struct JoinedHeapEntry {
+    scan_idx: usize,
+    row_idx: usize,
+    entity_key: bqlite_storage::segment::merge::EntityKeyValue,
+    ts_nanos: i64,
+}
+
+impl Ord for JoinedHeapEntry {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.entity_key
+            .cmp(&other.entity_key)
+            .then_with(|| self.ts_nanos.cmp(&other.ts_nanos))
+            .then_with(|| self.scan_idx.cmp(&other.scan_idx))
+            .then_with(|| self.row_idx.cmp(&other.row_idx))
+    }
+}
+impl PartialOrd for JoinedHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for JoinedHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for JoinedHeapEntry {}
+
+impl std::fmt::Debug for MergeSourcesOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergeSourcesOperator")
+            .field("sub_count", &self.subs.len())
+            .field("table_id_values", &self.table_id_values)
+            .field("batch_target_rows", &self.batch_target_rows)
+            .field("exhausted", &self.exhausted)
+            .field("opened", &self.opened)
+            .finish()
+    }
+}
+
+impl MergeSourcesOperator {
+    /// Construct a `MergeSourcesOperator`.
+    ///
+    /// # Arguments
+    ///
+    /// - `sub_ops` — one child operator per sub-table, in JOIN source
+    ///   order. Each must emit rows in `(entity_key, ts)` order.
+    /// - `sub_entity_key_cols` — parallel to `sub_ops`. Names of each
+    ///   sub-scan's entity-key column (table-local; may differ across
+    ///   tables per `cohorts-aliases-joins.md` §3.6).
+    /// - `sub_ts_cols` — parallel to `sub_ops`. Names of each
+    ///   sub-scan's timestamp column.
+    /// - `output_schema` — the combined schema declared by the
+    ///   planner's `MergeSourcesPhysical`.
+    /// - `table_id_map` — catalog names in JOIN source order; parallel
+    ///   to `sub_ops`. Used to resolve the `col_map`: sub-scan `i`'s
+    ///   bare column `c` maps to combined column `<table_id_map[i]>.<c>`
+    ///   for non-system columns, or bare `c` for system columns.
+    /// - `cancel` — shared cancellation token.
+    ///
+    /// # Errors
+    ///
+    /// - [`BqliteError::Execution`] if any parallel-vec length differs.
+    /// - [`BqliteError::Schema`] if any sub-scan's entity-key or ts
+    ///   column is absent from its own output schema, or if the
+    ///   combined schema declares `__source_table_id` with a type
+    ///   other than [`BqlType::Int`].
+    /// - [`BqliteError::Execution`] if any sub-scan's entity-key or ts
+    ///   column type is unsupported by
+    ///   [`bqlite_storage::segment::merge::validate_key_types`].
+    pub fn new(
+        sub_ops: Vec<Box<dyn PhysicalOperator>>,
+        sub_entity_key_cols: Vec<String>,
+        sub_ts_cols: Vec<String>,
+        output_schema: OperatorSchema,
+        table_id_map: Vec<String>,
+        cancel: CancellationToken,
+    ) -> Result<Self> {
+        if sub_ops.is_empty() {
+            return Err(BqliteError::Execution(
+                "MergeSourcesOperator: at least one sub-scan is required".into(),
+            ));
+        }
+        if sub_ops.len() != sub_entity_key_cols.len()
+            || sub_ops.len() != sub_ts_cols.len()
+            || sub_ops.len() != table_id_map.len()
+        {
+            return Err(BqliteError::Execution(format!(
+                "MergeSourcesOperator: parallel-vec length mismatch: \
+                 ops={}, entity_key_cols={}, ts_cols={}, table_id_map={}",
+                sub_ops.len(),
+                sub_entity_key_cols.len(),
+                sub_ts_cols.len(),
+                table_id_map.len(),
+            )));
+        }
+
+        // Resolve per-sub-scan column indices + col_map + reverse_col_map.
+        let mut descriptors: Vec<SubSourceDesc> = Vec::with_capacity(sub_ops.len());
+        for (i, op) in sub_ops.iter().enumerate() {
+            let sub_schema = op.output_schema();
+            let entity_key_name = &sub_entity_key_cols[i];
+            let ts_name = &sub_ts_cols[i];
+
+            let entity_key_col = sub_schema
+                .column(entity_key_name)
+                .map(|(idx, _)| idx)
+                .ok_or_else(|| {
+                    BqliteError::Schema(format!(
+                        "MergeSourcesOperator: sub-scan {i} ({}) \
+                         missing entity-key column `{entity_key_name}`",
+                        table_id_map[i]
+                    ))
+                })?;
+            let ts_col = sub_schema
+                .column(ts_name)
+                .map(|(idx, _)| idx)
+                .ok_or_else(|| {
+                    BqliteError::Schema(format!(
+                        "MergeSourcesOperator: sub-scan {i} ({}) \
+                         missing ts column `{ts_name}`",
+                        table_id_map[i]
+                    ))
+                })?;
+
+            // Build col_map: each sub-scan column → combined-schema index.
+            let mut col_map: Vec<Option<usize>> = Vec::with_capacity(sub_schema.columns().len());
+            for sub_col in sub_schema.columns() {
+                let combined_name = if sub_col.is_system() {
+                    // System columns share bare names across sub-tables.
+                    sub_col.name.clone()
+                } else {
+                    format!("{}.{}", table_id_map[i], sub_col.name)
+                };
+                let combined_idx = output_schema.column(&combined_name).map(|(idx, _)| idx);
+                col_map.push(combined_idx);
+            }
+
+            // Reverse map: combined column → sub-scan column.
+            let mut reverse_col_map: Vec<Option<usize>> = vec![None; output_schema.columns().len()];
+            for (sub_col_idx, maybe_out) in col_map.iter().enumerate() {
+                if let Some(out_col_idx) = *maybe_out {
+                    reverse_col_map[out_col_idx] = Some(sub_col_idx);
+                }
+            }
+
+            descriptors.push(SubSourceDesc {
+                entity_key_col,
+                ts_col,
+                col_map,
+                reverse_col_map,
+            });
+        }
+
+        // Resolve the __source_table_id column position (if present).
+        let source_table_id_col = output_schema
+            .column(bqlite_planner::logical::SOURCE_TABLE_ID_COLUMN)
+            .map(|(idx, def)| {
+                if !matches!(def.bql_type, BqlType::Int) {
+                    return Err(BqliteError::Schema(format!(
+                        "MergeSourcesOperator: `__source_table_id` must be Int, got {:?}",
+                        def.bql_type
+                    )));
+                }
+                Ok::<_, BqliteError>(idx)
+            })
+            .transpose()?;
+
+        let arrow_schema = Arc::new(output_schema.to_arrow_schema());
+
+        // Defense-in-depth: validate each sub-scan's entity-key/ts column
+        // types against the set `EntityKeyValue::extract` + `extract_ts_nanos`
+        // support. The planner's `build_joined_scan` already enforces
+        // type compatibility (cohorts-aliases-joins.md §3.6), but a
+        // test or manually constructed op could bypass it — fail here
+        // with a clear error rather than panicking inside the hot loop.
+        for (i, (op, desc)) in sub_ops.iter().zip(descriptors.iter()).enumerate() {
+            let sub_arrow = op.output_schema().to_arrow_schema();
+            bqlite_storage::segment::merge::validate_key_types(
+                &sub_arrow,
+                desc.entity_key_col,
+                desc.ts_col,
+            )
+            .map_err(|e| {
+                BqliteError::Execution(format!(
+                    "MergeSourcesOperator: sub-scan {i} ({}) key-type validation failed: {e}",
+                    table_id_map[i],
+                ))
+            })?;
+        }
+
+        let table_id_values: Vec<i64> = (0..sub_ops.len()).map(|i| i as i64).collect();
+
+        let subs = sub_ops
+            .into_iter()
+            .map(|op| SubSource {
+                op,
+                batch: None,
+                cursor: 0,
+                exhausted: false,
+            })
+            .collect();
+
+        Ok(Self {
+            subs,
+            output_schema,
+            arrow_schema,
+            descriptors,
+            table_id_values,
+            source_table_id_col,
+            heap: std::collections::BinaryHeap::new(),
+            batch_target_rows: MERGE_SOURCES_BATCH_ROWS,
+            exhausted: false,
+            cancel,
+            opened: false,
+        })
+    }
+
+    /// Override the output batch size. Test hook.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_batch_size(mut self, batch_target_rows: usize) -> Self {
+        assert!(batch_target_rows > 0, "batch_target_rows must be positive");
+        self.batch_target_rows = batch_target_rows;
+        self
+    }
+
+    /// Reload one sub-scan's batch by pulling from its child operator
+    /// and pushing its first row onto the heap.
+    fn reload_sub(&mut self, i: usize) -> Result<()> {
+        if self.subs[i].exhausted {
+            return Ok(());
+        }
+        loop {
+            match self.subs[i].op.next_batch()? {
+                None => {
+                    self.subs[i].exhausted = true;
+                    self.subs[i].batch = None;
+                    return Ok(());
+                }
+                Some(batch) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.subs[i].batch = Some(batch);
+                    self.subs[i].cursor = 0;
+                    self.push_active(i)?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Push the sub's current cursor position onto the heap.
+    fn push_active(&mut self, i: usize) -> Result<()> {
+        let batch = self.subs[i].batch.as_ref().expect("active sub has a batch");
+        let desc = &self.descriptors[i];
+        let ek_col = batch.column(desc.entity_key_col);
+        // TableSchema declares entity_id non-nullable, but defense in
+        // depth: a hand-built RecordBatch in a test could violate this,
+        // which would produce a garbage entity-key value and silently
+        // corrupt the merge order. Fail loudly in debug builds.
+        debug_assert!(
+            !ek_col.is_null(self.subs[i].cursor),
+            "MergeSourcesOperator: sub-scan {i} emitted null entity_id at row {}",
+            self.subs[i].cursor,
+        );
+        let entity_key =
+            bqlite_storage::segment::merge::EntityKeyValue::extract(ek_col, self.subs[i].cursor);
+        let ts_nanos = bqlite_storage::segment::merge::extract_ts_nanos(
+            batch.column(desc.ts_col),
+            self.subs[i].cursor,
+        );
+        self.heap.push(std::cmp::Reverse(JoinedHeapEntry {
+            scan_idx: i,
+            row_idx: self.subs[i].cursor,
+            entity_key,
+            ts_nanos,
+        }));
+        Ok(())
+    }
+
+    /// If the heap is empty, pull another batch from every
+    /// un-exhausted sub whose `batch` is `None`. Returns true if the
+    /// heap has rows after the reload, false if every sub is drained.
+    fn reload_if_empty_heap(&mut self) -> Result<bool> {
+        if !self.heap.is_empty() {
+            return Ok(true);
+        }
+        let sub_count = self.subs.len();
+        for i in 0..sub_count {
+            if self.subs[i].batch.is_none() && !self.subs[i].exhausted {
+                self.reload_sub(i)?;
+            }
+        }
+        Ok(!self.heap.is_empty())
+    }
+
+    /// Build one output `RecordBatch` from the accumulated picks.
+    ///
+    /// For each combined-schema output column `c`:
+    /// - If `c == __source_table_id`, construct an `Int64Array`
+    ///   directly from the picks' `scan_idx` values mapped through
+    ///   `table_id_values`.
+    /// - Otherwise, for each sub-scan `i`, consult
+    ///   `reverse_col_map[c]`: if `Some(sub_col_idx)` and the sub has
+    ///   a live batch, feed that column; otherwise feed a null array
+    ///   of the output column's type and the sub's current batch
+    ///   length. Call [`arrow::compute::interleave`] with the
+    ///   per-scan array refs and the pick list to produce the column.
+    fn build_output_batch(&self, indices: &[(usize, usize)]) -> Result<RecordBatch> {
+        use ::arrow::array::{new_null_array, Int64Array};
+        use ::arrow::compute::interleave;
+
+        let n_sub = self.subs.len();
+        let n_out_cols = self.arrow_schema.fields().len();
+        let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(n_out_cols);
+
+        for out_col_idx in 0..n_out_cols {
+            // Special-case: __source_table_id column is synthesized.
+            if Some(out_col_idx) == self.source_table_id_col {
+                let vals: Vec<i64> = indices
+                    .iter()
+                    .map(|(scan_idx, _)| self.table_id_values[*scan_idx])
+                    .collect();
+                out_cols.push(Arc::new(Int64Array::from(vals)) as ArrayRef);
+                continue;
+            }
+
+            let field_type = self.arrow_schema.field(out_col_idx).data_type();
+            let mut per_sub_arrays: Vec<ArrayRef> = Vec::with_capacity(n_sub);
+            for i in 0..n_sub {
+                let desc = &self.descriptors[i];
+                match desc.reverse_col_map[out_col_idx] {
+                    Some(sub_col_idx) => match self.subs[i].batch.as_ref() {
+                        Some(b) => per_sub_arrays.push(b.column(sub_col_idx).clone()),
+                        None => {
+                            // Sub has no current batch — its scan_idx
+                            // is guaranteed not to appear in `indices`
+                            // because we only drain batches after
+                            // `build_output_batch` completes. Length 0
+                            // placeholder is safe (never indexed).
+                            per_sub_arrays.push(new_null_array(field_type, 0));
+                        }
+                    },
+                    None => {
+                        // Sub i does not contribute to this output
+                        // column — provide a null array of the same
+                        // length as this sub's current batch.
+                        let len = self.subs[i]
+                            .batch
+                            .as_ref()
+                            .map(|b| b.num_rows())
+                            .unwrap_or(0);
+                        per_sub_arrays.push(new_null_array(field_type, len));
+                    }
+                }
+            }
+            let refs: Vec<&dyn ::arrow::array::Array> =
+                per_sub_arrays.iter().map(|a| a.as_ref()).collect();
+            let col = interleave(&refs, indices).map_err(|e| {
+                BqliteError::Execution(format!(
+                    "MergeSourcesOperator: interleave failed for output col {out_col_idx} ({}): {e}",
+                    self.arrow_schema.field(out_col_idx).name(),
+                ))
+            })?;
+            out_cols.push(col);
+        }
+
+        RecordBatch::try_new(self.arrow_schema.clone(), out_cols).map_err(|e| {
+            BqliteError::Execution(format!(
+                "MergeSourcesOperator: failed to assemble output batch: {e}"
+            ))
+        })
+    }
+}
+
+impl PhysicalOperator for MergeSourcesOperator {
+    fn output_schema(&self) -> &OperatorSchema {
+        &self.output_schema
+    }
+
+    fn open(&mut self) -> Result<()> {
+        if self.opened {
+            return Ok(());
+        }
+        for (i, sub) in self.subs.iter_mut().enumerate() {
+            sub.op.open().map_err(|e| {
+                BqliteError::Execution(format!(
+                    "MergeSourcesOperator: sub-scan {i} open failed: {e}"
+                ))
+            })?;
+        }
+        // Prime the heap: pull one batch from each sub, push first row.
+        for i in 0..self.subs.len() {
+            self.reload_sub(i)?;
+        }
+        self.opened = true;
+        Ok(())
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        if self.cancel.is_cancelled() {
+            return Err(BqliteError::Execution(
+                "MergeSourcesOperator: cancelled".into(),
+            ));
+        }
+        if self.exhausted {
+            return Ok(None);
+        }
+        if !self.opened {
+            return Err(BqliteError::Execution(
+                "MergeSourcesOperator::next_batch called before open".into(),
+            ));
+        }
+
+        // Accumulate picked rows up to batch_target_rows.
+        //
+        // Critical invariant: a sub-scan's `batch` field MUST NOT be
+        // cleared while its prior row indices are still referenced in
+        // `indices`, because `build_output_batch` will index into
+        // those arrays. We track drained sub-scans in a bitmap, keep
+        // their batches alive through the emit, and clear+reload them
+        // in a post-build sweep.
+        let mut indices: Vec<(usize, usize)> = Vec::with_capacity(self.batch_target_rows);
+        let mut drained: Vec<bool> = vec![false; self.subs.len()];
+        while indices.len() < self.batch_target_rows {
+            let Some(std::cmp::Reverse(entry)) = self.heap.pop() else {
+                // Heap empty. If any sub is drained, stop accumulating
+                // — reloads happen after the emit to avoid
+                // invalidating row references still in `indices`.
+                if drained.iter().any(|&d| d) {
+                    break;
+                }
+                // Every sub is genuinely exhausted (or not yet opened):
+                // attempt a reload and re-enter.
+                if !self.reload_if_empty_heap()? {
+                    break;
+                }
+                continue;
+            };
+            let scan_idx = entry.scan_idx;
+            let row_idx = entry.row_idx;
+            indices.push((scan_idx, row_idx));
+
+            // Advance that sub's cursor.
+            self.subs[scan_idx].cursor += 1;
+            let batch_rows = self.subs[scan_idx]
+                .batch
+                .as_ref()
+                .map(|b| b.num_rows())
+                .unwrap_or(0);
+            if self.subs[scan_idx].cursor < batch_rows {
+                self.push_active(scan_idx)?;
+            } else {
+                // Batch drained. Mark for post-build reload; do NOT
+                // clear `batch` yet — `build_output_batch` below still
+                // needs to read rows from it via `indices`.
+                drained[scan_idx] = true;
+            }
+        }
+
+        if indices.is_empty() {
+            // Safe to flip drained subs to empty now (no references).
+            for (i, &d) in drained.iter().enumerate() {
+                if d {
+                    self.subs[i].batch = None;
+                    self.subs[i].cursor = 0;
+                }
+            }
+            self.exhausted = true;
+            return Ok(None);
+        }
+
+        let out = self.build_output_batch(&indices)?;
+
+        // Post-emit sweep: now safe to clear drained batches. Reloads
+        // happen lazily at the top of the next `next_batch` call via
+        // `reload_if_empty_heap`.
+        for (i, &d) in drained.iter().enumerate() {
+            if d {
+                self.subs[i].batch = None;
+                self.subs[i].cursor = 0;
+            }
+        }
+        Ok(Some(out))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if !self.opened {
+            return Ok(());
+        }
+        let mut first_err: Option<BqliteError> = None;
+        for (i, sub) in self.subs.iter_mut().enumerate() {
+            if let Err(e) = sub.op.close() {
+                if first_err.is_none() {
+                    first_err = Some(BqliteError::Execution(format!(
+                        "MergeSourcesOperator: sub-scan {i} close failed: {e}"
+                    )));
+                }
+            }
+            sub.batch = None;
+            sub.cursor = 0;
+            sub.exhausted = true;
+        }
+        self.heap.clear();
+        self.exhausted = true;
+        self.opened = false;
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -3157,5 +3787,462 @@ mod tests {
         op.with_sample_filter(empty);
         op.open().unwrap();
         assert!(op.next_batch().unwrap().is_none());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // TASK-436: MergeSourcesOperator tests
+    // ──────────────────────────────────────────────────────────────────────
+
+    use super::MergeSourcesOperator;
+
+    /// Build a minimal three-column RecordBatch (`entity_id`, `ts`,
+    /// `event_type`) for feeding a joined-source sub-scan.
+    ///
+    /// The `event_type` column is filled with a constant value
+    /// (`"e"`) because these tests don't exercise event-type
+    /// semantics; `TableSchema::new` requires the entity-key, ts, and
+    /// event-type role columns to be three distinct columns.
+    fn merge_sources_batch(entity_ids: &[&str], tss: &[i64]) -> RecordBatch {
+        assert_eq!(entity_ids.len(), tss.len());
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("entity_id", DataType::Utf8View, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("event_type", DataType::Utf8View, false),
+        ]));
+        let eid: ArrayRef = Arc::new(StringViewArray::from(entity_ids.to_vec()));
+        let ts: ArrayRef = Arc::new(
+            TimestampNanosecondArray::from(tss.iter().copied().map(Some).collect::<Vec<_>>())
+                .with_timezone("UTC"),
+        );
+        let et: ArrayRef = Arc::new(StringViewArray::from(
+            entity_ids.iter().map(|_| "e").collect::<Vec<_>>(),
+        ));
+        RecordBatch::try_new(arrow_schema, vec![eid, ts, et]).unwrap()
+    }
+
+    /// Build a table schema with (entity_id, ts, event_type) columns.
+    fn merge_sources_table_schema(name: &str) -> TableSchema {
+        TableSchema::new(
+            name,
+            vec![
+                ColumnDef::required("entity_id", BqlType::String),
+                ColumnDef::required("ts", BqlType::Timestamp),
+                ColumnDef::required("event_type", BqlType::String),
+            ],
+            "entity_id",
+            "ts",
+            "event_type",
+        )
+        .unwrap()
+    }
+
+    /// Build one sub-scan operator (ScanOperator) over a single
+    /// RecordBatch. Returns `(op, entity_key_col_name, ts_col_name)`.
+    fn make_merge_sources_sub(
+        table: &str,
+        entity_ids: &[&str],
+        tss: &[i64],
+    ) -> (Box<dyn PhysicalOperator>, String, String) {
+        let schema = merge_sources_table_schema(table);
+        let segments: Vec<VecSegment> = if entity_ids.is_empty() {
+            Vec::new()
+        } else {
+            let batch = merge_sources_batch(entity_ids, tss);
+            vec![(
+                make_handle(0, entity_ids.len() as u64),
+                vec![batch],
+                vec![HashMap::new()],
+            )]
+        };
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(schema, segments));
+        let op = ScanOperator::full_scan(reader).expect("scan op");
+        (
+            Box::new(op) as Box<dyn PhysicalOperator>,
+            "entity_id".to_string(),
+            "ts".to_string(),
+        )
+    }
+
+    /// Combined schema for two sub-tables named `t0` and `t1`. Each
+    /// table's columns are qualified (`t0.entity_id`, etc.) and marked
+    /// nullable because merge-output rows contributed by one sub-scan
+    /// carry NULL for the other sub-scan's columns
+    /// (`cohorts-aliases-joins.md` §3.8). The discriminator
+    /// `__source_table_id` is non-nullable.
+    fn combined_schema_two(include_discriminator: bool) -> OperatorSchema {
+        let mut cols = vec![
+            ColumnDef::nullable("t0.entity_id", BqlType::String),
+            ColumnDef::nullable("t0.ts", BqlType::Timestamp),
+            ColumnDef::nullable("t0.event_type", BqlType::String),
+            ColumnDef::nullable("t1.entity_id", BqlType::String),
+            ColumnDef::nullable("t1.ts", BqlType::Timestamp),
+            ColumnDef::nullable("t1.event_type", BqlType::String),
+        ];
+        if include_discriminator {
+            cols.push(ColumnDef::required("__source_table_id", BqlType::Int));
+        }
+        OperatorSchema::new(cols).unwrap()
+    }
+
+    fn collect_source_table_ids(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let arr = b
+                    .column_by_name("__source_table_id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                (0..b.num_rows()).map(|i| arr.value(i)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_sources_two_disjoint_entities() {
+        let (op_a, ek_a, ts_a) = make_merge_sources_sub("t0", &["a"], &[100]);
+        let (op_b, ek_b, ts_b) = make_merge_sources_sub("t1", &["b"], &[200]);
+
+        let mut op = MergeSourcesOperator::new(
+            vec![op_a, op_b],
+            vec![ek_a, ek_b],
+            vec![ts_a, ts_b],
+            combined_schema_two(true),
+            vec!["t0".into(), "t1".into()],
+            CancellationToken::new(),
+        )
+        .expect("ctor");
+
+        op.open().unwrap();
+        let mut rows = Vec::new();
+        while let Some(b) = op.next_batch().unwrap() {
+            rows.push(b);
+        }
+        op.close().unwrap();
+
+        let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "expected 2 rows total");
+
+        // __source_table_id sequence: [0, 1] (entity "a" then "b").
+        let tids = collect_source_table_ids(&rows);
+        assert_eq!(tids, vec![0, 1]);
+
+        // Row 0 came from t0: t0.entity_id = "a", t1.entity_id is null.
+        let b0 = &rows[0];
+        let t0_eid = b0
+            .column_by_name("t0.entity_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(t0_eid.value(0), "a");
+        assert!(b0.column_by_name("t1.entity_id").unwrap().is_null(0));
+    }
+
+    #[test]
+    fn merge_sources_ordering_across_tables() {
+        // t0: [(x, 100), (x, 200)]; t1: [(x, 150), (y, 500)]
+        // Expected order: (x,100,t0), (x,150,t1), (x,200,t0), (y,500,t1)
+        let (op_a, ek_a, ts_a) = make_merge_sources_sub("t0", &["x", "x"], &[100, 200]);
+        let (op_b, ek_b, ts_b) = make_merge_sources_sub("t1", &["x", "y"], &[150, 500]);
+
+        let mut op = MergeSourcesOperator::new(
+            vec![op_a, op_b],
+            vec![ek_a, ek_b],
+            vec![ts_a, ts_b],
+            combined_schema_two(true),
+            vec!["t0".into(), "t1".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+        op.open().unwrap();
+        let mut all = Vec::new();
+        while let Some(b) = op.next_batch().unwrap() {
+            all.push(b);
+        }
+        op.close().unwrap();
+
+        let tids = collect_source_table_ids(&all);
+        assert_eq!(tids, vec![0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn merge_sources_same_ts_tiebroken_by_scan_idx() {
+        // Both tables emit (x, 100). Expected: t0 before t1.
+        let (op_a, ek_a, ts_a) = make_merge_sources_sub("t0", &["x"], &[100]);
+        let (op_b, ek_b, ts_b) = make_merge_sources_sub("t1", &["x"], &[100]);
+
+        let mut op = MergeSourcesOperator::new(
+            vec![op_a, op_b],
+            vec![ek_a, ek_b],
+            vec![ts_a, ts_b],
+            combined_schema_two(true),
+            vec!["t0".into(), "t1".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+        op.open().unwrap();
+        let batches: Vec<RecordBatch> = std::iter::from_fn(|| op.next_batch().unwrap()).collect();
+        op.close().unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+        let tids = collect_source_table_ids(&batches);
+        assert_eq!(tids, vec![0, 1]);
+    }
+
+    #[test]
+    fn merge_sources_one_sub_empty() {
+        let (op_a, ek_a, ts_a) = make_merge_sources_sub("t0", &["a"], &[100]);
+        let (op_b, ek_b, ts_b) = make_merge_sources_sub("t1", &[] as &[&str], &[]);
+
+        let mut op = MergeSourcesOperator::new(
+            vec![op_a, op_b],
+            vec![ek_a, ek_b],
+            vec![ts_a, ts_b],
+            combined_schema_two(true),
+            vec!["t0".into(), "t1".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+        op.open().unwrap();
+        let total: usize = std::iter::from_fn(|| op.next_batch().unwrap())
+            .map(|b| b.num_rows())
+            .sum();
+        op.close().unwrap();
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn merge_sources_both_empty() {
+        let (op_a, ek_a, ts_a) = make_merge_sources_sub("t0", &[] as &[&str], &[]);
+        let (op_b, ek_b, ts_b) = make_merge_sources_sub("t1", &[] as &[&str], &[]);
+        let mut op = MergeSourcesOperator::new(
+            vec![op_a, op_b],
+            vec![ek_a, ek_b],
+            vec![ts_a, ts_b],
+            combined_schema_two(true),
+            vec!["t0".into(), "t1".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+        op.open().unwrap();
+        assert!(op.next_batch().unwrap().is_none());
+        op.close().unwrap();
+    }
+
+    #[test]
+    fn merge_sources_three_tables_ordering() {
+        let (op_a, ek_a, ts_a) = make_merge_sources_sub("t0", &["x"], &[100]);
+        let (op_b, ek_b, ts_b) = make_merge_sources_sub("t1", &["x"], &[50]);
+        let (op_c, ek_c, ts_c) = make_merge_sources_sub("t2", &["x"], &[75]);
+        let combined = OperatorSchema::new(vec![
+            ColumnDef::nullable("t0.entity_id", BqlType::String),
+            ColumnDef::nullable("t0.ts", BqlType::Timestamp),
+            ColumnDef::nullable("t0.event_type", BqlType::String),
+            ColumnDef::nullable("t1.entity_id", BqlType::String),
+            ColumnDef::nullable("t1.ts", BqlType::Timestamp),
+            ColumnDef::nullable("t1.event_type", BqlType::String),
+            ColumnDef::nullable("t2.entity_id", BqlType::String),
+            ColumnDef::nullable("t2.ts", BqlType::Timestamp),
+            ColumnDef::nullable("t2.event_type", BqlType::String),
+            ColumnDef::required("__source_table_id", BqlType::Int),
+        ])
+        .unwrap();
+        let mut op = MergeSourcesOperator::new(
+            vec![op_a, op_b, op_c],
+            vec![ek_a, ek_b, ek_c],
+            vec![ts_a, ts_b, ts_c],
+            combined,
+            vec!["t0".into(), "t1".into(), "t2".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+        op.open().unwrap();
+        let batches: Vec<RecordBatch> = std::iter::from_fn(|| op.next_batch().unwrap()).collect();
+        op.close().unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+        // Expected order by (x, ts): ts=50 (t1), ts=75 (t2), ts=100 (t0)
+        let tids = collect_source_table_ids(&batches);
+        assert_eq!(tids, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn merge_sources_without_source_table_id_column() {
+        // §3.9: single-table queries don't produce MergeSources; a
+        // test-time combined schema without the discriminator should
+        // still work — source_table_id_col stays None and no
+        // synthetic column is emitted.
+        let (op_a, ek_a, ts_a) = make_merge_sources_sub("t0", &["a"], &[1]);
+        let (op_b, ek_b, ts_b) = make_merge_sources_sub("t1", &["a"], &[2]);
+        let mut op = MergeSourcesOperator::new(
+            vec![op_a, op_b],
+            vec![ek_a, ek_b],
+            vec![ts_a, ts_b],
+            combined_schema_two(false),
+            vec!["t0".into(), "t1".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+        op.open().unwrap();
+        let batches: Vec<RecordBatch> = std::iter::from_fn(|| op.next_batch().unwrap()).collect();
+        op.close().unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+        assert!(batches[0].column_by_name("__source_table_id").is_none());
+    }
+
+    #[test]
+    fn merge_sources_ctor_rejects_parallel_vec_mismatch() {
+        let (op_a, ek_a, ts_a) = make_merge_sources_sub("t0", &["a"], &[100]);
+        let err = MergeSourcesOperator::new(
+            vec![op_a],
+            vec![ek_a, "entity_id".into()],
+            vec![ts_a],
+            combined_schema_two(true),
+            vec!["t0".into()],
+            CancellationToken::new(),
+        )
+        .expect_err("expected parallel-vec mismatch error");
+        let s = format!("{err}");
+        assert!(s.contains("parallel-vec length mismatch"), "got: {s}");
+    }
+
+    #[test]
+    fn merge_sources_ctor_rejects_missing_entity_key_column() {
+        let (op_a, _ek_a, ts_a) = make_merge_sources_sub("t0", &["a"], &[100]);
+        let combined = OperatorSchema::new(vec![
+            ColumnDef::nullable("t0.entity_id", BqlType::String),
+            ColumnDef::nullable("t0.ts", BqlType::Timestamp),
+            ColumnDef::nullable("t0.event_type", BqlType::String),
+            ColumnDef::required("__source_table_id", BqlType::Int),
+        ])
+        .unwrap();
+        let err = MergeSourcesOperator::new(
+            vec![op_a],
+            vec!["no_such_column".into()],
+            vec![ts_a],
+            combined,
+            vec!["t0".into()],
+            CancellationToken::new(),
+        )
+        .expect_err("expected missing-column error");
+        let s = format!("{err}");
+        assert!(s.contains("missing entity-key column"), "got: {s}");
+    }
+
+    #[test]
+    fn merge_sources_ctor_rejects_empty_sub_ops() {
+        let err = MergeSourcesOperator::new(
+            vec![],
+            vec![],
+            vec![],
+            combined_schema_two(true),
+            vec![],
+            CancellationToken::new(),
+        )
+        .expect_err("expected empty sub-ops error");
+        let s = format!("{err}");
+        assert!(s.contains("at least one sub-scan is required"), "got: {s}");
+    }
+
+    /// Build a sub-scan operator fed by multiple segments (each
+    /// yielding one batch). Exercises the reload path: after
+    /// `MergeSourcesOperator` drains one sub's current batch, it must
+    /// lazily pull the next from that sub's child operator.
+    fn make_multi_batch_sub(
+        table: &str,
+        batches: &[(&[&str], &[i64])],
+    ) -> (Box<dyn PhysicalOperator>, String, String) {
+        let schema = merge_sources_table_schema(table);
+        let segments: Vec<VecSegment> = batches
+            .iter()
+            .enumerate()
+            .map(|(i, (ids, tss))| {
+                let batch = merge_sources_batch(ids, tss);
+                (
+                    make_handle(i as u64, ids.len() as u64),
+                    vec![batch],
+                    vec![HashMap::new()],
+                )
+            })
+            .collect();
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(schema, segments));
+        let op = ScanOperator::full_scan(reader).expect("scan op");
+        (
+            Box::new(op) as Box<dyn PhysicalOperator>,
+            "entity_id".into(),
+            "ts".into(),
+        )
+    }
+
+    #[test]
+    fn merge_sources_multi_batch_per_sub_scan() {
+        // Exercise the reload handoff: sub t0 has two segments (two
+        // batches) covering entities ["a","b"] then ["c","d"]; sub t1
+        // has one segment with ["b","c"]. Verify all rows appear in
+        // entity-sorted order and that each segment's rows survive the
+        // post-emit reload path.
+        let (op_a, ek_a, ts_a) =
+            make_multi_batch_sub("t0", &[(&["a", "b"], &[10, 20]), (&["c", "d"], &[30, 40])]);
+        let (op_b, ek_b, ts_b) = make_merge_sources_sub("t1", &["b", "c"], &[15, 35]);
+
+        let mut op = MergeSourcesOperator::new(
+            vec![op_a, op_b],
+            vec![ek_a, ek_b],
+            vec![ts_a, ts_b],
+            combined_schema_two(true),
+            vec!["t0".into(), "t1".into()],
+            CancellationToken::new(),
+        )
+        .unwrap()
+        // Small batch size forces the operator to drain + reload the
+        // sub-scan batches multiple times, exercising the post-emit
+        // sweep + lazy-reload handoff.
+        .with_batch_size(2);
+
+        op.open().unwrap();
+        let batches: Vec<RecordBatch> = std::iter::from_fn(|| op.next_batch().unwrap()).collect();
+        op.close().unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // 4 rows from t0 + 2 rows from t1 = 6, expected order:
+        // (a,10,t0), (b,15,t1), (b,20,t0), (c,30,t0), (c,35,t1), (d,40,t0)
+        assert_eq!(total, 6);
+        let tids = collect_source_table_ids(&batches);
+        assert_eq!(tids, vec![0, 1, 0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn merge_sources_small_batch_size_splits_output() {
+        // Exercise the with_batch_size test hook: force a batch size of
+        // 1 so we emit one row per `next_batch` call. Verifies the
+        // drained-bitmap logic handles rapid batch drain+reload.
+        let (op_a, ek_a, ts_a) = make_merge_sources_sub("t0", &["a", "b"], &[10, 30]);
+        let (op_b, ek_b, ts_b) = make_merge_sources_sub("t1", &["a", "b"], &[20, 40]);
+        let mut op = MergeSourcesOperator::new(
+            vec![op_a, op_b],
+            vec![ek_a, ek_b],
+            vec![ts_a, ts_b],
+            combined_schema_two(true),
+            vec!["t0".into(), "t1".into()],
+            CancellationToken::new(),
+        )
+        .unwrap()
+        .with_batch_size(1);
+
+        op.open().unwrap();
+        let batches: Vec<RecordBatch> = std::iter::from_fn(|| op.next_batch().unwrap()).collect();
+        op.close().unwrap();
+        // 4 rows total, 1 per batch, expected order: (a,10,t0),
+        // (a,20,t1), (b,30,t0), (b,40,t1) → source_table_ids [0,1,0,1].
+        assert_eq!(batches.len(), 4);
+        assert!(batches.iter().all(|b| b.num_rows() == 1));
+        let tids = collect_source_table_ids(&batches);
+        assert_eq!(tids, vec![0, 1, 0, 1]);
     }
 }

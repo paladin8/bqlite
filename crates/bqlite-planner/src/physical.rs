@@ -2557,6 +2557,9 @@ mod tests {
         let primary = events_schema();
         let joined = logins_schema_for_physical();
         // Build the combined output schema the way build_joined_scan does.
+        // Cross-table columns are marked nullable because merge-output
+        // rows from sub-scan `i` carry NULL for every other table's
+        // columns (cohorts-aliases-joins.md §3.8; TASK-436).
         let mut cols: Vec<ColumnDef> = Vec::new();
         for t in [&primary, &joined] {
             for c in t.columns() {
@@ -2566,8 +2569,8 @@ mod tests {
                 cols.push(ColumnDef {
                     name: format!("{}.{}", t.name(), c.name),
                     bql_type: c.bql_type.clone(),
-                    nullable: c.nullable,
-                    default_value: c.default_value.clone(),
+                    nullable: true,
+                    default_value: None,
                 });
             }
         }

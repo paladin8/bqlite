@@ -190,7 +190,8 @@ struct ScanState {
 /// `as_any().downcast_ref()` dynamic dispatch on every comparison
 /// (the #1 hotspot in pprof profiles of the 100M funnel query).
 #[derive(Debug, Clone)]
-enum EntityKeyValue {
+#[non_exhaustive]
+pub enum EntityKeyValue {
     /// Inline string key. Short strings (common for entity IDs like
     /// `"user_000042"`) are stored directly without heap allocation
     /// via `SmallVec`. Longer strings fall back to heap.
@@ -200,7 +201,12 @@ enum EntityKeyValue {
 }
 
 impl EntityKeyValue {
-    fn extract(col: &ArrayRef, row: usize) -> Self {
+    /// Extract a comparable key value from column `col` at row `row`.
+    ///
+    /// Supports `Utf8View` (canonical), `Utf8` (legacy), and `Int64`.
+    /// Other array types will `unreachable!` — callers should
+    /// validate column types first via [`validate_key_types`].
+    pub fn extract(col: &ArrayRef, row: usize) -> Self {
         if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
             let s = arr.value(row).as_bytes();
             EntityKeyValue::Str(smallvec::SmallVec::from_slice(s))
@@ -278,8 +284,11 @@ impl HeapEntry {
 }
 
 /// Extract the i64 nanosecond timestamp from a column at a given row.
+///
+/// Callers must ensure the column is a `TimestampNanosecondArray`; use
+/// [`validate_key_types`] at construction time to verify.
 #[inline]
-fn extract_ts_nanos(col: &ArrayRef, row: usize) -> i64 {
+pub fn extract_ts_nanos(col: &ArrayRef, row: usize) -> i64 {
     use ::arrow::array::TimestampNanosecondArray;
     col.as_any()
         .downcast_ref::<TimestampNanosecondArray>()
@@ -1190,7 +1199,20 @@ fn bql_type_for_sort_key(data_type: &DataType) -> BqlType {
 
 /// Validate that the entity-key and ts columns in `schema` have
 /// types we can compare in the merge hot loop.
-fn validate_key_types(schema: &ArrowSchema, entity_key_col: usize, ts_col: usize) -> Result<()> {
+///
+/// Accepts `Utf8`, `Utf8View`, or `Int64` for the entity-key column,
+/// and `Timestamp(Nanosecond, _)` for the ts column. Any other pair
+/// returns [`BqliteError::Execution`].
+///
+/// Exposed `pub` so operators that consume [`EntityKeyValue::extract`]
+/// and [`extract_ts_nanos`] outside this module (e.g., the
+/// joined-source scan runtime in TASK-436) can fail-fast at
+/// construction rather than panic inside the hot loop.
+pub fn validate_key_types(
+    schema: &ArrowSchema,
+    entity_key_col: usize,
+    ts_col: usize,
+) -> Result<()> {
     let ek_type = schema.field(entity_key_col).data_type();
     match ek_type {
         DataType::Utf8 | DataType::Utf8View | DataType::Int64 => (),

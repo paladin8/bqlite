@@ -1276,6 +1276,21 @@ fn build_joined_scan(
     let mut cols: Vec<ColumnDef> = Vec::new();
 
     // Per-table non-system columns, qualified with `<table>.<column>`.
+    //
+    // Every cross-table qualified column is marked **nullable** in the
+    // combined schema, regardless of its declared nullability in the
+    // source table. Rationale: in the merged output, a row picked from
+    // sub-scan `i` carries that table's column values and NULL for every
+    // other table's columns (cohorts-aliases-joins.md §3.8). Preserving
+    // the source's non-nullable flag here would let the physical layer
+    // declare columns non-nullable that the runtime cannot fill with
+    // non-null values, causing Arrow `RecordBatch::try_new` to fail at
+    // `MergeSourcesOperator` emit time. TASK-436 flips these to nullable
+    // so the schema matches the runtime contract.
+    //
+    // `default_value` is dropped for the same reason: the default
+    // applies to the source table's canonical insert, not to
+    // cross-table merge-output synthesis.
     for col in primary.columns() {
         if col.is_system() {
             continue;
@@ -1283,8 +1298,8 @@ fn build_joined_scan(
         cols.push(ColumnDef {
             name: format!("{}.{}", primary.name(), col.name),
             bql_type: col.bql_type.clone(),
-            nullable: col.nullable,
-            default_value: col.default_value.clone(),
+            nullable: true,
+            default_value: None,
         });
     }
     for t in &joined {
@@ -1295,8 +1310,8 @@ fn build_joined_scan(
             cols.push(ColumnDef {
                 name: format!("{}.{}", t.name(), col.name),
                 bql_type: col.bql_type.clone(),
-                nullable: col.nullable,
-                default_value: col.default_value.clone(),
+                nullable: true,
+                default_value: None,
             });
         }
     }
