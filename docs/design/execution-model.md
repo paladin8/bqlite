@@ -264,7 +264,7 @@ A few intentional consequences:
 
 > **Terminology.** "Materialization" here means "collapse a `FilteredBatch { batch, selection }` into a fresh contiguous `RecordBatch` containing only the selected rows." This is distinct from storage-format.md §7 "Compaction", which is segment-level LSM merging. Keeping the two concepts linguistically separated is load-bearing because they sit in different layers of the engine and both come up in benchmark/metric conversation.
 
-The selection vector is not free to carry forever. `FilteredBatch` is an *internal* shape inside a fused push segment of stateless operators; it never crosses the segment boundary. Three conditions trigger explicit materialization (a fresh `RecordBatch` containing only the selected rows is produced, and `selection` is reset to `None`):
+The selection vector is not free to carry forever. `FilteredBatch` is an *internal* shape inside the fused push segment of stateless operators described in this subsection (§3.8); it never crosses the outer `PhysicalOperator::next_batch()` boundary of that segment. (A separate, earlier materialization boundary exists *inside* the scan/filter segment when the encoded read path is used — see §3.8.6. That boundary also emits a `FilteredBatch`, which then becomes the input to the push segment described here.) Three conditions trigger explicit materialization at the §3.8 boundary (a fresh `RecordBatch` containing only the selected rows is produced, and `selection` is reset to `None`):
 
 1. **Sparsity threshold.** When `selection.len() < 0.10 * batch.num_rows()`, the indirection cost on subsequent kernel passes exceeds the cost of one bulk copy. Materialization happens at the sparsity-detecting kernel's entry point, before its own work.
 2. **Push segment boundary.** The push segment that wraps a stateless kernel chain materializes at its outer `PhysicalOperator::next_batch()` boundary. The `EntityOperatorAdapter` and any other downstream `PhysicalOperator` consumer always observe a contiguous `RecordBatch` — they never see a selection vector. This keeps the public operator trait surface unchanged: `FilteredBatch` is a stateless-segment-internal type only.
@@ -294,6 +294,31 @@ ScanOperator
 ```
 
 This means dictionary pushdown is no longer "filter the batch in place" — it is the canonical example of producing a selection vector without touching the underlying value buffers. The dictionary stays the dictionary, the codes stay the codes, the selection vector tells everyone downstream which rows count.
+
+#### 3.8.6 Pre-Boundary Encoded Read Path
+
+Subsections §3.8.1–§3.8.5 describe the pipeline *after* row data has been materialized into Arrow buffers. A separate, earlier stage applies when the scan operator runs on the encoded read path (see `docs/design/storage/zero-copy-scan-filter.md` for the end-to-end design and `docs/design/storage/reader-trait.md` §5.3 for the trait-level contract):
+
+```
+SegmentScan
+  ├─ emits EncodedBatch (Arc-backed encoded columns: PlainFixed, Dictionary,
+  │                      Rle, Constant, Delta, BitPacking, For, Fsst, ...)
+  │
+  ├─ encoded kernels (scan/filter) operate directly on EncodedBatch +
+  │   RowSelection (Indices | Runs) without decoding full columns
+  │
+  └─ materialization boundary
+      └─ collapses the selection and decodes surviving rows into a
+         RecordBatch, emitting FilteredBatch { batch, selection: None }
+```
+
+Three rules govern this pre-boundary stage:
+
+1. **Encoded IR is internal.** `EncodedBatch`, `EncodedColumn`, `PinnedChunk`, and `RowSelection` live in `bqlite-core::encoded`. They are the input/output currency between the scan and the encoded kernels only. Nothing downstream of the materialization boundary ever sees them.
+2. **Materialization happens exactly once per segment.** The encoded path does not produce a selection-carrying `FilteredBatch`; it produces a *dense* `FilteredBatch { batch, selection: None }` at the boundary. The §3.8 push segment inherits a dense batch and applies §3.8.1–§3.8.3 rules from there. A mid-segment stateless kernel in the §3.8 chain may still re-introduce a selection — that reintroduction is governed by §3.8.2, not by this subsection.
+3. **Boundary placement is additive.** The encoded read path is selected by `ScanPath::Encoded` (or `Auto` when the heuristic opts in). When `ScanPath::Materialized` is used, the scan emits `FilteredBatch::dense(record_batch)` directly and there is no encoded kernel stage at all. Downstream operators cannot tell which path produced their input.
+
+The copy-budget invariant enforced by this stage — 0 payload copies on the uncompressed read path and exactly one on the LZ4 decompression path, measured in bytes via `Metrics::record_bytes_*` — is documented and regression-tested in `docs/design/storage/zero-copy-scan-filter.md`. This subsection only fixes the execution-model vocabulary: "materialization" can mean *either* the §3.8.3 push-segment boundary *or* the §3.8.6 scan/filter boundary, and benchmark / metric discussion must say which one.
 
 ---
 

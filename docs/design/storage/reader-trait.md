@@ -242,6 +242,22 @@ pub trait SegmentScan: Send {
     /// carry Arrow null bitmaps; non-nullable columns do not
     /// (execution-model.md §3.7).
     fn next_row_group(&mut self) -> Result<Option<RecordBatch>>;
+
+    /// Yield the next row-group as an encoded-preserving `EncodedBatch`,
+    /// or `Ok(None)` when the segment is exhausted.
+    ///
+    /// This is the encoded-path read hook added for the zero-copy
+    /// scan/filter design (`docs/design/storage/zero-copy-scan-filter.md`).
+    /// It lets scan operators consume encoded column chunks directly
+    /// and run selection-first predicate kernels over them without
+    /// eagerly materializing each row-group into an Arrow array.
+    ///
+    /// Default body: delegates to `next_row_group()` and wraps each
+    /// produced Arrow column as `EncodedColumn::Materialized`. Every
+    /// existing implementor therefore works on the encoded surface
+    /// with no behavior change until it overrides this method with a
+    /// real encoded reader.
+    fn next_encoded_row_group(&mut self) -> Result<Option<EncodedBatch>> { /* default */ }
 }
 ```
 
@@ -256,6 +272,28 @@ pub trait SegmentScan: Send {
   predicate fully pruned; consumers must tolerate them. Implementations
   may also return `Ok(None)` early if they know every remaining row
   group is pruned.
+
+### 5.3 Encoded read path (additive extension)
+
+`next_encoded_row_group()` is an **additive extension** to the trait,
+not a replacement for `next_row_group()`. The two paths coexist:
+
+- The **materialized path** (`next_row_group`) remains the
+  compatibility default. Every pre-existing `SegmentScan` implementor
+  works without changes, and the default body of
+  `next_encoded_row_group` wraps each Arrow column as
+  `EncodedColumn::Materialized` so encoded-aware operators can still
+  consume the legacy path uniformly.
+- The **encoded path** (`next_encoded_row_group`) is opt-in for
+  readers that can produce `EncodedBatch` directly from segment bytes.
+  Selection-first predicate kernels (`bqlite-operators`) consume the
+  encoded batch without materializing every row-group first.
+
+Implementors must pick one path for the lifetime of a single scan —
+mixing encoded and materialized iteration on one scan instance is
+disallowed. Scan operators select the path via `ScanPath` (see
+`bqlite-operators::ScanPath`), overridable via the
+`BQLITE_SCAN_PATH=materialized|encoded|auto` environment variable.
 
 ## 6. Supporting types
 

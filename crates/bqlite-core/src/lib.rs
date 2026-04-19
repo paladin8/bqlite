@@ -49,6 +49,13 @@ pub use storage::{
     ScanPredicate, SegmentHandle, SegmentReader, SegmentScan, ZoneMap,
 };
 
+pub mod encoded;
+pub use encoded::{
+    ArcBytes, EncodedBatch, EncodedColumn, EncodedColumnView, EncodedKind, PinnedChunk,
+    PinnedChunkRef, RowRef, RowRun, RowSelection, SelectionVector, SourceRun, StitchedBatch,
+    StitchedRows,
+};
+
 pub mod scalar;
 pub use scalar::ScalarValue;
 

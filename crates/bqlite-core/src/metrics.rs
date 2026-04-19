@@ -52,6 +52,32 @@ pub struct MetricsSnapshot {
     pub bytes: u64,
     /// Wall-time nanoseconds consumed by the operator.
     pub elapsed_ns: u64,
+
+    // ── Copy-budget counters (encoded-preserving scan/filter path) ──
+    //
+    // See `docs/design/storage/zero-copy-scan-filter.md` §3 for the
+    // copy budget these counters track.
+    //
+    // Target: `bytes_materialized_before_filter == 0` on uncompressed
+    // dictionary / RLE / constant-encoded scan paths. On LZ4-wrapped
+    // segments, `bytes_decompressed == payload_bytes` and
+    // `bytes_materialized_before_filter` remains `0`.
+    /// Total encoded bytes read from the segment file.
+    pub bytes_scanned: u64,
+    /// Bytes produced by LZ4 decompression of encoded payloads.
+    pub bytes_decompressed: u64,
+    /// Bytes materialized into Arrow arrays **before** the predicate
+    /// filter runs. Zero on the encoded-preserving path.
+    pub bytes_materialized_before_filter: u64,
+    /// Bytes materialized into Arrow arrays **after** the predicate
+    /// filter runs (selected rows only).
+    pub bytes_materialized_after_filter: u64,
+    /// Rows that survived filter **before** any materialization
+    /// happened — the selection-vector size at the materialization
+    /// boundary.
+    pub selected_rows_before_materialization: u64,
+    /// Rows actually materialized into Arrow arrays at the boundary.
+    pub materialized_rows: u64,
 }
 
 impl MetricsSnapshot {
@@ -71,6 +97,23 @@ impl MetricsSnapshot {
         self.rows_out = self.rows_out.saturating_add(other.rows_out);
         self.bytes = self.bytes.saturating_add(other.bytes);
         self.elapsed_ns = self.elapsed_ns.saturating_add(other.elapsed_ns);
+
+        self.bytes_scanned = self.bytes_scanned.saturating_add(other.bytes_scanned);
+        self.bytes_decompressed = self
+            .bytes_decompressed
+            .saturating_add(other.bytes_decompressed);
+        self.bytes_materialized_before_filter = self
+            .bytes_materialized_before_filter
+            .saturating_add(other.bytes_materialized_before_filter);
+        self.bytes_materialized_after_filter = self
+            .bytes_materialized_after_filter
+            .saturating_add(other.bytes_materialized_after_filter);
+        self.selected_rows_before_materialization = self
+            .selected_rows_before_materialization
+            .saturating_add(other.selected_rows_before_materialization);
+        self.materialized_rows = self
+            .materialized_rows
+            .saturating_add(other.materialized_rows);
     }
 
     /// Return the component-wise sum of `self` and `other` without
@@ -83,7 +126,16 @@ impl MetricsSnapshot {
 
     /// True if every counter is zero.
     pub fn is_zero(&self) -> bool {
-        self.rows_in == 0 && self.rows_out == 0 && self.bytes == 0 && self.elapsed_ns == 0
+        self.rows_in == 0
+            && self.rows_out == 0
+            && self.bytes == 0
+            && self.elapsed_ns == 0
+            && self.bytes_scanned == 0
+            && self.bytes_decompressed == 0
+            && self.bytes_materialized_before_filter == 0
+            && self.bytes_materialized_after_filter == 0
+            && self.selected_rows_before_materialization == 0
+            && self.materialized_rows == 0
     }
 }
 
@@ -126,6 +178,38 @@ pub trait Metrics: Send + Sync {
     /// `Instant::now()` call per scope.
     fn record_elapsed_ns(&self, ns: u64);
 
+    // ── Copy-budget counters ─────────────────────────────────────────
+    //
+    // Default no-op bodies so `NoopMetrics` and third-party stub
+    // impls keep compiling. The production `AtomicMetrics` overrides
+    // each one with a fetch-add. See
+    // `docs/design/storage/zero-copy-scan-filter.md` §3.
+
+    /// Add `n` to the bytes-scanned counter.
+    #[inline]
+    fn record_bytes_scanned(&self, _n: u64) {}
+
+    /// Add `n` to the bytes-decompressed counter.
+    #[inline]
+    fn record_bytes_decompressed(&self, _n: u64) {}
+
+    /// Add `n` to the pre-filter materialization bytes counter.
+    #[inline]
+    fn record_bytes_materialized_before_filter(&self, _n: u64) {}
+
+    /// Add `n` to the post-filter materialization bytes counter.
+    #[inline]
+    fn record_bytes_materialized_after_filter(&self, _n: u64) {}
+
+    /// Add `n` to the selection-vector row count at the
+    /// materialization boundary.
+    #[inline]
+    fn record_selected_rows_before_materialization(&self, _n: u64) {}
+
+    /// Add `n` to the count of rows actually materialized.
+    #[inline]
+    fn record_materialized_rows(&self, _n: u64) {}
+
     /// Take a point-in-time snapshot of the current counter values.
     ///
     /// Not called on the hot path. The returned snapshot is a value
@@ -155,6 +239,13 @@ pub struct AtomicMetrics {
     rows_out: AtomicU64,
     bytes: AtomicU64,
     elapsed_ns: AtomicU64,
+
+    bytes_scanned: AtomicU64,
+    bytes_decompressed: AtomicU64,
+    bytes_materialized_before_filter: AtomicU64,
+    bytes_materialized_after_filter: AtomicU64,
+    selected_rows_before_materialization: AtomicU64,
+    materialized_rows: AtomicU64,
 }
 
 impl AtomicMetrics {
@@ -185,12 +276,57 @@ impl Metrics for AtomicMetrics {
         self.elapsed_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
+    #[inline]
+    fn record_bytes_scanned(&self, n: u64) {
+        self.bytes_scanned.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_bytes_decompressed(&self, n: u64) {
+        self.bytes_decompressed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_bytes_materialized_before_filter(&self, n: u64) {
+        self.bytes_materialized_before_filter
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_bytes_materialized_after_filter(&self, n: u64) {
+        self.bytes_materialized_after_filter
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_selected_rows_before_materialization(&self, n: u64) {
+        self.selected_rows_before_materialization
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_materialized_rows(&self, n: u64) {
+        self.materialized_rows.fetch_add(n, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             rows_in: self.rows_in.load(Ordering::Relaxed),
             rows_out: self.rows_out.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             elapsed_ns: self.elapsed_ns.load(Ordering::Relaxed),
+            bytes_scanned: self.bytes_scanned.load(Ordering::Relaxed),
+            bytes_decompressed: self.bytes_decompressed.load(Ordering::Relaxed),
+            bytes_materialized_before_filter: self
+                .bytes_materialized_before_filter
+                .load(Ordering::Relaxed),
+            bytes_materialized_after_filter: self
+                .bytes_materialized_after_filter
+                .load(Ordering::Relaxed),
+            selected_rows_before_materialization: self
+                .selected_rows_before_materialization
+                .load(Ordering::Relaxed),
+            materialized_rows: self.materialized_rows.load(Ordering::Relaxed),
         }
     }
 }
@@ -315,12 +451,14 @@ mod tests {
             rows_out: 5,
             bytes: 100,
             elapsed_ns: 1_000,
+            ..Default::default()
         };
         let b = MetricsSnapshot {
             rows_in: 3,
             rows_out: 1,
             bytes: 20,
             elapsed_ns: 500,
+            ..Default::default()
         };
         a.merge(&b);
         assert_eq!(a.rows_in, 13);
@@ -336,12 +474,14 @@ mod tests {
             rows_out: 2,
             bytes: 99,
             elapsed_ns: 42,
+            ..Default::default()
         };
         let b = MetricsSnapshot {
             rows_in: 3,
             rows_out: 8,
             bytes: 1,
             elapsed_ns: 58,
+            ..Default::default()
         };
         let mut a_into_b = b;
         a_into_b.merge(&a);
@@ -357,12 +497,14 @@ mod tests {
             rows_out: 2,
             bytes: 3,
             elapsed_ns: 4,
+            ..Default::default()
         };
         let b = MetricsSnapshot {
             rows_in: 10,
             rows_out: 20,
             bytes: 30,
             elapsed_ns: 40,
+            ..Default::default()
         };
         let sum = a.add(&b);
         // Neither operand mutated.
@@ -382,12 +524,14 @@ mod tests {
             rows_out: u64::MAX - 1,
             bytes: u64::MAX,
             elapsed_ns: 100,
+            ..Default::default()
         };
         let b = MetricsSnapshot {
             rows_in: 1,
             rows_out: 10,
             bytes: u64::MAX,
             elapsed_ns: 100,
+            ..Default::default()
         };
         a.merge(&b);
         assert_eq!(a.rows_in, u64::MAX);
@@ -521,6 +665,81 @@ mod tests {
         noop.record_rows_in(5);
         assert_eq!(atomic.snapshot().rows_in, 5);
         assert_eq!(noop.snapshot().rows_in, 0);
+    }
+
+    // ── Copy-budget counters ─────────────────────────────────────────
+
+    #[test]
+    fn snapshot_is_zero_includes_copy_budget_counters() {
+        let mut s = MetricsSnapshot::zero();
+        assert!(s.is_zero());
+        s.bytes_scanned = 1;
+        assert!(!s.is_zero());
+        s.bytes_scanned = 0;
+        s.bytes_materialized_before_filter = 1;
+        assert!(!s.is_zero());
+        s.bytes_materialized_before_filter = 0;
+        s.materialized_rows = 1;
+        assert!(!s.is_zero());
+    }
+
+    #[test]
+    fn snapshot_merge_sums_copy_budget_counters() {
+        let mut a = MetricsSnapshot {
+            bytes_scanned: 100,
+            bytes_decompressed: 50,
+            bytes_materialized_before_filter: 0,
+            bytes_materialized_after_filter: 40,
+            selected_rows_before_materialization: 10,
+            materialized_rows: 10,
+            ..Default::default()
+        };
+        let b = MetricsSnapshot {
+            bytes_scanned: 200,
+            bytes_decompressed: 75,
+            bytes_materialized_before_filter: 0,
+            bytes_materialized_after_filter: 30,
+            selected_rows_before_materialization: 5,
+            materialized_rows: 5,
+            ..Default::default()
+        };
+        a.merge(&b);
+        assert_eq!(a.bytes_scanned, 300);
+        assert_eq!(a.bytes_decompressed, 125);
+        assert_eq!(a.bytes_materialized_before_filter, 0);
+        assert_eq!(a.bytes_materialized_after_filter, 70);
+        assert_eq!(a.selected_rows_before_materialization, 15);
+        assert_eq!(a.materialized_rows, 15);
+    }
+
+    #[test]
+    fn atomic_metrics_copy_budget_counters_accumulate() {
+        let m = AtomicMetrics::new();
+        m.record_bytes_scanned(100);
+        m.record_bytes_scanned(50);
+        m.record_bytes_decompressed(30);
+        m.record_bytes_materialized_before_filter(0);
+        m.record_bytes_materialized_after_filter(25);
+        m.record_selected_rows_before_materialization(10);
+        m.record_materialized_rows(10);
+
+        let s = m.snapshot();
+        assert_eq!(s.bytes_scanned, 150);
+        assert_eq!(s.bytes_decompressed, 30);
+        assert_eq!(s.bytes_materialized_before_filter, 0);
+        assert_eq!(s.bytes_materialized_after_filter, 25);
+        assert_eq!(s.selected_rows_before_materialization, 10);
+        assert_eq!(s.materialized_rows, 10);
+    }
+
+    #[test]
+    fn noop_metrics_default_bodies_accept_copy_budget_writes() {
+        // Default trait bodies are no-ops; `NoopMetrics` inherits them.
+        let m = NoopMetrics::new();
+        m.record_bytes_scanned(100);
+        m.record_bytes_materialized_before_filter(999);
+        m.record_materialized_rows(42);
+        assert_eq!(m.snapshot(), MetricsSnapshot::zero());
     }
 
     #[test]

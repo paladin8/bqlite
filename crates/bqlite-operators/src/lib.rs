@@ -54,6 +54,7 @@ pub mod aggregate;
 pub mod distinct;
 pub mod eval;
 pub mod filter;
+pub mod filtered_batch;
 pub mod limit;
 pub mod matcher;
 pub mod operator;
@@ -67,11 +68,12 @@ pub use aggregate::{
 };
 pub use distinct::DistinctOperator;
 pub use filter::FilterOperator;
+pub use filtered_batch::FilteredBatch;
 pub use limit::LimitOperator;
 pub use matcher::SequenceMatchOperator;
 pub use operator::{
     CancellationToken, EntityOperator, PhysicalOperator, DEFAULT_OUTPUT_BATCH_SIZE,
 };
 pub use project::ProjectOperator;
-pub use scan::ScanOperator;
+pub use scan::{ScanOperator, ScanPath};
 pub use sort::SortOperator;

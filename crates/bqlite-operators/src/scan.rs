@@ -94,6 +94,76 @@ use crate::eval;
 use crate::operator::{CancellationToken, PhysicalOperator};
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ScanPath
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read-path selector for [`ScanOperator`].
+///
+/// Chooses whether the scan iterates over materialized `RecordBatch`es
+/// (the pre-Wave-5 path) or encoded-preserving `EncodedBatch`es (the
+/// selection-first path from
+/// `docs/design/storage/zero-copy-scan-filter.md`).
+///
+/// # Checkpoint 1 state
+///
+/// Every variant currently dispatches to the materialized path —
+/// encoded kernels haven't landed yet. The selector exists so later
+/// checkpoints can flip the default without further API churn:
+/// Checkpoint 3 enables `Auto`, Checkpoint 7 makes `Auto` the default.
+///
+/// # Environment override
+///
+/// Set `BQLITE_SCAN_PATH=materialized|encoded|auto` to override the
+/// session default per process. Unrecognized values log a warning and
+/// fall back to the compile-time default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPath {
+    /// Classic path: every row-group is decoded to a `RecordBatch`
+    /// and post-filters run via `compute::filter_record_batch`.
+    Materialized,
+    /// Selection-first encoded path: scan produces `EncodedBatch`es
+    /// and kernels emit row selections. Not yet implemented — treated
+    /// as `Materialized` until Checkpoint 3 lands dictionary kernels.
+    Encoded,
+    /// Pick `Encoded` when every predicate has an encoded kernel and
+    /// the input scan supports `next_encoded_row_group`; otherwise
+    /// `Materialized`. Currently resolves to `Materialized` until
+    /// Checkpoint 3.
+    Auto,
+}
+
+impl Default for ScanPath {
+    /// Compile-time default: the safe materialized path. Flipped to
+    /// `Auto` in Checkpoint 7 once encoded kernels prove stable.
+    fn default() -> Self {
+        ScanPath::Materialized
+    }
+}
+
+impl ScanPath {
+    /// Resolve the scan-path mode by consulting the `BQLITE_SCAN_PATH`
+    /// environment variable, falling back to
+    /// [`ScanPath::default`].
+    pub fn from_env() -> ScanPath {
+        match std::env::var("BQLITE_SCAN_PATH") {
+            Ok(v) => Self::parse(&v).unwrap_or_default(),
+            Err(_) => ScanPath::default(),
+        }
+    }
+
+    /// Parse a string value (`"materialized"`, `"encoded"`, `"auto"`,
+    /// case-insensitive). Returns `None` on unrecognized input.
+    pub fn parse(s: &str) -> Option<ScanPath> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "materialized" => Some(ScanPath::Materialized),
+            "encoded" => Some(ScanPath::Encoded),
+            "auto" => Some(ScanPath::Auto),
+            _ => None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ScanOperator
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -143,6 +213,10 @@ pub struct ScanOperator {
     /// Latches on the first `Ok(None)` from `next_batch` and keeps
     /// subsequent pulls cheap and side-effect-free.
     exhausted: bool,
+    /// Read-path mode. In Checkpoint 1 this is recorded but does not
+    /// affect behavior — every variant dispatches to the materialized
+    /// path. Checkpoint 3 lights up the `Encoded` branch.
+    scan_path: ScanPath,
 }
 
 impl std::fmt::Debug for ScanOperator {
@@ -162,6 +236,7 @@ impl std::fmt::Debug for ScanOperator {
             .field("post_filter_count", &self.post_filters.len())
             .field("open", &self.merge.is_some())
             .field("exhausted", &self.exhausted)
+            .field("scan_path", &self.scan_path)
             .finish()
     }
 }
@@ -202,6 +277,28 @@ impl ScanOperator {
         projected_columns: &[String],
         scan_predicates: Vec<CompiledExpr>,
         cancel: CancellationToken,
+    ) -> Result<Self> {
+        Self::with_scan_path(
+            reader,
+            projected_columns,
+            scan_predicates,
+            cancel,
+            ScanPath::from_env(),
+        )
+    }
+
+    /// Construct a scan with an explicit [`ScanPath`] mode, overriding
+    /// both the session default and the `BQLITE_SCAN_PATH` env var.
+    ///
+    /// In Checkpoint 1 the path is recorded for later dispatch but
+    /// does not alter runtime behavior; every variant resolves to the
+    /// materialized path.
+    pub fn with_scan_path(
+        reader: Arc<dyn SegmentReader>,
+        projected_columns: &[String],
+        scan_predicates: Vec<CompiledExpr>,
+        cancel: CancellationToken,
+        scan_path: ScanPath,
     ) -> Result<Self> {
         let projection = if projected_columns.is_empty() {
             ColumnProjection::all()
@@ -244,6 +341,7 @@ impl ScanOperator {
             ts_col,
             merge: None,
             exhausted: false,
+            scan_path,
         })
     }
 
@@ -253,6 +351,11 @@ impl ScanOperator {
     /// iteration shape without building a full `CompiledExpr` tree.
     pub fn full_scan(reader: Arc<dyn SegmentReader>) -> Result<Self> {
         Self::new(reader, &[], Vec::new(), CancellationToken::new())
+    }
+
+    /// Read the current scan-path mode.
+    pub fn scan_path(&self) -> ScanPath {
+        self.scan_path
     }
 
     /// Evaluate every entry in `post_filters` against `batch` and
@@ -1435,5 +1538,26 @@ mod tests {
             pred.referenced_columns(),
             &["event_type".to_string(), "entity_id".to_string()]
         );
+    }
+
+    // ── ScanPath ──────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_path_default_is_materialized() {
+        assert_eq!(ScanPath::default(), ScanPath::Materialized);
+    }
+
+    #[test]
+    fn scan_path_parse_accepts_all_variants_case_insensitive() {
+        assert_eq!(ScanPath::parse("materialized"), Some(ScanPath::Materialized));
+        assert_eq!(ScanPath::parse("MATERIALIZED"), Some(ScanPath::Materialized));
+        assert_eq!(ScanPath::parse("encoded"), Some(ScanPath::Encoded));
+        assert_eq!(ScanPath::parse("  Auto  "), Some(ScanPath::Auto));
+    }
+
+    #[test]
+    fn scan_path_parse_rejects_unknown() {
+        assert_eq!(ScanPath::parse("nope"), None);
+        assert_eq!(ScanPath::parse(""), None);
     }
 }

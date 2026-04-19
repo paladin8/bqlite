@@ -777,6 +777,57 @@ pub trait SegmentScan: Send {
     /// After the first `Ok(None)`, subsequent calls must continue
     /// returning `Ok(None)` without side effects.
     fn next_row_group(&mut self) -> Result<Option<RecordBatch>>;
+
+    /// Yield the next row-group as an encoded-preserving
+    /// [`EncodedBatch`], or `Ok(None)` when the segment is exhausted.
+    ///
+    /// This is the encoded-path read hook described in
+    /// `docs/design/storage/zero-copy-scan-filter.md` and
+    /// `docs/design/storage/reader-trait.md`. It lets scan operators
+    /// consume encoded column chunks directly and run selection-first
+    /// predicate kernels over them without eagerly materializing every
+    /// row-group into an Arrow array.
+    ///
+    /// # Default implementation
+    ///
+    /// The default delegates to [`SegmentScan::next_row_group`] and
+    /// wraps each resulting Arrow column into
+    /// [`EncodedColumn::Materialized`]. This means every existing
+    /// `SegmentScan` implementor works on the encoded-path surface
+    /// with no behavior change — they just stay on the materialized
+    /// fallback until they override this method with a real encoded
+    /// reader.
+    ///
+    /// # Contract
+    ///
+    /// - Column order matches the [`ColumnProjection`] passed to
+    ///   [`SegmentReader::open_segment`] — identical to
+    ///   `next_row_group`.
+    /// - Returned `EncodedBatch::row_count` equals the row count of
+    ///   the equivalent `next_row_group` call. Every column in the
+    ///   batch has the same `rows()` value.
+    /// - Implementors must not mix encoded and materialized-fallback
+    ///   iteration within one scan instance — pick one path for the
+    ///   lifetime of the scan.
+    /// - After the first `Ok(None)`, subsequent calls must continue
+    ///   returning `Ok(None)` without side effects.
+    fn next_encoded_row_group(&mut self) -> Result<Option<crate::encoded::EncodedBatch>> {
+        match self.next_row_group()? {
+            None => Ok(None),
+            Some(batch) => {
+                let row_count = batch.num_rows() as u32;
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|array| crate::encoded::EncodedColumn::Materialized {
+                        array: array.clone(),
+                        rows: array.len() as u32,
+                    })
+                    .collect();
+                Ok(Some(crate::encoded::EncodedBatch::new(row_count, columns)))
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1789,6 +1840,45 @@ mod tests {
     }
 
     // ── Trait-level back-compat: Wave 1 impls keep working ──────────
+
+    // ── Encoded-path default fallback ───────────────────────────────
+
+    #[test]
+    fn next_encoded_row_group_default_wraps_record_batch_as_materialized() {
+        // A scan that only implements `next_row_group` must still
+        // produce an `EncodedBatch` via the default body — every
+        // column becomes an `EncodedColumn::Materialized` fallback.
+        let mut scan = FakeScan {
+            batches: vec![ArrowRecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("a", DataType::Int64, false),
+                    Field::new("b", DataType::Utf8, false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+                    Arc::new(StringArray::from(vec!["x", "y", "z", "w"])),
+                ],
+            )
+            .unwrap()],
+            zone_maps: vec![HashMap::new()],
+            position: 0,
+        };
+
+        let encoded = scan.next_encoded_row_group().unwrap().unwrap();
+        assert_eq!(encoded.row_count, 4);
+        assert_eq!(encoded.columns.len(), 2);
+        for col in &encoded.columns {
+            assert_eq!(col.rows(), 4);
+            assert!(matches!(
+                col,
+                crate::encoded::EncodedColumn::Materialized { .. }
+            ));
+        }
+
+        // Second call exhausts; third must stay None.
+        assert!(scan.next_encoded_row_group().unwrap().is_none());
+        assert!(scan.next_encoded_row_group().unwrap().is_none());
+    }
 
     #[test]
     fn wave1_predicate_impls_keep_compiling_via_default_bodies() {
