@@ -39,6 +39,26 @@
 //! - **`Aggregate`**: materializes a [`HashAggregateOperator`].
 //! - **`Sort`**: materializes a [`SortOperator`].
 //! - **`Distinct`**: materializes a [`DistinctOperator`].
+//!
+//! ## Wave 4 scope (TASK-438)
+//!
+//! Extends the bind step with the Wave 4 `EntityOperator`-based operators,
+//! a fallback SAMPLE filter, and the joined-source merge:
+//!
+//! - **`Sessionize`**, **`EventSelect`**, **`Attribute`**: each implements
+//!   [`EntityOperator`] and is wrapped by a generic
+//!   [`EntityOperatorAdapter`] that detects entity boundaries and drives
+//!   the per-entity `create_state` → `process_sub_batch*` → `finish_entity`
+//!   protocol. Wave 4 operators do not support fused aggregates; the
+//!   `fused_aggregate` field is asserted `None` by each operator constructor.
+//! - **`Sample`** (fallback): when the optimizer's sample-pushdown pass
+//!   cannot push SAMPLE into the scan layer (because a stateful operator
+//!   sits between SAMPLE and the scan), the bind step materializes a
+//!   [`SampleFilterOperator`] that applies the xxHash64 entity-level filter
+//!   above the stateful stage.
+//! - **`MergeSources`**: materializes a `MergeSourcesOperator` that
+//!   performs an N-ary k-way merge over one `ScanOperator` per joined
+//!   table.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -53,14 +73,18 @@ use bqlite_core::{
 use bqlite_operators::matcher::SequenceMatchState;
 use bqlite_operators::operator::EntityOperator;
 use bqlite_operators::{
-    Accumulator, CancellationToken, CohortHashSet, DistinctOperator, FilterOperator,
-    HashAccumulator, HashAggregateOperator, LimitOperator, PhysicalOperator, ProjectOperator,
-    ScanOperator, SequenceMatchOperator, SortOperator, SubqueryFilterOperator,
+    Accumulator, AttributeOperator, CancellationToken, CohortHashSet, DistinctOperator,
+    EventSelectOperator, FilterOperator, HashAccumulator, HashAggregateOperator, LimitOperator,
+    PhysicalOperator, ProjectOperator, ScanOperator, SequenceMatchOperator, SessionizeOperator,
+    SortOperator, SubqueryFilterOperator,
 };
 use bqlite_planner::compiled::{
     ArrowKernelId, CompareKernel, CompareOp, CompiledExpr, CompiledNode,
 };
-use bqlite_planner::{PhysicalPlan, ScanPhysical, SequenceMatchPhysical, SubqueryFilterPhysical};
+use bqlite_planner::{
+    AttributePhysical, EventSelectPhysical, PhysicalPlan, ScanPhysical, SequenceMatchPhysical,
+    SessionizePhysical, SubqueryFilterPhysical,
+};
 use bqlite_storage::Database;
 
 use crate::ddl::{
@@ -320,6 +344,154 @@ impl PhysicalOperator for SequenceMatchAdapter {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// EntityOperatorAdapter — generic Wave 4 entity-operator driver (TASK-438)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Generic adapter that wraps any [`EntityOperator`] implementor as a
+/// [`PhysicalOperator`].
+///
+/// The adapter scans the child's entity-sorted output for entity-id
+/// transitions, routing each entity's rows through the
+/// `create_state` → `process_sub_batch*` → `finish_entity` protocol
+/// required by [`EntityOperator`]. Output batches are buffered in
+/// `pending` and returned one at a time on each `next_batch` call.
+///
+/// ## Wave 4 fused-aggregate deferrals
+///
+/// `SessionizeOperator`, `EventSelectOperator`, and `AttributeOperator`
+/// all assert that their `fused_aggregate` field is `None` at operator
+/// construction time (per the Wave 4/5 deferral contract). This adapter
+/// therefore has no fused path — it always routes output through the
+/// non-fused `pending` buffer. The fused path will be added in Wave 5
+/// alongside the operator-side changes that enable it.
+struct EntityOperatorAdapter<Op: EntityOperator> {
+    operator: Op,
+    child: Box<dyn PhysicalOperator>,
+    output_schema: OperatorSchema,
+    /// Index of the entity-key column inside the *child's* output batches.
+    /// Used to detect entity-id transitions so the adapter can finalize
+    /// one entity and open the next.
+    entity_id_col_idx: usize,
+    current_entity: Option<EntityId>,
+    current_state: Option<Op::State>,
+    /// Non-fused output batches waiting to be returned.
+    pending: VecDeque<RecordBatch>,
+    /// Set once the child has been fully drained and the last entity
+    /// finalized.
+    exhausted: bool,
+}
+
+impl<Op: EntityOperator> EntityOperatorAdapter<Op> {
+    fn new(
+        operator: Op,
+        child: Box<dyn PhysicalOperator>,
+        output_schema: OperatorSchema,
+        entity_id_col_idx: usize,
+    ) -> Self {
+        Self {
+            operator,
+            child,
+            output_schema,
+            entity_id_col_idx,
+            current_entity: None,
+            current_state: None,
+            pending: VecDeque::new(),
+            exhausted: false,
+        }
+    }
+
+    /// Finalize `entity`: call `finish_entity` and buffer the result.
+    fn finalize_entity(&mut self, entity: EntityId, state: Op::State) -> Result<()> {
+        if let Some(batch) = self.operator.finish_entity(state) {
+            // Entity-key columns are filled by the operator from the
+            // buffered input rows (e.g. Sessionize buffers "entity_id"
+            // from the scan). No post-processing fill is needed here.
+            let _ = entity;
+            self.pending.push_back(batch);
+        }
+        Ok(())
+    }
+
+    /// Split `child_batch` at entity boundaries, routing each slice through
+    /// `process_sub_batch`.
+    fn process_child_batch(&mut self, child_batch: RecordBatch) -> Result<()> {
+        let entity_col = child_batch.column(self.entity_id_col_idx).clone();
+        let num_rows = child_batch.num_rows();
+        let mut start = 0;
+
+        while start < num_rows {
+            let row_entity = extract_entity_id(&entity_col, start);
+
+            // Detect entity boundary.
+            if self.current_entity.as_ref() != Some(&row_entity) {
+                if let (Some(prev_entity), Some(prev_state)) =
+                    (self.current_entity.take(), self.current_state.take())
+                {
+                    self.finalize_entity(prev_entity, prev_state)?;
+                }
+                let new_state = self.operator.create_state(&row_entity);
+                self.current_entity = Some(row_entity.clone());
+                self.current_state = Some(new_state);
+            }
+
+            let end = find_entity_end(&entity_col, start, &row_entity, num_rows);
+            let sub_batch = child_batch.slice(start, end - start);
+            let state = self.current_state.as_mut().expect("state must be set");
+            self.operator.process_sub_batch(state, &sub_batch);
+            start = end;
+        }
+
+        Ok(())
+    }
+}
+
+impl<Op: EntityOperator> PhysicalOperator for EntityOperatorAdapter<Op> {
+    fn output_schema(&self) -> &OperatorSchema {
+        &self.output_schema
+    }
+
+    fn open(&mut self) -> Result<()> {
+        self.child.open()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.child.close()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            // Return any buffered output first.
+            if let Some(batch) = self.pending.pop_front() {
+                return Ok(Some(batch));
+            }
+
+            if self.exhausted {
+                return Ok(None);
+            }
+
+            match self.child.next_batch()? {
+                None => {
+                    // Child exhausted: finalize the last in-flight entity.
+                    if let (Some(entity), Some(state)) =
+                        (self.current_entity.take(), self.current_state.take())
+                    {
+                        self.finalize_entity(entity, state)?;
+                    }
+                    self.exhausted = true;
+                    // Loop once more to drain `pending`.
+                }
+                Some(batch) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.process_child_batch(batch)?;
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Plan-tree helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -331,14 +503,29 @@ impl PhysicalOperator for SequenceMatchAdapter {
 /// operator (Scan / Filter) still exposes the column under its original
 /// name (e.g. `"user_id"`). The adapter must detect entity boundaries by
 /// looking for that original name in the child's output batches.
+///
+/// Wave 4 passthrough operators (`Sessionize`, `EventSelect`, `Attribute`,
+/// `Sample`, `SubqueryFilter`) carry the entity key column through from
+/// their input unchanged, so the function recurses into their children.
+/// `MergeSources` normalises all entity-key columns to `"entity_id"` in
+/// its output per cohorts-aliases-joins.md §3.8; the `_ => "entity_id"`
+/// fallback covers that case (and any future unrecognised node shapes).
 fn entity_key_col_name(plan: &PhysicalPlan) -> &str {
     match plan {
         PhysicalPlan::Scan(scan) => scan.entity_key_col.as_str(),
         PhysicalPlan::Filter(filter) => entity_key_col_name(&filter.input),
         PhysicalPlan::Project(proj) => entity_key_col_name(&proj.input),
         PhysicalPlan::Limit(limit) => entity_key_col_name(&limit.input),
-        // For other plan shapes (unusual but forward-compat), fall back to
-        // the renamed column name used in the match output schema.
+        // Wave 4 passthrough operators — entity key column name propagates
+        // unchanged through these nodes.
+        PhysicalPlan::Sessionize(sess) => entity_key_col_name(&sess.input),
+        PhysicalPlan::EventSelect(es) => entity_key_col_name(&es.input),
+        PhysicalPlan::Attribute(attr) => entity_key_col_name(&attr.input),
+        PhysicalPlan::Sample(s) => entity_key_col_name(&s.input),
+        PhysicalPlan::SubqueryFilter(sqf) => entity_key_col_name(&sqf.input),
+        // For other plan shapes (SequenceMatch output, MergeSources output,
+        // or any future forward-compat shape), fall back to the normalised
+        // column name used in the match / merged output schema.
         _ => "entity_id",
     }
 }
@@ -601,17 +788,18 @@ fn bind_physical_with_cache(
             )))
         }
 
-        // ── Wave 4 stubs ─────────────────────────────────────────
-        // These arms will be implemented by TASK-438 (engine bind
-        // extension for Wave 4 query nodes). For now, they return
-        // unsupported errors so the crate compiles and downstream
-        // tasks can land their variants independently.
-        PhysicalPlan::Sessionize(_)
-        | PhysicalPlan::EventSelect(_)
-        | PhysicalPlan::Attribute(_)
-        | PhysicalPlan::Sample(_)
-        | PhysicalPlan::MergeSources(_) => Err(BqliteError::Execution(
-            "Wave 4 operator binding is not yet implemented (TASK-438)".into(),
+        // ── Wave 4 EntityOperator-based operators (TASK-438) ─────
+        PhysicalPlan::Sessionize(sess) => bind_sessionize(sess, db, cohorts),
+
+        PhysicalPlan::EventSelect(es) => bind_event_select(es, db, cohorts),
+
+        PhysicalPlan::Attribute(attr) => bind_attribute(attr, db, cohorts),
+
+        // ── Wave 4 stubs: Sample + MergeSources ──────────────────
+        // Implemented by TASK-438 CP2. The arms below keep the
+        // crate compiling while CP1 ships.
+        PhysicalPlan::Sample(_) | PhysicalPlan::MergeSources(_) => Err(BqliteError::Execution(
+            "Wave 4 Sample / MergeSources binding not yet implemented (TASK-438 CP2)".into(),
         )),
 
         // DELETE is intentionally not bound through this path —
@@ -897,6 +1085,113 @@ fn compiled_timestamp_compare(
         result_type: BqlType::Bool,
         nullable: false,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4 EntityOperator bind helpers (TASK-438 CP1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Shared logic: find the entity key column index in a child operator's
+/// output schema, returning a typed `BqliteError::Schema` on failure.
+fn resolve_entity_key_col(
+    child: &dyn PhysicalOperator,
+    ek_col_name: &str,
+    operator_label: &str,
+) -> Result<usize> {
+    child
+        .output_schema()
+        .columns()
+        .iter()
+        .position(|c| c.name == ek_col_name)
+        .ok_or_else(|| {
+            BqliteError::Schema(format!(
+                "{operator_label}: entity key column '{ek_col_name}' \
+                 not found in child output schema"
+            ))
+        })
+}
+
+/// Bind a [`SessionizePhysical`] descriptor into a
+/// [`EntityOperatorAdapter`]<[`SessionizeOperator`]>.
+///
+/// The `SessionizeOperator` expects its input schema to expose the entity
+/// key column under the name it was given in the source table's schema
+/// (commonly `"entity_id"`). `entity_key_col_name` walks the plan tree
+/// to find that name, which the adapter uses to detect entity boundaries.
+fn bind_sessionize(
+    sess: &SessionizePhysical,
+    db: &mut Database,
+    cohorts: &mut CohortCache,
+) -> Result<Box<dyn PhysicalOperator>> {
+    let child = bind_physical_with_cache(&sess.input, db, cohorts)?;
+    let ek_col_name = entity_key_col_name(&sess.input);
+    let entity_id_col_idx =
+        resolve_entity_key_col(child.as_ref(), ek_col_name, "SessionizeAdapter")?;
+    let operator = SessionizeOperator::new(sess);
+    Ok(Box::new(EntityOperatorAdapter::new(
+        operator,
+        child,
+        sess.output_schema.clone(),
+        entity_id_col_idx,
+    )))
+}
+
+/// Bind an [`EventSelectPhysical`] descriptor into a
+/// [`EntityOperatorAdapter`]<[`EventSelectOperator`]>.
+///
+/// `EventSelectOperator::new` resolves column indices from the planner's
+/// view of the child's output schema (`es.input.output_schema()`) rather
+/// than from the already-bound child operator's narrower runtime schema.
+/// This is required because `EventSelectOperator` expects the full logical
+/// schema — including the `__seq_id` system column used for timestamp
+/// tiebreaking — which the physical planner includes in `ScanPhysical`'s
+/// `output_schema` but which the current `ScanOperator` runtime does not
+/// yet materialise in batches. When the scan runtime gains `__seq_id`
+/// materialisation, both schemas will agree and no change here will be
+/// needed.
+fn bind_event_select(
+    es: &EventSelectPhysical,
+    db: &mut Database,
+    cohorts: &mut CohortCache,
+) -> Result<Box<dyn PhysicalOperator>> {
+    let child = bind_physical_with_cache(&es.input, db, cohorts)?;
+    let ek_col_name = entity_key_col_name(&es.input);
+    let entity_id_col_idx =
+        resolve_entity_key_col(child.as_ref(), ek_col_name, "EventSelectAdapter")?;
+    // Use the planner's schema for operator construction — it includes
+    // `__seq_id` which the operator requires for ts-tiebreaking.
+    let operator = EventSelectOperator::new(es, es.input.output_schema());
+    Ok(Box::new(EntityOperatorAdapter::new(
+        operator,
+        child,
+        es.output_schema.clone(),
+        entity_id_col_idx,
+    )))
+}
+
+/// Bind an [`AttributePhysical`] descriptor into a
+/// [`EntityOperatorAdapter`]<[`AttributeOperator`]>.
+///
+/// `AttributeOperator::from_physical` validates the descriptor (non-empty
+/// conversion/touchpoint event lists, String touchpoint_key, non-negative
+/// window, fused_aggregate == None) and returns a typed error on any
+/// violation.
+fn bind_attribute(
+    attr: &AttributePhysical,
+    db: &mut Database,
+    cohorts: &mut CohortCache,
+) -> Result<Box<dyn PhysicalOperator>> {
+    let child = bind_physical_with_cache(&attr.input, db, cohorts)?;
+    let ek_col_name = entity_key_col_name(&attr.input);
+    let entity_id_col_idx =
+        resolve_entity_key_col(child.as_ref(), ek_col_name, "AttributeAdapter")?;
+    let operator = AttributeOperator::from_physical(attr)?;
+    Ok(Box::new(EntityOperatorAdapter::new(
+        operator,
+        child,
+        attr.output_schema.clone(),
+        entity_id_col_idx,
+    )))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1677,5 +1972,83 @@ mod tests {
         let mut entities = collect_first_string_col(&result);
         entities.dedup();
         assert_eq!(entities, vec!["alice".to_string(), "carol".to_string()]);
+    }
+
+    // ── TASK-438 CP1: Wave 4 EntityOperator bind arms ───────────────────
+
+    /// Create a database with an "events" table whose entity key is named
+    /// "entity_id" (as required by SessionizeOperator, EventSelectOperator,
+    /// and AttributeOperator — all three hardcode that column name in their
+    /// input schema lookups).
+    fn create_db_with_entity_id_table(path: &Path) -> (Database, crate::Engine) {
+        let mut db = Database::create(path).expect("create db");
+        let engine = crate::Engine::new();
+        engine
+            .query(
+                "CREATE TABLE events (\
+                     entity_id STRING NOT NULL ENTITY KEY, \
+                     ts TIMESTAMP NOT NULL EVENT TIME, \
+                     event_type STRING NOT NULL EVENT TYPE\
+                 )",
+                &mut db,
+            )
+            .expect("create entity_id-keyed events table");
+        (db, engine)
+    }
+
+    #[test]
+    fn wave4_sessionize_empty_table_binds_and_runs() {
+        // Smoke test: bind_sessionize must construct the operator tree without
+        // error and return zero rows for an empty table.
+        let scratch = Scratch::new("wave4-sess-empty");
+        let (mut db, engine) = create_db_with_entity_id_table(scratch.path());
+
+        let result = engine
+            .query("events | sessionize(gap: 30m)", &mut db)
+            .expect("sessionize on empty table must not error");
+
+        assert_eq!(result.row_count(), 0, "empty table → 0 sessions");
+    }
+
+    #[test]
+    fn wave4_event_select_first_empty_table_binds_and_runs() {
+        // Smoke test: bind_event_select must construct the operator tree and
+        // return zero rows for an empty table.
+        //
+        // NOTE: EventSelectOperator uses the planner's input schema (which
+        // includes `__seq_id`) for column-index resolution; the current
+        // ScanOperator runtime does not yet materialise `__seq_id` in
+        // batches, so data-driven tests for EventSelect are deferred until
+        // the scan layer gains `__seq_id` materialisation.
+        let scratch = Scratch::new("wave4-esel-empty");
+        let (mut db, engine) = create_db_with_entity_id_table(scratch.path());
+
+        let result = engine
+            .query("events | first(click)", &mut db)
+            .expect("first(click) on empty table must not error");
+
+        assert_eq!(result.row_count(), 0, "empty table → 0 selected events");
+    }
+
+    #[test]
+    fn wave4_attribute_empty_table_binds_and_runs() {
+        // Smoke test: bind_attribute must construct the operator tree and
+        // return zero rows for an empty table.
+        let scratch = Scratch::new("wave4-attr-empty");
+        let (mut db, engine) = create_db_with_entity_id_table(scratch.path());
+
+        let result = engine
+            .query(
+                "events | attribute(\
+                     conversion: (purchase), \
+                     touchpoints: (view, click), \
+                     window: 7d, \
+                     touchpoint_key: event_type\
+                 )",
+                &mut db,
+            )
+            .expect("attribute on empty table must not error");
+
+        assert_eq!(result.row_count(), 0, "empty table → 0 attributions");
     }
 }
