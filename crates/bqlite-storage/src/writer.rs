@@ -2087,6 +2087,169 @@ mod tests {
     }
 
     #[test]
+    fn mixed_v1_and_v2_segments_readable_in_same_database() {
+        // End-to-end mixed-version coverage for TASK-419 CP3:
+        //   - Bucket A uses low-cardinality strings that never escape
+        //     the v1 encoding set → the segment must land on
+        //     format_version 1 and stay readable by the v2 reader.
+        //   - Bucket B uses high-cardinality URLs that force FSST →
+        //     the segment must be promoted to format_version 2 with a
+        //     segment-level FSST symbol table.
+        //
+        // Opening the database after both writes, both segments must
+        // round-trip every row — proving per-segment version dispatch
+        // works inside a single database root and that the v2 reader
+        // handles pre-existing v1 segments without churn (§8.2).
+        let scratch = Scratch::new("e2e-mixed-v1-v2");
+        let mut db = open_db_with_events_table(scratch.path());
+
+        // Bucket A — low-cardinality strings: 10 entities, 2 event
+        // types. Dictionary wins on both string columns; no Wave 4
+        // codec appears.
+        let bucket_a: Vec<Event> = (0..200)
+            .map(|i| {
+                let user = format!("u{:03}", i % 10);
+                let kind = if i % 2 == 0 { "click" } else { "view" };
+                ev(&user, 1_700_000_000_000_000_000 + i, kind)
+            })
+            .collect();
+        let mut sorted_a = bucket_a;
+        sorted_a.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.timestamp.cmp(&b.timestamp)));
+
+        let batch_a = db.allocate_batch_id("events").unwrap();
+        let meta_a = {
+            let mut writer = SegmentWriter::new(&mut db);
+            writer
+                .write_bucket("events", 0, 0, batch_a, &sorted_a)
+                .expect("write bucket A")
+        };
+
+        // Bucket B — high-cardinality URL entity ids: 200 distinct
+        // users, each with one event. The selector must pick FSST on
+        // `user_id`, promoting the segment to v2.
+        let bucket_b: Vec<Event> = (0..200)
+            .map(|i| {
+                let url = format!("https://example.com/users/{i:05}/profile?ref=landing");
+                ev(&url, 1_700_000_086_400_000_000 + i, "click")
+            })
+            .collect();
+        let mut sorted_b = bucket_b;
+        sorted_b.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.timestamp.cmp(&b.timestamp)));
+
+        let batch_b = db.allocate_batch_id("events").unwrap();
+        let meta_b = {
+            let mut writer = SegmentWriter::new(&mut db);
+            writer
+                .write_bucket("events", 1, 0, batch_b, &sorted_b)
+                .expect("write bucket B")
+        };
+
+        let segment_path = |window: u64, segment_id: u64| {
+            scratch
+                .path()
+                .join("events")
+                .join("windows")
+                .join(format!("w_{window:06}"))
+                .join("shard_00")
+                .join(format!("segment_{segment_id}.seg"))
+        };
+
+        // Segment A must be v1 and must have an empty FSST region.
+        let reader_a =
+            SegmentFileReader::open(segment_path(0, meta_a.segment_id), events_schema()).unwrap();
+        assert_eq!(
+            reader_a.footer().format_version(),
+            SEGMENT_FORMAT_VERSION_V1
+        );
+        assert!(reader_a.footer().fsst_symbol_tables().is_empty());
+
+        // Segment B must be v2 and must carry at least one FSST symbol
+        // table (the user_id column).
+        let reader_b =
+            SegmentFileReader::open(segment_path(1, meta_b.segment_id), events_schema()).unwrap();
+        assert_eq!(
+            reader_b.footer().format_version(),
+            SEGMENT_FORMAT_VERSION_V2
+        );
+        assert!(!reader_b.footer().fsst_symbol_tables().is_empty());
+
+        // Round-trip bucket A through the v1 reader path. Entity ids
+        // come back in sorted order.
+        let mut scan = reader_a.scan(&ColumnProjection::all(), None).unwrap();
+        let mut observed_a: Vec<String> = Vec::new();
+        while let Some(rg) = scan.next_row_group().unwrap() {
+            let col = rg
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            for i in 0..col.len() {
+                observed_a.push(col.value(i).to_string());
+            }
+        }
+        assert_eq!(observed_a.len(), 200);
+        let expected_a: Vec<String> = sorted_a
+            .iter()
+            .map(|e| match &e.entity {
+                EntityId::String(s) => s.clone(),
+                other => panic!("unexpected entity {other:?}"),
+            })
+            .collect();
+        assert_eq!(observed_a, expected_a);
+
+        // Round-trip bucket B through the v2 reader path, including
+        // the FSST symbol-table lookup.
+        let mut scan = reader_b.scan(&ColumnProjection::all(), None).unwrap();
+        let mut observed_b: Vec<String> = Vec::new();
+        while let Some(rg) = scan.next_row_group().unwrap() {
+            let col = rg
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            for i in 0..col.len() {
+                observed_b.push(col.value(i).to_string());
+            }
+        }
+        assert_eq!(observed_b.len(), 200);
+        let expected_b: Vec<String> = sorted_b
+            .iter()
+            .map(|e| match &e.entity {
+                EntityId::String(s) => s.clone(),
+                other => panic!("unexpected entity {other:?}"),
+            })
+            .collect();
+        assert_eq!(observed_b, expected_b);
+
+        // And the v1 reader still works after a v2 segment has been
+        // opened in the same database — this pins the §8.2 invariant
+        // that the two readers don't interfere.
+        let reader_a_again =
+            SegmentFileReader::open(segment_path(0, meta_a.segment_id), events_schema()).unwrap();
+        assert_eq!(
+            reader_a_again.footer().format_version(),
+            SEGMENT_FORMAT_VERSION_V1
+        );
+        let mut scan = reader_a_again.scan(&ColumnProjection::all(), None).unwrap();
+        let mut rows = 0;
+        while let Some(rg) = scan.next_row_group().unwrap() {
+            rows += rg.num_rows();
+        }
+        assert_eq!(rows, 200);
+
+        // And symmetrically: re-open the v2 segment after a v1 open.
+        // Pins the other direction of §8.2 — opening a v1 segment
+        // first and then a v2 segment must also work.
+        let reader_b_again =
+            SegmentFileReader::open(segment_path(1, meta_b.segment_id), events_schema()).unwrap();
+        assert_eq!(
+            reader_b_again.footer().format_version(),
+            SEGMENT_FORMAT_VERSION_V2
+        );
+        assert!(!reader_b_again.footer().fsst_symbol_tables().is_empty());
+    }
+
+    #[test]
     fn wave4_codec_promotes_segment_to_format_version_v2() {
         // Hand-build a row-group whose only chunk uses a v2 codec and
         // feed it straight into `derived_format_version` — the helper
