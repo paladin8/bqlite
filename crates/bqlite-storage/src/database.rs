@@ -709,6 +709,29 @@ impl Database {
         })
     }
 
+    /// Compact every eligible `(window, shard)` for `table` synchronously.
+    ///
+    /// Implements the `compact_now` API from
+    /// `docs/design/storage/compaction-concurrency.md` §3.3. Runs on
+    /// the caller's thread, bypasses the core-budget semaphore (the
+    /// caller is opting in explicitly), and uses the default
+    /// [`crate::compaction::CompactionConfig`].
+    ///
+    /// Primary consumers: tests, CLI commands, operator scripts. The
+    /// background scheduler (CP5) acquires the semaphore via its own
+    /// path and does not call this method.
+    ///
+    /// Returns a list of every successful [`CompactionOutcome`].
+    /// Surfaces the first compaction failure; outcomes that succeeded
+    /// before the failure stay durable.
+    pub fn compact_now(
+        &mut self,
+        table: &str,
+    ) -> Result<Vec<crate::compaction::CompactionOutcome>> {
+        let cfg = crate::compaction::CompactionConfig::default();
+        crate::compaction::run_compact_now(self, table, &cfg)
+    }
+
     /// Atomically swap a set of compaction inputs for one compacted
     /// output in `(table, window_id, shard_id)`'s manifest inventory.
     ///

@@ -707,6 +707,114 @@ fn compute_segment_ranges(
     Ok((entity_range, (tmin, tmax)))
 }
 
+// ── Eligibility selector + run_compact_now (CP4) ────────────────────────────
+
+/// One eligible `(window, shard)` candidate produced by
+/// [`eligible_buckets`].
+///
+/// Carries the L0 count and total byte size so the scheduler's
+/// priority queue (CP5) can sort with the data already at hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EligibleBucket {
+    pub window_id: u32,
+    pub shard_id: u32,
+    pub l0_count: u64,
+    pub l0_byte_size: u64,
+}
+
+/// Eligible `(window, shard)` buckets for a single table at a given
+/// moment, ordered the way the scheduler's priority queue would
+/// process them: highest L0 count first, then largest L0 byte size,
+/// then ascending `(window_id, shard_id)` for determinism.
+///
+/// **Eligibility rule:** a bucket qualifies when its L0 segment count
+/// is strictly greater than `cfg.l0_count_trigger` OR the total L0
+/// byte size is strictly greater than `cfg.l0_size_trigger_bytes`.
+/// Buckets with fewer than two L0 segments never qualify (compaction
+/// needs at least two inputs to do useful work).
+///
+/// Only L0 segments are counted toward the thresholds — higher-level
+/// segments are the *output* of past compactions and would not
+/// re-enter the queue under the v1 size-tiered rule.
+pub fn eligible_buckets(
+    db: &Database,
+    table: &str,
+    cfg: &CompactionConfig,
+) -> Result<Vec<EligibleBucket>> {
+    let entry = db.manifest().tables.get(table).ok_or_else(|| {
+        BqliteError::Execution(format!("eligible_buckets: unknown table '{table}'"))
+    })?;
+    let mut out: Vec<EligibleBucket> = Vec::new();
+    for win in &entry.windows {
+        for (shard_idx, segments) in win.shards.iter().enumerate() {
+            // Only L0 segments count toward the trigger thresholds.
+            // We materialise the count and byte total in one pass.
+            let mut count: u64 = 0;
+            let mut size: u64 = 0;
+            for seg in segments {
+                if seg.level == 0 {
+                    count += 1;
+                    size += seg.byte_size;
+                }
+            }
+            if count < 2 {
+                continue;
+            }
+            let count_eligible = count > u64::from(cfg.l0_count_trigger);
+            let size_eligible = size > cfg.l0_size_trigger_bytes;
+            if count_eligible || size_eligible {
+                out.push(EligibleBucket {
+                    window_id: win.window_id,
+                    shard_id: shard_idx as u32,
+                    l0_count: count,
+                    l0_byte_size: size,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        b.l0_count
+            .cmp(&a.l0_count)
+            .then_with(|| b.l0_byte_size.cmp(&a.l0_byte_size))
+            .then_with(|| a.window_id.cmp(&b.window_id))
+            .then_with(|| a.shard_id.cmp(&b.shard_id))
+    });
+    Ok(out)
+}
+
+/// Synchronous compaction entry point for a single table.
+///
+/// Drains the eligibility set to a fixed point: each iteration
+/// recomputes [`eligible_buckets`], picks the highest-priority one,
+/// and runs [`compact_one`] on it. Stops when no bucket is eligible.
+///
+/// Implements the §3.3 `compact_now` API surface — runs on the
+/// caller's thread, ignores the core-budget semaphore (the caller
+/// is opting in explicitly), and returns every successful outcome.
+/// The first failure aborts the loop and surfaces the error;
+/// previously-published outcomes stay durable.
+///
+/// Direct callers are mostly tests and the future CLI / operator
+/// scripts; production code typically reaches this through
+/// [`Database::compact_now`] (which thin-wraps with the default
+/// [`CompactionConfig`]).
+pub fn run_compact_now(
+    db: &mut Database,
+    table: &str,
+    cfg: &CompactionConfig,
+) -> Result<Vec<CompactionOutcome>> {
+    let mut outcomes = Vec::new();
+    loop {
+        let eligible = eligible_buckets(db, table, cfg)?;
+        let Some(bucket) = eligible.into_iter().next() else {
+            break;
+        };
+        let outcome = compact_one(db, table, bucket.window_id, bucket.shard_id)?;
+        outcomes.push(outcome);
+    }
+    Ok(outcomes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1256,5 +1364,209 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── eligible_buckets / run_compact_now / Database::compact_now (CP4) ───
+
+    fn cfg_count_only(trigger: u32) -> CompactionConfig {
+        CompactionConfig {
+            l0_count_trigger: trigger,
+            l0_size_trigger_bytes: u64::MAX,
+            ..CompactionConfig::default()
+        }
+    }
+
+    #[test]
+    fn eligible_buckets_skips_buckets_under_threshold() {
+        let scratch = ScratchDir::new("eligible-skip");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+        // 3 segments — under the default trigger of 4.
+        for i in 0..3 {
+            ingest_one_segment(&mut db, "events", 0, 0, &[make_event("a", 100 + i, "x")]);
+        }
+        let cfg = cfg_count_only(4);
+        let elig = eligible_buckets(&db, "events", &cfg).unwrap();
+        assert!(elig.is_empty(), "3 < 4: must not be eligible, got {elig:?}");
+    }
+
+    #[test]
+    fn eligible_buckets_picks_up_count_above_threshold() {
+        let scratch = ScratchDir::new("eligible-count");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+        // 5 segments — strictly greater than the default trigger of 4.
+        for i in 0..5 {
+            ingest_one_segment(&mut db, "events", 0, 0, &[make_event("a", 100 + i, "x")]);
+        }
+        let cfg = cfg_count_only(4);
+        let elig = eligible_buckets(&db, "events", &cfg).unwrap();
+        assert_eq!(elig.len(), 1);
+        assert_eq!(elig[0].window_id, 0);
+        assert_eq!(elig[0].shard_id, 0);
+        assert_eq!(elig[0].l0_count, 5);
+    }
+
+    #[test]
+    fn eligible_buckets_picks_up_size_above_threshold() {
+        // Set a very small size trigger so a single segment's bytes
+        // alone don't matter — we need >= 2 segments to be eligible
+        // (compact_one needs that anyway), and the sum of their bytes
+        // must exceed the trigger.
+        let scratch = ScratchDir::new("eligible-size");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+        for i in 0..2 {
+            ingest_one_segment(&mut db, "events", 0, 0, &[make_event("a", 100 + i, "x")]);
+        }
+        let cfg = CompactionConfig {
+            l0_count_trigger: u32::MAX, // disable count trigger
+            l0_size_trigger_bytes: 1,   // trivially exceedable by 2 real segments
+            ..CompactionConfig::default()
+        };
+        let elig = eligible_buckets(&db, "events", &cfg).unwrap();
+        assert_eq!(elig.len(), 1, "got: {elig:?}");
+        assert!(elig[0].l0_byte_size > 0);
+    }
+
+    #[test]
+    fn eligible_buckets_orders_by_count_then_size() {
+        // Set up two shards: shard 0 with 6 segments, shard 1 with 8.
+        // Shard 1 must come first.
+        let scratch = ScratchDir::new("eligible-order");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+        for i in 0..6 {
+            ingest_one_segment(&mut db, "events", 0, 0, &[make_event("a", 100 + i, "x")]);
+        }
+        for i in 0..8 {
+            ingest_one_segment(&mut db, "events", 0, 1, &[make_event("b", 200 + i, "x")]);
+        }
+        let cfg = cfg_count_only(4);
+        let elig = eligible_buckets(&db, "events", &cfg).unwrap();
+        assert_eq!(elig.len(), 2);
+        assert_eq!(elig[0].shard_id, 1, "highest count first");
+        assert_eq!(elig[0].l0_count, 8);
+        assert_eq!(elig[1].shard_id, 0);
+        assert_eq!(elig[1].l0_count, 6);
+    }
+
+    #[test]
+    fn eligible_buckets_excludes_higher_level_segments() {
+        // Compact once, then ingest 2 fresh L0 segments. Eligibility
+        // must count only the 2 L0s, not the L1 we already produced.
+        let scratch = ScratchDir::new("eligible-l0only");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+        // Five L0s -> compact -> one L1.
+        for i in 0..5 {
+            ingest_one_segment(&mut db, "events", 0, 0, &[make_event("a", 100 + i, "x")]);
+        }
+        compact_one(&mut db, "events", 0, 0).unwrap();
+        // Add 2 fresh L0s; total segments is now 3 (1 L1 + 2 L0).
+        for i in 0..2 {
+            ingest_one_segment(&mut db, "events", 0, 0, &[make_event("b", 200 + i, "x")]);
+        }
+        let cfg = cfg_count_only(4);
+        let elig = eligible_buckets(&db, "events", &cfg).unwrap();
+        // L0 count is 2, which is NOT > 4, so not eligible.
+        assert!(elig.is_empty(), "L1 segment must not count, got {elig:?}");
+
+        // Lower the trigger to 1: now 2 > 1 so the bucket is eligible
+        // but the count is taken from L0s only.
+        let cfg = cfg_count_only(1);
+        let elig = eligible_buckets(&db, "events", &cfg).unwrap();
+        assert_eq!(elig.len(), 1);
+        assert_eq!(elig[0].l0_count, 2, "must count only the 2 fresh L0s");
+    }
+
+    #[test]
+    fn eligible_buckets_rejects_unknown_table() {
+        let scratch = ScratchDir::new("eligible-unknown");
+        let db = Database::create(scratch.path()).unwrap();
+        let err = eligible_buckets(&db, "nope", &CompactionConfig::default()).unwrap_err();
+        assert!(matches!(err, BqliteError::Execution(_)));
+    }
+
+    #[test]
+    fn run_compact_now_drains_eligible_buckets_to_fixed_point() {
+        let scratch = ScratchDir::new("run-now-drain");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+        // Two eligible shards in window 0.
+        for i in 0..5 {
+            ingest_one_segment(&mut db, "events", 0, 0, &[make_event("a", 100 + i, "x")]);
+        }
+        for i in 0..6 {
+            ingest_one_segment(&mut db, "events", 0, 1, &[make_event("b", 200 + i, "x")]);
+        }
+        let cfg = cfg_count_only(4);
+        let outcomes = run_compact_now(&mut db, "events", &cfg).unwrap();
+        assert_eq!(outcomes.len(), 2, "both shards compacted");
+        // After draining, every shard has at most one (compacted) L0.
+        let entry = db.manifest().tables.get("events").unwrap();
+        for (idx, segments) in entry.windows[0].shards.iter().enumerate() {
+            let l0: Vec<_> = segments.iter().filter(|s| s.level == 0).collect();
+            assert!(
+                l0.len() < 2,
+                "shard {idx} still has {} L0 segments after compact_now",
+                l0.len()
+            );
+        }
+    }
+
+    #[test]
+    fn run_compact_now_is_noop_when_nothing_eligible() {
+        let scratch = ScratchDir::new("run-now-noop");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+        ingest_one_segment(&mut db, "events", 0, 0, &[make_event("a", 1, "x")]);
+        let outcomes = run_compact_now(&mut db, "events", &CompactionConfig::default()).unwrap();
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn eligible_buckets_finds_candidates_across_multiple_windows() {
+        // Two distinct windows on the same table should each surface
+        // independently in the eligibility list, ordered by L0 count.
+        let scratch = ScratchDir::new("eligible-multi-window");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+        // Window 0 shard 0: 5 segments.
+        for i in 0..5 {
+            ingest_one_segment(&mut db, "events", 0, 0, &[make_event("a", 100 + i, "x")]);
+        }
+        // Window 7 shard 0: 7 segments — larger backlog, should sort first.
+        for i in 0..7 {
+            ingest_one_segment(&mut db, "events", 7, 0, &[make_event("b", 200 + i, "x")]);
+        }
+        let cfg = cfg_count_only(4);
+        let elig = eligible_buckets(&db, "events", &cfg).unwrap();
+        assert_eq!(elig.len(), 2);
+        assert_eq!(elig[0].window_id, 7, "higher count first");
+        assert_eq!(elig[0].l0_count, 7);
+        assert_eq!(elig[1].window_id, 0);
+        assert_eq!(elig[1].l0_count, 5);
+    }
+
+    #[test]
+    fn database_compact_now_uses_default_config() {
+        // Smoke test of the public Database::compact_now wrapper. The
+        // default config has trigger=4 so we ingest 5 segments to push
+        // past it.
+        let scratch = ScratchDir::new("db-compact-now");
+        let mut db = Database::create(scratch.path()).unwrap();
+        db.create_table("events".into(), events_schema()).unwrap();
+        for i in 0..5 {
+            ingest_one_segment(&mut db, "events", 0, 0, &[make_event("a", 100 + i, "x")]);
+        }
+        let outcomes = db.compact_now("events").expect("compact_now");
+        assert_eq!(outcomes.len(), 1);
+        let entry = db.manifest().tables.get("events").unwrap();
+        let l0: Vec<_> = entry.windows[0].shards[0]
+            .iter()
+            .filter(|s| s.level == 0)
+            .collect();
+        assert!(l0.is_empty(), "all L0s consumed by compaction");
     }
 }
