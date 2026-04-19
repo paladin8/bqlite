@@ -114,11 +114,16 @@ fn materialize_encoded_kind(
     ty: &BqlType,
 ) -> Result<ArrayRef> {
     match kind {
-        EncodedKind::Constant { value } => materialize_constant(value, rows, ty, chunk.nulls.as_deref()),
-        EncodedKind::Bool
-        | EncodedKind::PlainFixed { .. }
-        | EncodedKind::PlainString => materialize_plain(chunk, ty, rows),
+        EncodedKind::Constant { value } => {
+            materialize_constant(value, rows, ty, chunk.nulls.as_deref())
+        }
+        EncodedKind::Bool | EncodedKind::PlainFixed { .. } | EncodedKind::PlainString => {
+            materialize_plain(chunk, ty, rows)
+        }
         EncodedKind::Rle => materialize_rle(chunk, ty, rows),
+        EncodedKind::Dictionary { values } => {
+            materialize_dictionary(chunk, values.as_ref(), ty, rows)
+        }
         // Every other kind in the encoded IR is unreachable on the
         // CP2 read path because `pin_column_chunk` routes them
         // through `EncodedColumn::Materialized`. If they ever show
@@ -141,9 +146,9 @@ fn materialize_constant(
         (ScalarValue::Bool(b), BqlType::Bool) => Arc::new(BooleanArray::from(vec![*b; rows])),
         (ScalarValue::Int(v), BqlType::Int) => Arc::new(Int64Array::from(vec![*v; rows])),
         (ScalarValue::Float(v), BqlType::Float) => Arc::new(Float64Array::from(vec![*v; rows])),
-        (ScalarValue::Timestamp(v), BqlType::Timestamp) => Arc::new(
-            TimestampNanosecondArray::from(vec![*v; rows]).with_timezone("UTC"),
-        ),
+        (ScalarValue::Timestamp(v), BqlType::Timestamp) => {
+            Arc::new(TimestampNanosecondArray::from(vec![*v; rows]).with_timezone("UTC"))
+        }
         (ScalarValue::String(s), BqlType::String) => {
             let mut b = StringViewBuilder::with_capacity(rows);
             for _ in 0..rows {
@@ -210,6 +215,108 @@ fn materialize_rle(
     }
 }
 
+/// Materialize a [`EncodedKind::Dictionary`] column back to a dense
+/// Arrow array. Codes live in `chunk.payload` (bit-packed, non-null
+/// count); the dictionary region lives in `values` (raw bytes parsed
+/// per logical type); `chunk.params` is the on-disk 5-byte block
+/// `dict_id u32 LE + code_bit_width u8` — only byte 4 is relevant
+/// here.
+fn materialize_dictionary(
+    chunk: &bqlite_core::encoded::PinnedChunk,
+    values: &[u8],
+    ty: &BqlType,
+    rows: usize,
+) -> Result<ArrayRef> {
+    if chunk.params.len() != 5 {
+        return Err(BqliteError::Execution(format!(
+            "materialize: Dictionary chunk params expected 5 bytes, got {}",
+            chunk.params.len()
+        )));
+    }
+    let code_bit_width = chunk.params[4];
+    let non_null_count = match chunk.nulls.as_deref() {
+        None => rows,
+        Some(b) => super::reader::count_set_bits_pub(b, rows),
+    };
+    let codes = crate::encoding::dictionary::unpack_codes(
+        &chunk.payload,
+        non_null_count,
+        code_bit_width,
+    )?;
+    let dense: ArrayRef = match ty {
+        BqlType::Int => {
+            if !values.len().is_multiple_of(8) {
+                return Err(BqliteError::Execution(format!(
+                    "materialize: Dictionary Int region length {} is not a multiple of 8",
+                    values.len()
+                )));
+            }
+            let cardinality = values.len() / 8;
+            let mut dict: Vec<i64> = Vec::with_capacity(cardinality);
+            for c in values.chunks_exact(8) {
+                dict.push(i64::from_le_bytes(c.try_into().unwrap()));
+            }
+            let mut out = Vec::with_capacity(non_null_count);
+            for code in &codes {
+                let idx = *code as usize;
+                if idx >= cardinality {
+                    return Err(BqliteError::Execution(format!(
+                        "materialize: Dictionary code {code} out of bounds (cardinality {cardinality})"
+                    )));
+                }
+                out.push(dict[idx]);
+            }
+            Arc::new(Int64Array::from(out))
+        }
+        BqlType::String => {
+            let mut dict: Vec<&str> = Vec::new();
+            let mut off = 0usize;
+            while off < values.len() {
+                if off + 4 > values.len() {
+                    return Err(BqliteError::Execution(
+                        "materialize: Dictionary String region truncated at length prefix".into(),
+                    ));
+                }
+                let len = u32::from_le_bytes(values[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                if off + len > values.len() {
+                    return Err(BqliteError::Execution(
+                        "materialize: Dictionary String region truncated at value".into(),
+                    ));
+                }
+                let s = std::str::from_utf8(&values[off..off + len]).map_err(|e| {
+                    BqliteError::Execution(format!(
+                        "materialize: Dictionary String value is not valid UTF-8: {e}"
+                    ))
+                })?;
+                off += len;
+                dict.push(s);
+            }
+            let mut b = StringViewBuilder::with_capacity(non_null_count);
+            for code in &codes {
+                let idx = *code as usize;
+                if idx >= dict.len() {
+                    return Err(BqliteError::Execution(format!(
+                        "materialize: Dictionary code {code} out of bounds (cardinality {})",
+                        dict.len()
+                    )));
+                }
+                b.append_value(dict[idx]);
+            }
+            Arc::new(b.finish())
+        }
+        other => {
+            return Err(BqliteError::Execution(format!(
+                "materialize: Dictionary encoding does not support BqlType::{other}"
+            )));
+        }
+    };
+    match chunk.nulls.as_deref() {
+        None => Ok(dense),
+        Some(bitmap) => super::reader::splice_nulls_pub(&dense, bitmap, rows, ty),
+    }
+}
+
 fn apply_null_bitmap(
     dense: &ArrayRef,
     bitmap: &[u8],
@@ -225,21 +332,24 @@ fn apply_null_bitmap(
             let a = dense
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| BqliteError::Execution("apply_null_bitmap: expected BooleanArray".into()))?;
+                .ok_or_else(|| {
+                    BqliteError::Execution("apply_null_bitmap: expected BooleanArray".into())
+                })?;
             Ok(Arc::new(BooleanArray::new(a.values().clone(), Some(nb))))
         }
         BqlType::Int => {
-            let a = dense
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| BqliteError::Execution("apply_null_bitmap: expected Int64Array".into()))?;
+            let a = dense.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                BqliteError::Execution("apply_null_bitmap: expected Int64Array".into())
+            })?;
             Ok(Arc::new(Int64Array::new(a.values().clone(), Some(nb))))
         }
         BqlType::Float => {
             let a = dense
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| BqliteError::Execution("apply_null_bitmap: expected Float64Array".into()))?;
+                .ok_or_else(|| {
+                    BqliteError::Execution("apply_null_bitmap: expected Float64Array".into())
+                })?;
             Ok(Arc::new(Float64Array::new(a.values().clone(), Some(nb))))
         }
         BqlType::Timestamp => {
@@ -247,7 +357,9 @@ fn apply_null_bitmap(
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .ok_or_else(|| {
-                    BqliteError::Execution("apply_null_bitmap: expected TimestampNanosecondArray".into())
+                    BqliteError::Execution(
+                        "apply_null_bitmap: expected TimestampNanosecondArray".into(),
+                    )
                 })?;
             Ok(Arc::new(
                 TimestampNanosecondArray::new(a.values().clone(), Some(nb)).with_timezone("UTC"),

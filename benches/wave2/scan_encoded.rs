@@ -13,9 +13,11 @@
 //!   lands as `Constant`-encoded. The encoded path hits
 //!   [`ConstantEqKernel`] — its best case.
 //! - `realistic_rg`: default row groups so every low-cardinality string
-//!   column is Dictionary-encoded. No kernel fires today; the encoded
-//!   path falls back to `EncodedColumn::Materialized` for the filter
-//!   column. Expected: ≈ parity with the materialized path.
+//!   column is Dictionary-encoded. [`DictionaryEqKernel`] fires here —
+//!   binary-searches the literal in the sorted dict, then scans the
+//!   bit-packed code stream. Expected: ≈ parity with or faster than
+//!   the materialized path (the win scales with row count and dict
+//!   selectivity).
 //!
 //! The comparison isolates the filter-application cost: both paths do
 //! the same segment read, they differ only in how they apply the
@@ -24,15 +26,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Array, Scalar, StringViewArray};
+use arrow::array::{Scalar, StringViewArray};
 use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::cmp;
 use bqlite_benches::common::*;
 use bqlite_core::encoded::RowSelection;
-use bqlite_core::scalar::ScalarValue;
 use bqlite_core::storage::{ColumnProjection, SegmentScan};
-use bqlite_core::BqlType;
-use bqlite_operators::encoded_filter::{ConstantEqKernel, EncodedPredicateKernel};
+use bqlite_core::{BqlType, PropertyValue};
+use bqlite_operators::encoded_filter::{apply_encoded_eq, EncodedEqShape};
 use bqlite_operators::materialize_selected;
 use bqlite_storage::segment::reader::SegmentFileReader;
 use bqlite_storage::writer::{SegmentWriter, WriterConfig};
@@ -109,13 +110,12 @@ fn run_materialized(
     total
 }
 
-/// Encoded kernel path: `next_encoded_row_group` → [`ConstantEqKernel`] →
-/// `materialize_selected`.
+/// Encoded kernel path: `next_encoded_row_group` → `apply_encoded_eq`
+/// (dispatches to ConstantEq / RleIntEq / DictionaryEq or falls back
+/// to arrow-compute on Materialized columns) → `materialize_selected`.
 ///
-/// Uses the kernel when the filter column is Constant-encoded; otherwise
-/// falls back to materializing the column and running `cmp::eq` on it
-/// (the same arrow-compute path the materialized baseline uses) — this
-/// models the current encoded path when no kernel exists.
+/// `apply_encoded_eq` is the same entry point the real ScanOperator
+/// drives, so the bench measures what production runs.
 fn run_encoded(
     bytes: &[u8],
     schema: &bqlite_core::schema::TableSchema,
@@ -124,13 +124,14 @@ fn run_encoded(
     types: &[BqlType],
     arrow_schema: Arc<arrow::datatypes::Schema>,
 ) -> u64 {
-    use bqlite_core::encoded::EncodedColumn;
-    use bqlite_storage::materialize_encoded_column;
-
     let reader = SegmentFileReader::from_bytes(bytes.to_vec(), schema.clone()).unwrap();
     let projection = ColumnProjection::all();
     let mut scan = reader.scan(&projection, None).unwrap();
-    let kernel = ConstantEqKernel::new(ScalarValue::String(literal.to_string()));
+    let shape = EncodedEqShape {
+        col_index: col_idx,
+        literal: PropertyValue::String(literal.into()),
+    };
+    let col_type = types[col_idx].clone();
     let mut total = 0u64;
     while let Some(encoded) = scan.next_encoded_row_group().unwrap() {
         let rows = encoded.row_count;
@@ -138,22 +139,7 @@ fn run_encoded(
             start: 0,
             len: rows,
         }]);
-        let col = &encoded.columns[col_idx];
-        let sel = match col {
-            EncodedColumn::Encoded { .. } => kernel.apply(&col.view(), &input_sel),
-            EncodedColumn::Materialized { .. } => {
-                // Fallback path: no kernel yet — materialize the filter
-                // column and produce a boolean mask via arrow-compute.
-                let dense = materialize_encoded_column(col, &BqlType::String).unwrap();
-                let lit = Scalar::new(StringViewArray::from(vec![literal]));
-                let mask = cmp::eq(&dense.as_ref(), &lit).unwrap();
-                let mask_bool = mask
-                    .as_any()
-                    .downcast_ref::<arrow::array::BooleanArray>()
-                    .unwrap();
-                bqlite_operators::encoded_filter::apply_materialized_mask(mask_bool, &input_sel)
-            }
-        };
+        let sel = apply_encoded_eq(&shape, &encoded, &input_sel, &col_type).unwrap();
         let fb = materialize_selected(&encoded, Some(&sel), types, arrow_schema.clone()).unwrap();
         total += fb.batch.num_rows() as u64;
         black_box(&fb);
@@ -231,7 +217,7 @@ fn bench_constant_column_filter(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Bench 2: Realistic row groups (no kernel → fallback path) ────────────────
+// ── Bench 2: Realistic row groups (Dictionary kernel) ───────────────────────
 
 fn bench_realistic_column_filter(c: &mut Criterion) {
     let mode = BenchMode::from_env();
@@ -279,7 +265,7 @@ fn bench_realistic_column_filter(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("encoded_fallback", |b| {
+    group.bench_function("encoded_kernel", |b| {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {

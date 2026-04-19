@@ -33,9 +33,7 @@ use std::sync::Arc;
 
 use ::arrow::array::ArrayRef;
 
-use bqlite_core::encoded::{
-    ArcBytes, EncodedBatch, EncodedColumn, EncodedKind, PinnedChunk,
-};
+use bqlite_core::encoded::{ArcBytes, EncodedBatch, EncodedColumn, EncodedKind, PinnedChunk};
 use bqlite_core::scalar::ScalarValue;
 use bqlite_core::{BqlType, BqliteError, ColumnDef, Result};
 
@@ -69,6 +67,7 @@ pub fn pin_column_chunk(
     meta: &ColumnChunkMeta,
     write_time_col: &ColumnDef,
     row_group_row_count: usize,
+    segment_dict_bytes: Option<&[ArcBytes]>,
     materialize_fallback: impl FnOnce() -> Result<ArrayRef>,
 ) -> Result<EncodedColumn> {
     let chunk_start = meta.byte_offset as usize;
@@ -254,11 +253,52 @@ pub fn pin_column_chunk(
                 rows,
             })
         }
-        // Everything else: transitional materialized fallback. CP3
-        // promotes Dictionary; CP4 RLE kernels build on CP2's Rle
-        // view; CP6 covers compressed numeric / FSST.
-        EncodingType::Dictionary
-        | EncodingType::Delta
+        EncodingType::Dictionary => {
+            // The on-disk Dictionary chunk params (§9.2) are 5 bytes:
+            // `dict_id: u32 LE` + `code_bit_width: u8`. The dictionary
+            // values themselves live in the segment-level
+            // dictionaries region and are handed in via
+            // `segment_dict_bytes`. When that side-channel is absent
+            // (legacy callers that don't thread it through), fall
+            // back to the materialized decoder — correctness over
+            // perf.
+            let Some(dict_bytes) = segment_dict_bytes else {
+                return Ok(EncodedColumn::Materialized {
+                    array: materialize_fallback()?,
+                    rows,
+                });
+            };
+            if on_disk_params.len() != 5 {
+                return Err(BqliteError::Corruption(format!(
+                    "segment reader: Dictionary params for `{}` are {} bytes (expected 5)",
+                    write_time_col.name,
+                    on_disk_params.len()
+                )));
+            }
+            let dict_id = u32::from_le_bytes(on_disk_params[..4].try_into().unwrap()) as usize;
+            if dict_id >= dict_bytes.len() {
+                return Err(BqliteError::Corruption(format!(
+                    "segment reader: Dictionary dict_id {dict_id} out of range \
+                     (segment has {} dictionaries)",
+                    dict_bytes.len()
+                )));
+            }
+            let values = dict_bytes[dict_id].clone();
+            let payload_arc: ArcBytes = Arc::from(uncompressed_payload.as_ref());
+            let params_arc: ArcBytes = Arc::from(on_disk_params);
+            Ok(EncodedColumn::Encoded {
+                chunk: PinnedChunk {
+                    payload: payload_arc,
+                    nulls: null_bitmap,
+                    params: params_arc,
+                },
+                kind: EncodedKind::Dictionary { values },
+                rows,
+            })
+        }
+        // Everything else: transitional materialized fallback. CP6
+        // covers compressed numeric / FSST.
+        EncodingType::Delta
         | EncodingType::DoubleDelta
         | EncodingType::BitPacking
         | EncodingType::Fsst

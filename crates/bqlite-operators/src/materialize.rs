@@ -28,9 +28,7 @@ use arrow::compute;
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::encoded::{
-    EncodedBatch, RowSelection, StitchedBatch, StitchedRows,
-};
+use bqlite_core::encoded::{EncodedBatch, RowSelection, StitchedBatch, StitchedRows};
 use bqlite_core::metrics::Metrics;
 use bqlite_core::{BqlType, BqliteError, Result};
 use bqlite_storage::{materialize_encoded_column, materialize_encoded_column_selected};
@@ -112,7 +110,9 @@ pub fn materialize_selected_with_metrics(
         arrays.push(materialize_encoded_column_selected(col, ty, selection)?);
     }
     let record = RecordBatch::try_new(schema, arrays).map_err(|e| {
-        BqliteError::Execution(format!("materialize_selected: record-batch build failed: {e}"))
+        BqliteError::Execution(format!(
+            "materialize_selected: record-batch build failed: {e}"
+        ))
     })?;
     if let Some(m) = metrics {
         m.record_materialized_rows(record.num_rows() as u64);
@@ -254,9 +254,7 @@ fn materialize_stitched_indices(
             continue;
         }
         let src = sources.get(idx).ok_or_else(|| {
-            BqliteError::Execution(format!(
-                "materialize_stitched: ref references source {idx}"
-            ))
+            BqliteError::Execution(format!("materialize_stitched: ref references source {idx}"))
         })?;
         if src.columns.len() != types.len() {
             return Err(BqliteError::Execution(format!(
@@ -305,8 +303,10 @@ fn concat_chunks(mut chunks: Vec<Vec<ArrayRef>>) -> Result<Vec<ArrayRef>> {
                 "materialize_stitched: column has no chunks to concatenate".into(),
             ));
         }
-        let refs: Vec<&dyn arrow::array::Array> =
-            col_chunks.iter().map(|a| a.as_ref() as &dyn arrow::array::Array).collect();
+        let refs: Vec<&dyn arrow::array::Array> = col_chunks
+            .iter()
+            .map(|a| a.as_ref() as &dyn arrow::array::Array)
+            .collect();
         let concatenated = compute::concat(&refs).map_err(|e| {
             BqliteError::Execution(format!(
                 "materialize_stitched: arrow::compute::concat failed: {e}"
@@ -329,7 +329,11 @@ mod tests {
     use bqlite_core::encoded::{EncodedColumn, RowRef, RowRun, SelectionVector, SourceRun};
 
     fn i64_schema() -> Arc<ArrowSchema> {
-        Arc::new(ArrowSchema::new(vec![Field::new("x", DataType::Int64, true)]))
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Int64,
+            true,
+        )]))
     }
 
     fn materialized_column(vals: Vec<i64>) -> EncodedColumn {
@@ -344,8 +348,7 @@ mod tests {
     fn materialize_selected_dense_passes_every_row() {
         let col = materialized_column(vec![10, 20, 30, 40]);
         let batch = EncodedBatch::new(4, vec![col]);
-        let fb =
-            materialize_selected(&batch, None, &[BqlType::Int], i64_schema()).unwrap();
+        let fb = materialize_selected(&batch, None, &[BqlType::Int], i64_schema()).unwrap();
         assert!(fb.is_dense());
         assert_eq!(fb.batch.num_rows(), 4);
         assert!(fb.selection.is_none());
@@ -391,9 +394,8 @@ mod tests {
     fn materialize_selected_type_mismatch_errors() {
         let col = materialized_column(vec![1, 2]);
         let batch = EncodedBatch::new(2, vec![col]);
-        let err =
-            materialize_selected(&batch, None, &[BqlType::Int, BqlType::Int], i64_schema())
-                .expect_err("wrong types count must fail");
+        let err = materialize_selected(&batch, None, &[BqlType::Int, BqlType::Int], i64_schema())
+            .expect_err("wrong types count must fail");
         assert!(matches!(err, BqliteError::Execution(_)));
     }
 
@@ -433,14 +435,13 @@ mod tests {
         let batch = EncodedBatch::new(10, vec![col]);
 
         // Kernel: value == 1 → runs [0,3) and [5,10).
-        let kernel = RleIntEqKernel::new(1);
+        let kernel = RleIntEqKernel::new(vec![1]);
         let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
         let sel = kernel.apply(&batch.columns[0].view(), &input);
 
         // Boundary: materialize selected rows. Expected values = 1
         // repeated 8 times (3 + 5).
-        let fb =
-            materialize_selected(&batch, Some(&sel), &[BqlType::Int], i64_schema()).unwrap();
+        let fb = materialize_selected(&batch, Some(&sel), &[BqlType::Int], i64_schema()).unwrap();
         assert!(fb.is_dense());
         assert_eq!(fb.batch.num_rows(), 8);
         let ints = fb

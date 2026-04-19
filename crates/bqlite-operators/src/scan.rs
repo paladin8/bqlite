@@ -83,14 +83,18 @@ use arrow::compute::{self, kernels::boolean};
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 
+use bqlite_core::encoded::{RowRun, RowSelection};
 use bqlite_core::{
-    BqliteError, ColumnDef, ColumnProjection, OperatorSchema, Predicate, PropertyValue, RangeOp,
-    Result, ScanConjunct, ScanPredicate, SegmentHandle, SegmentReader, SegmentScan, TableSchema,
+    BqlType, BqliteError, ColumnDef, ColumnProjection, OperatorSchema, Predicate, PropertyValue,
+    RangeOp, Result, ScanConjunct, ScanPredicate, SegmentHandle, SegmentReader, SegmentScan,
+    TableSchema,
 };
 use bqlite_planner::compiled::{CompareOp, CompiledExpr, CompiledNode};
 use bqlite_storage::segment::merge::KWayMergeScan;
 
+use crate::encoded_filter::{apply_encoded_eq, partition_encoded_eq, EncodedEqShape};
 use crate::eval;
+use crate::materialize::materialize_selected;
 use crate::operator::{CancellationToken, PhysicalOperator};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -208,8 +212,13 @@ pub struct ScanOperator {
     ts_col: usize,
     /// Running k-way merge. `None` until `open()` has been called;
     /// reset to `None` by `close()` so the operator may be closed
-    /// before any data flows.
+    /// before any data flows. Mutually exclusive with `encoded_scan`:
+    /// the encoded single-segment fast path bypasses the merge.
     merge: Option<KWayMergeScan>,
+    /// Direct single-segment scan for the encoded path. `Some` only
+    /// when `scan_path != Materialized` and exactly one segment handle
+    /// is visible — otherwise we fall back to the merge.
+    encoded_scan: Option<Box<dyn SegmentScan>>,
     /// Latches on the first `Ok(None)` from `next_batch` and keeps
     /// subsequent pulls cheap and side-effect-free.
     exhausted: bool,
@@ -217,6 +226,20 @@ pub struct ScanOperator {
     /// affect behavior — every variant dispatches to the materialized
     /// path. Checkpoint 3 lights up the `Encoded` branch.
     scan_path: ScanPath,
+    /// Per-column `BqlType` list, in the same order as
+    /// `arrow_schema.fields()`. Cached so the encoded path's
+    /// materialization boundary and fallback-eq decoder don't
+    /// re-derive it per row-group.
+    types: Vec<BqlType>,
+    /// Predicates partitioned into the `col == literal` shape the
+    /// encoded path dispatches on. Populated only when `scan_path !=
+    /// Materialized`; empty otherwise.
+    encoded_shapes: Vec<EncodedEqShape>,
+    /// Residual `CompiledExpr` list that the encoded path still needs
+    /// to enforce post-materialization via arrow-compute (anything that
+    /// didn't match the encoded shape goes here). Populated only when
+    /// `scan_path != Materialized`.
+    encoded_residual: Vec<CompiledExpr>,
 }
 
 impl std::fmt::Debug for ScanOperator {
@@ -234,7 +257,10 @@ impl std::fmt::Debug for ScanOperator {
             .field("ts_col", &self.ts_col)
             .field("has_scan_predicate", &self.scan_predicate.is_some())
             .field("post_filter_count", &self.post_filters.len())
-            .field("open", &self.merge.is_some())
+            .field(
+                "open",
+                &(self.merge.is_some() || self.encoded_scan.is_some()),
+            )
             .field("exhausted", &self.exhausted)
             .field("scan_path", &self.scan_path)
             .finish()
@@ -329,6 +355,17 @@ impl ScanOperator {
 
         let scan_predicate = build_scan_predicate(&scan_predicates);
 
+        let types: Vec<BqlType> = output_schema
+            .columns()
+            .iter()
+            .map(|c| c.bql_type.clone())
+            .collect();
+        let (encoded_shapes, encoded_residual) = if scan_path == ScanPath::Materialized {
+            (Vec::new(), Vec::new())
+        } else {
+            partition_encoded_eq(&scan_predicates)
+        };
+
         Ok(Self {
             reader,
             projection,
@@ -340,8 +377,12 @@ impl ScanOperator {
             entity_col,
             ts_col,
             merge: None,
+            encoded_scan: None,
             exhausted: false,
             scan_path,
+            types,
+            encoded_shapes,
+            encoded_residual,
         })
     }
 
@@ -356,6 +397,65 @@ impl ScanOperator {
     /// Read the current scan-path mode.
     pub fn scan_path(&self) -> ScanPath {
         self.scan_path
+    }
+
+    /// Single-segment encoded pull: drive `next_encoded_row_group` on
+    /// the stashed scan, apply recognized `col == literal` predicates
+    /// via [`apply_encoded_eq`] (kernel or fallback), materialize the
+    /// resulting selection, and enforce any residual predicates via the
+    /// existing post-filter path.
+    ///
+    /// Loops until it finds a row-group that yields a non-empty batch
+    /// so downstream consumers never see an empty result (matches the
+    /// materialized path's "re-pull on empty" convention).
+    fn encoded_next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            let scan = self
+                .encoded_scan
+                .as_mut()
+                .expect("encoded_scan is Some (checked by caller)");
+            let Some(encoded) = scan.next_encoded_row_group()? else {
+                self.exhausted = true;
+                return Ok(None);
+            };
+            let rows = encoded.row_count;
+            if rows == 0 {
+                return Ok(Some(RecordBatch::new_empty(self.arrow_schema.clone())));
+            }
+            let mut sel = RowSelection::from_runs(vec![RowRun {
+                start: 0,
+                len: rows,
+            }]);
+            for shape in &self.encoded_shapes {
+                if sel.is_empty() {
+                    break;
+                }
+                sel = apply_encoded_eq(shape, &encoded, &sel, &self.types[shape.col_index])?;
+            }
+            if sel.is_empty() {
+                // Every row filtered — pull the next row-group without
+                // paying a full materialization.
+                continue;
+            }
+            let fb =
+                materialize_selected(&encoded, Some(&sel), &self.types, self.arrow_schema.clone())?;
+            let batch = fb.batch;
+            // Residual predicates: everything that didn't match the
+            // encoded-eq shape. Runs the full post_filters list when
+            // there are no recognized shapes so we stay correct on the
+            // "encoded mode requested but no pushable equality"
+            // fixture.
+            let batch = if self.encoded_shapes.is_empty() {
+                self.apply_post_filters(batch)?
+            } else if self.encoded_residual.is_empty() {
+                batch
+            } else {
+                apply_compiled_filters(&self.encoded_residual, batch)?
+            };
+            if batch.num_rows() > 0 {
+                return Ok(Some(batch));
+            }
+        }
     }
 
     /// Evaluate every entry in `post_filters` against `batch` and
@@ -405,6 +505,18 @@ impl PhysicalOperator for ScanOperator {
             scans.push(scan);
         }
 
+        // Encoded single-segment fast path: when the caller requested
+        // the encoded read path and exactly one segment is visible,
+        // bypass KWayMergeScan and drive the segment directly via
+        // `next_encoded_row_group`. Multi-segment encoded scans fall
+        // through to the merge path below until CP5's stitched merge
+        // producer lands.
+        if self.scan_path != ScanPath::Materialized && scans.len() == 1 {
+            self.encoded_scan = Some(scans.pop().unwrap());
+            self.exhausted = false;
+            return Ok(());
+        }
+
         let merge = KWayMergeScan::new(
             scans,
             self.arrow_schema.clone(),
@@ -422,6 +534,9 @@ impl PhysicalOperator for ScanOperator {
         }
         if self.cancel.is_cancelled() {
             return Err(BqliteError::Cancelled);
+        }
+        if self.encoded_scan.is_some() {
+            return self.encoded_next_batch();
         }
         loop {
             let merge = self.merge.as_mut().ok_or_else(|| {
@@ -446,14 +561,35 @@ impl PhysicalOperator for ScanOperator {
     }
 
     fn close(&mut self) -> Result<()> {
-        // Dropping the merge releases every held per-segment scan
-        // (file handles, decompression state) via its destructors.
-        // `close` must tolerate being called with `merge == None`
+        // Dropping both scan holders releases every held per-segment
+        // scan (file handles, decompression state) via destructors.
+        // `close` must tolerate being called with both fields `None`
         // after a failed `open` or without ever reaching `open`.
         self.merge = None;
+        self.encoded_scan = None;
         self.exhausted = true;
         Ok(())
     }
+}
+
+/// Free-function counterpart to [`ScanOperator::apply_post_filters`]
+/// used by the encoded path, where the residual list is a borrowed
+/// slice rather than `self.post_filters`.
+fn apply_compiled_filters(predicates: &[CompiledExpr], batch: RecordBatch) -> Result<RecordBatch> {
+    if predicates.is_empty() {
+        return Ok(batch);
+    }
+    let mut combined: Option<BooleanArray> = None;
+    for predicate in predicates {
+        let mask = eval::evaluate_bool(predicate, &batch)?;
+        combined = Some(match combined {
+            None => mask,
+            Some(acc) => boolean::and_kleene(&acc, &mask)?,
+        });
+    }
+    let mask = combined.expect("predicates non-empty");
+    let filtered = compute::filter_record_batch(&batch, &mask)?;
+    Ok(filtered)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1549,8 +1685,14 @@ mod tests {
 
     #[test]
     fn scan_path_parse_accepts_all_variants_case_insensitive() {
-        assert_eq!(ScanPath::parse("materialized"), Some(ScanPath::Materialized));
-        assert_eq!(ScanPath::parse("MATERIALIZED"), Some(ScanPath::Materialized));
+        assert_eq!(
+            ScanPath::parse("materialized"),
+            Some(ScanPath::Materialized)
+        );
+        assert_eq!(
+            ScanPath::parse("MATERIALIZED"),
+            Some(ScanPath::Materialized)
+        );
         assert_eq!(ScanPath::parse("encoded"), Some(ScanPath::Encoded));
         assert_eq!(ScanPath::parse("  Auto  "), Some(ScanPath::Auto));
     }
@@ -1559,5 +1701,172 @@ mod tests {
     fn scan_path_parse_rejects_unknown() {
         assert_eq!(ScanPath::parse("nope"), None);
         assert_eq!(ScanPath::parse(""), None);
+    }
+
+    // ── Encoded dispatch ─────────────────────────────────────────────────────
+
+    /// Drain every batch and collect `(entity_id, event_type)` pairs.
+    /// Used by the parity tests below so the check compares on both a
+    /// sort-key column and a filter-target column.
+    fn drain_pairs(op: &mut ScanOperator) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch().expect("next_batch ok") {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            let evts = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                out.push((ids.value(i).to_string(), evts.value(i).to_string()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn encoded_path_matches_materialized_on_single_segment_eq_filter() {
+        // Single-segment `event_type = 'keep'`. Both ScanPath variants
+        // must produce the same row set. The test exercises the
+        // encoded-path plumbing end-to-end — the VecReader uses the
+        // default `next_encoded_row_group` which wraps each column as
+        // `EncodedColumn::Materialized`, so dispatch lands in the
+        // arrow-compute fallback. That path is the realistic case for
+        // any encoding without a kernel yet (Dictionary, BitPacking,
+        // …), which is exactly what this wiring has to support.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("event_type"), string_lit("keep")),
+            &output_schema,
+        );
+        let batch = make_batch(
+            &["u1", "u2", "u3", "u4"],
+            &[10, 20, 30, 40],
+            &["keep", "skip", "keep", "skip"],
+        );
+        let make_reader = || -> Arc<dyn SegmentReader> {
+            Arc::new(VecReader::with_segments(
+                minimal_schema(),
+                vec![(make_handle(1, 4), vec![batch.clone()], vec![HashMap::new()])],
+            ))
+        };
+
+        let mut mat_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            vec![pred.clone()],
+            CancellationToken::new(),
+            ScanPath::Materialized,
+        )
+        .unwrap();
+        mat_op.open().unwrap();
+        let mat_pairs = drain_pairs(&mut mat_op);
+
+        let mut enc_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            vec![pred],
+            CancellationToken::new(),
+            ScanPath::Encoded,
+        )
+        .unwrap();
+        enc_op.open().unwrap();
+        let enc_pairs = drain_pairs(&mut enc_op);
+
+        assert_eq!(
+            mat_pairs,
+            vec![
+                ("u1".to_string(), "keep".to_string()),
+                ("u3".to_string(), "keep".to_string()),
+            ]
+        );
+        assert_eq!(enc_pairs, mat_pairs, "encoded and materialized must agree");
+    }
+
+    #[test]
+    fn encoded_path_preserves_non_pushable_residual() {
+        // The `ts > 150` predicate does not match the `col == literal`
+        // shape, so it lands in the encoded-path residual list and is
+        // applied after the materialization boundary. The test asserts
+        // both paths agree on a workload that has *only* a residual
+        // predicate — no encoded-eq shape at all.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Greater, col("ts"), int_lit(150)),
+            &output_schema,
+        );
+        let batch = make_batch(
+            &["u1", "u2", "u3", "u4"],
+            &[100, 150, 200, 300],
+            &["a", "b", "c", "d"],
+        );
+        let make_reader = || -> Arc<dyn SegmentReader> {
+            Arc::new(VecReader::with_segments(
+                minimal_schema(),
+                vec![(make_handle(1, 4), vec![batch.clone()], vec![HashMap::new()])],
+            ))
+        };
+
+        let mut mat_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            vec![pred.clone()],
+            CancellationToken::new(),
+            ScanPath::Materialized,
+        )
+        .unwrap();
+        mat_op.open().unwrap();
+        let mat_ids = drain_entity_ids(&mut mat_op);
+
+        let mut enc_op = ScanOperator::with_scan_path(
+            make_reader(),
+            &[],
+            vec![pred],
+            CancellationToken::new(),
+            ScanPath::Encoded,
+        )
+        .unwrap();
+        enc_op.open().unwrap();
+        let enc_ids = drain_entity_ids(&mut enc_op);
+
+        assert_eq!(mat_ids, vec!["u3".to_string(), "u4".to_string()]);
+        assert_eq!(enc_ids, mat_ids);
+    }
+
+    #[test]
+    fn encoded_path_falls_back_to_merge_on_multi_segment() {
+        // Until CP5's stitched merge producer is wired, multi-segment
+        // scans must stay on the materialized merge path even when
+        // `ScanPath::Encoded` is requested — otherwise a naïve encoded
+        // single-source loop would violate the `(entity_id, ts)`
+        // ordering contract by emitting one segment completely before
+        // the next starts. The test asserts the globally-sorted output
+        // shape is preserved.
+        let s1 = make_batch(&["u1", "u3"], &[100, 300], &["a", "c"]);
+        let s2 = make_batch(&["u2", "u2", "u4"], &[150, 200, 400], &["b", "b", "d"]);
+        let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::with_segments(
+            minimal_schema(),
+            vec![
+                (make_handle(1, 2), vec![s1], vec![HashMap::new()]),
+                (make_handle(2, 3), vec![s2], vec![HashMap::new()]),
+            ],
+        ));
+        let mut op = ScanOperator::with_scan_path(
+            reader,
+            &[],
+            Vec::new(),
+            CancellationToken::new(),
+            ScanPath::Encoded,
+        )
+        .unwrap();
+        op.open().unwrap();
+        assert_eq!(
+            drain_entity_ids(&mut op),
+            vec!["u1", "u2", "u2", "u3", "u4"],
+        );
     }
 }

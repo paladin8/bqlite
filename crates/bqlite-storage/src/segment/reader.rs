@@ -130,6 +130,14 @@ pub struct SegmentFileReader {
     /// Segment-level dictionaries, indexed by footer dictionaries
     /// position. Loaded eagerly on open per §11.
     dictionaries: Arc<[DictionaryValues]>,
+    /// Raw byte region for each segment-level dictionary, in the same
+    /// order as [`Self::dictionaries`]. These are the on-disk
+    /// dictionary-region bytes (Int: `n × i64 LE`; String:
+    /// `[u32 LE length][utf8 bytes]…`) wrapped in an
+    /// [`bqlite_core::encoded::ArcBytes`] so the encoded read path can
+    /// hand them to `EncodedKind::Dictionary { values }` without
+    /// reparsing. One copy at open; shared freely across scans.
+    dict_bytes: Arc<[bqlite_core::encoded::ArcBytes]>,
     /// Current manifest schema the reader should project rows
     /// against, passed in by the caller. This is the target schema
     /// for name-based lookups during row-group decode (§14 schema
@@ -233,11 +241,13 @@ impl SegmentFileReader {
         verify_checksum(&bytes)?;
 
         let dictionaries = load_dictionaries(&bytes, &footer)?;
+        let dict_bytes = load_dict_bytes(&bytes, &footer);
 
         Ok(Self {
             bytes: Arc::from(bytes.into_boxed_slice()),
             footer: Arc::new(footer),
             dictionaries: Arc::from(dictionaries.into_boxed_slice()),
+            dict_bytes: Arc::from(dict_bytes.into_boxed_slice()),
             current_schema,
         })
     }
@@ -322,6 +332,7 @@ impl SegmentFileReader {
             bytes: self.bytes.clone(),
             footer: self.footer.clone(),
             dictionaries: self.dictionaries.clone(),
+            dict_bytes: self.dict_bytes.clone(),
             plan,
             predicate,
             next_idx: 0,
@@ -365,6 +376,9 @@ pub struct SegmentFileScan {
     bytes: Arc<[u8]>,
     footer: Arc<SegmentFooter>,
     dictionaries: Arc<[DictionaryValues]>,
+    /// Dict region bytes indexed by dict_id — see
+    /// [`SegmentFileReader::dict_bytes`].
+    dict_bytes: Arc<[bqlite_core::encoded::ArcBytes]>,
     plan: ScanPlan,
     predicate: Option<Arc<dyn Predicate>>,
     next_idx: usize,
@@ -712,6 +726,7 @@ impl SegmentFileScan {
                         meta,
                         write_time_col,
                         row_count,
+                        Some(&self.dict_bytes),
                         move || {
                             decode_column_chunk(
                                 &bytes,
@@ -1727,6 +1742,28 @@ fn verify_checksum(bytes: &[u8]) -> Result<()> {
 /// We decode them directly into owned Rust vectors so the row-group
 /// decoder in the next checkpoint can look up dictionary values by
 /// code without touching the file buffer.
+/// Build one [`bqlite_core::encoded::ArcBytes`] per segment-level
+/// dictionary, wrapping its on-disk byte region (§11).
+///
+/// `validate_footer` already bounds-checked every dictionary range —
+/// this helper assumes those invariants hold and clips any pathological
+/// entry to the file end defensively. One copy per dictionary happens
+/// at open; the returned handles are shared across scans via `Arc`.
+fn load_dict_bytes(bytes: &[u8], footer: &SegmentFooter) -> Vec<bqlite_core::encoded::ArcBytes> {
+    footer
+        .dictionaries()
+        .iter()
+        .map(|dict_ref| {
+            let start = (dict_ref.byte_offset as usize).min(bytes.len());
+            let end = start
+                .saturating_add(dict_ref.byte_length as usize)
+                .min(bytes.len());
+            let region = &bytes[start..end];
+            Arc::<[u8]>::from(region)
+        })
+        .collect()
+}
+
 fn load_dictionaries(bytes: &[u8], footer: &SegmentFooter) -> Result<Vec<DictionaryValues>> {
     let mut out = Vec::with_capacity(footer.dictionaries().len());
     for (i, dict_ref) in footer.dictionaries().iter().enumerate() {
@@ -4546,8 +4583,7 @@ mod tests {
         let encoded = scan2.next_encoded_row_group().unwrap().expect("row group");
         let columns =
             crate::segment::materialize::materialize_encoded_batch(&encoded, &types).unwrap();
-        let rebuilt =
-            ::arrow::array::RecordBatch::try_new(materialized.schema(), columns).unwrap();
+        let rebuilt = ::arrow::array::RecordBatch::try_new(materialized.schema(), columns).unwrap();
 
         assert_eq!(materialized.num_rows(), rebuilt.num_rows());
         assert_eq!(materialized.num_columns(), rebuilt.num_columns());

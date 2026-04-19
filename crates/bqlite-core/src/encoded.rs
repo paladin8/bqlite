@@ -198,10 +198,9 @@ impl EncodedColumn {
                 kind,
                 rows: *rows,
             },
-            EncodedColumn::Materialized { array, rows } => EncodedColumnView::Materialized {
-                array,
-                rows: *rows,
-            },
+            EncodedColumn::Materialized { array, rows } => {
+                EncodedColumnView::Materialized { array, rows: *rows }
+            }
         }
     }
 }
@@ -817,10 +816,7 @@ mod tests {
             RowSelection::Runs(runs) => {
                 assert_eq!(
                     runs,
-                    vec![
-                        RowRun { start: 3, len: 2 },
-                        RowRun { start: 12, len: 3 },
-                    ]
+                    vec![RowRun { start: 3, len: 2 }, RowRun { start: 12, len: 3 },]
                 );
             }
             _ => panic!("expected Runs"),
@@ -863,10 +859,7 @@ mod tests {
             RowSelection::Runs(runs) => {
                 assert_eq!(
                     runs,
-                    &vec![
-                        RowRun { start: 0, len: 3 },
-                        RowRun { start: 10, len: 2 },
-                    ]
+                    &vec![RowRun { start: 0, len: 3 }, RowRun { start: 10, len: 2 },]
                 );
             }
             _ => panic!("expected Runs"),

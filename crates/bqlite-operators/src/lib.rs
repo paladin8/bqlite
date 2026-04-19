@@ -71,7 +71,8 @@ pub use aggregate::{
 };
 pub use distinct::DistinctOperator;
 pub use encoded_filter::{
-    apply_materialized_mask, ConstantEqKernel, EncodedPredicateKernel, RleIntEqKernel,
+    apply_encoded_eq, apply_materialized_mask, partition_encoded_eq, recognize_encoded_eq,
+    ConstantEqKernel, DictionaryEqKernel, EncodedEqShape, EncodedPredicateKernel, RleIntEqKernel,
 };
 pub use filter::FilterOperator;
 pub use filtered_batch::FilteredBatch;
