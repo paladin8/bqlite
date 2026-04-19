@@ -27,7 +27,7 @@
 //! lands in CP7.
 
 use bqlite_core::encoded::{
-    EncodedColumnView, EncodedKind, PinnedChunkRef, RowSelection, SelectionVector,
+    EncodedColumnView, EncodedKind, PinnedChunkRef, RowRun, RowSelection, SelectionVector,
 };
 use bqlite_core::scalar::ScalarValue;
 
@@ -155,6 +155,112 @@ fn bit_is_set(bitmap: &[u8], index: usize) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RleIntEqKernel — RLE-preserving equality for Int/Timestamp columns
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Kernel for `rle_int_or_timestamp_column = literal`.
+///
+/// This is CP4's reason to exist: for a low-cardinality column with
+/// long runs, the filter output stays in [`RowSelection::Runs`] shape.
+/// The cost is one comparison per run, not one per row — a large win
+/// for event_type, country, os columns and similar.
+///
+/// # On-disk layout consumed
+///
+/// Matches `bqlite-storage/src/encoding/rle.rs`:
+/// - `params` = `run_count: u32 LE` (4 bytes)
+/// - `payload` = `[run_ends: u32 LE × run_count] || [i64 LE × run_count]`
+///
+/// Null handling: rows whose validity bit is unset are dropped after
+/// run matching (runs are coerced to indices only when the null bitmap
+/// splits them).
+pub struct RleIntEqKernel {
+    pub literal: i64,
+}
+
+impl RleIntEqKernel {
+    pub fn new(literal: i64) -> Self {
+        Self { literal }
+    }
+}
+
+impl EncodedPredicateKernel for RleIntEqKernel {
+    fn apply(&self, column: &EncodedColumnView<'_>, input: &RowSelection) -> RowSelection {
+        let (chunk, rows) = match column {
+            EncodedColumnView::Encoded { chunk, kind, rows } => match kind {
+                EncodedKind::Rle => (chunk, *rows),
+                _ => return input.clone(),
+            },
+            EncodedColumnView::Materialized { .. } => return input.clone(),
+        };
+        let matched = match parse_rle_int_runs(chunk, rows) {
+            Some(runs) => select_runs_matching_i64(&runs, self.literal),
+            None => return RowSelection::empty(),
+        };
+        // Intersect the predicate's matching runs with the input
+        // selection. When both are runs, result stays as runs.
+        let predicate_sel = RowSelection::from_runs(matched);
+        let narrowed = RowSelection::intersect(&predicate_sel, input);
+        // If the column has nulls, drop rows whose validity bit is
+        // unset. This coerces to Indices when splitting runs.
+        if chunk.nulls.is_some() {
+            apply_null_mask(chunk, rows, &narrowed)
+        } else {
+            narrowed
+        }
+    }
+}
+
+/// Parse run_ends and i64 values for an RLE-encoded Int/Timestamp
+/// column.
+///
+/// Returns `None` on malformed bytes (defensive — the reader already
+/// validates segment integrity, but kernels prefer "no selection" over
+/// panic on adversarial input).
+fn parse_rle_int_runs(chunk: &PinnedChunkRef<'_>, rows: u32) -> Option<Vec<(u32, i64)>> {
+    if chunk.params.len() < 4 {
+        return None;
+    }
+    let run_count =
+        u32::from_le_bytes(chunk.params[..4].try_into().ok()?) as usize;
+    let needed = run_count
+        .checked_mul(4)?
+        .checked_add(run_count.checked_mul(8)?)?;
+    if chunk.payload.len() < needed {
+        return None;
+    }
+    let (ends_bytes, values_bytes) = chunk.payload.split_at(run_count * 4);
+    let mut out = Vec::with_capacity(run_count);
+    for i in 0..run_count {
+        let end = u32::from_le_bytes(ends_bytes[i * 4..i * 4 + 4].try_into().ok()?);
+        let val = i64::from_le_bytes(values_bytes[i * 8..i * 8 + 8].try_into().ok()?);
+        out.push((end, val));
+    }
+    // Sanity: final run_end must equal the logical row count.
+    if out.last().map(|(e, _)| *e).unwrap_or(0) != rows && run_count > 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// Given parsed `(run_end, value)` pairs, emit the runs whose value
+/// equals `literal`. Each output run is `[prev_end, run_end)`.
+fn select_runs_matching_i64(runs: &[(u32, i64)], literal: i64) -> Vec<RowRun> {
+    let mut out = Vec::new();
+    let mut prev_end: u32 = 0;
+    for &(end, val) in runs {
+        if val == literal {
+            out.push(RowRun {
+                start: prev_end,
+                len: end - prev_end,
+            });
+        }
+        prev_end = end;
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -251,6 +357,124 @@ mod tests {
             rows: 2,
         };
         let kernel = ConstantEqKernel::new(ScalarValue::Int(1));
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1]));
+        let out = kernel.apply(&col.view(), &input);
+        assert_eq!(out.len(), 2);
+    }
+
+    fn rle_int_column(runs: &[(u32, i64)], row_count: u32, nulls: Option<Vec<u8>>) -> EncodedColumn {
+        let run_count = runs.len() as u32;
+        let params = run_count.to_le_bytes().to_vec();
+        let mut payload = Vec::with_capacity(runs.len() * 12);
+        for &(end, _) in runs {
+            payload.extend_from_slice(&end.to_le_bytes());
+        }
+        for &(_, val) in runs {
+            payload.extend_from_slice(&val.to_le_bytes());
+        }
+        EncodedColumn::Encoded {
+            chunk: PinnedChunk {
+                payload: Arc::from(payload),
+                nulls: nulls.map(Arc::from),
+                params: Arc::from(params),
+            },
+            kind: EncodedKind::Rle,
+            rows: row_count,
+        }
+    }
+
+    #[test]
+    fn rle_int_eq_preserves_runs_through_filter() {
+        // 10 rows, runs: [A=1]x3, [A=2]x2, [A=1]x5
+        //   run_ends = [3, 5, 10], values = [1, 2, 1]
+        let col = rle_int_column(&[(3, 1), (5, 2), (10, 1)], 10, None);
+        let kernel = RleIntEqKernel::new(1);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = kernel.apply(&col.view(), &input);
+        match &out {
+            RowSelection::Runs(runs) => {
+                assert_eq!(
+                    runs,
+                    &vec![
+                        RowRun { start: 0, len: 3 },
+                        RowRun { start: 5, len: 5 },
+                    ]
+                );
+            }
+            _ => panic!("expected runs output; got indices"),
+        }
+        assert_eq!(out.len(), 8);
+    }
+
+    #[test]
+    fn rle_int_eq_no_match_empty() {
+        let col = rle_int_column(&[(3, 1), (5, 2), (10, 1)], 10, None);
+        let kernel = RleIntEqKernel::new(99);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = kernel.apply(&col.view(), &input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rle_int_eq_narrows_with_input_runs() {
+        let col = rle_int_column(&[(3, 1), (5, 2), (10, 1)], 10, None);
+        let kernel = RleIntEqKernel::new(1);
+        // Input restricts to rows [2..7)
+        let input = RowSelection::from_runs(vec![RowRun { start: 2, len: 5 }]);
+        let out = kernel.apply(&col.view(), &input);
+        match &out {
+            RowSelection::Runs(runs) => {
+                // Matches for value=1: rows [0..3) ∩ [2..7) = [2..3),
+                // and rows [5..10) ∩ [2..7) = [5..7).
+                assert_eq!(
+                    runs,
+                    &vec![
+                        RowRun { start: 2, len: 1 },
+                        RowRun { start: 5, len: 2 },
+                    ]
+                );
+            }
+            _ => panic!("expected runs"),
+        }
+    }
+
+    #[test]
+    fn rle_int_eq_null_bitmap_drops_null_rows() {
+        // 10 rows, runs: value 1 for rows 0..3, 2 for 3..5, 1 for 5..10.
+        // Nulls: rows 1 and 6 are null. Bitmap = 0b1111_1101_1111_1101 =
+        // bytes [0xFD, 0xBF]  (LSB-first: byte0 bit1 = 0, byte1 bit(6-8)=bit-2 off = bit 6 off).
+        //   row 0: bit 0 of byte 0 → 1
+        //   row 1: bit 1 of byte 0 → 0 (null)
+        //   row 2-7: bits 2..8 (byte 0 bits 2-7 plus byte 1 bit 0) → but
+        //     row 6 → bit 6 of byte 0 → 0 (null)
+        //   rows 3,4,5,7,8,9 → valid
+        // byte0 = 0b1011_1101 = 0xBD; byte1 = 0b0000_0011 = 0x03
+        let col = rle_int_column(
+            &[(3, 1), (5, 2), (10, 1)],
+            10,
+            Some(vec![0xBDu8, 0x03u8]),
+        );
+        let kernel = RleIntEqKernel::new(1);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = kernel.apply(&col.view(), &input);
+        // value-1 runs cover rows {0,1,2, 5,6,7,8,9}. After null drop:
+        // exclude row 1 (null) and row 6 (null) → {0,2, 5,7,8,9}.
+        let sv = out.as_indices();
+        assert_eq!(sv.as_slice(), &[0, 2, 5, 7, 8, 9]);
+    }
+
+    #[test]
+    fn rle_int_eq_wrong_encoding_passes_through() {
+        let col = EncodedColumn::Encoded {
+            chunk: PinnedChunk {
+                payload: Arc::from(Vec::<u8>::new()),
+                nulls: None,
+                params: Arc::from(Vec::<u8>::new()),
+            },
+            kind: EncodedKind::PlainFixed { width: 8 },
+            rows: 2,
+        };
+        let kernel = RleIntEqKernel::new(42);
         let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1]));
         let out = kernel.apply(&col.view(), &input);
         assert_eq!(out.len(), 2);

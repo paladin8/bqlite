@@ -69,7 +69,7 @@ pub use aggregate::{
     DEFAULT_MAX_GROUPS,
 };
 pub use distinct::DistinctOperator;
-pub use encoded_filter::{ConstantEqKernel, EncodedPredicateKernel};
+pub use encoded_filter::{ConstantEqKernel, EncodedPredicateKernel, RleIntEqKernel};
 pub use filter::FilterOperator;
 pub use filtered_batch::FilteredBatch;
 pub use limit::LimitOperator;
