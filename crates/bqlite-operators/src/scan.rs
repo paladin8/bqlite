@@ -141,12 +141,13 @@ use crate::operator::{CancellationToken, PhysicalOperator};
 /// selection-first path from
 /// `docs/design/storage/zero-copy-scan-filter.md`).
 ///
-/// # Checkpoint 1 state
+/// # Default
 ///
-/// Every variant currently dispatches to the materialized path —
-/// encoded kernels haven't landed yet. The selector exists so later
-/// checkpoints can flip the default without further API churn:
-/// Checkpoint 3 enables `Auto`, Checkpoint 7 makes `Auto` the default.
+/// `Auto` — the scan picks `Encoded` when every pushed predicate has
+/// an encoded kernel and the input scan supports
+/// `next_encoded_row_group`, otherwise it falls back to
+/// `Materialized`. The materialized path is retained as a debug
+/// escape hatch.
 ///
 /// # Environment override
 ///
@@ -170,10 +171,12 @@ pub enum ScanPath {
 }
 
 impl Default for ScanPath {
-    /// Compile-time default: the safe materialized path. Flipped to
-    /// `Auto` in Checkpoint 7 once encoded kernels prove stable.
+    /// Compile-time default: `Auto` — pick the encoded path when every
+    /// pushed predicate has an encoded kernel, otherwise fall back to
+    /// `Materialized`. Set `BQLITE_SCAN_PATH=materialized` to force the
+    /// debug-only materialized path for an entire process.
     fn default() -> Self {
-        ScanPath::Materialized
+        ScanPath::Auto
     }
 }
 
@@ -2008,8 +2011,8 @@ mod tests {
     // ── ScanPath ──────────────────────────────────────────────────────
 
     #[test]
-    fn scan_path_default_is_materialized() {
-        assert_eq!(ScanPath::default(), ScanPath::Materialized);
+    fn scan_path_default_is_auto() {
+        assert_eq!(ScanPath::default(), ScanPath::Auto);
     }
 
     #[test]
