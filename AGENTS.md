@@ -13,9 +13,10 @@ You have been handed exactly one task. The lock file at `tasks/active/TASK-NNN.l
 1. Read the task definition in `TASKS.md` and the relevant design doc under `docs/design/`
 2. Check for a task note at `tasks/notes/TASK-NNN.md` and read it in full if present (see *Task Notes*)
 3. If the task seems complex at all, build a development plan *before* writing code (see *Planning Before Implementation*)
-4. Implement the task in small checkpoints (see *Checkpoint Discipline*)
-5. After the final checkpoint merges to `main`, mark the task complete (see *Completion Protocol*)
-6. End your turn
+4. If a plan was produced, have it reviewed by a subagent before implementation (see *Plan Review via Subagent*)
+5. Implement the task in small checkpoints (see *Checkpoint Discipline*)
+6. After the final checkpoint merges to `main`, mark the task complete (see *Completion Protocol*)
+7. End your turn
 
 Do not claim another task. Do not start a loop. When you finish, the wrapper will launch a fresh session for the next task.
 
@@ -44,6 +45,24 @@ Use the `superpowers:writing-plans` skill to produce the plan. Save it under `do
 - Reconciles against the relevant `docs/design/` spec; if the plan requires spec changes, note that explicitly
 
 When the task is genuinely trivial (single-file change, mechanical edit, obvious fix), skip the plan and go straight to implementation. When in doubt, plan — the cost of a short plan is small compared to the cost of ripping up a half-finished implementation.
+
+### Plan Review via Subagent
+
+After writing the plan and before beginning implementation, spawn a subagent to review it. The reviewer must evaluate the plan against three criteria:
+
+1. **Completeness** — Does the plan cover every requirement in the task definition, task note (if present), and relevant design doc? Are there missing checkpoints, untested edge cases, or unaddressed error paths?
+2. **Correctness** — Are the proposed abstractions, type signatures, and data flows consistent with the crate map, dependency direction, and existing APIs? Does the plan respect the invariants documented in `docs/core-beliefs.md` and the relevant `docs/design/` spec? Would the proposed changes break any existing contract?
+3. **Performance** — Does the plan follow the performance conventions in `CLAUDE.md`? Are there unnecessary allocations, eager materializations, or hot-path heap work that could be avoided? Does the plan preserve entity locality, dictionary/compressed representations, and zero-copy guarantees where applicable?
+
+The subagent should receive the full plan text, the task definition from `TASKS.md`, the task note (if any), and paths to the relevant design docs. Its output should be a structured review with:
+
+- **Blocking issues** — problems that must be fixed before implementation starts
+- **Suggestions** — non-blocking improvements worth considering
+- **Verdict** — `APPROVE` or `REVISE`
+
+If the verdict is `REVISE`, address every blocking issue, update the plan file, and re-review. Do not begin implementation until the plan review returns `APPROVE`.
+
+If the plan is short enough that a review would be purely ceremonial (e.g., a two-step plan for a single-file change), you may skip the review — but if you wrote a plan at all, the default expectation is that it gets reviewed.
 
 ## Completion Protocol
 
