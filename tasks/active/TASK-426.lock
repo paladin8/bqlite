@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-426",
+  "claimed_at": "2026-04-19T21:31:49Z",
+  "branch": "task/TASK-426",
+  "description": "RETENTION desugaring pass"
+}
