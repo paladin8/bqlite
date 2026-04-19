@@ -58,6 +58,12 @@ pub struct PinnedColumn {
 /// logical row count (may exceed `meta.row_count` for all-null
 /// columns — though v1 currently materializes those via Constant).
 ///
+/// `format_version` comes from the segment footer and is used to
+/// gate the encoding-discriminant parse: v1 segments accept only the
+/// v1 encoding set, v2 segments additionally accept the Wave 4
+/// codecs (FSST, FOR, PFor, ALP). Callers must pass the value the
+/// footer reports — see `segment-format-v2.md` §8.1.
+///
 /// Returns either an `Encoded` variant (for Constant / PlainFixed /
 /// PlainString / Rle) or a `Materialized` fallback. Callers that
 /// always need a dense array should run the result through
@@ -68,6 +74,7 @@ pub fn pin_column_chunk(
     write_time_col: &ColumnDef,
     row_group_row_count: usize,
     segment_dict_bytes: Option<&[ArcBytes]>,
+    format_version: u16,
     materialize_fallback: impl FnOnce() -> Result<ArrayRef>,
 ) -> Result<EncodedColumn> {
     let chunk_start = meta.byte_offset as usize;
@@ -111,12 +118,13 @@ pub fn pin_column_chunk(
     }
     let encoding_byte = chunk_bytes[cursor];
     cursor += 1;
-    let encoding = EncodingType::from_discriminant(encoding_byte).map_err(|e| {
-        BqliteError::Corruption(format!(
-            "segment reader: column chunk for `{}`: {e}",
-            write_time_col.name
-        ))
-    })?;
+    let encoding = EncodingType::from_discriminant_versioned(encoding_byte, format_version)
+        .map_err(|e| {
+            BqliteError::Corruption(format!(
+                "segment reader: column chunk for `{}`: {e}",
+                write_time_col.name
+            ))
+        })?;
 
     // 3. Encoding-specific params.
     let params_start = cursor;

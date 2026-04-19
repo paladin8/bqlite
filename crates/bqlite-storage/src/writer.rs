@@ -105,6 +105,7 @@ use crate::database::Database;
 use crate::encoding::{select_encoding, EncodedChunk, EncodingType, SelectedEncoding};
 use crate::ingest::partitioner::Partitioner;
 use crate::manifest::{ColumnStats, SegmentMeta};
+use crate::segment::layout::{SEGMENT_FORMAT_VERSION_V1, SEGMENT_FORMAT_VERSION_V2};
 use crate::segment::writer::{
     write_segment, PreparedColumnChunk, PreparedDictionary, PreparedRowGroup, SegmentWriteRequest,
     SegmentWriteSummary,
@@ -409,6 +410,16 @@ fn prepare_segment(
 
     let created_at_ns = current_timestamp_ns();
 
+    // Pick the on-disk format version from the encodings the selector
+    // produced. Segments that only contain v1 codecs stay v1 so they
+    // are readable by older binaries; the moment any Wave 4 codec
+    // lands in a chunk, the writer promotes the whole segment to v2
+    // per `segment-format-v2.md` §9.1 ("compaction always uses the
+    // current writer, and the current writer produces v2"). This is
+    // additive — a Wave 2 reader opening a v2 segment fails cleanly
+    // at the file-header version check (§8.3).
+    let format_version = derived_format_version(&prepared_groups);
+
     let request = SegmentWriteRequest {
         schema: schema.clone(),
         schema_version,
@@ -419,7 +430,7 @@ fn prepare_segment(
         batch_id,
         compaction_level: 0,
         fsst_symbol_tables: vec![],
-        format_version: 1,
+        format_version,
     };
 
     Ok(PreparedSegment {
@@ -466,6 +477,44 @@ fn build_segment_meta(
         created_at: created_at_ns,
         batch_id,
     }
+}
+
+// ── Format-version derivation ───────────────────────────────────────────────
+
+/// Pick the on-disk format version for a prepared segment based on the
+/// encodings the selector chose. If every chunk uses a v1-exclusive
+/// codec (Plain, Dictionary, Delta, BitPacking, Constant) the result
+/// is v1; the moment any Wave 4 codec appears in any chunk the result
+/// is v2.
+///
+/// This mirrors `segment-format-v2.md` §9.1's rule that the current
+/// writer always produces the newest format a chunk requires. v1
+/// readers reject unknown file-header versions cleanly (§8.3), so
+/// downgrading a fresh v2 segment on a Wave 2 binary is an
+/// error-on-open — exactly what the spec intends.
+fn derived_format_version(groups: &[PreparedRowGroup]) -> u16 {
+    for rg in groups {
+        for chunk in &rg.columns {
+            if encoding_requires_v2(chunk.encoded.encoding) {
+                return SEGMENT_FORMAT_VERSION_V2;
+            }
+        }
+    }
+    SEGMENT_FORMAT_VERSION_V1
+}
+
+/// Predicate matching `advanced-encodings.md` §1.2 — the six Wave 4
+/// codecs that extend the v1 encoding set in v2.
+fn encoding_requires_v2(e: EncodingType) -> bool {
+    matches!(
+        e,
+        EncodingType::Rle
+            | EncodingType::DoubleDelta
+            | EncodingType::For
+            | EncodingType::PFor
+            | EncodingType::Fsst
+            | EncodingType::Alp
+    )
 }
 
 // ── Row-group planning ──────────────────────────────────────────────────────
@@ -1722,6 +1771,102 @@ mod tests {
             rows += rg.num_rows();
         }
         assert_eq!(rows, 200);
+    }
+
+    #[test]
+    fn low_cardinality_workload_stays_on_format_version_v1() {
+        // A dictionary-heavy workload selects only v1 codecs
+        // (Dictionary, Delta, Constant). The writer must keep the
+        // segment on format_version 1 so old readers can still open it.
+        let scratch = Scratch::new("v1-fv");
+        let mut db = open_db_with_events_table(scratch.path());
+
+        let events: Vec<Event> = (0..200)
+            .map(|i| {
+                let user = format!("u{:03}", i % 10);
+                let ts = 1_700_000_000_000_000_000 + i;
+                let kind = if i % 2 == 0 { "click" } else { "view" };
+                ev(&user, ts, kind)
+            })
+            .collect();
+        let mut sorted = events;
+        sorted.sort_by(|a, b| a.entity.cmp(&b.entity).then(a.timestamp.cmp(&b.timestamp)));
+
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        let mut writer = SegmentWriter::new(&mut db);
+        let meta = writer
+            .write_bucket("events", 0, 0, batch_id, &sorted)
+            .expect("write_bucket");
+
+        let path = scratch
+            .path()
+            .join("events")
+            .join("windows")
+            .join("w_000000")
+            .join("shard_00")
+            .join(format!("segment_{}.seg", meta.segment_id));
+        let reader = SegmentFileReader::open(&path, events_schema()).unwrap();
+        assert_eq!(reader.footer().format_version(), SEGMENT_FORMAT_VERSION_V1);
+    }
+
+    #[test]
+    fn wave4_codec_promotes_segment_to_format_version_v2() {
+        // Hand-build a row-group whose only chunk uses a v2 codec and
+        // feed it straight into `derived_format_version` — the helper
+        // must short-circuit to v2 the moment any chunk reports a
+        // Wave 4 encoding. This test anchors the writer's v1→v2
+        // promotion contract without having to construct a full
+        // `Database` + `SegmentWriter` pipeline.
+        let rg_v1 = PreparedRowGroup {
+            row_count: 4,
+            columns: vec![PreparedColumnChunk {
+                column_ordinal: 0,
+                null_bitmap: None,
+                encoded: EncodedChunk {
+                    encoding: EncodingType::Plain,
+                    params: vec![],
+                    payload: vec![],
+                    row_count: 4,
+                },
+                compression: crate::encoding::CompressionType::None,
+                null_count: 0,
+                zone_min: None,
+                zone_max: None,
+            }],
+        };
+        assert_eq!(derived_format_version(&[rg_v1]), SEGMENT_FORMAT_VERSION_V1);
+
+        for v2_enc in [
+            EncodingType::Rle,
+            EncodingType::DoubleDelta,
+            EncodingType::For,
+            EncodingType::PFor,
+            EncodingType::Fsst,
+            EncodingType::Alp,
+        ] {
+            let rg_v2 = PreparedRowGroup {
+                row_count: 4,
+                columns: vec![PreparedColumnChunk {
+                    column_ordinal: 0,
+                    null_bitmap: None,
+                    encoded: EncodedChunk {
+                        encoding: v2_enc,
+                        params: vec![],
+                        payload: vec![],
+                        row_count: 4,
+                    },
+                    compression: crate::encoding::CompressionType::None,
+                    null_count: 0,
+                    zone_min: None,
+                    zone_max: None,
+                }],
+            };
+            assert_eq!(
+                derived_format_version(&[rg_v2]),
+                SEGMENT_FORMAT_VERSION_V2,
+                "{v2_enc:?} must promote the segment to v2"
+            );
+        }
     }
 
     #[test]

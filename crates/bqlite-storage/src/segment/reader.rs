@@ -682,6 +682,7 @@ impl SegmentFileScan {
                         write_time_col,
                         row_count,
                         &self.dictionaries,
+                        self.footer.format_version(),
                     )?
                 }
                 PlannedColumnSource::BackfillAllNull => {
@@ -721,12 +722,14 @@ impl SegmentFileScan {
                     let dictionaries = self.dictionaries.clone();
                     let wt_col = write_time_col.clone();
                     let meta_clone = meta.clone();
+                    let format_version = self.footer.format_version();
                     crate::segment::encoded::pin_column_chunk(
                         &self.bytes,
                         meta,
                         write_time_col,
                         row_count,
                         Some(&self.dict_bytes),
+                        format_version,
                         move || {
                             decode_column_chunk(
                                 &bytes,
@@ -734,6 +737,7 @@ impl SegmentFileScan {
                                 &wt_col,
                                 row_count,
                                 &dictionaries,
+                                format_version,
                             )
                         },
                     )?
@@ -767,6 +771,7 @@ fn decode_column_chunk(
     write_time_col: &ColumnDef,
     row_group_row_count: usize,
     dictionaries: &[DictionaryValues],
+    format_version: u16,
 ) -> Result<ArrayRef> {
     let chunk_start = meta.byte_offset as usize;
     let chunk_end = chunk_start + meta.byte_length as usize;
@@ -812,12 +817,13 @@ fn decode_column_chunk(
     }
     let encoding_byte = chunk_bytes[cursor];
     cursor += 1;
-    let encoding = EncodingType::from_discriminant(encoding_byte).map_err(|e| {
-        BqliteError::Corruption(format!(
-            "segment reader: column chunk for `{}`: {e}",
-            write_time_col.name
-        ))
-    })?;
+    let encoding = EncodingType::from_discriminant_versioned(encoding_byte, format_version)
+        .map_err(|e| {
+            BqliteError::Corruption(format!(
+                "segment reader: column chunk for `{}`: {e}",
+                write_time_col.name
+            ))
+        })?;
 
     // 3. Encoding-specific params.
     let params_start = cursor;

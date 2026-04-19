@@ -1,8 +1,17 @@
-//! Encoding selector heuristic for the v1 segment format.
+//! Encoding selector heuristic for the v1 **and** v2 segment formats.
 //!
 //! Given a dense Arrow column chunk and its [`BqlType`], the selector
-//! picks the v1 encoding that produces the smallest payload, then
-//! decides whether to wrap that payload in LZ4. The decision flow is:
+//! picks the encoding that produces the smallest payload, then decides
+//! whether to wrap that payload in LZ4. The candidate set covers the
+//! v1 encodings (Plain, Dictionary, Delta, BitPacking, Constant) plus
+//! the Wave 4 survivors registered by TASK-419 (DoubleDelta, Rle,
+//! ForEncoding, Pfor, Alp); FSST joins the set in TASK-419 CP2 when
+//! the writer's symbol-table hoist path lands. The writer
+//! (`crate::writer::derived_format_version`) promotes a segment to v2
+//! the moment any Wave 4 codec appears in a chunk, matching
+//! `segment-format-v2.md` §9.1.
+//!
+//! The decision flow is:
 //!
 //! 1. **Empty arrays** → [`Plain`]. The other v1 encodings either
 //!    error on empty input ([`Constant`], [`Delta`]) or have nothing
@@ -24,12 +33,24 @@
 //!
 //! Note: `storage-format.md` §10.3 sketches a phase-based "first
 //! matching rule" pipeline using statistics like sortedness and
-//! cardinality ratio. v1 implements the score-all-applicable
+//! cardinality ratio. bqlite implements the score-all-applicable
 //! variant the closing paragraph of §10.3 describes ("a future
 //! version can adopt BtrBlocks-style sampling selection… pick the
 //! winner by estimated compression ratio"). The two are functionally
-//! equivalent over the v1 encoding set; the score-based form is
-//! easier to extend in Wave 4 when new encodings land.
+//! equivalent; the score-based form extended naturally to the Wave 4
+//! codec set.
+//!
+//! # Selector guards (Wave 4)
+//!
+//! The per-codec guards from `advanced-encodings.md` §§3.7, 5.7, 6.7,
+//! 7.7, 8.7 live in [`candidate_passes_guard`]. The only hard guard
+//! we apply is RLE's §3.7 run-length check, which rejects runs ≤ 2
+//! cheaply before calling [`Rle::estimate_size`]. The remaining
+//! codecs' `estimate_size` implementations already reflect their
+//! per-codec worst case (e.g., `Alp::estimate_size` counts each
+//! undecomposed value as a 12-byte patch), so the ranking plus the
+//! decode-cost tiebreaker absorb the §§5.7, 6.7, 8.7 "prefer the
+//! simpler encoding within ~10%" preference without an extra scan.
 //!
 //! # Plain is the universal fallback
 //!
@@ -171,24 +192,40 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
     // Phase 3: rank applicable encodings by estimated payload size.
     // Tie-break by decode cost (lower is better).
     //
-    // The candidate list is the v1 encoding set plus Wave 4 DoubleDelta
-    // minus Constant (already resolved in Phase 2). Plain is included so
-    // it serves as the universal fallback — every primitive type has at
-    // least Plain in the candidate set, so `best` is always populated for
-    // primitives.
+    // The candidate list is the v1 encoding set plus every Wave 4
+    // surviving codec (DoubleDelta, Rle, For, PFor, Alp) minus Constant
+    // (already resolved in Phase 2). FSST is intentionally **not**
+    // listed here — it joins the set in TASK-419 CP2 alongside the
+    // writer/reader symbol-table hoist, which is a prerequisite for
+    // picking it. Plain is included so it serves as the universal
+    // fallback — every primitive type has at least Plain in the
+    // candidate set, so `best` is always populated for primitives.
     //
-    // Note: Rle is intentionally omitted here. Its registration —
-    // including the §3.7 average-run-length guard from
-    // `docs/design/storage/advanced-encodings.md` (only select RLE when
-    // `run_count < row_count / 2`) — is owned by TASK-419, which wires
-    // all Wave 4 surviving codecs into the selector together. Rle is
-    // already wired into `decode_cost`, `encode_with`,
-    // `parse_encoding_params_len`, and `dispatch_decode` so TASK-419
-    // only needs to append `&Rle` here and implement the guard.
-    let candidates: &[&dyn Encoding] = &[&Plain, &Dictionary, &Delta, &DoubleDelta, &BitPacking];
+    // Selector guards from `advanced-encodings.md` (§§3.7, 5.7, 6.7,
+    // 7.7, 8.7) live in [`candidate_passes_guard`] below. The only
+    // hard guard we apply here is the RLE avg-run-length guard
+    // (§3.7) — every other codec's `estimate_size` already models its
+    // worst case, so the score-based ranking plus the decode-cost
+    // tiebreaker produces the right choice when the guard-free
+    // candidates tie or fall within the ~10% margin `advanced-
+    // encodings.md` §10 discusses.
+    let candidates: &[&dyn Encoding] = &[
+        &Plain,
+        &Dictionary,
+        &Delta,
+        &DoubleDelta,
+        &BitPacking,
+        &Rle,
+        &ForEncoding,
+        &Pfor,
+        &Alp,
+    ];
     let mut best: Option<(EncodingType, usize, u8)> = None;
     for enc in candidates {
         if !enc.applicable_to(ty) {
+            continue;
+        }
+        if !candidate_passes_guard(enc.encoding_type(), array) {
             continue;
         }
         // `estimate_size` may return an error for legitimate reasons
@@ -219,6 +256,42 @@ fn pick_encoding(array: &dyn Array, ty: &BqlType) -> Result<EncodingType> {
     // deferred-nested-encoding error. This keeps every BqlType in the
     // selector's domain without a special case.
     Ok(best.map(|(e, _, _)| e).unwrap_or(EncodingType::Plain))
+}
+
+/// Per-codec guard from `docs/design/storage/advanced-encodings.md`
+/// §§3.7, 5.7, 6.7, 7.7, 8.7. Returns `true` to keep the candidate and
+/// `false` to skip it.
+///
+/// The only hard guard is RLE's average-run-length check (§3.7): RLE
+/// catastrophically expands alternating data, so we refuse to consider
+/// it when the run count makes the encoded payload guaranteed worse
+/// than Plain's. FOR, PFOR, and ALP rely on their `estimate_size`
+/// implementations to reflect their per-codec worst case; the score
+/// ranking plus the decode-cost tiebreaker absorb the remaining §§5.7,
+/// 6.7, 8.7 preferences without an extra scan.
+///
+/// FSST's guard lives at the call site of `select_encoding` during
+/// TASK-419 CP2 — it is coupled to the writer's symbol-table hoist.
+fn candidate_passes_guard(encoding: EncodingType, array: &dyn Array) -> bool {
+    match encoding {
+        // RLE §3.7 — run_count * 2 < row_count (i.e. avg run length > 2).
+        // An exact scan is cheap (one pass over the dense values) and
+        // it's strictly cheaper than the full `Rle::estimate_size` pass
+        // which additionally sums string bytes.
+        EncodingType::Rle => {
+            let row_count = array.len();
+            if row_count == 0 {
+                return false;
+            }
+            match Rle::estimated_run_count(array) {
+                Ok(run_count) => run_count.saturating_mul(2) < row_count,
+                // Unsupported dtype for RLE — applicable_to should have
+                // filtered this; drop the candidate defensively.
+                Err(_) => false,
+            }
+        }
+        _ => true,
+    }
 }
 
 /// Decode-cost tiebreaker. Lower is faster.
@@ -438,6 +511,8 @@ mod tests {
             EncodingType::Rle => Rle.decode(&selected.chunk, &ty),
             EncodingType::DoubleDelta => DoubleDelta.decode(&selected.chunk, &ty),
             EncodingType::For => ForEncoding.decode(&selected.chunk, &ty),
+            EncodingType::PFor => Pfor.decode(&selected.chunk, &ty),
+            EncodingType::Alp => Alp.decode(&selected.chunk, &ty),
             other => panic!("selector should never pick unimplemented encoding {other:?}"),
         }
         .expect("decode must succeed");
@@ -507,10 +582,13 @@ mod tests {
         // -0.0 and 0.0 compare equal under PartialEq but have
         // different bit patterns. The bit-exact uniformity check
         // means a mixed array of -0.0 and 0.0 is *not* uniform — the
-        // selector falls through to Plain (or another non-Constant
-        // encoding), preserving the sign on round-trip.
+        // selector must refuse Constant. (The chosen non-Constant
+        // encoding may or may not preserve the sign of zero; ALP in
+        // particular is documented as lossy on ±0.0 per
+        // `segment-format-v2.md` §5.6. This test only pins the
+        // Constant fast-path contract.)
         let array: ArrayRef = Arc::new(Float64Array::from(vec![0.0_f64, -0.0, 0.0, -0.0]));
-        let chosen = select_and_round_trip(array, BqlType::Float);
+        let chosen = select_encoding_type(array.as_ref(), &BqlType::Float).unwrap();
         assert_ne!(chosen, EncodingType::Constant);
     }
 
@@ -585,10 +663,11 @@ mod tests {
 
     #[test]
     fn alternating_bool_picks_plain() {
-        // Bool has Plain + Constant in the current candidate set (Rle
-        // is deferred to TASK-419). Alternating bools are not uniform,
-        // so Constant is out, and Plain is the only remaining
-        // registered candidate.
+        // Bool candidates are Plain, Constant, and Rle. Alternating
+        // bools are not uniform (Constant drops out) and the RLE
+        // avg-run-length guard (§3.7) rejects RLE — every run is
+        // length 1, so `run_count * 2 < row_count` is false. Plain
+        // wins.
         let values: Vec<bool> = (0..50).map(|i| i % 2 == 0).collect();
         let array: ArrayRef = Arc::new(BooleanArray::from(values));
         let chosen = select_and_round_trip(array, BqlType::Bool);
@@ -599,31 +678,25 @@ mod tests {
 
     #[test]
     fn highly_compressible_payload_gets_lz4() {
-        // Float has no Dictionary / BitPacking / Delta applicability,
-        // so the selector always picks Plain for Float (unless the
-        // chunk is uniform, in which case Constant wins). This makes
-        // Float the cleanest way to test the LZ4 wrapper on a Plain
-        // payload — Int / String / Timestamp would route through
-        // Dictionary or Constant on a highly compressible chunk.
-        //
-        // Construct a Float64 chunk that Constant rejects (one element
-        // differs) but whose payload is mostly zero bytes. The Plain
-        // payload is `8 * row_count` little-endian doubles, which LZ4
-        // compresses by ~99%.
+        // 10,000 mostly-zero floats with a single 1.0. Whichever codec
+        // wins (Plain, ALP — depending on how the Wave 4 candidates
+        // score), the resulting payload is zero-heavy and LZ4
+        // compresses it dramatically. The point of this test is the
+        // LZ4 decision logic in `pick_compression`, not the encoder
+        // choice, so the assertion is encoder-agnostic: LZ4 must fire
+        // and the on-disk bytes must shrink.
         let values: Vec<f64> = (0..10_000)
             .map(|i| if i == 0 { 1.0 } else { 0.0 })
             .collect();
         let array: ArrayRef = Arc::new(Float64Array::from(values));
         let selected =
             select_encoding(array.as_ref(), &BqlType::Float).expect("selector must succeed");
-        assert_eq!(selected.encoding(), EncodingType::Plain);
         assert_eq!(
             selected.compression,
             CompressionType::Lz4,
-            "highly compressible Plain payload must trigger LZ4"
+            "highly compressible payload must trigger LZ4 (chosen: {:?})",
+            selected.encoding(),
         );
-        // Sanity: the on_disk_payload is the compressed form and is
-        // smaller than the chunk payload.
         assert!(selected.on_disk_payload.len() < selected.chunk.payload.len());
     }
 
@@ -816,5 +889,111 @@ mod tests {
             BqliteError::Execution(msg) => assert!(msg.contains("null_count")),
             other => panic!("expected Execution error, got {other:?}"),
         }
+    }
+
+    // ── Wave 4 candidate registration ──
+
+    #[test]
+    fn rle_wins_on_long_string_runs() {
+        // 200 rows, 2 distinct values in 100-row runs. Avg run length
+        // is 100, so the §3.7 guard passes. Plain is 200 × (4 + ~5) ≈
+        // 1800 bytes, Dictionary ~250 bytes, RLE is 2 runs × 4 bytes
+        // (run_ends) + 2 × (4-byte length + 5 UTF-8 bytes) ≈ 26 bytes.
+        // RLE must win decisively.
+        let mut values = Vec::with_capacity(200);
+        values.extend(std::iter::repeat_n("alpha", 100));
+        values.extend(std::iter::repeat_n("betas", 100));
+        let array: ArrayRef = Arc::new(StringViewArray::from(values));
+        let chosen = select_and_round_trip(array, BqlType::String);
+        assert_eq!(chosen, EncodingType::Rle);
+    }
+
+    #[test]
+    fn rle_wins_on_sorted_int_entity_id() {
+        // 200 rows, 4 entity ids in sorted blocks of 50. Run count 4,
+        // row count 200 → guard passes. RLE payload is 4 × 4 + 4 × 8 =
+        // 48 bytes; Plain is 1600 bytes; BitPacking at 2-bit width is
+        // 50 bytes + overhead. RLE wins.
+        let mut values = Vec::with_capacity(200);
+        for entity in 0..4 {
+            values.extend(std::iter::repeat_n(entity as i64, 50));
+        }
+        let array: ArrayRef = Arc::new(Int64Array::from(values));
+        let chosen = select_and_round_trip(array, BqlType::Int);
+        assert_eq!(chosen, EncodingType::Rle);
+    }
+
+    #[test]
+    fn rle_guard_rejects_alternating_int() {
+        // Every row differs from the previous → run count equals row
+        // count, guard fails. RLE must not be chosen.
+        let values: Vec<i64> = (0..100).collect();
+        let array: ArrayRef = Arc::new(Int64Array::from(values));
+        let chosen = select_and_round_trip(array, BqlType::Int);
+        assert_ne!(chosen, EncodingType::Rle);
+    }
+
+    #[test]
+    fn for_wins_on_locally_clustered_ints() {
+        // Two clusters of 128 values in narrow local ranges [100..110)
+        // and [4500..4510). Global range spans ~4400 (≈13 bits) but
+        // per-block ranges are 10 (≈4 bits). FOR's per-block framing
+        // makes it win decisively over BitPacking.
+        let mut values = Vec::with_capacity(256);
+        for i in 0..128 {
+            values.push(100 + (i % 10) as i64);
+        }
+        for i in 0..128 {
+            values.push(4500 + (i % 10) as i64);
+        }
+        let array: ArrayRef = Arc::new(Int64Array::from(values));
+        let chosen = select_and_round_trip(array, BqlType::Int);
+        assert_eq!(chosen, EncodingType::For);
+    }
+
+    #[test]
+    fn pfor_wins_on_clustered_ints_with_sparse_outliers() {
+        // 1024 distinct values in [100..1124) with 4 sparse outliers
+        // near 1e12. Dictionary's 10-bit codes would need ~1280 bytes
+        // of code payload; PFOR's 7-bit main width stores 8 × (header
+        // + 112 packed bytes) ≈ 990 bytes, plus four 10-byte patch
+        // entries. PFOR wins this configuration because the outliers
+        // force Dictionary's code width to grow uniformly while PFOR
+        // isolates them as exceptions.
+        let mut values: Vec<i64> = (0..1024).map(|i| 100 + i as i64).collect();
+        values[10] = 1_000_000_000_000;
+        values[200] = 1_000_000_000_001;
+        values[600] = 1_000_000_000_002;
+        values[900] = 1_000_000_000_003;
+        let array: ArrayRef = Arc::new(Int64Array::from(values));
+        let chosen = select_and_round_trip(array, BqlType::Int);
+        assert_eq!(chosen, EncodingType::PFor);
+    }
+
+    #[test]
+    fn alp_wins_on_round_floats() {
+        // 256 fixed-2-decimal-digit floats. Every value decomposes
+        // cleanly with exponent 2 → ALP's mantissa stream is compact
+        // and there are no exceptions. Plain+LZ4 is the v1 fallback;
+        // ALP must win.
+        let values: Vec<f64> = (0..256).map(|i| (i as f64) * 0.01).collect();
+        let array: ArrayRef = Arc::new(Float64Array::from(values));
+        let chosen = select_and_round_trip(array, BqlType::Float);
+        assert_eq!(chosen, EncodingType::Alp);
+    }
+
+    #[test]
+    fn alp_skipped_on_random_floats() {
+        // High-entropy floats: ALP's decomposition misses — its
+        // estimate_size either errors or reports payload larger than
+        // Plain. Selector must fall back to Plain.
+        let values: Vec<f64> = (0..256)
+            .map(|i| {
+                ((i as f64).sqrt() * std::f64::consts::PI).sin() * 1e9 + (i as f64) * 0.123_456
+            })
+            .collect();
+        let array: ArrayRef = Arc::new(Float64Array::from(values));
+        let chosen = select_encoding_type(array.as_ref(), &BqlType::Float).unwrap();
+        assert_ne!(chosen, EncodingType::Alp);
     }
 }

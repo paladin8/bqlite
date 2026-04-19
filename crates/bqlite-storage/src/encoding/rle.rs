@@ -83,6 +83,61 @@ impl Rle {
     pub const fn new() -> Self {
         Rle
     }
+
+    /// Number of runs the current array would produce when RLE-encoded.
+    ///
+    /// Used by the encoding selector (TASK-419) to apply the §3.7 guard
+    /// from `advanced-encodings.md` — "only choose RLE when estimated
+    /// average run length > 2" — without paying for a full
+    /// [`Self::estimate_size`] call, which additionally scans string
+    /// bytes. Returns `0` for empty arrays.
+    pub fn estimated_run_count(array: &dyn Array) -> Result<usize> {
+        if array.is_empty() {
+            return Ok(0);
+        }
+        match array.data_type() {
+            DataType::Boolean => {
+                let a = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        BqliteError::Execution(
+                            "Rle::estimated_run_count: expected BooleanArray, downcast failed"
+                                .into(),
+                        )
+                    })?;
+                Ok(count_bool_runs(a))
+            }
+            DataType::Int64 | DataType::Timestamp(TimeUnit::Nanosecond, _) => count_i64_runs(array),
+            DataType::Utf8View => {
+                let a = array
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .ok_or_else(|| {
+                        BqliteError::Execution(
+                            "Rle::estimated_run_count: expected StringViewArray, downcast failed"
+                                .into(),
+                        )
+                    })?;
+                Ok(count_string_view_runs(a).0)
+            }
+            DataType::Utf8 => {
+                let a = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        BqliteError::Execution(
+                            "Rle::estimated_run_count: expected StringArray, downcast failed"
+                                .into(),
+                        )
+                    })?;
+                Ok(count_string_utf8_runs(a).0)
+            }
+            other => Err(BqliteError::Execution(format!(
+                "Rle::estimated_run_count: unsupported Arrow type {other:?}"
+            ))),
+        }
+    }
 }
 
 /// Params block length: `run_count: u32 LE` (4 bytes).
