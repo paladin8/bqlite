@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-444",
+  "claimed_at": "2026-04-20T02:34:16Z",
+  "branch": "task/TASK-444",
+  "description": "SESSIONIZE semantic audit"
+}
