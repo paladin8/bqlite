@@ -1329,13 +1329,12 @@ fn bind_sample(
 ) -> Result<Box<dyn PhysicalOperator>> {
     let child = bind_physical_with_cache(&sample.input, db, cohorts)?;
     let ek_col_name = entity_key_col_name(&sample.input);
-    let entity_id_col_idx = resolve_entity_key_col(child.as_ref(), ek_col_name, "SampleFilter")?;
 
-    // Look up the entity-key column type from the child's runtime schema.
-    let entity_type = child
+    // Resolve the entity-key column index and type in a single schema walk.
+    let (entity_id_col_idx, entity_type) = child
         .output_schema()
         .column(ek_col_name)
-        .map(|(_, coldef)| coldef.bql_type.clone())
+        .map(|(idx, coldef)| (idx, coldef.bql_type.clone()))
         .ok_or_else(|| {
             BqliteError::Schema(format!(
                 "SampleFilter: entity key column '{ek_col_name}' not found in child schema"
