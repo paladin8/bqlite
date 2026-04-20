@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-455",
   "claimed_at": "2026-04-20T04:26:09Z",
+  "completed_at": "2026-04-20T06:00:00Z",
   "branch": "task/TASK-455",
   "description": "Wave 4 post-acceptance closure"
 }
