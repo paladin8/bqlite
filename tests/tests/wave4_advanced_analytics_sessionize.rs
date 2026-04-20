@@ -36,32 +36,18 @@
 //! automatically by Cargo. The flat layout keeps the checkpoint ideal
 //! of "add files only, never edit manifests" intact.
 //!
-//! ## Runtime-schema workaround
+//! ## Schema plumbing (resolved)
 //!
-//! Every query in this binary prepends `| SELECT entity_id, ts, event_type`
-//! before invoking SESSIONIZE. Background:
-//!
-//! - The scan runtime (`crates/bqlite-operators/src/scan.rs`) does not
-//!   materialise the `__seq_id` / `__batch_id` system columns in its
-//!   emitted `RecordBatch`es — see the note on `bind_event_select` in
-//!   `bqlite-engine::bind` explaining the same behavior for EventSelect.
-//! - `SessionizeOperator::new` resolves its buffered-column indices
-//!   against the planner's `input.output_schema()` (which carries the
-//!   full logical schema including system columns). Without an
-//!   intervening projection, the runtime `RecordBatch` has fewer
-//!   columns than the operator expects, and the buffered-slice path
-//!   panics with `index out of bounds` inside
-//!   `SessionizeOperator::push_slice`.
-//! - Interposing an explicit `SELECT` tightens the planner's input
-//!   schema to the three user-visible columns, which matches the
-//!   runtime batch and lets SESSIONIZE bind cleanly.
-//!
-//! Surfacing the projection here — rather than hiding it behind a test
-//! helper — makes the workaround auditable for the semantic-audit task
-//! (TASK-444). The projection is purely a plumbing band-aid; the
-//! SESSIONIZE semantics under test do not depend on it. When the scan
-//! runtime gains system-column materialisation (tracked separately),
-//! the projection can be dropped uniformly.
+//! Earlier drafts of this suite interposed `| SELECT entity_id, ts,
+//! event_type` before every SESSIONIZE stage to work around a
+//! planner/runtime schema mismatch (the scan runtime does not
+//! materialise `__seq_id` / `__batch_id`, but the planner-advertised
+//! `ScanPhysical.output_schema` carried them, which made SESSIONIZE's
+//! buffered-columns path index past the end of the actual batch). The
+//! SESSIONIZE lowering now filters `__`-prefixed columns out of its
+//! advertised output, and the operator has a matching safety net, so
+//! the interposed projection is no longer needed — every query below
+//! invokes SESSIONIZE directly.
 
 use std::collections::HashMap;
 
@@ -247,10 +233,7 @@ fn gap_exclusive_boundary_keeps_adjacent_events_in_same_session() {
     );
 
     let result = engine
-        .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 1h)",
-            &mut db,
-        )
+        .query("events | SESSIONIZE(gap: 1h)", &mut db)
         .expect("SESSIONIZE query");
     let rows = collect_session_rows(&result);
     assert_eq!(session_ids_for(&rows, "alice"), vec![1, 1, 1, 2]);
@@ -272,10 +255,7 @@ fn single_event_entity_is_single_zero_duration_session() {
     insert_row(&engine, &mut db, "alice", T0, "click");
 
     let result = engine
-        .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 30m)",
-            &mut db,
-        )
+        .query("events | SESSIONIZE(gap: 30m)", &mut db)
         .expect("SESSIONIZE");
     let rows = collect_session_rows(&result);
     assert_eq!(rows.len(), 1);
@@ -301,10 +281,7 @@ fn all_events_separated_produces_singleton_sessions() {
     );
 
     let result = engine
-        .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 5m)",
-            &mut db,
-        )
+        .query("events | SESSIONIZE(gap: 5m)", &mut db)
         .expect("SESSIONIZE");
     let rows = collect_session_rows(&result);
     assert_eq!(session_ids_for(&rows, "alice"), vec![1, 2, 3]);
@@ -331,10 +308,7 @@ fn entity_boundary_resets_session_id_to_one() {
     );
 
     let result = engine
-        .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 5m)",
-            &mut db,
-        )
+        .query("events | SESSIONIZE(gap: 5m)", &mut db)
         .expect("SESSIONIZE");
     let rows = collect_session_rows(&result);
     // alice's events alone: 3 sessions because every delta (1h, 9h)
@@ -369,10 +343,7 @@ fn end_event_closes_current_session() {
     );
 
     let result = engine
-        .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 1h, end: logout)",
-            &mut db,
-        )
+        .query("events | SESSIONIZE(gap: 1h, end: logout)", &mut db)
         .expect("SESSIONIZE end: logout");
     let rows = collect_session_rows(&result);
     // session 1: click, view, logout. session 2: click.
@@ -405,7 +376,7 @@ fn end_event_list_closes_on_any_listed_type() {
 
     let result = engine
         .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 1h, end: (logout, timeout))",
+            "events | SESSIONIZE(gap: 1h, end: (logout, timeout))",
             &mut db,
         )
         .expect("SESSIONIZE end list");
@@ -439,10 +410,7 @@ fn gap_plus_end_event_on_same_event_produces_singleton() {
     );
 
     let result = engine
-        .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 1h, end: logout)",
-            &mut db,
-        )
+        .query("events | SESSIONIZE(gap: 1h, end: logout)", &mut db)
         .expect("SESSIONIZE gap+end");
     let rows = collect_session_rows(&result);
     // session 1: click, view. session 2: logout only.
@@ -505,7 +473,7 @@ fn within_session_match_expires_across_boundary() {
 
     let result = engine
         .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 1h) \
+            "events | SESSIONIZE(gap: 1h) \
              | MATCH FIRST SEQUENCE(search THEN checkout) WITHIN SESSION",
             &mut db,
         )
@@ -567,7 +535,7 @@ fn within_session_match_composes_with_downstream_stats() {
 
     let result = engine
         .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 1h) \
+            "events | SESSIONIZE(gap: 1h) \
              | MATCH FIRST SEQUENCE(search THEN checkout) WITHIN SESSION \
              | STATS matched = COUNT(*)",
             &mut db,
@@ -625,7 +593,7 @@ fn sessionize_stats_per_entity_session_count_uses_group_by() {
 
     let result = engine
         .query(
-            "events | SELECT entity_id, ts, event_type | SESSIONIZE(gap: 5m) \
+            "events | SESSIONIZE(gap: 5m) \
              | STATS sessions = COUNT_DISTINCT(session_id) GROUP BY entity_id",
             &mut db,
         )

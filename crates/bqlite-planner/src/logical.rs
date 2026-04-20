@@ -2588,7 +2588,21 @@ fn lower_sessionize(
         }
     }
 
-    let mut cols = input_schema.columns().to_vec();
+    // Drop planner-only system columns (`__seq_id` / `__batch_id`) from
+    // sessionize's advertised output. They live in the planner-level
+    // `OperatorSchema::from_table` contract but are not physically
+    // produced by `ScanOperator` (see `bqlite-operators::scan` module
+    // docs: "Implicit system columns [...] are not included"), so any
+    // sessionize output batch would have to null-pad them — which
+    // violates their non-nullable contract. Operators that genuinely
+    // need `__seq_id` resolve it against the scan's own schema, not
+    // against sessionize's output.
+    let mut cols: Vec<ColumnDef> = input_schema
+        .columns()
+        .iter()
+        .filter(|c| !c.name.starts_with("__"))
+        .cloned()
+        .collect();
     cols.push(ColumnDef::required("session_id", BqlType::Int));
     cols.push(ColumnDef::required("session_duration", BqlType::Int));
     let output_schema = OperatorSchema::new(cols)?;
@@ -6322,7 +6336,11 @@ mod tests {
                     .iter()
                     .map(|c| c.name.as_str())
                     .collect();
-                // Input columns + session_id + session_duration at the end.
+                // Declared input columns (minus planner-only `__seq_id` /
+                // `__batch_id` system columns, which sessionize drops from
+                // its advertised output because the scan runtime does not
+                // physically emit them) followed by session_id +
+                // session_duration.
                 assert_eq!(
                     names,
                     vec![
@@ -6331,8 +6349,6 @@ mod tests {
                         "event",
                         "amount",
                         "country",
-                        "__seq_id",
-                        "__batch_id",
                         "session_id",
                         "session_duration"
                     ]

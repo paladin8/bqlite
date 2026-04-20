@@ -211,11 +211,25 @@ impl SessionizeOperator {
         // null value for a non-nullable output column and a real pipeline
         // would never prune such a column without also dropping it from
         // the output schema. This is a planner-safety net, not a hot path.
+        //
+        // Exception: system columns (names starting with `__`, e.g.
+        // `__seq_id` / `__batch_id`) live in the planner-level
+        // `OperatorSchema` but are NOT part of the runtime `RecordBatch`
+        // produced by `ScanOperator` (see `bqlite-operators::scan` module
+        // docs: "Implicit system columns [...] are not included [...] the
+        // Wave 2 segment reader does not yet expose them to the scan
+        // plan"). Buffering them would attempt to index past the end of
+        // the actual batch. The sessionize lowering already strips them
+        // from `output_schema`; this is a belt-and-suspenders fence
+        // against a planner that hasn't been updated.
         for col in desc.output_schema.columns() {
             if col.nullable {
                 continue;
             }
             if col.name == "session_id" || col.name == "session_duration" {
+                continue;
+            }
+            if col.name.starts_with("__") {
                 continue;
             }
             if input_schema.column(&col.name).is_some() {
