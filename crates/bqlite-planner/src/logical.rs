@@ -2070,6 +2070,25 @@ fn lower_match(
     // Carry brackets through from the AST (always None in Wave 3).
     let brackets = pattern.brackets.clone();
 
+    // Validate that BRACKETS durations are strictly ascending (§4.12).
+    // Out-of-order durations would produce inverted or overlapping time
+    // slices at runtime; reject early with a clear diagnostic.
+    if let Some(b) = &brackets {
+        for i in 1..b.durations.len() {
+            if b.durations[i - 1] >= b.durations[i] {
+                return Err(BqliteError::Plan(format!(
+                    "BRACKETS durations must be strictly ascending — \
+                     got {}ns >= {}ns at positions {} and {}; \
+                     example: BRACKETS [7d, 14d, 30d]",
+                    b.durations[i - 1],
+                    b.durations[i],
+                    i - 1,
+                    i,
+                )));
+            }
+        }
+    }
+
     // ── Scan time-range extension (planner-pipeline.md §4.4) ─────────
     // Extend the scan's upper time bound so events beyond the user's
     // stated range can complete matches started near the boundary.
@@ -2814,10 +2833,13 @@ fn lower_attribute(
     registry: &FunctionRegistry,
     source_table: &TableSchema,
 ) -> Result<LogicalPlan> {
-    // window > 0.
-    if args.window <= 0 {
+    // window >= 0. Zero is semantically valid (every conversion LEFT-UNNESTs
+    // since no touchpoint can fall in an empty lookback window); negative
+    // windows have no defined semantics and are rejected.
+    // Per attribute.md §16.1: "window: 0s — not rejected at plan time."
+    if args.window < 0 {
         return Err(BqliteError::Plan(format!(
-            "ATTRIBUTE: window must be positive — got {}ns",
+            "ATTRIBUTE: window must be non-negative — got {}ns",
             args.window
         )));
     }
@@ -6083,6 +6105,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn brackets_descending_order_rejected() {
+        // BRACKETS via RETENTION sugar with reversed durations [30d, 7d, 1d]
+        // must be a plan error. The validation fires in lower_match after the
+        // RETENTION desugar pass forwards the BracketSpec through.
+        use bqlite_ast::pattern::BracketSpec;
+        use bqlite_ast::Retention;
+
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_1d = 86_400_000_000_000_i64;
+        let entry = bqlite_ast::pattern::EventRef {
+            table: None,
+            event: Name::synthetic("signup"),
+            span: Span::EMPTY,
+        };
+        let activity = bqlite_ast::pattern::EventRef {
+            table: None,
+            event: Name::synthetic("purchase"),
+            span: Span::EMPTY,
+        };
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Retention(Retention {
+                entry,
+                activity,
+                brackets: BracketSpec {
+                    // descending: 30d, 7d, 1d — must be rejected
+                    durations: vec![30 * ns_1d, 7 * ns_1d, ns_1d],
+                    cumulative: false,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            })],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(ref msg) if msg.contains("strictly ascending")),
+            "expected 'strictly ascending' plan error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn brackets_equal_adjacent_rejected() {
+        // BRACKETS [7d, 7d, 30d] via RETENTION sugar — equal adjacent
+        // durations are also not strictly ascending and must be rejected.
+        use bqlite_ast::pattern::BracketSpec;
+        use bqlite_ast::Retention;
+
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let ns_7d = 7 * 86_400_000_000_000_i64;
+        let ns_30d = 30 * 86_400_000_000_000_i64;
+        let entry = bqlite_ast::pattern::EventRef {
+            table: None,
+            event: Name::synthetic("signup"),
+            span: Span::EMPTY,
+        };
+        let activity = bqlite_ast::pattern::EventRef {
+            table: None,
+            event: Name::synthetic("purchase"),
+            span: Span::EMPTY,
+        };
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![PipelineStage::Retention(Retention {
+                entry,
+                activity,
+                brackets: BracketSpec {
+                    // equal adjacent: [7d, 7d, 30d]
+                    durations: vec![ns_7d, ns_7d, ns_30d],
+                    cumulative: false,
+                    span: Span::EMPTY,
+                },
+                span: Span::EMPTY,
+            })],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(ref msg) if msg.contains("strictly ascending")),
+            "expected 'strictly ascending' plan error, got {err:?}"
+        );
+    }
+
     // ── Source time-range lowering ──────────────────────────────────────
 
     fn pipeline_with_time_range(
@@ -6924,7 +7028,30 @@ mod tests {
     }
 
     #[test]
-    fn attribute_non_positive_window_rejected() {
+    fn attribute_negative_window_rejected() {
+        // Negative windows have no defined semantics and are rejected.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![attribute_stage(
+                -1,
+                vec!["purchase"],
+                vec!["ad_click"],
+                "country",
+            )],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(ref msg) if msg.contains("window must be non-negative")),
+            "expected non-negative window error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn attribute_zero_window_accepted() {
+        // window: 0s is semantically valid per attribute.md §16.1:
+        // every conversion LEFT-UNNESTs since no touchpoint can precede
+        // it. The planner must not reject it.
         let cat = InMemoryCatalog::default().with(purchases_schema());
         let pipeline = pipeline_with_stages(
             "purchases",
@@ -6935,8 +7062,11 @@ mod tests {
                 "country",
             )],
         );
-        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
-        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("window must be positive")));
+        let result = lower_statement(Statement::Query(pipeline), &cat);
+        assert!(
+            result.is_ok(),
+            "window: 0s should be accepted; got {result:?}"
+        );
     }
 
     #[test]

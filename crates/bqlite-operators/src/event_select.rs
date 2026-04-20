@@ -222,6 +222,21 @@ impl EventSelectOperator {
     /// (i.e. `desc.input.output_schema()`). Column indices are
     /// resolved once here so per-row access is branchless.
     pub fn new(desc: &EventSelectPhysical, input_schema: &OperatorSchema) -> Self {
+        // Fused-aggregate path deferred to Wave 5; assert here so a planner
+        // bug that sets fused_aggregate: Some(...) fails loudly at bind time
+        // rather than silently producing unfused output.
+        assert!(
+            desc.fused_aggregate.is_none(),
+            "EventSelect fused aggregates are deferred to Wave 5"
+        );
+
+        // Nth(0) is invalid: the spec says n >= 1 (event-select-sample.md
+        // §4.2). The parser/planner enforces this; guard defensively here so
+        // a programmatically-constructed descriptor with Nth(0) fails fast.
+        if let EventSelectKind::Nth(0) = desc.kind {
+            panic!("EventSelectOperator: Nth(0) is invalid; n must be >= 1");
+        }
+
         // Build event-type set.
         let event_types: HashSet<String> = desc.event_types.iter().cloned().collect();
 

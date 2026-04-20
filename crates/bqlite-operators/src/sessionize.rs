@@ -521,6 +521,11 @@ impl EntityOperator for SessionizeOperator {
 
     fn process_sub_batch(&self, state: &mut SessionizeState, batch: &RecordBatch) {
         if state.skipping {
+            // Still count all events in skipped sub-batches so that the
+            // diagnostic channel (§11.4) can report "including those skipped
+            // after the cap fires".  The warning is deferred to Wave 5 but
+            // the count should be accurate when it lands.
+            state.entity_event_count += batch.num_rows() as u64;
             return;
         }
         if batch.num_rows() == 0 {
@@ -733,12 +738,15 @@ impl SessionizeOperator {
     /// un-forwarded columns as typed null arrays.
     fn flush_session(&self, state: &mut SessionizeState) {
         if state.open_buffer.is_empty() {
-            // Nothing buffered — either cap already flushed at this row
-            // or a pathological empty session. Reset bookkeeping below.
+            // Nothing buffered — either cap already flushed at this session
+            // or a pathological empty flush call.  Reset bookkeeping but do
+            // NOT advance current_session_id: no output row was produced for
+            // this session, so the ID counter must not skip a value.
+            // Incrementing here would make session_id non-contiguous,
+            // violating the "monotonically increasing by 1" property.
             state.session_start_ts = i64::MIN;
             state.session_last_ts = i64::MIN;
             state.session_event_count = 0;
-            state.current_session_id += 1;
             return;
         }
 
