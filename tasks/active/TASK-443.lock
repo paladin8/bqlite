@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-443",
+  "claimed_at": "2026-04-20T02:34:02Z",
+  "branch": "task/TASK-443",
+  "description": "RETENTION semantic audit"
+}
