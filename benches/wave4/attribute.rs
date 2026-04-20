@@ -340,6 +340,49 @@ fn bench_left_unnest_dominant(c: &mut Criterion, scale: &Scale) {
     group.finish();
 }
 
+/// Touchpoint-to-conversion ratio sweep (TASK-441 extension to
+/// `docs/design/operators/attribute.md` §17.1).
+///
+/// Reuses the `single_entity_events` interleaving but parameterises
+/// the touchpoint-to-conversion ratio at 10:1 / 100:1 / 1000:1 with
+/// the total event count held fixed at
+/// `scale.single_entity_touchpoints`. This isolates the deque-walk
+/// cost as a function of how often a conversion forces a window
+/// scan: at 10:1 the deque stays short; at 1000:1 every conversion
+/// sweeps a long deque.
+fn bench_ratio_sweep(c: &mut Criterion, scale: &Scale) {
+    let total = scale.single_entity_touchpoints.max(10);
+
+    let mut group = c.benchmark_group("attribute/ratio_sweep");
+    group.throughput(Throughput::Elements(total as u64));
+
+    for &ratio in &[10usize, 100, 1000] {
+        // Pick conversion count so the total event count stays
+        // constant. Use `div_ceil` so rounding lands on the tighter
+        // side of the target ratio (e.g. at total=10000 and ratio=1000
+        // this gives 10 conversions and 9 990 touchpoints → 999:1,
+        // not 1 110:1 which integer floor-division would produce).
+        let n_conv = total.div_ceil(ratio + 1).max(1);
+        let n_tp = total - n_conv;
+        let events = single_entity_events(n_tp, n_conv);
+        let batch = build_batch("user-1", &events);
+        // Window wide enough to hold every touchpoint before the
+        // first conversion — stresses the deque walk.
+        let window_ns = (n_tp as i64) * 10 * 2;
+
+        group.bench_with_input(BenchmarkId::new("tp_per_conv", ratio), &(), |b, _| {
+            let op = build_operator(&["purchase"], &["click"], window_ns);
+            b.iter(|| {
+                let mut state = op.create_state(&EntityId::String("user-1".into()));
+                op.process_sub_batch(&mut state, &batch);
+                black_box(op.finish_entity(state));
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_multi_type_attribution(c: &mut Criterion, scale: &Scale) {
     let events = multi_type_events(scale.multi_type_events);
     let total = events.len() as u64;
@@ -373,6 +416,7 @@ fn all_benches(c: &mut Criterion) {
     bench_high_fan_out(c, &scale);
     bench_left_unnest_dominant(c, &scale);
     bench_multi_type_attribution(c, &scale);
+    bench_ratio_sweep(c, &scale);
 }
 
 criterion_group! {
