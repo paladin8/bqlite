@@ -166,3 +166,12 @@ harness = false
 name = "sample"
 path = "wave4/sample.rs"
 harness = false
+
+# Wave 4 cohort + joined-source bench (TASK-441): probe throughput
+# for `SubqueryFilterOperator` against sized cohorts, plus
+# `MergeSourcesOperator` k-way merge overhead vs a single-scan
+# baseline.
+[[bench]]
+name = "cohort_join"
+path = "wave4/cohort_join.rs"
+harness = false

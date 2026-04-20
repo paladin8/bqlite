@@ -67,8 +67,8 @@ Enforced only when `BQLITE_BENCH_MODE=reference`; CI mode relies on Criterion's 
 | `sample/pushdown/fraction_0.01` | `(rows_produced / rows_scanned) − 0.01` | ≤ 0.002 (absolute) | **[floor]** derived from event-select-sample.md §21.2 "bit-identical entity sets" determinism plus the law-of-large-numbers 3σ bound at 100 k entities. |
 | `sample/pushdown/fraction_0.10` | `(rows_produced / rows_scanned) − 0.10` | ≤ 0.010 (absolute) | **[floor]** same derivation. |
 | `sample/pushdown/throughput_fraction_0.10` | Throughput, entities/sec | ≥ 50 × 10⁶ | **[spec]** event-select-sample.md §21.2 row 1. |
-| `cohort/semijoin/large_cohort` | Overhead vs scan-only | ≤ 1.5× | **[floor]** cohorts-aliases-joins.md §4.2 ("`SubqueryFilter` is a hash-set probe") pins no number. Chosen as a regression tripwire. |
-| `merge_sources/k2_overhead` | Overhead vs single-table scan | ≤ 2.0× | **[floor]** cohorts-aliases-joins.md §3.7 ("N-ary merge operator") pins no number. Chosen as a regression tripwire. |
+| `cohort/semijoin/cohort_10000/rows_per_sec` | Absolute probe throughput | ≥ 10 M rows/sec | **[floor]** cohorts-aliases-joins.md pins no number. The original plan wanted an `overhead_ratio ≤ 1.5×` target, but the `VecOp` baseline is a trivial pre-built-batch iterator and the probe cost dominates by many orders of magnitude — the ratio carries no signal. Absolute rows/sec against the same synthetic fixture gives a clean regression tripwire; the Criterion comparison plot still shows the relative cost. |
+| `merge_sources/k2/rows_per_sec` | Absolute merged throughput | ≥ 10 M rows/sec | **[floor]** same rationale as the cohort row above: the VecOp baseline is too thin to yield a meaningful ratio, so the target is absolute merged-row throughput at k=2. Container-class floor; reference hardware should comfortably exceed this. |
 
 Everything above is measured in reference mode; CI mode runs the same benches at Wave-2-style scaled fixtures and reports the same metrics to `target/bench-results.json` but does not panic on miss.
 
