@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-446",
+  "claimed_at": "2026-04-20T02:49:59Z",
+  "branch": "task/TASK-446",
+  "description": "ATTRIBUTE semantic audit"
+}
