@@ -1,7 +1,0 @@
-{
-  "agent_id": "agent-2",
-  "task_id": "TASK-439",
-  "claimed_at": "2026-04-20T00:23:57Z",
-  "branch": "task/TASK-439",
-  "description": "Advanced analytics integration tests"
-}
