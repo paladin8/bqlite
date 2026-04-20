@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-439",
   "claimed_at": "2026-04-20T01:16:39Z",
+  "completed_at": "2026-04-20T01:46:55Z",
   "branch": "task/TASK-439",
   "description": "Advanced analytics integration tests"
 }
