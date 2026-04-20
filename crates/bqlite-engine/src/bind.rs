@@ -1246,16 +1246,13 @@ fn bind_sessionize(
 /// Bind an [`EventSelectPhysical`] descriptor into a
 /// [`EntityOperatorAdapter`]<[`EventSelectOperator`]>.
 ///
-/// `EventSelectOperator::new` resolves column indices from the planner's
-/// view of the child's output schema (`es.input.output_schema()`) rather
-/// than from the already-bound child operator's narrower runtime schema.
-/// This is required because `EventSelectOperator` expects the full logical
-/// schema — including the `__seq_id` system column used for timestamp
-/// tiebreaking — which the physical planner includes in `ScanPhysical`'s
-/// `output_schema` but which the current `ScanOperator` runtime does not
-/// yet materialise in batches. When the scan runtime gains `__seq_id`
-/// materialisation, both schemas will agree and no change here will be
-/// needed.
+/// The operator resolves column indices against the planner's view of
+/// the child's output schema (`es.input.output_schema()`). Same-`ts`
+/// tie-breaking relies on the scan runtime's `(entity_id, ts,
+/// __seq_id)` emission order (positional tie-breaking) — see the doc
+/// on `EventSelectInputMap` — so it no longer reads `__seq_id` values
+/// out of batches, and the earlier runtime-vs-planner schema mismatch
+/// for `__seq_id` is irrelevant here.
 fn bind_event_select(
     es: &EventSelectPhysical,
     db: &mut Database,
@@ -1265,17 +1262,6 @@ fn bind_event_select(
     let ek_col_name = entity_key_col_name(&es.input);
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "EventSelectAdapter")?;
-    // Use the planner's schema for operator construction — it includes
-    // `__seq_id` which the operator requires for ts-tiebreaking.
-    //
-    // SAFETY NOTE: `EventSelectOperator` stores `seq_id_idx` (resolved here
-    // from the planner schema) for use in same-ts tiebreaking. Until
-    // `ScanOperator` materialises `__seq_id` in its output batches, the
-    // resolved index will exceed the runtime batch column count. Any
-    // `process_sub_batch` call that reaches the tiebreaking path will
-    // therefore panic. The empty-table smoke test (CP1) does not exercise
-    // this path; data-driven EventSelect tests are gated on scan-layer
-    // `__seq_id` materialisation.
     let operator = EventSelectOperator::new(es, es.input.output_schema());
     Ok(Box::new(EntityOperatorAdapter::new(
         operator,

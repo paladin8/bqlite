@@ -2739,6 +2739,23 @@ fn lower_event_select(
         }
     }
 
+    // Drop planner-only system columns (`__seq_id` / `__batch_id`) from
+    // EventSelect's advertised output. The scan runtime does not
+    // physically emit those system columns, and EventSelect does not
+    // read their values (same-`ts` tie-breaking uses positional order
+    // per the doc on `EventSelectInputMap`). Keeping them in the output
+    // schema would force the operator to populate non-nullable columns
+    // with no underlying data. See the same treatment in
+    // `lower_sessionize`.
+    let output_schema = OperatorSchema::new(
+        input_schema
+            .columns()
+            .iter()
+            .filter(|c| !c.name.starts_with("__"))
+            .cloned()
+            .collect(),
+    )?;
+
     Ok(LogicalPlan::EventSelect {
         kind,
         event_types,
@@ -2747,7 +2764,7 @@ fn lower_event_select(
         forwarded_columns: Vec::new(),
         fused_downstream: None,
         input: Box::new(acc),
-        output_schema: input_schema,
+        output_schema,
     })
 }
 
@@ -6620,7 +6637,12 @@ mod tests {
                     }
                     other => panic!("expected Scan under EventSelect, got {other:?}"),
                 }
-                assert_eq!(output_schema.columns().len(), 7);
+                // Input's declared columns (purchases_schema has 5:
+                // user_id, ts, event, amount, country). The system
+                // columns `__seq_id` / `__batch_id` are dropped from
+                // EventSelect's advertised output — see
+                // `lower_event_select`.
+                assert_eq!(output_schema.columns().len(), 5);
             }
             other => panic!("expected EventSelect, got {other:?}"),
         }
@@ -6751,7 +6773,10 @@ mod tests {
     }
 
     #[test]
-    fn event_select_output_schema_equals_input() {
+    fn event_select_output_schema_matches_input_minus_system_cols() {
+        // EventSelect's advertised output equals the input's declared
+        // columns; the planner-only `__seq_id` / `__batch_id` system
+        // columns are stripped — see `lower_event_select`.
         let cat = InMemoryCatalog::default().with(purchases_schema());
         let pipeline = pipeline_with_stages(
             "purchases",
@@ -6771,7 +6796,19 @@ mod tests {
         else {
             panic!("expected EventSelect");
         };
-        assert_eq!(&output_schema, input.output_schema());
+        let expected_names: Vec<&str> = input
+            .output_schema()
+            .columns()
+            .iter()
+            .filter(|c| !c.name.starts_with("__"))
+            .map(|c| c.name.as_str())
+            .collect();
+        let actual_names: Vec<&str> = output_schema
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(actual_names, expected_names);
     }
 
     fn attribute_stage(

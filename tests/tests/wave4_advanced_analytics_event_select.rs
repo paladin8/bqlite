@@ -16,39 +16,29 @@
 //! | SAMPLE fraction: 1.0 → pass-through | runs |
 //! | SAMPLE determinism across repeat runs | runs |
 //! | SAMPLE population invariance with stateless filter | runs |
-//! | FIRST / LAST / NTH (any shape) | `#[ignore]` (see below) |
-//! | FIRST event-type list | `#[ignore]` |
-//! | FIRST `lookback:` widening | `#[ignore]` |
-//! | NTH + candidate-predicate filtering | `#[ignore]` |
-//! | RETENTION standard brackets | `#[ignore]` |
+//! | FIRST / LAST / NTH (every shape) | runs |
+//! | FIRST event-type list | runs |
+//! | FIRST `lookback:` widening | runs |
+//! | NTH + candidate-predicate filtering | runs |
+//! | RETENTION standard brackets | `#[ignore]` (see below) |
 //! | RETENTION `cumulative: true` | `#[ignore]` |
-//!
-//! The `#[ignore]`'d tests encode the spec shapes the suite will assert
-//! once the underlying implementation gaps close. Each ignored test
-//! carries a specific file:line citation for the blocker so a semantic
-//! audit (TASK-445, TASK-443) can find them.
 //!
 //! ## Known gaps tracked by this binary
 //!
-//! 1. **`__seq_id` not materialised at the scan runtime.** FIRST/LAST/NTH
-//!    (`crates/bqlite-operators/src/event_select.rs` ~line 218) require
-//!    `__seq_id` in the input schema for timestamp tie-breaking; the
-//!    scan runtime does not emit it today. `EventSelectOperator::new`
-//!    panics with `required column '__seq_id' not found in input
-//!    schema`. Not a routing-layer issue — even a bare
-//!    `events | FIRST(x)` on a non-empty table hits it.
+//! **`bracket` column declared non-nullable but produced as null.**
+//! `MATCH … BRACKETS [..]` (which RETENTION desugars to per
+//! `crates/bqlite-planner/src/opt/desugar_retention.rs`) errors at
+//! batch assembly: `crates/bqlite-operators/src/matcher/output.rs`
+//! ~line 97 enforces the declared non-null schema but the matcher
+//! produces a null `bracket` for at least one code path. Surfaces as
+//! `"Invalid argument error: Column 'bracket' is declared as
+//! non-nullable but contains null values"`. Once this gap closes,
+//! remove the corresponding `#[ignore]` markers.
 //!
-//! 2. **`bracket` column declared non-nullable but produced as null.**
-//!    `MATCH … BRACKETS [..]` (which RETENTION desugars to per
-//!    `crates/bqlite-planner/src/opt/desugar_retention.rs`) errors at
-//!    batch assembly: `crates/bqlite-operators/src/matcher/output.rs`
-//!    ~line 97 enforces the declared non-null schema but the matcher
-//!    produces a null `bracket` for at least one code path. Surfaces
-//!    as `"Invalid argument error: Column 'bracket' is declared as
-//!    non-nullable but contains null values"`.
-//!
-//! Once either gap closes, the corresponding `#[ignore]` should be
-//! removed and the matching test run.
+//! FIRST/LAST/NTH previously shared this gated-by-`__seq_id` status,
+//! but the operator now uses the scan's `(entity_id, ts, __seq_id)`
+//! emission order for same-`ts` tie-breaking and does not read
+//! `__seq_id` values directly (see the doc on `EventSelectInputMap`).
 
 use std::collections::HashSet;
 
@@ -310,26 +300,8 @@ fn sample_population_invariance_with_stateless_filter() {
 // ─────────────────────────────────────────────────────────────────────────────
 // FIRST / LAST / NTH (event-select-sample.md)
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// All FIRST/LAST/NTH tests are currently gated with `#[ignore]` because
-// `EventSelectOperator::new` (crates/bqlite-operators/src/event_select.rs
-// ~line 218) requires `__seq_id` on the input schema for same-`ts`
-// tie-breaking per event-select-sample.md, but the scan runtime does
-// not emit `__seq_id` today. Every test below fails at
-// `EventSelectOperator::new` with `"required column '__seq_id' not
-// found in input schema"`.
-//
-// The same gap is acknowledged for EventSelect's own smoke test —
-// see `bind_event_select` in `crates/bqlite-engine/src/bind.rs`,
-// which explicitly notes the deferral.
-//
-// Removing the `#[ignore]` marker is the correct action once the
-// scan layer materialises `__seq_id`.
 
 #[test]
-#[ignore = "FIRST/LAST/NTH need __seq_id on the input schema; \
-    scan runtime does not materialise it yet \
-    (see crates/bqlite-operators/src/event_select.rs ~line 218)"]
 fn first_returns_first_event_per_entity() {
     let (_tmp, mut db, engine) = fresh_db("first-basic");
     insert_rows(
@@ -350,8 +322,6 @@ fn first_returns_first_event_per_entity() {
 }
 
 #[test]
-#[ignore = "FIRST/LAST/NTH need __seq_id on the input schema; \
-    see crates/bqlite-operators/src/event_select.rs ~line 218"]
 fn first_with_candidate_predicate_filters_before_selection() {
     // event-select-sample.md §X: the WHERE predicate is applied per
     // event before position selection, so NTH(e WHERE P, 3) returns
@@ -393,8 +363,6 @@ fn first_with_candidate_predicate_filters_before_selection() {
 }
 
 #[test]
-#[ignore = "FIRST with event-type lists (query-language.md §14.1) \
-    need __seq_id; same blocker as the basic FIRST tests"]
 fn first_with_event_type_list_matches_any() {
     let (_tmp, mut db, engine) = fresh_db("first-list");
     insert_rows(
@@ -419,7 +387,6 @@ fn first_with_event_type_list_matches_any() {
 }
 
 #[test]
-#[ignore = "FIRST `lookback:` needs __seq_id; same blocker"]
 fn first_without_lookback_is_bounded_by_outer_range() {
     // event-select-sample.md: without `lookback:`, FIRST/NTH operate
     // only within the outer time range. The pre-range signup should
@@ -443,17 +410,28 @@ fn first_without_lookback_is_bounded_by_outer_range() {
 }
 
 #[test]
-#[ignore = "FIRST `lookback:` needs __seq_id; same blocker"]
 fn first_with_lookback_widens_scan_range() {
     // With `lookback: 60d`, the same fixture widens the scan to 60d
     // into the past, so the 30d-old signup is now visible.
+    //
+    // `LAST 7d` is anchored at wall-clock "now" — use a recent-now
+    // fixture so the expected rows fall inside the widened window at
+    // query time. Anchoring at the module-constant `T0` (a 2023 epoch
+    // picked for determinism of other tests) would place every row
+    // outside any plausible `lookback:` window in a 2026+ CI run.
     let (_tmp, mut db, engine) = fresh_db("first-lookback");
+    let now_ns: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_nanos()
+        .try_into()
+        .expect("now fits in i64 ns");
     insert_rows(
         &engine,
         &mut db,
         &[
-            ("alice", T0 - 30 * D, "signup"),
-            ("alice", T0 - 3 * D, "click"),
+            ("alice", now_ns - 30 * D, "signup"),
+            ("alice", now_ns - 3 * D, "click"),
         ],
     );
     let result = engine
@@ -463,7 +441,6 @@ fn first_with_lookback_widens_scan_range() {
 }
 
 #[test]
-#[ignore = "LAST needs __seq_id; same blocker"]
 fn last_returns_last_event_per_entity() {
     let (_tmp, mut db, engine) = fresh_db("last-basic");
     insert_rows(
@@ -482,7 +459,6 @@ fn last_returns_last_event_per_entity() {
 }
 
 #[test]
-#[ignore = "NTH needs __seq_id; same blocker"]
 fn nth_returns_third_matching_event() {
     let (_tmp, mut db, engine) = fresh_db("nth-3");
     // Alice has 5 page_views; Bob has only 2. NTH(page_view, 3)

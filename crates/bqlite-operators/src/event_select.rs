@@ -32,7 +32,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::{EntityId, OperatorSchema, ScalarValue, SEQ_ID_COLUMN};
+use bqlite_core::{EntityId, OperatorSchema, ScalarValue};
 use bqlite_planner::compiled::CompiledExpr;
 use bqlite_planner::demand::DemandCapabilities;
 use bqlite_planner::logical::EventSelectKind;
@@ -53,18 +53,32 @@ const EVENT_TYPE_COL: &str = "event_type";
 // EventSelectInputMap
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Pre-resolved column indices for the four always-needed columns.
+/// Pre-resolved column indices for the always-needed columns.
 ///
 /// Resolved once at operator construction from the input schema so
 /// per-row access is an array index lookup rather than a name lookup.
+///
+/// ## Why there is no `seq_id_idx`
+///
+/// Same-`ts` tie-breaking is *defined* by `__seq_id` ordering
+/// (`docs/design/operators/event-select-sample.md` §6), but the
+/// operator does not need to physically read `__seq_id` values. The
+/// scan runtime guarantees rows are emitted in `(entity_id, ts,
+/// __seq_id)` ascending order (`bqlite-operators::scan` module docs
+/// and `KWayMergeScan`'s sort key), so within a single sub-batch the
+/// positional row order IS the `__seq_id` order. FIRST takes the first
+/// qualifying row, LAST overwrites as rows arrive, and NTH counts in
+/// arrival order — all three are equivalent to ascending-by-`__seq_id`
+/// tie-breaking. Resolving `__seq_id` from the input schema would
+/// couple this operator to scan-layer system-column materialisation
+/// (a feature the Wave 2 scan does not yet expose, per
+/// `bqlite-operators::scan` module header) without changing behaviour.
 #[derive(Debug, Clone)]
 pub struct EventSelectInputMap {
     /// Index of `entity_id` in the input batch.
     pub entity_id_idx: usize,
     /// Index of `ts` (timestamp) in the input batch.
     pub ts_idx: usize,
-    /// Index of `__seq_id` in the input batch.
-    pub seq_id_idx: usize,
     /// Index of `event_type` in the input batch.
     pub event_type_idx: usize,
 }
@@ -221,7 +235,6 @@ impl EventSelectOperator {
         let input_map = EventSelectInputMap {
             entity_id_idx: find_required(ENTITY_ID_COL),
             ts_idx: find_required(TS_COL),
-            seq_id_idx: find_required(SEQ_ID_COLUMN),
             event_type_idx: find_required(EVENT_TYPE_COL),
         };
 
@@ -236,10 +249,11 @@ impl EventSelectOperator {
 
         // Build required column names:
         // always-needed + output schema columns + predicate columns.
+        // `__seq_id` is intentionally not required — see the doc on
+        // `EventSelectInputMap`.
         let mut required = vec![
             ENTITY_ID_COL.to_string(),
             TS_COL.to_string(),
-            SEQ_ID_COLUMN.to_string(),
             EVENT_TYPE_COL.to_string(),
         ];
         // Add output schema columns.
@@ -1371,7 +1385,11 @@ mod tests {
     }
 
     #[test]
-    fn entity_operator_required_columns_includes_system_columns() {
+    fn entity_operator_required_columns_covers_user_columns() {
+        // `__seq_id` is no longer in `required_columns()`: FIRST/LAST/NTH
+        // rely on the scan's `(entity_id, ts, __seq_id)` emission order
+        // for tie-breaking rather than reading `__seq_id` values (see
+        // the doc on `EventSelectInputMap`).
         let desc = make_physical(
             EventSelectKind::First,
             vec!["purchase"],
@@ -1382,8 +1400,11 @@ mod tests {
 
         assert!(req.contains(&"entity_id".to_string()));
         assert!(req.contains(&"ts".to_string()));
-        assert!(req.contains(&SEQ_ID_COLUMN.to_string()));
         assert!(req.contains(&"event_type".to_string()));
+        assert!(
+            !req.contains(&SEQ_ID_COLUMN.to_string()),
+            "__seq_id is not a required input column"
+        );
     }
 
     #[test]
