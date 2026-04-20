@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-499",
+  "claimed_at": "2026-04-20T05:09:58Z",
+  "branch": "task/TASK-499",
+  "description": "Wave 4 quality audit"
+}
