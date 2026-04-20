@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-447",
+  "claimed_at": "2026-04-20T02:51:29Z",
+  "branch": "task/TASK-447",
+  "description": "Cohort, alias, and joined-source semantic audit"
+}
