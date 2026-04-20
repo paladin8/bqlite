@@ -64,6 +64,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, StringViewBuilder};
+use arrow::compute;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
@@ -82,8 +83,8 @@ use bqlite_planner::compiled::{
     ArrowKernelId, CompareKernel, CompareOp, CompiledExpr, CompiledNode,
 };
 use bqlite_planner::{
-    AttributePhysical, EventSelectPhysical, PhysicalPlan, ScanPhysical, SequenceMatchPhysical,
-    SessionizePhysical, SubqueryFilterPhysical,
+    AttributePhysical, EventSelectPhysical, MergeSourcesPhysical, PhysicalPlan, SamplePhysical,
+    ScanPhysical, SequenceMatchPhysical, SessionizePhysical, SubqueryFilterPhysical,
 };
 use bqlite_storage::Database;
 
@@ -507,6 +508,99 @@ impl<Op: EntityOperator> PhysicalOperator for EntityOperatorAdapter<Op> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SampleFilterOperator — fallback SAMPLE filter (TASK-438 CP2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fallback [`PhysicalOperator`] that applies an entity-level SAMPLE filter
+/// above a stateful pipeline stage.
+///
+/// When the planner's sample-pushdown pass (TASK-430) cannot push SAMPLE
+/// into the scan layer — because a stateful operator (SequenceMatch,
+/// Sessionize, EventSelect, Attribute) sits between the SAMPLE node and
+/// the source scan — the `SamplePhysical` descriptor remains in the plan
+/// tree and the engine bind step materialises it here.
+///
+/// ## Entity-level semantics
+///
+/// The filter evaluates each row's entity-id column via xxHash64 against a
+/// fraction threshold, identically to the scan-layer
+/// [`bqlite_storage::SampleFilter`]. Because the child output is
+/// entity-sorted, consecutive rows with the same entity id produce the same
+/// hash result: either all rows for that entity pass or all fail, preserving
+/// the same deterministic entity-level sampling guarantee as the pushed-down
+/// variant.
+struct SampleFilterOperator {
+    filter: bqlite_storage::SampleFilter,
+    child: Box<dyn PhysicalOperator>,
+    /// Index of the entity-key column in the *child's* output batches.
+    entity_id_col_idx: usize,
+    output_schema: OperatorSchema,
+}
+
+impl SampleFilterOperator {
+    fn new(
+        filter: bqlite_storage::SampleFilter,
+        child: Box<dyn PhysicalOperator>,
+        entity_id_col_idx: usize,
+        output_schema: OperatorSchema,
+    ) -> Self {
+        Self {
+            filter,
+            child,
+            entity_id_col_idx,
+            output_schema,
+        }
+    }
+}
+
+impl PhysicalOperator for SampleFilterOperator {
+    fn output_schema(&self) -> &OperatorSchema {
+        &self.output_schema
+    }
+
+    fn open(&mut self) -> Result<()> {
+        self.child.open()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.child.close()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        // Short-circuit: fraction == 0.0 → no rows survive.
+        if self.filter.is_empty_set() {
+            return Ok(None);
+        }
+
+        loop {
+            let batch = match self.child.next_batch()? {
+                None => return Ok(None),
+                Some(b) => b,
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Short-circuit: fraction == 1.0 → all rows survive.
+            if self.filter.is_pass_through() {
+                return Ok(Some(batch));
+            }
+
+            // Apply the entity-level hash filter row-by-row.
+            let entity_col = batch.column(self.entity_id_col_idx);
+            let mask = self.filter.apply_to_array(entity_col.as_ref())?;
+            let filtered =
+                compute::filter_record_batch(&batch, &mask).map_err(BqliteError::Arrow)?;
+
+            if filtered.num_rows() > 0 {
+                return Ok(Some(filtered));
+            }
+            // All rows in this batch were filtered out — pull the next batch.
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Plan-tree helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -810,12 +904,10 @@ fn bind_physical_with_cache(
 
         PhysicalPlan::Attribute(attr) => bind_attribute(attr, db, cohorts),
 
-        // ── Wave 4 stubs: Sample + MergeSources ──────────────────
-        // Implemented by TASK-438 CP2. The arms below keep the
-        // crate compiling while CP1 ships.
-        PhysicalPlan::Sample(_) | PhysicalPlan::MergeSources(_) => Err(BqliteError::Execution(
-            "Wave 4 Sample / MergeSources binding not yet implemented (TASK-438 CP2)".into(),
-        )),
+        // ── Wave 4 Sample + MergeSources (TASK-438 CP2) ──────────
+        PhysicalPlan::Sample(s) => bind_sample(s, db, cohorts),
+
+        PhysicalPlan::MergeSources(merge) => bind_merge_sources(merge, db),
 
         // DELETE is intentionally not bound through this path —
         // `Engine::query` dispatches it to `crate::delete` directly so
@@ -1216,6 +1308,88 @@ fn bind_attribute(
         attr.output_schema.clone(),
         entity_id_col_idx,
     )))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4 Sample + MergeSources bind helpers (TASK-438 CP2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Bind a [`SamplePhysical`] descriptor into a [`SampleFilterOperator`].
+///
+/// This arm is reached only when the planner's sample-pushdown pass
+/// (TASK-430) cannot push SAMPLE into the scan layer — typically because a
+/// stateful operator (SequenceMatch, Sessionize, EventSelect, Attribute)
+/// sits between the SAMPLE node and the source scan. In all other cases
+/// the sample has been folded into the `ScanPhysical::sample` field and
+/// the bind step sees only a bare `Scan` node.
+fn bind_sample(
+    sample: &SamplePhysical,
+    db: &mut Database,
+    cohorts: &mut CohortCache,
+) -> Result<Box<dyn PhysicalOperator>> {
+    let child = bind_physical_with_cache(&sample.input, db, cohorts)?;
+    let ek_col_name = entity_key_col_name(&sample.input);
+    let entity_id_col_idx = resolve_entity_key_col(child.as_ref(), ek_col_name, "SampleFilter")?;
+
+    // Look up the entity-key column type from the child's runtime schema.
+    let entity_type = child
+        .output_schema()
+        .column(ek_col_name)
+        .map(|(_, coldef)| coldef.bql_type.clone())
+        .ok_or_else(|| {
+            BqliteError::Schema(format!(
+                "SampleFilter: entity key column '{ek_col_name}' not found in child schema"
+            ))
+        })?;
+
+    let filter =
+        bqlite_storage::SampleFilter::new(sample.fraction, sample.seed, ek_col_name, entity_type)?;
+
+    Ok(Box::new(SampleFilterOperator::new(
+        filter,
+        child,
+        entity_id_col_idx,
+        sample.output_schema.clone(),
+    )))
+}
+
+/// Bind a [`MergeSourcesPhysical`] descriptor into a
+/// [`bqlite_operators::scan::MergeSourcesOperator`].
+///
+/// Each sub-table in `merge.tables` is bound independently into a
+/// `ScanOperator`; the operator performs an N-ary k-way merge over all
+/// sub-scans, emitting a unified entity-sorted event stream with a
+/// `__source_table_id` discriminator column.
+fn bind_merge_sources(
+    merge: &MergeSourcesPhysical,
+    db: &mut Database,
+) -> Result<Box<dyn PhysicalOperator>> {
+    let sub_ops: Vec<Box<dyn PhysicalOperator>> = merge
+        .tables
+        .iter()
+        .map(|scan| bind_scan(scan, db))
+        .collect::<Result<Vec<_>>>()?;
+
+    let sub_entity_key_cols: Vec<String> = merge
+        .tables
+        .iter()
+        .map(|s| s.entity_key_col.clone())
+        .collect();
+
+    let sub_ts_cols: Vec<String> = merge
+        .tables
+        .iter()
+        .map(|s| s.timestamp_col.clone())
+        .collect();
+
+    Ok(Box::new(bqlite_operators::scan::MergeSourcesOperator::new(
+        sub_ops,
+        sub_entity_key_cols,
+        sub_ts_cols,
+        merge.output_schema.clone(),
+        merge.table_id_map.clone(),
+        CancellationToken::new(),
+    )?))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2074,5 +2248,135 @@ mod tests {
             .expect("attribute on empty table must not error");
 
         assert_eq!(result.row_count(), 0, "empty table → 0 attributions");
+    }
+
+    // ── TASK-438 CP2: SampleFilterOperator + MergeSources bind ──────────
+
+    #[test]
+    fn wave4_sample_fallback_bind_pass_through() {
+        // `events | sessionize(gap: 30m) | sample(fraction: 1.0)` forces the
+        // fallback path: the planner's sample-pushdown pass recognises
+        // Sessionize as a stateful operator and leaves the SamplePhysical node
+        // above it. The bind step must materialise a SampleFilterOperator with
+        // fraction=1.0, which is a pass-through and returns all rows (0 for an
+        // empty table).
+        let scratch = Scratch::new("wave4-sample-pt");
+        let (mut db, engine) = create_db_with_entity_id_table(scratch.path());
+
+        let result = engine
+            .query(
+                "events | sessionize(gap: 30m) | sample(fraction: 1.0)",
+                &mut db,
+            )
+            .expect("sample(fraction: 1.0) after sessionize on empty table must not error");
+
+        assert_eq!(result.row_count(), 0, "empty table → 0 rows");
+    }
+
+    #[test]
+    fn wave4_sample_fallback_bind_empty_set() {
+        // `sample(fraction: 0.0)` on an empty table: the SampleFilterOperator
+        // short-circuits to Ok(None) before pulling any child batches.
+        let scratch = Scratch::new("wave4-sample-empty");
+        let (mut db, engine) = create_db_with_entity_id_table(scratch.path());
+
+        let result = engine
+            .query(
+                "events | sessionize(gap: 30m) | sample(fraction: 0.0)",
+                &mut db,
+            )
+            .expect("sample(fraction: 0.0) must not error");
+
+        assert_eq!(result.row_count(), 0, "fraction=0.0 → 0 rows");
+    }
+
+    #[test]
+    fn wave4_merge_sources_bind_two_empty_tables() {
+        // Directly construct a MergeSourcesPhysical over two empty bootstrap
+        // tables and verify that bind_physical creates a valid operator that
+        // returns 0 rows.
+        use bqlite_core::{BqlType, ColumnDef, OperatorSchema};
+        use bqlite_planner::{MergeSourcesPhysical, PhysicalPlan, ScanPhysical, SortDirection};
+
+        let scratch = Scratch::new("wave4-merge-two-empty");
+        let mut db = Database::create(scratch.path()).expect("create db");
+        let engine = crate::Engine::new();
+
+        // Create two tables with the same bootstrap schema.
+        engine
+            .query(
+                "CREATE TABLE events_a (\
+                     entity_id STRING NOT NULL ENTITY KEY, \
+                     ts TIMESTAMP NOT NULL EVENT TIME, \
+                     event_type STRING NOT NULL EVENT TYPE\
+                 )",
+                &mut db,
+            )
+            .expect("create events_a");
+        engine
+            .query(
+                "CREATE TABLE events_b (\
+                     entity_id STRING NOT NULL ENTITY KEY, \
+                     ts TIMESTAMP NOT NULL EVENT TIME, \
+                     event_type STRING NOT NULL EVENT TYPE\
+                 )",
+                &mut db,
+            )
+            .expect("create events_b");
+
+        // Build scan descriptors for each sub-table.
+        // For simplicity use the same declared-column schema.
+        let sub_schema = OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+        ])
+        .expect("sub schema");
+
+        let make_scan = |table: &str| ScanPhysical {
+            table: table.to_string(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: sub_schema.clone(),
+            entity_key_col: "entity_id".to_string(),
+            timestamp_col: "ts".to_string(),
+            sample: None,
+        };
+
+        // Combined output schema: qualified user columns + __source_table_id.
+        let merged_schema = OperatorSchema::new(vec![
+            ColumnDef::required("events_a.entity_id", BqlType::String),
+            ColumnDef::required("events_a.ts", BqlType::Timestamp),
+            ColumnDef::required("events_a.event_type", BqlType::String),
+            ColumnDef::nullable("events_b.entity_id", BqlType::String),
+            ColumnDef::nullable("events_b.ts", BqlType::Timestamp),
+            ColumnDef::nullable("events_b.event_type", BqlType::String),
+            ColumnDef::required("__source_table_id", BqlType::Int),
+        ])
+        .expect("merged schema");
+
+        let merge_plan = PhysicalPlan::MergeSources(MergeSourcesPhysical {
+            tables: vec![make_scan("events_a"), make_scan("events_b")],
+            order: vec![
+                ("entity_id".into(), SortDirection::Asc),
+                ("ts".into(), SortDirection::Asc),
+                ("__source_table_id".into(), SortDirection::Asc),
+            ],
+            table_id_map: vec!["events_a".into(), "events_b".into()],
+            output_schema: merged_schema,
+        });
+
+        let mut op = bind_physical(&merge_plan, &mut db).expect("bind_merge_sources must succeed");
+        op.open().expect("open must succeed");
+        // Both tables are empty — the merge operator must return None immediately.
+        assert!(
+            op.next_batch()
+                .expect("next_batch must not error")
+                .is_none(),
+            "two empty tables must yield 0 rows"
+        );
+        op.close().expect("close must succeed");
     }
 }
