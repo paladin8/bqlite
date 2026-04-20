@@ -1123,6 +1123,10 @@ Multi-column IN arity is validated at plan time: `(a, b) IN QUERY (pipeline_with
 
 Type rules: see type-system.md Section 6.9.
 
+### 17.5 Memory Budget for IN QUERY
+
+Subquery results used in `IN QUERY` and alias-based `IN` expressions are materialized as hash sets in memory. Materialization draws from the query's memory budget (configured at engine initialization). If the hash set exceeds the budget, the entire query fails with an out-of-budget error — there is no partial-result mode and the set is never silently truncated.
+
 ---
 
 ## 18. Aliases
@@ -1146,6 +1150,7 @@ events | WHERE entity_id IN churned | MATCH FIRST SEQUENCE(support_ticket THEN c
 - **No cycles.** Circular references are a planner error.
 - **Lexically scoped naming.** An alias name must be a valid identifier and must not shadow a keyword or table name. Shadowing other aliases is permitted — the most recent definition wins.
 - **Top-down order.** An alias must be defined before it is referenced within the submission.
+- **Memory-bounded materialization.** When an alias is materialized as a hash set for `IN` matching, it draws from the query's memory budget. Exceeding the budget fails the entire query with an out-of-budget error — there is no partial-result or silent-truncation mode. See also §17.5.
 
 ### 18.2 Alias Resolution in IN
 
@@ -1160,6 +1165,10 @@ Persistent aliases — named views, materialized results — are a v2 feature an
 ### 18.4 Alias Top-Level Structure
 
 A BQL script is a sequence of zero or more alias definitions followed by a terminal pipeline. The formal production `query := (alias_def)* pipeline` is in Section 26. The terminal pipeline is what executes and produces output; alias definitions on their own do nothing — they are inert until referenced.
+
+### 18.5 Alias Equivalence With IN QUERY
+
+`IN alias` is **semantically equivalent** to `IN QUERY (same pipeline)` when the pipelines are identical. The planner normalizes both forms to the same internal cohort representation. Multiple `IN alias` references and multiple `IN QUERY` references to an identical pipeline are both eligible for deduplication within a single submission — either way, the set is materialized at most once. The alias form offers the additional benefit of a stable, human-readable name that makes intent explicit in large query scripts; prefer it when the same subquery result is needed in more than one place.
 
 ---
 
@@ -1203,6 +1212,24 @@ In single-table queries (no JOIN), the table prefix is never written — bare ev
 ### 19.2 No Self-Joins
 
 A table cannot appear more than once in a source expression. `events JOIN events` is a **parse error** (`ParseError::SelfJoin`). Self-joins would require table aliases to disambiguate `events.signup` (which events?), and v1 does not introduce table aliases for the source expression. If you need multiple independent views of the same table (e.g., to find pairs of events within one entity's stream), use variable bindings inside a single MATCH or use aliases.
+
+#### 19.2.1 No DELETE FROM with JOIN
+
+`DELETE FROM <table> JOIN ...` is a **parse error**. The `JOIN` source clause is only valid in query-type source expressions; `DELETE FROM` targets a single table. To express a cross-table delete (e.g., delete all events for users listed in a second table), use a sequential `IN QUERY` pattern:
+
+```bql
+-- Cannot: DELETE FROM purchases JOIN events ...
+-- Instead, use IN QUERY to compute the target set from the second table:
+DELETE FROM purchases
+WHERE user_id IN QUERY (
+    events LAST 90d
+    | WHERE event_type = 'churn'
+    | SELECT entity_id
+)
+ALLOW SCAN
+```
+
+The `ALLOW SCAN` qualifier is required when the `IN QUERY` subquery is not a cheap predicate. See §28.16 for further DELETE examples.
 
 ### 19.3 FUNNEL and RETENTION Inside JOINs
 

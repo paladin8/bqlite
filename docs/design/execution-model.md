@@ -34,7 +34,7 @@ Each stateful operator has its own optimal execution strategy:
 | Operator | Execution Strategy | State Per Entity |
 |---|---|---|
 | Sequence match (MATCH) | NFA or specialized fast path (see Section 8) | Active state set + timestamps + held properties |
-| Sessionization (SESSIONIZE) | Streaming fold | Current session ID + last event timestamp |
+| Sessionization (SESSIONIZE) | Streaming fold | Current session ID + open-session event buffer (rows for the in-progress session) + session start/last timestamps + event count |
 | Event sub-selection (FIRST/LAST/NTH) | Single-event extraction with predicate filter | At most one retained event |
 | Attribution (ATTRIBUTE) | Sliding window deque of qualifying touchpoints; auto-unnested emission on conversion | Deque entries are `(ts, pre-computed touchpoint_key)` pairs — minimal per-touchpoint state |
 
