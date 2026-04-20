@@ -158,3 +158,11 @@ harness = false
 name = "compaction"
 path = "wave4/compaction.rs"
 harness = false
+
+# Wave 4 SAMPLE pushdown bench (TASK-441): per-row xxHash64 +
+# threshold throughput on entity-id columns, plus selectivity
+# determinism within the 3σ law-of-large-numbers bound.
+[[bench]]
+name = "sample"
+path = "wave4/sample.rs"
+harness = false
