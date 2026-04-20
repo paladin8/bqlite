@@ -1316,16 +1316,17 @@ fn build_joined_scan(
         }
     }
 
-    // Discriminator + shared system columns.
+    // Discriminator column. `__seq_id` / `__batch_id` are intentionally
+    // omitted from the combined schema: the Wave 2 `ScanOperator` does
+    // not materialise them in per-sub-scan batches (see
+    // `bqlite-operators::scan` module docs), so declaring them here
+    // would force `MergeSourcesOperator` to populate non-nullable
+    // columns with values it has no way to source — exactly the
+    // failure mode that blocked `events JOIN purchases` end-to-end. If
+    // a future scan gains system-column materialisation, `__seq_id` /
+    // `__batch_id` can be re-added to the combined schema in lockstep;
+    // see `cohorts-aliases-joins.md` §3.8 for the spec shape.
     cols.push(ColumnDef::required(SOURCE_TABLE_ID_COLUMN, BqlType::Int));
-    cols.push(ColumnDef::required(
-        bqlite_core::schema::SEQ_ID_COLUMN,
-        BqlType::Int,
-    ));
-    cols.push(ColumnDef::required(
-        bqlite_core::schema::BATCH_ID_COLUMN,
-        BqlType::Int,
-    ));
 
     let output_schema = OperatorSchema::new(cols)?;
 

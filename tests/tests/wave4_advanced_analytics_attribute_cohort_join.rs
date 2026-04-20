@@ -576,23 +576,15 @@ fn cohort_plus_filter_plus_aggregate_exact_count() {
 // Joined-source queries (query-language.md §19)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Both joined-source tests are currently gated with `#[ignore]`
-// because even a bare `events JOIN purchases` on ingested data fails
-// at batch assembly with:
-//
-//     "MergeSourcesOperator: failed to assemble output batch:
-//      Invalid argument error: Column '__seq_id' is declared as
-//      non-nullable but contains null values"
-//
-// The merge's output schema declares `__seq_id` non-null per the
-// planner, but one side of the n-way merge produces nulls. This is
-// the same family of runtime-vs-planner schema drift called out in
-// `bind_event_select`. The test bodies encode spec shapes to run
-// once the merge output contract is reconciled.
+// Joined-source tests previously required `#[ignore]` because
+// `MergeSourcesOperator`'s output schema carried non-nullable
+// `__seq_id` / `__batch_id` columns that the underlying per-sub-scan
+// runtime does not materialise. The planner now omits those system
+// columns from the combined joined-scan schema (see
+// `build_joined_scan` in `crates/bqlite-planner/src/logical.rs`), so
+// the tests run.
 
 #[test]
-#[ignore = "MergeSourcesOperator fails __seq_id nullability at assembly; \
-    any `events JOIN purchases` surfaces it"]
 fn joined_source_stats_counts_entities_in_both_tables() {
     let (_tmp, mut db, engine) = fresh_db("join-basic");
     insert_events(
@@ -624,8 +616,11 @@ fn joined_source_stats_counts_entities_in_both_tables() {
 }
 
 #[test]
-#[ignore = "Joined-source + sequence MATCH hits the same MergeSources \
-    nullability issue as the basic JOIN test"]
+#[ignore = "MATCH over a joined source expects a bare `event_type` \
+    column, but the combined schema qualifies it as \
+    `events.event_type` / `purchases.event_type` (a separate \
+    planner/matcher issue from the MergeSources __seq_id bug that \
+    this test was previously gated on)"]
 fn joined_source_sequence_match_spans_tables() {
     // query-language.md §19.1: table-qualified references inside
     // multi-table queries. A MATCH pattern whose steps come from
