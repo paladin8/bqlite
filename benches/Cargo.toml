@@ -151,3 +151,10 @@ harness = false
 name = "wave4_ingest"
 path = "wave4/ingest.rs"
 harness = false
+
+# Wave 4 compaction bench (TASK-441): L0-to-L1 throughput and L0
+# segment-fan-in reduction measurement via `Database::compact_now`.
+[[bench]]
+name = "compaction"
+path = "wave4/compaction.rs"
+harness = false

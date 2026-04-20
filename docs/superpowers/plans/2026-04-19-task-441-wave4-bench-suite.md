@@ -63,7 +63,7 @@ Enforced only when `BQLITE_BENCH_MODE=reference`; CI mode relies on Criterion's 
 | `ingest/jsonl/end_to_end` | Throughput | ≥ 100 MB/s | **[floor]** parity with the Wave 2 CSV ingest target enforced in `benches/wave2/ingest.rs`; no separate JSONL number pinned in a design doc. |
 | `ingest/parquet/end_to_end` | Throughput | ≥ 150 MB/s | **[floor]** Parquet reader decodes columnar chunks, expected to beat JSONL parse; chosen as a regression tripwire. |
 | `compaction/throughput/l0_to_l1` | MB/s of input consumed | ≥ 200 MB/s | **[floor]** compaction-concurrency.md pins no MB/s number (§5 Backpressure discusses the L0 threshold in *segment count*, not MB/s). Chosen as a regression tripwire. |
-| `compaction/l0_reduction/4_to_1` | L0-count-before / L0-count-after | ≥ 4 | **[spec]** compaction-concurrency.md §3.2 — the "4 segments" L0 trigger fires a compaction that replaces 4 inputs with 1 output. |
+| `compaction/l0_reduction/5_to_1` | L0-count-before / L0-count-after | ≥ 5 | **[spec]** compaction-concurrency.md §3.2 — the L0 trigger is "eligible when count > 4", so 5 segments is the smallest stack that triggers; all 5 collapse into 1 output. |
 | `sample/pushdown/fraction_0.01` | `(rows_produced / rows_scanned) − 0.01` | ≤ 0.002 (absolute) | **[floor]** derived from event-select-sample.md §21.2 "bit-identical entity sets" determinism plus the law-of-large-numbers 3σ bound at 100 k entities. |
 | `sample/pushdown/fraction_0.10` | `(rows_produced / rows_scanned) − 0.10` | ≤ 0.010 (absolute) | **[floor]** same derivation. |
 | `sample/pushdown/throughput_fraction_0.10` | Throughput, entities/sec | ≥ 50 × 10⁶ | **[spec]** event-select-sample.md §21.2 row 1. |
