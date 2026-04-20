@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-445",
   "claimed_at": "2026-04-20T02:49:13Z",
+  "completed_at": "2026-04-20T04:15:00Z",
   "branch": "task/TASK-445",
   "description": "EventSelect + SAMPLE semantic audit"
 }
