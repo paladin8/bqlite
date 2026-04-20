@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-441",
   "claimed_at": "2026-04-19T23:35:23Z",
+  "completed_at": "2026-04-20T00:28:19Z",
   "branch": "task/TASK-441",
   "description": "Advanced analytics benchmark suite"
 }
