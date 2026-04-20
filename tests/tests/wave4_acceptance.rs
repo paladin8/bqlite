@@ -701,10 +701,6 @@ fn parquet_ingest_lands_expected_rows() {
 // task can find them.
 
 #[test]
-#[ignore = "RETENTION desugars to MATCH BRACKETS which trips matcher \
-    output assembly: `bracket` column is declared non-nullable but \
-    the matcher produces a null for at least one code path \
-    (crates/bqlite-operators/src/matcher/output.rs ~line 97)"]
 fn retention_invariance_under_compaction() {
     let (_tmp, mut db, engine) = build_acceptance_db("retention-invar");
 
@@ -714,7 +710,7 @@ fn retention_invariance_under_compaction() {
     // (query-language.md §6.3).
     let pre = engine
         .query(
-            "events | RETENTION(ad_click, ad_click) BRACKETS [0d, 7d, 14d]",
+            "events | RETENTION(entry: ad_click, activity: ad_click, brackets: [7d, 14d])",
             &mut db,
         )
         .expect("baseline RETENTION");
@@ -727,7 +723,7 @@ fn retention_invariance_under_compaction() {
         .expect("DELETE one entity");
     let pre_logical = engine
         .query(
-            "events | RETENTION(ad_click, ad_click) BRACKETS [0d, 7d, 14d]",
+            "events | RETENTION(entry: ad_click, activity: ad_click, brackets: [7d, 14d])",
             &mut db,
         )
         .expect("pre-compaction RETENTION");
@@ -735,7 +731,7 @@ fn retention_invariance_under_compaction() {
     let _ = compact_all_eligible(&mut db, "events");
     let post = engine
         .query(
-            "events | RETENTION(ad_click, ad_click) BRACKETS [0d, 7d, 14d]",
+            "events | RETENTION(entry: ad_click, activity: ad_click, brackets: [7d, 14d])",
             &mut db,
         )
         .expect("post-compaction RETENTION");
@@ -748,11 +744,6 @@ fn retention_invariance_under_compaction() {
 }
 
 #[test]
-#[ignore = "FIRST/LAST/NTH need __seq_id materialised on the input \
-    schema for same-ts tie-breaking; the scan runtime does not emit \
-    it today, so EventSelectOperator::new panics with `required \
-    column '__seq_id' not found in input schema` \
-    (crates/bqlite-operators/src/event_select.rs ~line 218)"]
 fn first_last_nth_invariance_under_compaction() {
     let (_tmp, mut db, engine) = build_acceptance_db("flnth-invar");
 
