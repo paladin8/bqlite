@@ -85,6 +85,7 @@ fn nfa_a_then_b(window: Option<i64>) -> CompiledNfa {
         pattern_class: PatternClass::LinearSimple,
         variable_bindings: vec![],
         global_window: window,
+        session_window: false,
         emit_all: false,
         state_to_step: vec![0, 1, 2],
     }
@@ -116,6 +117,7 @@ fn nfa_a_then_b_then_c(window: Option<i64>) -> CompiledNfa {
         pattern_class: PatternClass::LinearSimple,
         variable_bindings: vec![],
         global_window: window,
+        session_window: false,
         emit_all: false,
         state_to_step: vec![0, 1, 2, 3],
     }
@@ -143,6 +145,7 @@ fn nfa_a_then_b_without_c(window: Option<i64>) -> CompiledNfa {
         pattern_class: PatternClass::LinearWithNegation,
         variable_bindings: vec![],
         global_window: window,
+        session_window: false,
         emit_all: false,
         state_to_step: vec![0, 1, 2],
     }
@@ -174,6 +177,7 @@ fn nfa_a_then_b_plus_then_c(window: Option<i64>) -> CompiledNfa {
         pattern_class: PatternClass::GeneralNfa,
         variable_bindings: vec![],
         global_window: window,
+        session_window: false,
         emit_all: false,
         state_to_step: vec![0, 1, 2, 3],
     }

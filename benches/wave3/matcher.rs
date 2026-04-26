@@ -81,6 +81,7 @@ fn linear_nfa(steps: &[&str], pattern_class: PatternClass) -> CompiledNfa {
         pattern_class,
         variable_bindings: Vec::new(),
         global_window: None,
+        session_window: false,
         emit_all: false,
         state_to_step,
     }
@@ -134,6 +135,7 @@ fn linear_nfa_with_negation(steps: &[&str], poison_type: &str) -> CompiledNfa {
         pattern_class: PatternClass::LinearWithNegation,
         variable_bindings: Vec::new(),
         global_window: None,
+        session_window: false,
         emit_all: false,
         state_to_step,
     }
@@ -187,6 +189,7 @@ fn linear_nfa_with_bindings(steps: &[&str]) -> CompiledNfa {
             bind_step: 0,
         }],
         global_window: None,
+        session_window: false,
         emit_all: false,
         state_to_step,
     }
@@ -246,6 +249,7 @@ fn linear_nfa_full(steps: &[&str], poison_type: &str) -> CompiledNfa {
             bind_step: 0,
         }],
         global_window: None,
+        session_window: false,
         emit_all: false,
         state_to_step,
     }
@@ -318,6 +322,7 @@ fn general_nfa_alternation(steps: &[&str]) -> CompiledNfa {
         pattern_class: PatternClass::GeneralNfa,
         variable_bindings: Vec::new(),
         global_window: None,
+        session_window: false,
         emit_all: false,
         state_to_step,
     }
@@ -394,6 +399,7 @@ fn general_nfa_repetition(steps: &[&str]) -> CompiledNfa {
         pattern_class: PatternClass::GeneralNfa,
         variable_bindings: Vec::new(),
         global_window: None,
+        session_window: false,
         emit_all: false,
         state_to_step: vec![0, 1, 2, 3],
     }

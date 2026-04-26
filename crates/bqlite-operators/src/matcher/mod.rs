@@ -120,6 +120,14 @@ impl SequenceMatchOperator {
             "ts".to_string(),
             "event_type".to_string(),
         ];
+        // `WITHIN SESSION` reads the upstream SESSIONIZE column at
+        // runtime; declare it required so the engine bind step does not
+        // project it away. The parser/planner mutual-exclusion check
+        // guarantees `session_window` only fires when SESSIONIZE is
+        // upstream, so the column will always exist.
+        if desc.compiled_nfa.session_window {
+            required_column_names.push("session_id".to_string());
+        }
         // Add columns referenced by variable bindings.
         for vb in &desc.compiled_nfa.variable_bindings {
             if !required_column_names.contains(&vb.source_column) {
@@ -637,6 +645,7 @@ mod tests {
             pattern_class: PatternClass::LinearSimple,
             variable_bindings: Vec::new(),
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step,
         }

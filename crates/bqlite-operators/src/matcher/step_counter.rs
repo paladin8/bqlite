@@ -193,6 +193,10 @@ pub struct StepCounterState {
     pub cap_exceeded: bool,
     /// Number of tracks dropped due to the active-state cap.
     pub dropped_count: u64,
+    /// Last `session_id` observed for this entity, used by the
+    /// `WITHIN SESSION` boundary expiry. See `EntityNfaState` for the
+    /// matching field on the general NFA path.
+    pub last_session_id: Option<i64>,
 }
 
 impl StepCounterState {
@@ -205,7 +209,34 @@ impl StepCounterState {
             active_candidate_count: 0,
             cap_exceeded: false,
             dropped_count: 0,
+            last_session_id: None,
         }
+    }
+
+    /// Drain every active track and the step-0 backlog when the
+    /// upstream `session_id` increments. Anchors from a closed session
+    /// can no longer participate in a `WITHIN SESSION` match, and the
+    /// step-0 backlog only stores anchors from the current session, so
+    /// both are dropped together.
+    fn expire_for_session_boundary(&mut self, emit_all: bool) {
+        if emit_all {
+            // Surface in-flight tracks as partials before dropping them.
+            // Skip already-completed tracks (`done`) and unstarted tracks
+            // (`current_step == 0`) — neither has a matching anchor in
+            // the closing session.
+            for track in self.tracks.iter() {
+                if track.current_step > 0 && !track.done {
+                    self.partials.push(PartialMatch {
+                        anchor_ts: track.anchor_ts,
+                        step_reached: track.max_step_reached,
+                        bindings: track.bindings.to_vec(),
+                    });
+                }
+            }
+        }
+        self.tracks.clear();
+        self.step0_candidates.clear();
+        self.active_candidate_count = 0;
     }
 
     /// Returns the index of the first track whose `bindings` equals `key`.
@@ -435,6 +466,16 @@ impl StepCounterSimulator {
             None => return,
         };
 
+        // `WITHIN SESSION`: see `NfaSimulator::process_batch` — the same
+        // boundary check is required on the step-counter fast path so
+        // patterns lowered to `LinearSimple` / `LinearWithBindings` /
+        // `LinearWithNegation` honour session-scoped expiry.
+        let session_ids = if self.nfa.session_window {
+            super::nfa::resolve_session_id_column(batch)
+        } else {
+            None
+        };
+
         // Pre-evaluate all predicates once per batch (avoids O(N²) re-eval).
         let pred_cache = StepPredCache::build(&self.nfa, batch);
         // Pre-extract all binding column values (empty if no bindings).
@@ -455,6 +496,16 @@ impl StepCounterSimulator {
             }
             let event_type = event_types.value(row);
             let event_ts = timestamps[row];
+
+            if let Some(sids) = session_ids {
+                let sid = sids[row];
+                if let Some(prev) = state.last_session_id {
+                    if prev != sid {
+                        state.expire_for_session_boundary(self.nfa.emit_all);
+                    }
+                }
+                state.last_session_id = Some(sid);
+            }
 
             self.process_event(
                 state,
@@ -1127,6 +1178,7 @@ mod tests {
             pattern_class: PatternClass::LinearSimple,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2, 3],
         }
@@ -1171,6 +1223,7 @@ mod tests {
             pattern_class: PatternClass::LinearWithNegation,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2, 3],
         }
@@ -1445,6 +1498,7 @@ mod tests {
             pattern_class: PatternClass::LinearSimple,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1],
         };
@@ -1652,6 +1706,7 @@ mod tests {
                 bind_step: 0,
             }],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2],
         };

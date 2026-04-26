@@ -432,6 +432,7 @@ mod tests {
             pattern_class: PatternClass::LinearSimple,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all,
             state_to_step: vec![0, 1],
         }

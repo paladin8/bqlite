@@ -49,6 +49,14 @@ pub struct CompiledNfa {
     pub variable_bindings: Vec<VariableBindingDef>,
     /// Global time window in nanoseconds, if any.
     pub global_window: Option<i64>,
+    /// Whether the pattern was declared with `WITHIN SESSION`.
+    ///
+    /// When true, the matcher must read the upstream `session_id` column
+    /// and expire all in-flight candidates whenever the value increments
+    /// per entity (sequence-matching.md §12.1, sessionize.md §12.1).
+    /// `global_window` and `session_window` are mutually exclusive — the
+    /// AST grammar forbids combining `WITHIN <duration>` with `WITHIN SESSION`.
+    pub session_window: bool,
     /// Whether EMIT ALL is enabled.
     pub emit_all: bool,
     /// Map from NFA state index to logical step number (0-indexed).
@@ -257,10 +265,15 @@ pub fn compile_pattern(
     let relevant_event_types = collect_event_types(pattern);
 
     // ── Step 9: Extract global window ───────────────────────────────
+    // `WITHIN <duration>` becomes a numeric window applied via anchor
+    // arithmetic; `WITHIN SESSION` is observed at runtime through the
+    // `session_id` column rather than a fixed duration, so the two are
+    // tracked in separate fields and never both set.
     let global_window = match pattern.window {
         Some(MatchWindow::Within(nanos)) => Some(nanos),
         Some(MatchWindow::WithinSession) | None => None,
     };
+    let session_window = matches!(pattern.window, Some(MatchWindow::WithinSession));
 
     let emit_all = pattern.emit_all || pattern.mode == MatchMode::EmitAll;
 
@@ -271,6 +284,7 @@ pub fn compile_pattern(
         pattern_class,
         variable_bindings,
         global_window,
+        session_window,
         emit_all,
         state_to_step,
     })
@@ -1552,7 +1566,12 @@ mod tests {
     }
 
     #[test]
-    fn global_window_session_is_none() {
+    fn within_session_sets_session_window_flag() {
+        // `WITHIN SESSION` is not a numeric duration, so `global_window`
+        // stays `None`; the runtime instead expires candidates when
+        // `session_id` increments. The compiler must surface that signal
+        // via `session_window: true` so the matcher can read the upstream
+        // SESSIONIZE column.
         let p = MatchPattern {
             steps: vec![simple_step("signup")],
             mode: MatchMode::First,
@@ -1563,6 +1582,7 @@ mod tests {
         };
         let nfa = compile_pattern(&p, &test_schema(), &test_registry()).unwrap();
         assert_eq!(nfa.global_window, None);
+        assert!(nfa.session_window);
     }
 
     #[test]
@@ -1570,6 +1590,21 @@ mod tests {
         let p = pattern(vec![simple_step("signup")]);
         let nfa = compile_pattern(&p, &test_schema(), &test_registry()).unwrap();
         assert_eq!(nfa.global_window, None);
+        assert!(!nfa.session_window);
+    }
+
+    #[test]
+    fn within_duration_does_not_set_session_window() {
+        let p = MatchPattern {
+            steps: vec![simple_step("signup"), simple_step("purchase")],
+            mode: MatchMode::First,
+            emit_all: false,
+            window: Some(MatchWindow::Within(86_400_000_000_000)),
+            brackets: None,
+            span: Span::EMPTY,
+        };
+        let nfa = compile_pattern(&p, &test_schema(), &test_registry()).unwrap();
+        assert!(!nfa.session_window);
     }
 
     // ── emit_all ────────────────────────────────────────────────────

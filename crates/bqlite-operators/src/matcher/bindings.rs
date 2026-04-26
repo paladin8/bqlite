@@ -367,6 +367,12 @@ pub struct EntityBindingState {
     num_nfa_states: usize,
     /// Tracks dropped due to the active track limit.
     dropped_track_count: u64,
+    /// Last `session_id` observed for this entity, for the
+    /// `WITHIN SESSION` boundary check (see
+    /// `EntityNfaState::last_session_id`). Tracked on the parent state
+    /// rather than per-track because every track shares the same input
+    /// stream and crosses session boundaries together.
+    last_session_id: Option<i64>,
 }
 
 impl EntityBindingState {
@@ -379,7 +385,19 @@ impl EntityBindingState {
             num_variables,
             num_nfa_states,
             dropped_track_count: 0,
+            last_session_id: None,
         }
+    }
+
+    /// Last `session_id` observed for this entity, used by
+    /// `WITHIN SESSION` boundary detection.
+    pub fn last_session_id(&self) -> Option<i64> {
+        self.last_session_id
+    }
+
+    /// Record the `session_id` of the row currently being processed.
+    pub fn set_last_session_id(&mut self, session_id: i64) {
+        self.last_session_id = Some(session_id);
     }
 
     /// Override the active track limit.
@@ -513,6 +531,17 @@ impl NfaSimulator {
             None => return,
         };
 
+        // `WITHIN SESSION`: see the matching block in
+        // `NfaSimulator::process_batch` for the rationale. With variable
+        // bindings, every track in `binding_state` carries its own deque
+        // of in-flight candidates, so the boundary check must drain
+        // every track on a session-id transition.
+        let session_ids = if self.nfa().session_window {
+            super::nfa::resolve_session_id_column(batch)
+        } else {
+            None
+        };
+
         let pred_cache = self.build_predicate_cache(batch);
         let binding_cache = BindingValueCache::build(&self.nfa().variable_bindings, batch);
 
@@ -523,6 +552,22 @@ impl NfaSimulator {
             }
             let event_type = event_types.value(row);
             let event_ts = timestamps[row];
+
+            if let Some(sids) = session_ids {
+                let sid = sids[row];
+                let prev = binding_state.last_session_id();
+                if let Some(prev_sid) = prev {
+                    if prev_sid != sid {
+                        let nfa = self.nfa();
+                        for track in binding_state.tracks.iter_mut() {
+                            track
+                                .nfa_state
+                                .expire_all_candidates(&nfa.state_to_step, nfa.emit_all);
+                        }
+                    }
+                }
+                binding_state.set_last_session_id(sid);
+            }
 
             self.process_event_with_bindings(
                 binding_state,

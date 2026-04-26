@@ -427,27 +427,10 @@ fn gap_plus_end_event_on_same_event_produces_singleton() {
 // WITHIN SESSION composition (§12.1)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// NOTE: The two `WITHIN SESSION` tests below are marked `#[ignore]` for
-// the same reason: `MatchWindow::WithinSession` is parsed by the grammar
-// (`crates/bqlite-parser/src/pattern.rs`) and flows through AST lowering,
-// but the planner currently coalesces `Some(MatchWindow::WithinSession)`
-// with `None` at `crates/bqlite-planner/src/compile.rs` ~line 262:
-//
-//     Some(MatchWindow::Within(nanos)) => Some(nanos),
-//     Some(MatchWindow::WithinSession) | None => None,
-//
-// i.e. `WITHIN SESSION` compiles to "no window" and the matcher never
-// observes `session_id` increments. As a result, cross-session pairs
-// still match today — these tests would assert the *spec* (query-language.md
-// §12.1 + sessionize.md §12.1: "MATCH with WITHIN SESSION observes the
-// `session_id` column in its input schema and expires all active NFA
-// candidates when `session_id` increments") but the spec is not yet wired
-// through. Gating both tests with `#[ignore]` keeps the specification
-// visible while the TASK-439 suite ships the SESSIONIZE body the task
-// can actually cover today.
+// Spec: query-language.md §12.1 + sessionize.md §12.1 — MATCH with
+// WITHIN SESSION observes the `session_id` column in its input schema
+// and expires all active NFA candidates when `session_id` increments.
 #[test]
-#[ignore = "WITHIN SESSION not yet enforced in matcher \
-    (see crates/bqlite-planner/src/compile.rs:262)"]
 fn within_session_match_expires_across_boundary() {
     // §12.1: MATCH with WITHIN SESSION observes `session_id` changes
     // and expires active NFA candidates when `session_id` increments.
@@ -505,8 +488,6 @@ fn within_session_match_expires_across_boundary() {
 }
 
 #[test]
-#[ignore = "WITHIN SESSION not yet enforced in matcher \
-    (see crates/bqlite-planner/src/compile.rs:262)"]
 fn within_session_match_composes_with_downstream_stats() {
     // Extends `within_session_match_expires_across_boundary` by
     // folding a terminal `| STATS matched = COUNT(*)` and asserting

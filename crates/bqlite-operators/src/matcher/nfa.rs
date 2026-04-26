@@ -266,6 +266,11 @@ pub struct EntityNfaState {
     /// lives in multiple state deques (e.g. state1 and state2 after
     /// propagation), only the highest-step partial is emitted.
     partial_expiry_seen: Vec<i64>,
+    /// Last `session_id` observed for this entity, used by the
+    /// `WITHIN SESSION` boundary check (sessionize.md §12.1). `None`
+    /// before any event has been processed; once set, a transition to
+    /// a different value expires every in-flight candidate.
+    last_session_id: Option<i64>,
 }
 
 impl EntityNfaState {
@@ -284,7 +289,36 @@ impl EntityNfaState {
             scan_from: None,
             propagation_buf: Vec::new(),
             partial_expiry_seen: Vec::new(),
+            last_session_id: None,
         }
+    }
+
+    /// Drain every in-flight candidate, optionally recording each as a
+    /// partial match. Used by the `WITHIN SESSION` boundary expiry
+    /// (sequence-matching.md §12.1).
+    ///
+    /// Mirrors `drain_as_partials`: iterates highest-step first and dedups
+    /// by `anchor_ts` so that an anchor sitting in multiple deques after
+    /// propagation produces exactly one partial at its highest reached step.
+    pub fn expire_all_candidates(&mut self, state_to_step: &[u8], emit_all: bool) {
+        if emit_all {
+            self.drain_as_partials(state_to_step);
+        } else {
+            for deque in &mut self.state_deques {
+                deque.candidates.clear();
+            }
+        }
+    }
+
+    /// Read this entity's last-observed `session_id`, used to detect
+    /// session boundaries between rows.
+    pub fn last_session_id(&self) -> Option<i64> {
+        self.last_session_id
+    }
+
+    /// Record the `session_id` of the row currently being processed.
+    pub fn set_last_session_id(&mut self, session_id: i64) {
+        self.last_session_id = Some(session_id);
     }
 
     /// Total number of active candidate entries across all states.
@@ -732,6 +766,16 @@ impl NfaSimulator {
             None => return,
         };
 
+        // `WITHIN SESSION`: read the upstream SESSIONIZE column so
+        // session boundaries can expire active candidates. If the
+        // pattern was not declared with `WITHIN SESSION` (or the column
+        // is missing), the per-row check is skipped.
+        let session_ids = if self.nfa.session_window {
+            resolve_session_id_column(batch)
+        } else {
+            None
+        };
+
         // For MATCH FIRST: if we already have a completion and this is
         // not MATCH ALL, skip processing.
         if !self.match_all && !state.completions.is_empty() {
@@ -749,6 +793,20 @@ impl NfaSimulator {
             }
             let event_type = event_types.value(row);
             let event_ts = timestamps[row];
+
+            // `WITHIN SESSION` boundary expiry: when the current row's
+            // `session_id` differs from the last value seen for this
+            // entity, every in-flight candidate was anchored in a prior
+            // session and must be dropped before the row is processed.
+            if let Some(sids) = session_ids {
+                let sid = sids[row];
+                if let Some(prev) = state.last_session_id {
+                    if prev != sid {
+                        state.expire_all_candidates(&self.nfa.state_to_step, self.nfa.emit_all);
+                    }
+                }
+                state.last_session_id = Some(sid);
+            }
 
             self.process_event(state, event_type, event_ts, row, &pred_cache);
 
@@ -1107,6 +1165,26 @@ pub(super) fn resolve_timestamp_column<'a>(
     None
 }
 
+/// Resolve the `session_id` column produced by SESSIONIZE
+/// (sessionize.md §6.2). The column is declared `Int64 NOT NULL` but a
+/// downstream stage can still emit a batch without it (planner/runtime
+/// drift); returning `None` lets the caller skip session-boundary
+/// expiry on that batch rather than panic.
+///
+/// Returns `None` if the column is missing, has the wrong type, or
+/// contains any nulls — the underlying `values()` buffer is uninitialized
+/// at null slots, so reading it would produce garbage `i64`s and trigger
+/// spurious session boundaries.
+pub(super) fn resolve_session_id_column(batch: &RecordBatch) -> Option<&[i64]> {
+    use arrow::array::Int64Array;
+    let col = batch.column_by_name("session_id")?;
+    let arr = col.as_any().downcast_ref::<Int64Array>()?;
+    if arr.null_count() != 0 {
+        return None;
+    }
+    Some(arr.values().as_ref())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1214,6 +1292,7 @@ mod tests {
             pattern_class: PatternClass::LinearSimple,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2],
         }
@@ -1249,6 +1328,7 @@ mod tests {
             pattern_class: PatternClass::LinearSimple,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2, 3],
         }
@@ -1287,6 +1367,7 @@ mod tests {
             pattern_class: PatternClass::GeneralNfa,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2, 3],
         }
@@ -1321,6 +1402,7 @@ mod tests {
             pattern_class: PatternClass::GeneralNfa,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2],
         }
@@ -1537,6 +1619,7 @@ mod tests {
             pattern_class: PatternClass::LinearWithNegation,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2],
         };
@@ -1579,6 +1662,7 @@ mod tests {
             pattern_class: PatternClass::LinearWithNegation,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2],
         };
@@ -1625,6 +1709,7 @@ mod tests {
             pattern_class: PatternClass::LinearWithNegation,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2, 3],
         };
@@ -1736,6 +1821,7 @@ mod tests {
             pattern_class: PatternClass::GeneralNfa,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2, 3],
         };
@@ -2074,6 +2160,7 @@ mod tests {
             pattern_class: PatternClass::LinearSimple,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2, 3],
         };
@@ -2152,6 +2239,7 @@ mod tests {
             pattern_class: PatternClass::LinearSimple,
             variable_bindings: vec![],
             global_window: None,
+            session_window: false,
             emit_all: false,
             state_to_step: vec![0, 1, 2],
         };
