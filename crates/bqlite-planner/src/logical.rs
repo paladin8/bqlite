@@ -8063,6 +8063,43 @@ mod tests {
     }
 
     #[test]
+    fn joined_pipeline_omits_system_columns_from_combined_schema() {
+        // Regression guard for TASK-499 audit finding J1: the Wave 2
+        // ScanOperator does not materialise `__seq_id` / `__batch_id`
+        // (see `bqlite-operators::scan` module docs), so the joined
+        // schema must not declare them — otherwise MergeSourcesOperator
+        // would emit non-nullable columns it has no way to populate and
+        // `RecordBatch::try_new` would panic. If a future scan gains
+        // system-column materialisation, this test must be updated in
+        // lockstep with `build_joined_scan` per `cohorts-aliases-joins.md` §3.8.
+        let cat = InMemoryCatalog::default()
+            .with(purchases_schema())
+            .with(logins_schema());
+        let mut pipeline = bare_pipeline("purchases");
+        pipeline.source.joins.push(TableRef {
+            name: Name::synthetic("logins"),
+            span: Span::EMPTY,
+        });
+        let plan = lower_statement(Statement::Query(pipeline), &cat).unwrap();
+        let LogicalPlan::Scan { output_schema, .. } = plan else {
+            panic!("expected Scan");
+        };
+        let names: Vec<&str> = output_schema
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"__seq_id"),
+            "joined schema must not declare __seq_id while scan does not materialise it; got {names:?}",
+        );
+        assert!(
+            !names.contains(&"__batch_id"),
+            "joined schema must not declare __batch_id while scan does not materialise it; got {names:?}",
+        );
+    }
+
+    #[test]
     fn joined_pipeline_entity_key_type_mismatch_rejected() {
         let cat = InMemoryCatalog::default()
             .with(purchases_schema())
