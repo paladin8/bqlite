@@ -84,6 +84,14 @@ pub fn build_output_batch(
                     field.data_type(),
                 )
             }
+            "bracket" | "bracket_end" => {
+                // Per-bracket emission is unimplemented (TASK-509). Until
+                // the matcher enumerates brackets, emit a null array; the
+                // planner declares both columns nullable (see
+                // `lower_match` in `bqlite-planner/src/logical.rs`) so
+                // this does not violate Arrow's non-null contract.
+                build_null_column(total_rows, field.data_type())
+            }
             _ => {
                 // Unimplemented column (match_events, step properties) —
                 // emit typed NULL array matching the schema field's data type.
@@ -398,5 +406,54 @@ mod tests {
         // emit_all = false: partials should be excluded.
         let batch = build_output_batch(&schema, &completions, &partials, false, 3);
         assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn bracket_columns_emit_null_arrays_under_nullable_contract() {
+        // Regression guard for TASK-499 audit P1 #4: the matcher does
+        // not yet emit per-bracket rows (TASK-509). Until it does, the
+        // planner declares `bracket` / `bracket_end` as **nullable** so
+        // `build_output_batch` can fall through to a null array without
+        // violating Arrow's non-nullable contract at `RecordBatch::try_new`.
+        // This test locks the contract in: if a future change re-tightens
+        // either column to non-nullable before the matcher learns brackets,
+        // this test panics with the same "declared as non-nullable but
+        // contains null values" error users would see.
+        let schema = OperatorSchema::new(vec![
+            ColumnDef {
+                name: "entity_id".into(),
+                bql_type: BqlType::String,
+                nullable: false,
+                default_value: None,
+            },
+            ColumnDef {
+                name: "bracket".into(),
+                bql_type: BqlType::Int,
+                nullable: true,
+                default_value: None,
+            },
+            ColumnDef {
+                name: "bracket_end".into(),
+                bql_type: BqlType::Int,
+                nullable: true,
+                default_value: None,
+            },
+        ])
+        .unwrap();
+
+        let completions = vec![MatchCompletion {
+            anchor_ts: 100,
+            final_ts: 400,
+            bindings: Vec::new(),
+        }];
+        let batch = build_output_batch(&schema, &completions, &[], false, 2);
+
+        assert_eq!(batch.num_rows(), 1);
+        let bracket = batch.column_by_name("bracket").expect("bracket present");
+        let bracket_end = batch
+            .column_by_name("bracket_end")
+            .expect("bracket_end present");
+        assert_eq!(bracket.null_count(), 1);
+        assert_eq!(bracket_end.null_count(), 1);
     }
 }
