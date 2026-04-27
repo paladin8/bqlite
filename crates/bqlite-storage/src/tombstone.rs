@@ -150,6 +150,58 @@ impl TombstoneFile {
             ..Default::default()
         }
     }
+
+    /// Materialize the entity-delete set as type-specialized hash indices.
+    ///
+    /// Computed once per scan and reused across batches by the scan
+    /// wrappers via [`TombstoneFilter::filter_batch_with_index`] /
+    /// [`TombstoneFilter::apply_entity_deletes_with_index`]; the inline
+    /// path through [`TombstoneFilter::filter_batch`] would otherwise
+    /// rebuild it on every batch (see deletes.md §7 per-batch hot path).
+    pub fn entity_delete_index(&self) -> EntityDeleteIndex {
+        EntityDeleteIndex::from_tombstones(self)
+    }
+}
+
+/// Precomputed lookup index for entity-level tombstones.
+///
+/// Splits `TombstoneFile::entity_deletes` (a `HashSet<ScalarValue>`)
+/// into type-specialized sets so the filter loop can probe directly
+/// on `&str` / `i64` without per-row allocation. Build once per
+/// scan; pass by reference to
+/// `TombstoneFilter::filter_batch_with_index` for every batch.
+#[derive(Debug, Clone, Default)]
+pub struct EntityDeleteIndex {
+    str_set: HashSet<String>,
+    int_set: HashSet<i64>,
+}
+
+impl EntityDeleteIndex {
+    /// Build an index from a tombstone file's entity-delete set.
+    pub fn from_tombstones(tombstones: &TombstoneFile) -> Self {
+        let mut str_set = HashSet::new();
+        let mut int_set = HashSet::new();
+        for v in &tombstones.entity_deletes {
+            match v {
+                ScalarValue::String(s) => {
+                    str_set.insert(s.clone());
+                }
+                ScalarValue::Int(n) => {
+                    int_set.insert(*n);
+                }
+                // Other ScalarValue variants are not valid entity keys
+                // (entity keys are String or Int per type-system.md §2.1)
+                // — ignore defensively.
+                _ => {}
+            }
+        }
+        Self { str_set, int_set }
+    }
+
+    /// Returns `true` when neither set has entries.
+    pub fn is_empty(&self) -> bool {
+        self.str_set.is_empty() && self.int_set.is_empty()
+    }
 }
 
 impl TimeRangeDelete {
@@ -391,7 +443,27 @@ impl<'a> TombstoneFilter<'a> {
     /// Filter `batch`, returning a new batch with tombstoned rows removed.
     ///
     /// Returns the batch unchanged when tombstones are empty (zero cost).
+    ///
+    /// Builds an entity-delete index inline. Scan wrappers that filter
+    /// many batches against the same tombstone file should hold an
+    /// [`EntityDeleteIndex`] across calls and use
+    /// [`Self::filter_batch_with_index`] instead.
     pub fn filter_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let index = EntityDeleteIndex::from_tombstones(self.tombstones);
+        self.filter_batch_with_index(batch, &index)
+    }
+
+    /// Filter `batch` using a caller-supplied precomputed entity index.
+    ///
+    /// Avoids per-batch HashSet construction in the entity-delete
+    /// path — the wrappers in `tombstone_scan.rs` build one
+    /// [`EntityDeleteIndex`] per scan and pass it through here for
+    /// every batch.
+    pub fn filter_batch_with_index(
+        &self,
+        batch: RecordBatch,
+        entity_index: &EntityDeleteIndex,
+    ) -> Result<RecordBatch> {
         if self.tombstones.is_empty() || batch.num_rows() == 0 {
             return Ok(batch);
         }
@@ -402,7 +474,7 @@ impl<'a> TombstoneFilter<'a> {
         // 1. Batch-level: __batch_id (SS7.1 — cheapest check)
         self.apply_batch_deletes(&batch, &mut alive)?;
         // 2. Entity-level
-        self.apply_entity_deletes(&batch, &mut alive)?;
+        self.apply_entity_deletes_with_index(&batch, &mut alive, entity_index)?;
         // 3. Row-level: __seq_id
         self.apply_row_deletes(&batch, &mut alive)?;
         // 4. Time-range
@@ -457,12 +529,17 @@ impl<'a> TombstoneFilter<'a> {
         Ok(())
     }
 
-    pub(crate) fn apply_entity_deletes(
+    /// Apply entity-level tombstones using a caller-supplied precomputed
+    /// index. The index is built once per scan via
+    /// [`TombstoneFile::entity_delete_index`] and reused across every
+    /// batch — `filter_batch` builds an inline index for ad-hoc use.
+    pub(crate) fn apply_entity_deletes_with_index(
         &self,
         batch: &RecordBatch,
         alive: &mut [bool],
+        index: &EntityDeleteIndex,
     ) -> Result<()> {
-        if self.tombstones.entity_deletes.is_empty() {
+        if index.is_empty() {
             return Ok(());
         }
         let col_idx = batch.schema().index_of(self.entity_key_col).map_err(|_| {
@@ -474,35 +551,14 @@ impl<'a> TombstoneFilter<'a> {
         let col = batch.column(col_idx);
 
         if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
-            // Pre-compute a borrowed &str set from the entity tombstones
-            // to avoid per-row String allocation in the inner loop.
-            let str_set: HashSet<&str> = self
-                .tombstones
-                .entity_deletes
-                .iter()
-                .filter_map(|v| match v {
-                    ScalarValue::String(s) => Some(s.as_str()),
-                    _ => None,
-                })
-                .collect();
             for (i, flag) in alive.iter_mut().enumerate() {
-                if *flag && str_set.contains(arr.value(i)) {
+                if *flag && index.str_set.contains(arr.value(i)) {
                     *flag = false;
                 }
             }
         } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            // Pre-compute an i64 set to avoid ScalarValue construction per row.
-            let int_set: HashSet<i64> = self
-                .tombstones
-                .entity_deletes
-                .iter()
-                .filter_map(|v| match v {
-                    ScalarValue::Int(n) => Some(*n),
-                    _ => None,
-                })
-                .collect();
             for (i, flag) in alive.iter_mut().enumerate() {
-                if *flag && int_set.contains(&arr.value(i)) {
+                if *flag && index.int_set.contains(&arr.value(i)) {
                     *flag = false;
                 }
             }
@@ -1326,5 +1382,48 @@ mod tests {
         let batch = make_filter_test_batch(&["a"], &[100], &["e1"]);
         let err = filter.filter_batch(batch).unwrap_err();
         assert!(err.to_string().contains("__batch_id"), "got: {err}");
+    }
+
+    // Pins the invariant the entity-delete cache relies on: a single
+    // precomputed `EntityDeleteIndex` reused across many batches must
+    // produce bit-identical results to building the index inline per
+    // batch (the prior `filter_batch` behavior).
+    #[test]
+    fn filter_batch_with_index_matches_inline_across_batches() {
+        let tf = TombstoneFile::for_entities([
+            ScalarValue::String("alice".into()),
+            ScalarValue::String("carol".into()),
+        ]);
+        let filter = TombstoneFilter::new(&tf, "entity_id", "ts");
+        let index = tf.entity_delete_index();
+
+        let batches = vec![
+            make_filter_test_batch(&["alice", "bob"], &[100, 200], &["e1", "e2"]),
+            make_filter_test_batch(&["carol", "dave"], &[300, 400], &["e3", "e4"]),
+            make_filter_test_batch(
+                &["alice", "carol", "eve"],
+                &[500, 600, 700],
+                &["e5", "e6", "e7"],
+            ),
+        ];
+
+        for batch in batches {
+            let inline = filter.filter_batch(batch.clone()).unwrap();
+            let cached = filter.filter_batch_with_index(batch, &index).unwrap();
+            assert_eq!(inline.num_rows(), cached.num_rows());
+            let inline_ids = inline
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            let cached_ids = cached
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            for i in 0..inline.num_rows() {
+                assert_eq!(inline_ids.value(i), cached_ids.value(i));
+            }
+        }
     }
 }

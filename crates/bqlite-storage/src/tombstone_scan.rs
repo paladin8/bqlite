@@ -27,7 +27,7 @@ use arrow::record_batch::RecordBatch;
 use bqlite_core::error::Result;
 use bqlite_core::{SegmentScan, ZoneMap};
 
-use crate::tombstone::{TombstoneFile, TombstoneFilter};
+use crate::tombstone::{EntityDeleteIndex, TombstoneFile, TombstoneFilter};
 
 /// A [`SegmentScan`] that removes tombstoned rows from every row group
 /// before handing them to the merge layer.
@@ -41,6 +41,10 @@ pub struct TombstoneScanWrapper {
     tombstones: TombstoneFile,
     entity_key_col: String,
     ts_col: String,
+    /// Type-specialized entity-delete sets, computed once at wrap time
+    /// and reused across batches (audit P3 #7 — avoids rebuilding the
+    /// HashSet inside `apply_entity_deletes` for every row group).
+    entity_index: EntityDeleteIndex,
 }
 
 impl TombstoneScanWrapper {
@@ -51,11 +55,13 @@ impl TombstoneScanWrapper {
         entity_key_col: String,
         ts_col: String,
     ) -> Self {
+        let entity_index = tombstones.entity_delete_index();
         Self {
             inner,
             tombstones,
             entity_key_col,
             ts_col,
+            entity_index,
         }
     }
 }
@@ -75,7 +81,7 @@ impl SegmentScan for TombstoneScanWrapper {
             Some(batch) => {
                 let filter =
                     TombstoneFilter::new(&self.tombstones, &self.entity_key_col, &self.ts_col);
-                let filtered = filter.filter_batch(batch)?;
+                let filtered = filter.filter_batch_with_index(batch, &self.entity_index)?;
                 Ok(Some(filtered))
             }
         }
@@ -111,6 +117,9 @@ pub struct CompactionTombstoneScan {
     /// Cached "entire segment is batch-deleted" flag, computed once
     /// from the tombstone file at construction time.
     all_dropped: bool,
+    /// Type-specialized entity-delete sets, computed once at wrap time
+    /// and reused across batches (audit P3 #7).
+    entity_index: EntityDeleteIndex,
 }
 
 impl CompactionTombstoneScan {
@@ -129,6 +138,7 @@ impl CompactionTombstoneScan {
         batch_id: u64,
     ) -> Self {
         let all_dropped = tombstones.batch_deletes.contains(&batch_id);
+        let entity_index = tombstones.entity_delete_index();
         Self {
             inner,
             tombstones,
@@ -137,6 +147,7 @@ impl CompactionTombstoneScan {
             seq_id_first,
             next_row_offset: 0,
             all_dropped,
+            entity_index,
         }
     }
 }
@@ -207,7 +218,7 @@ impl SegmentScan for CompactionTombstoneScan {
         if has_entity_work || has_time_work {
             let filter = TombstoneFilter::new(&self.tombstones, &self.entity_key_col, &self.ts_col);
             if has_entity_work {
-                filter.apply_entity_deletes(&batch, &mut alive)?;
+                filter.apply_entity_deletes_with_index(&batch, &mut alive, &self.entity_index)?;
             }
             if has_time_work {
                 filter.apply_time_range_deletes(&batch, &mut alive)?;
