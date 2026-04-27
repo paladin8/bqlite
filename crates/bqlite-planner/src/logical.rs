@@ -2806,7 +2806,9 @@ fn lower_event_select(
 /// Validations:
 /// - `conversion` and `touchpoints` lists are non-empty and contain no
 ///   duplicates (parser-guaranteed; defensive).
-/// - `window > 0`.
+/// - `window >= 0`. Zero is accepted (attribute.md §16.1: a zero-duration
+///   window is semantically valid — every conversion LEFT-UNNESTs since no
+///   touchpoint can fall in an empty lookback interval).
 /// - `touchpoint_key` expression type-checks against the input schema and
 ///   produces `BqlType::String` (per the grammar note in query-language.md
 ///   §14.3: "Use `CAST(… AS STRING)` if the source column isn't already a
