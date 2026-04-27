@@ -21,12 +21,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Array, ArrayRef, Int64Array, StringViewArray, TimestampNanosecondArray};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, StringViewArray, TimestampNanosecondArray,
+};
 use bqlite_benches::common::*;
 use bqlite_core::BqlType;
 use bqlite_storage::encoding::{
-    compress_lz4, decompress_lz4, BitPacking, Constant, Delta, Dictionary, DoubleDelta, Encoding,
-    ForEncoding, Fsst, Plain, Rle,
+    compress_lz4, decompress_lz4, Alp, BitPacking, Constant, Delta, Dictionary, DoubleDelta,
+    Encoding, ForEncoding, Fsst, Plain, Rle,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use fsst::fsst::{
@@ -1087,6 +1089,56 @@ fn bench_for_timestamp(c: &mut Criterion) {
     group.finish();
 }
 
+// ── ALP (Adaptive Lossless floating-Point) — Wave 4 / TASK-417 ──────────────
+
+/// ALP on round-decimal f64 — the codec's hot path.
+///
+/// `gen_float64_array(N, 0.0)` produces `[0.0, 0.1, 0.2, …]`, a clean
+/// `factor = 10` decomposition with no exceptions. Decode reads a pure
+/// FOR-mantissa stream with an empty patch list — the happy path.
+fn bench_alp_float64(c: &mut Criterion) {
+    let array = gen_float64_array(ROW_GROUP_SIZE, 0.0);
+    let chunk = Alp.encode(array.as_ref()).unwrap();
+    let payload_bytes = chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/alp/float64");
+    group.throughput(Throughput::Bytes(payload_bytes));
+
+    group.bench_function("encode", |b| {
+        b.iter(|| Alp.encode(black_box(array.as_ref())).unwrap())
+    });
+    group.bench_function("decode", |b| {
+        b.iter(|| Alp.decode(black_box(&chunk), &BqlType::Float).unwrap())
+    });
+    group.finish();
+}
+
+/// ALP on patch-heavy f64 — exercises the patch-index validation path
+/// (TASK-499 followup audit P1 #8: strict-ascending + in-range check).
+/// Irrational base values don't decompose cleanly at any exponent, so
+/// every row enters the patch list and the validator is forced to walk
+/// the full index vector.
+fn bench_alp_float64_patches(c: &mut Criterion) {
+    let values: Vec<f64> = (0..ROW_GROUP_SIZE)
+        .map(|i| std::f64::consts::PI + (i as f64) * 0.0001)
+        .collect();
+    let array: ArrayRef = Arc::new(Float64Array::from(values));
+
+    let chunk = Alp.encode(array.as_ref()).unwrap();
+    let payload_bytes = chunk.payload.len() as u64;
+
+    let mut group = c.benchmark_group("encoding/alp/float64_patches");
+    group.throughput(Throughput::Bytes(payload_bytes));
+
+    group.bench_function("encode", |b| {
+        b.iter(|| Alp.encode(black_box(array.as_ref())).unwrap())
+    });
+    group.bench_function("decode", |b| {
+        b.iter(|| Alp.decode(black_box(&chunk), &BqlType::Float).unwrap())
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = encoding_benches;
     config = criterion_for_mode(BenchMode::from_env());
@@ -1110,6 +1162,8 @@ criterion_group! {
         bench_for_int64_clustered,
         bench_for_int64_sequential,
         bench_for_timestamp,
+        bench_alp_float64,
+        bench_alp_float64_patches,
         bench_lz4_compress,
         bench_lz4_repetitive,
         bench_fsst_url_strings,
