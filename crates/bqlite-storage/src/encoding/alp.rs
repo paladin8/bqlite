@@ -600,6 +600,29 @@ fn decode_impl(
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         .collect();
 
+    // Patch indices must be strictly ascending and < row_count.  The
+    // streaming reconstruction loop below scans forward through
+    // `i = 0..row_count` and consumes one patch per matching `i`; any
+    // violation walks past the mantissa stream (panic in release
+    // builds with bounds checks elided is undefined behavior on the
+    // surrounding slice).  Treat the chunk as corrupt instead.
+    let mut last: Option<u32> = None;
+    for &idx in &patch_indices {
+        if (idx as usize) >= row_count {
+            return Err(BqliteError::Corruption(format!(
+                "Alp::decode: patch index {idx} out of range for row_count {row_count}"
+            )));
+        }
+        if let Some(prev) = last {
+            if idx <= prev {
+                return Err(BqliteError::Corruption(format!(
+                    "Alp::decode: patch indices must be strictly ascending, found {prev} followed by {idx}"
+                )));
+            }
+        }
+        last = Some(idx);
+    }
+
     // 3. Parse patch values.
     let patch_values_end = patch_indices_end + patch_count * 8;
     if patch_values_end > payload.len() {
@@ -908,6 +931,102 @@ mod tests {
         match err {
             BqliteError::Execution(msg) => assert!(msg.contains("null_count")),
             other => panic!("expected Execution error, got {other:?}"),
+        }
+    }
+
+    /// Build an all-exception ALP chunk (mantissa_count == 0, FOR
+    /// stream empty) with caller-supplied patch indices.  Used by the
+    /// patch-index validation tests below to forge corrupted payloads
+    /// without going through the encoder.
+    fn build_alp_chunk_with_indices(patch_indices: &[u32], row_count: usize) -> EncodedChunk {
+        let patch_count = patch_indices.len();
+        let mut params = Vec::with_capacity(PARAMS_SIZE);
+        params.push(0u8); // exponent
+        params.extend_from_slice(&1.0f64.to_le_bytes()); // factor
+        params.extend_from_slice(&(patch_count as u32).to_le_bytes());
+        params.extend_from_slice(&(FOR_BLOCK_SIZE as u16).to_le_bytes());
+        params.extend_from_slice(&0u32.to_le_bytes()); // for_block_count = 0
+
+        let mut payload = Vec::with_capacity(patch_count * 12);
+        for &idx in patch_indices {
+            payload.extend_from_slice(&idx.to_le_bytes());
+        }
+        for _ in 0..patch_count {
+            payload.extend_from_slice(&0.0f64.to_le_bytes());
+        }
+
+        EncodedChunk {
+            encoding: EncodingType::Alp,
+            params,
+            payload,
+            row_count,
+        }
+    }
+
+    #[test]
+    fn decode_rejects_out_of_range_patch_index() {
+        // patch_indices[1] = 99, but row_count = 2 — index points
+        // outside the output array.  Without validation the decoder
+        // walks past the end of the (empty) mantissa stream.
+        let chunk = build_alp_chunk_with_indices(&[0, 99], 2);
+        let err = Alp.decode(&chunk, &BqlType::Float).unwrap_err();
+        match err {
+            BqliteError::Corruption(msg) => {
+                assert!(
+                    msg.contains("patch") && msg.contains("99"),
+                    "expected message to mention patch index 99, got: {msg}"
+                );
+            }
+            other => panic!("expected Corruption error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_patch_indices() {
+        // Two patches claiming the same row.  The decoder would
+        // double-consume that slot and underflow the mantissa stream
+        // for the remaining row.
+        let chunk = build_alp_chunk_with_indices(&[0, 0], 2);
+        let err = Alp.decode(&chunk, &BqlType::Float).unwrap_err();
+        match err {
+            BqliteError::Corruption(msg) => {
+                assert!(
+                    msg.contains("patch"),
+                    "expected message to mention patch indices, got: {msg}"
+                );
+            }
+            other => panic!("expected Corruption error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_accepts_well_formed_all_exception_chunk() {
+        // Pins the helper itself: well-formed indices ([0, 1, 2],
+        // strictly ascending and < row_count) must decode cleanly.
+        // Without this, the negative tests above could be defeated
+        // by an implementation that returns Corruption unconditionally
+        // or by a helper that produces malformed chunks for unrelated
+        // reasons.
+        let chunk = build_alp_chunk_with_indices(&[0, 1, 2], 3);
+        let decoded = Alp.decode(&chunk, &BqlType::Float).unwrap();
+        assert_f64_eq(&decoded, &[0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn decode_rejects_unsorted_patch_indices() {
+        // Indices [2, 1, 0] are descending.  The decode loop scans
+        // forward through `i`, so a non-ascending stream silently
+        // produces wrong output (later indices are never matched).
+        let chunk = build_alp_chunk_with_indices(&[2, 1, 0], 3);
+        let err = Alp.decode(&chunk, &BqlType::Float).unwrap_err();
+        match err {
+            BqliteError::Corruption(msg) => {
+                assert!(
+                    msg.contains("patch"),
+                    "expected message to mention patch indices, got: {msg}"
+                );
+            }
+            other => panic!("expected Corruption error, got {other:?}"),
         }
     }
 
