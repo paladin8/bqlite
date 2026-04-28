@@ -105,6 +105,19 @@ pub struct SegmentHandle {
     /// reader to backfill columns added after the segment was
     /// written.
     pub schema_version: u32,
+    /// First `__seq_id` in this segment (`SegmentMeta::seq_id_range.0`).
+    /// Row at segment-relative offset `n` has `__seq_id = seq_id_first + n`.
+    /// Carried here so [`bqlite_storage::TombstoneScanWrapper`] can
+    /// synthesise per-row `__seq_id` values when the scan projection omits
+    /// the system column but tombstone filtering still needs it.
+    /// `0` is the safe default for callers that do not populate system-column
+    /// metadata (e.g. unit-test stub readers).
+    pub seq_id_first: u64,
+    /// Ingest batch that produced this segment (`SegmentMeta::batch_id`).
+    /// Used by [`bqlite_storage::TombstoneScanWrapper`] to apply batch-level
+    /// tombstones when `__batch_id` is absent from the scan output.
+    /// `0` is the safe default for callers that do not populate this field.
+    pub batch_id: u64,
 }
 
 /// Per-row-group, per-column zone map (storage-format.md §11.1).
@@ -961,6 +974,8 @@ mod tests {
             window_id: 3,
             row_count: 4,
             schema_version: 5,
+            seq_id_first: 0,
+            batch_id: 0,
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -1209,6 +1224,8 @@ mod tests {
                     window_id: 0,
                     row_count: 3,
                     schema_version: 0,
+                    seq_id_first: 0,
+                    batch_id: 0,
                 },
                 SegmentHandle {
                     segment_id: 2,
@@ -1216,6 +1233,8 @@ mod tests {
                     window_id: 0,
                     row_count: 3,
                     schema_version: 0,
+                    seq_id_first: 0,
+                    batch_id: 0,
                 },
             ],
         };
@@ -1235,6 +1254,8 @@ mod tests {
                 window_id: 0,
                 row_count: 3,
                 schema_version: 0,
+                seq_id_first: 0,
+                batch_id: 0,
             }],
         };
         let handle = reader.segments().next().unwrap().unwrap();
@@ -1265,6 +1286,8 @@ mod tests {
                 window_id: 0,
                 row_count: 3,
                 schema_version: 0,
+                seq_id_first: 0,
+                batch_id: 0,
             }],
         };
         let stale = SegmentHandle {
@@ -1273,6 +1296,8 @@ mod tests {
             window_id: 0,
             row_count: 0,
             schema_version: 0,
+            seq_id_first: 0,
+            batch_id: 0,
         };
         let err = match reader.open_segment(&stale, &ColumnProjection::all(), None) {
             Err(e) => e,
@@ -1336,6 +1361,8 @@ mod tests {
                 window_id: 0,
                 row_count: 0,
                 schema_version: 0,
+                seq_id_first: 0,
+                batch_id: 0,
             }],
         };
         let handle = reader.segments().next().unwrap().unwrap();

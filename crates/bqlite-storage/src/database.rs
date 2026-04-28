@@ -1096,6 +1096,8 @@ impl SegmentReader for ManifestSegmentReader {
                             window_id: u64::from(window_id),
                             row_count: seg.row_count,
                             schema_version: seg.schema_version,
+                            seq_id_first: seg.seq_id_range.0,
+                            batch_id: seg.batch_id,
                         })
                     })
                 })
@@ -1818,6 +1820,8 @@ mod tests {
             window_id: 0,
             row_count: 10,
             schema_version: 1,
+            seq_id_first: 0,
+            batch_id: 0,
         };
         match reader.open_segment(&foreign, &ColumnProjection::all(), None) {
             Err(BqliteError::Execution(msg)) => {

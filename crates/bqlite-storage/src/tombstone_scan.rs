@@ -6,29 +6,35 @@
 //!
 //! - [`TombstoneScanWrapper`] — the query-time wrapper. Applies
 //!   [`TombstoneFilter`] from `deletes.md` §7 against row-group batches
-//!   produced by a normal `ScanOperator`. Expects `__seq_id` and
-//!   `__batch_id` to be present as columns on the batch (future scan
-//!   output surface); today only entity- and time-range tombstones are
-//!   meaningful here.
-//! - [`CompactionTombstoneScan`] — the compaction-time wrapper. Carries
-//!   the segment's `batch_id` and `seq_id_first` as struct fields
-//!   (from manifest metadata) and derives per-row `__seq_id` without
-//!   materialised columns. Used by `compact_one` to physically reclaim
-//!   tombstoned rows during the k-way merge. See `deletes.md` §12.
+//!   produced by a normal `ScanOperator`. Carries the segment's
+//!   `seq_id_first` and `batch_id` from manifest metadata
+//!   (`SegmentHandle::seq_id_first` / `SegmentHandle::batch_id`) so it
+//!   can synthesise the system columns when the scan projection omits
+//!   them: row- and batch-level tombstone checks need those values even
+//!   when the downstream query does not reference `__seq_id` /
+//!   `__batch_id` directly.  Synthesised columns are stripped from the
+//!   returned batch so callers never observe extra columns.
+//! - [`CompactionTombstoneScan`] — the compaction-time wrapper. Also
+//!   carries `seq_id_first` and `batch_id` but derives per-row
+//!   `__seq_id` without materialised columns (compaction-time segments
+//!   do not include system columns in their scan output). Used by
+//!   `compact_one` to physically reclaim tombstoned rows. See
+//!   `deletes.md` §12.
 //!
 //! Both wrappers preserve the scan-pipeline ordering: column projection
 //! → zone-map pushdown → **tombstone filtering** → merge → post-filter
 //! → operators.
 
 use std::collections::HashMap;
-
-use arrow::record_batch::RecordBatch;
-
 use std::sync::Arc;
+
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::record_batch::RecordBatch;
 
 use bqlite_core::error::Result;
 use bqlite_core::metrics::Metrics;
-use bqlite_core::{SegmentScan, ZoneMap};
+use bqlite_core::schema::{BATCH_ID_COLUMN, SEQ_ID_COLUMN};
+use bqlite_core::{BqliteError, SegmentScan, ZoneMap};
 
 use crate::tombstone::{EntityDeleteIndex, TombstoneFile, TombstoneFilter};
 
@@ -39,32 +45,66 @@ use crate::tombstone::{EntityDeleteIndex, TombstoneFile, TombstoneFilter};
 /// filtering does not affect zone-map semantics because zone maps
 /// describe the *unfiltered* data and are used by predicate pushdown
 /// which runs before tombstone checks.
+///
+/// ## System-column synthesis
+///
+/// When `__seq_id` or `__batch_id` are absent from a row-group batch
+/// (because the scan projection omitted them), this wrapper synthesises
+/// them from `seq_id_first` / `batch_id` metadata before applying the
+/// tombstone filter, then strips those synthetic columns from the
+/// returned batch so downstream operators see the schema they expect.
 pub struct TombstoneScanWrapper {
     inner: Box<dyn SegmentScan>,
     tombstones: TombstoneFile,
     entity_key_col: String,
     ts_col: String,
+    /// First `__seq_id` value for this segment (storage-format §6.2).
+    /// Row at segment-relative offset `n` has `__seq_id = seq_id_first + n`.
+    seq_id_first: u64,
+    /// Ingest batch identifier for this segment (storage-format §6.2).
+    /// All rows share the same `__batch_id`.
+    batch_id: u64,
+    /// Cumulative rows yielded by the inner scan across all previous
+    /// `next_row_group` calls.  Used to derive the `__seq_id` of rows
+    /// in subsequent batches when synthesis is needed.
+    next_row_offset: u64,
     /// Type-specialized entity-delete sets, computed once at wrap time
     /// and reused across batches (audit P3 #7 — avoids rebuilding the
     /// HashSet inside `apply_entity_deletes` for every row group).
     entity_index: EntityDeleteIndex,
+    /// `true` when the segment's `batch_id` is in `tombstones.batch_deletes`.
+    /// Computed once at construction; when set, every `next_row_group`
+    /// call returns an empty batch immediately.
+    all_batch_dropped: bool,
 }
 
 impl TombstoneScanWrapper {
     /// Wrap `inner` with tombstone filtering for the given shard's tombstone state.
+    ///
+    /// `seq_id_first` and `batch_id` are the segment-level identifiers from
+    /// [`bqlite_core::SegmentHandle`] / `SegmentMeta`.  They are used to
+    /// synthesise `__seq_id` / `__batch_id` values when those columns are not
+    /// present in the row-group batch.
     pub fn new(
         inner: Box<dyn SegmentScan>,
         tombstones: TombstoneFile,
         entity_key_col: String,
         ts_col: String,
+        seq_id_first: u64,
+        batch_id: u64,
     ) -> Self {
         let entity_index = tombstones.entity_delete_index();
+        let all_batch_dropped = tombstones.batch_deletes.contains(&batch_id);
         Self {
             inner,
             tombstones,
             entity_key_col,
             ts_col,
+            seq_id_first,
+            batch_id,
+            next_row_offset: 0,
             entity_index,
+            all_batch_dropped,
         }
     }
 }
@@ -79,15 +119,104 @@ impl SegmentScan for TombstoneScanWrapper {
     }
 
     fn next_row_group(&mut self) -> Result<Option<RecordBatch>> {
-        match self.inner.next_row_group()? {
-            None => Ok(None),
-            Some(batch) => {
-                let filter =
-                    TombstoneFilter::new(&self.tombstones, &self.entity_key_col, &self.ts_col);
-                let filtered = filter.filter_batch_with_index(batch, &self.entity_index)?;
-                Ok(Some(filtered))
-            }
+        // Fast-path: if the entire segment is batch-deleted, exhaust the
+        // inner scan without returning any rows.
+        if self.all_batch_dropped {
+            // Drain all remaining row groups so the inner scan reaches its
+            // natural exhaustion state.  Subsequent calls on the already-
+            // exhausted inner scan return `Ok(None)` immediately (per the
+            // `SegmentScan` contract), so re-entrancy is safe.
+            while self.inner.next_row_group()?.is_some() {}
+            return Ok(None);
         }
+
+        let Some(batch) = self.inner.next_row_group()? else {
+            return Ok(None);
+        };
+
+        let num_rows = batch.num_rows();
+        let start_offset = self.next_row_offset;
+        self.next_row_offset = start_offset.checked_add(num_rows as u64).ok_or_else(|| {
+            BqliteError::Execution(
+                "TombstoneScanWrapper: cumulative row offset overflowed u64".into(),
+            )
+        })?;
+
+        if num_rows == 0 {
+            return Ok(Some(batch));
+        }
+
+        // Determine which system columns need to be synthesised.
+        let has_seq_id = batch.schema().column_with_name(SEQ_ID_COLUMN).is_some();
+        let has_batch_id = batch.schema().column_with_name(BATCH_ID_COLUMN).is_some();
+
+        let need_seq = !has_seq_id && !self.tombstones.row_deletes.is_empty();
+        // `all_batch_dropped` already fast-paths when this segment's batch_id is in
+        // batch_deletes, so we only need to synthesise `__batch_id` when it is absent
+        // AND this segment's own batch_id is targeted — which is already handled above.
+        // This condition is therefore always false past the `all_batch_dropped` guard,
+        // but is written explicitly to document the intent.
+        let need_batch = !has_batch_id && self.tombstones.batch_deletes.contains(&self.batch_id);
+
+        if !need_seq && !need_batch {
+            // All required system columns are already present (or no deletes
+            // need them).  Delegate directly to TombstoneFilter.
+            let filter = TombstoneFilter::new(&self.tombstones, &self.entity_key_col, &self.ts_col);
+            let filtered = filter.filter_batch_with_index(batch, &self.entity_index)?;
+            return Ok(Some(filtered));
+        }
+
+        // Synthesise missing system columns and augment the batch.
+        let original_col_count = batch.num_columns();
+        let mut extra_cols: Vec<(String, ArrayRef)> = Vec::with_capacity(2);
+
+        if need_seq {
+            let base = self.seq_id_first.checked_add(start_offset).ok_or_else(|| {
+                BqliteError::Execution(
+                    "TombstoneScanWrapper: seq_id overflow when synthesising __seq_id".into(),
+                )
+            })?;
+            let ids: Vec<i64> = (0..num_rows as u64).map(|n| (base + n) as i64).collect();
+            extra_cols.push((SEQ_ID_COLUMN.to_string(), Arc::new(Int64Array::from(ids))));
+        }
+        if need_batch {
+            let arr = Int64Array::from(vec![self.batch_id as i64; num_rows]);
+            extra_cols.push((BATCH_ID_COLUMN.to_string(), Arc::new(arr)));
+        }
+
+        // Build the augmented schema and batch.
+        let mut schema_fields = batch.schema().fields().to_vec();
+        for (name, _) in &extra_cols {
+            schema_fields.push(Arc::new(arrow::datatypes::Field::new(
+                name.as_str(),
+                arrow::datatypes::DataType::Int64,
+                false,
+            )));
+        }
+        let aug_schema = Arc::new(arrow::datatypes::Schema::new(schema_fields));
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        for (_, arr) in &extra_cols {
+            columns.push(arr.clone());
+        }
+        let augmented = RecordBatch::try_new(aug_schema, columns).map_err(|e| {
+            BqliteError::Execution(format!(
+                "TombstoneScanWrapper: failed to build augmented batch: {e}"
+            ))
+        })?;
+
+        // Apply tombstone filter on the augmented batch.
+        let filter = TombstoneFilter::new(&self.tombstones, &self.entity_key_col, &self.ts_col);
+        let filtered = filter.filter_batch_with_index(augmented, &self.entity_index)?;
+
+        // Strip the synthesised columns: project back to the original column
+        // count so downstream operators see the schema they expect.
+        let indices: Vec<usize> = (0..original_col_count).collect();
+        let stripped = filtered.project(&indices).map_err(|e| {
+            BqliteError::Execution(format!(
+                "TombstoneScanWrapper: failed to project out synthetic columns: {e}"
+            ))
+        })?;
+        Ok(Some(stripped))
     }
 
     fn attach_metrics(&mut self, metrics: Arc<dyn Metrics>) {
@@ -323,6 +452,8 @@ mod tests {
             TombstoneFile::default(),
             "entity_id".into(),
             "ts".into(),
+            0,
+            0,
         );
         let result = wrapper.next_row_group().unwrap().unwrap();
         assert_eq!(result.num_rows(), 2);
@@ -342,6 +473,8 @@ mod tests {
             tf,
             "entity_id".into(),
             "ts".into(),
+            0,
+            0,
         );
         let result = wrapper.next_row_group().unwrap().unwrap();
         assert_eq!(result.num_rows(), 1);
@@ -362,6 +495,8 @@ mod tests {
             tf,
             "entity_id".into(),
             "ts".into(),
+            0,
+            0,
         );
         let result = wrapper.next_row_group().unwrap().unwrap();
         assert_eq!(result.num_rows(), 0);
@@ -377,6 +512,8 @@ mod tests {
             tf,
             "entity_id".into(),
             "ts".into(),
+            0,
+            0,
         );
         let r1 = wrapper.next_row_group().unwrap().unwrap();
         assert_eq!(r1.num_rows(), 1); // bob survives
@@ -394,6 +531,8 @@ mod tests {
             TombstoneFile::default(),
             "entity_id".into(),
             "ts".into(),
+            0,
+            0,
         );
         assert_eq!(wrapper.row_group_count(), 2);
     }

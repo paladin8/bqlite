@@ -304,12 +304,11 @@ fn batch_id_delete_uses_segment_metadata_for_count() {
     assert_eq!(result.rows_affected, Some(4));
 
     // The `__batch_id` tombstone is on disk — at least one shard's
-    // tombstone file should now hold a batch_deletes entry. The bare
-    // SELECT path cannot filter batch tombstones today (the scan
-    // does not expose the `__batch_id` system column; see
-    // `bqlite-operators::scan` `row_tombstones_error_when_seq_id_column_missing`),
-    // so we verify the on-disk tombstone state instead of doing a
-    // follow-up SELECT.
+    // tombstone file should now hold a batch_deletes entry.  The
+    // SELECT-based correctness check (subsequent query returns only
+    // non-deleted rows) lives in
+    // `tests/wave5_system_columns::batch_id_delete_filters_rows_in_subsequent_select`.
+    // Here we verify the on-disk tombstone state directly.
     let total_batch_entries = sum_tombstone_field(&db, "events", |tf| tf.batch_deletes.len());
     assert!(
         total_batch_entries >= 1,
@@ -468,12 +467,11 @@ fn allow_scan_materializes_row_tombstones_to_disk() {
 
     // Walk every populated shard and sum the `row_deletes` set
     // sizes — exactly two `__seq_id`s should have landed on disk.
-    // The bare SELECT path cannot filter row tombstones today (the
-    // scan does not expose `__seq_id`; see
-    // `bqlite-operators::scan` `row_tombstones_error_when_seq_id_column_missing`),
-    // so the on-disk tombstone state is the primary correctness
-    // check for ALLOW SCAN — mirroring the engine-level test
-    // `allow_scan_writes_row_level_tombstones`.
+    // The SELECT-based correctness check (follow-up query filters the
+    // tombstoned rows) lives in
+    // `tests/wave5_system_columns::allow_scan_delete_filters_rows_in_subsequent_select`.
+    // Here we verify the on-disk tombstone state directly, mirroring
+    // the engine-level test `allow_scan_writes_row_level_tombstones`.
     let total_row_deletes = sum_tombstone_field(&db, "events", |tf| tf.row_deletes.len());
     assert_eq!(
         total_row_deletes, 2,
@@ -714,14 +712,11 @@ fn compaction_purges_shard_when_every_input_row_is_tombstoned() {
         );
     }
 
-    // We deliberately do not run a follow-up `SELECT events` here:
-    // the bare scan cannot filter the surviving batch tombstones
-    // because `__batch_id` is not exposed as a virtual column today
-    // (see `bqlite-operators::scan` module docs and
-    // `row_tombstones_error_when_seq_id_column_missing`). Verifying
-    // the manifest + per-shard tombstone state is the correctness
-    // signal for the §12.2 reclamation contract that this test
-    // exists to cover.
+    // We verify the manifest and per-shard tombstone state here; the
+    // SELECT-based post-compaction correctness check lives in
+    // `tests/wave5_system_columns::batch_id_delete_after_compaction_still_filters`.
+    // Verifying the tombstone state is the correctness signal for the
+    // §12.2 reclamation contract that this test exists to cover.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -63,11 +63,20 @@ use crate::physical::{
 /// the minimal sorted list of column names demanded by the operators above it.
 /// All other node fields are structurally unchanged.
 pub fn prune_columns(plan: PhysicalPlan) -> PhysicalPlan {
-    // Seed the backward pass with all output columns of the root node.
+    // Seed the backward pass with all *declared* output columns of the root
+    // node.  System columns (`__`-prefixed, e.g. `__seq_id`, `__batch_id`)
+    // are excluded from the seed: they appear in every `ScanPhysical`
+    // output schema (via `OperatorSchema::from_table`) but most queries do
+    // not reference them.  Seeding with system columns would propagate them
+    // into the scan projection for every filter/pass-through query even when
+    // no expression actually uses them.  System columns enter the demand only
+    // via `collect_column_names` when a predicate or projection expression
+    // explicitly references one.
     let initial_demand: HashSet<String> = plan
         .output_schema()
         .columns()
         .iter()
+        .filter(|c| !c.name.starts_with("__"))
         .map(|c| c.name.clone())
         .collect();
     prune_with_demand(plan, initial_demand)
@@ -108,19 +117,62 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
             all_demand.insert(entity_key_col.clone());
             all_demand.insert(timestamp_col.clone());
 
-            // System columns (names starting with `__`, e.g. `__seq_id`,
-            // `__batch_id`) appear in the planner-level `OperatorSchema`
-            // produced by `OperatorSchema::from_table`, but they are NOT part
-            // of the physical table schema on disk. The scan operator validates
-            // that every name in `projected_columns` maps to a real table
-            // column, so system column names must be excluded here.
-            //
-            // Sort for deterministic plan shape (regression-friendly).
-            let mut cols: Vec<String> = all_demand
-                .into_iter()
-                .filter(|c| !c.starts_with("__"))
-                .collect();
+            // Separate declared and system columns.  System column names
+            // (e.g. `__seq_id`, `__batch_id`) are synthesised by the scan
+            // operator from segment metadata rather than decoded from disk, so
+            // they cannot appear on their own in `projected_columns`.  They
+            // ARE valid after TASK-508 wired end-to-end materialisation, but
+            // only when every declared column that precedes them in the logical
+            // schema is also projected.  `OperatorSchema::from_table` orders
+            // columns as: declared columns (0..N-1) then `__seq_id` (N) then
+            // `__batch_id` (N+1).  `CompiledNode::Column { index }` carries
+            // the full-schema ordinal, so the pruned batch must preserve those
+            // positions.  When any system column is demanded we therefore widen
+            // the projection to the complete declared column set so that
+            // system-column indices remain valid in the output batch.
+            use bqlite_core::schema::{BATCH_ID_COLUMN, SEQ_ID_COLUMN};
+
+            // Check which system columns are demanded before consuming the set.
+            let need_seq_id = all_demand.contains(SEQ_ID_COLUMN);
+            let need_batch_id = all_demand.contains(BATCH_ID_COLUMN);
+            let any_system = need_seq_id || need_batch_id;
+
+            let mut cols: Vec<String> = if !any_system {
+                // No system column demand — project only demanded declared cols.
+                all_demand
+                    .into_iter()
+                    .filter(|c| !c.starts_with("__"))
+                    .collect()
+            } else {
+                // System columns demanded: include ALL declared columns from
+                // the output schema so their full-schema indices are preserved.
+                // `OperatorSchema::from_table` positions declared columns at
+                // 0..N-1, `__seq_id` at N, `__batch_id` at N+1.
+                // `CompiledNode::Column { index }` carries the full-schema
+                // ordinal, so every declared column must be present for those
+                // indices to remain valid in the pruned batch.
+                output_schema
+                    .columns()
+                    .iter()
+                    .filter(|c| !c.name.starts_with("__"))
+                    .map(|c| c.name.clone())
+                    .collect()
+            };
+            // Sort declared columns for deterministic plan shape.
             cols.sort_unstable();
+
+            // Append system columns in canonical logical-schema order:
+            // `__seq_id` at N (before `__batch_id` at N+1).
+            // When `__batch_id` is demanded but `__seq_id` is not, we still
+            // include `__seq_id` to keep `__batch_id` at its full-schema index
+            // N+1.  `CompiledNode::Column { index }` carries the full-schema
+            // ordinal, so the batch must preserve that position.
+            if need_seq_id || need_batch_id {
+                cols.push(SEQ_ID_COLUMN.to_string());
+            }
+            if need_batch_id {
+                cols.push(BATCH_ID_COLUMN.to_string());
+            }
 
             PhysicalPlan::Scan(ScanPhysical {
                 table,

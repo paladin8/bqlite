@@ -781,6 +781,8 @@ impl PhysicalOperator for ScanOperator {
                             tf.clone(),
                             self.entity_key_name.clone(),
                             self.ts_col_name.clone(),
+                            handle.seq_id_first,
+                            handle.batch_id,
                         )) as Box<dyn SegmentScan>
                     }
                     _ => scan,
@@ -1983,6 +1985,8 @@ mod tests {
             window_id: 0,
             row_count,
             schema_version: 0,
+            seq_id_first: 0,
+            batch_id: 0,
         }
     }
 
@@ -3166,6 +3170,8 @@ mod tests {
             window_id: window,
             row_count: rows,
             schema_version: 0,
+            seq_id_first: 0,
+            batch_id: 0,
         }
     }
 
