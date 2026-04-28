@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-501",
   "claimed_at": "2026-04-28T05:37:45Z",
+  "completed_at": "2026-04-28T06:03:21Z",
   "branch": "task/TASK-501",
   "description": "Memory budget enforcement model"
 }
