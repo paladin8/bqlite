@@ -17,6 +17,9 @@ pub mod error;
 pub mod telemetry;
 pub use error::{BqliteError, Result};
 
+pub mod warning;
+pub use warning::QueryWarning;
+
 pub mod time;
 pub use time::{duration, TimeRange, Timestamp};
 

@@ -959,48 +959,46 @@ Compaction and ingest for the same table both need to update that table's manife
 
 ### 12.1 Error Propagation
 
-Errors propagate upward through the pipeline in two layers. Operators return `OperatorError`. The engine wraps that in `ExecutionError` when surfacing the failure to callers. The pipeline is torn down and resources (including spill files) are released.
+Operators and the engine unify on `bqlite_core::BqliteError` (per
+`docs/design/operators/operator-traits.md` §2). The earlier sketch of
+separate `OperatorError` / `ExecutionError` enums is **superseded** by
+this rule.
 
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum OperatorError {
-    #[error("memory budget exceeded: {used} bytes used, {budget} bytes budgeted")]
-    MemoryBudgetExceeded { used: u64, budget: u64 },
+Variants relevant to runtime failures:
 
-    #[error("aggregation group cardinality limit exceeded: {limit} groups")]
-    MaxGroupsExceeded { limit: usize },
+- `BqliteError::Cancelled` — caller cancellation or LIMIT
+  short-circuit (the LIMIT case never reaches the user).
+- `BqliteError::Timeout { elapsed_ms }` — query exceeded its
+  configured timeout. The engine's per-query timer fires
+  `CancelReason::Timeout`, then `token.cancel()`.
+- `BqliteError::OperatorPanic { message, location }` — a worker
+  panicked. Caught at the morsel boundary by `catch_unwind`; peer
+  workers exit at their next yield point via cascading
+  `token.cancel()`.
+- `BqliteError::MemoryBudgetExceeded { used, budget }` — per-query
+  memory budget exhausted with no spillable handler willing to free
+  bytes.
+- `BqliteError::MaxGroupsExceeded { limit }` — `HashAccumulator` /
+  `DistinctOperator` group-cardinality cap.
+- `BqliteError::Io` / `BqliteError::Arrow` / `BqliteError::Schema` /
+  `BqliteError::Plan` / `BqliteError::Execution` /
+  `BqliteError::Corruption` — domain-specific failures unchanged
+  from earlier waves.
 
-    #[error("storage error: {0}")]
-    Storage(#[from] StorageError),
-
-    #[error("type error: {0}")]
-    Type(#[from] TypeError),
-
-    #[error("query cancelled")]
-    Cancelled,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ExecutionError {
-    #[error(transparent)]
-    Operator(#[from] OperatorError),
-
-    #[error("query timed out after {elapsed_ms}ms")]
-    Timeout { elapsed_ms: u64 },
-}
-```
+The first-fire CAS on `QueryContext::reason` and the precedence rule
+(panic > cancel > timeout > LimitHit) live in
+`docs/design/engine/cancellation.md` §3.1 — that note is the single
+source of truth for cancellation/timeout/panic attribution.
 
 ### 12.2 Query Warnings
 
-Non-fatal conditions (entity event limit exceeded, etc.) are recorded as warnings in `QueryContext`, not as errors:
-
-```rust
-pub enum QueryWarning {
-    EntityEventLimitExceeded { entity_id: String, count: u64, limit: u64 },
-}
-```
-
-Warnings are attached to the query result and surfaced to the caller. They do not abort the query. Each worker caps warnings at **1,000 entries** in its `WorkerContext` to prevent unbounded growth (e.g., bot-heavy datasets where many entities exceed the limit). When the cap is reached, a final `WarningsOverflow { suppressed_count }` warning is recorded. The coordinator sums `suppressed_count` across all workers when merging final metrics, so the user sees the total number of suppressed warnings even when many workers hit the cap.
+Non-fatal conditions are surfaced through `bqlite_core::QueryWarning`
+and attached to the result as `ExecutionResult::warnings` (success
+path) or `ExecutionFailure::warnings` (error path). Per-worker
+1,000-entry caps, coordinator merge, and `WarningsOverflow` ordering
+are specified in `docs/design/engine/cancellation.md` §7. Operators
+record warnings via `EntityOperator::take_pending_warnings` so the
+hot path never sees engine-orchestration types.
 
 ---
 
