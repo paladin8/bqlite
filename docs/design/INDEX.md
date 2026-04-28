@@ -51,6 +51,7 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 - **storage/advanced-encodings.md** — Wave 4 advanced encoding research: go/no-go evaluation of RLE, DoubleDelta, FOR, PFOR, FSST, ALP, and Frequency encoding against the v1 baseline, with compression ratio, decode throughput, and predicate-pushdown analysis per candidate (TASK-401, Wave 4)
 - **storage/deletes.md** — tombstone and delete semantics: cheap-class predicate taxonomy, `ALLOW SCAN` opt-in for full-scan deletes, `TombstoneFile` schema with four granularities, per-query tombstone snapshots, scan-time filtering order, concurrent-delete serialization, cross-shard crash atomicity via idempotent retry, exact `rows_affected` return, compaction-time reclamation ordering (TASK-404, Wave 4)
 - **storage/segment-format-v2.md** — byte-level v2 segment format extension: six new encoding discriminants (RLE, DoubleDelta, FOR, PFOR, FSST, ALP), FSST symbol tables region, FooterV2, reader compatibility for mixed v1/v2 databases, compaction rewrite policy, v2 encoding selection heuristics (TASK-402, Wave 4)
+- **storage/system-columns.md** — `__seq_id` / `__batch_id` materialization contract: per-segment derivation rules (`seq_id_first + offset`, constant `batch_id`), reader projection semantics for system columns, `ScanOperator` + `MergeSourcesOperator` output-schema rules, reconciliation against pre-TASK-508 carve-outs in `bqlite-operators::scan` and `bqlite-planner::logical::build_joined_scan` (TASK-508, Wave 5)
 
 ### Engine
 
