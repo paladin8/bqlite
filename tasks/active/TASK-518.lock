@@ -1,7 +1,0 @@
-{
-  "agent_id": "agent-1",
-  "task_id": "TASK-518",
-  "claimed_at": "2026-04-28T08:40:31Z",
-  "branch": "task/TASK-518",
-  "description": "Fused stateless segment scaffold"
-}
