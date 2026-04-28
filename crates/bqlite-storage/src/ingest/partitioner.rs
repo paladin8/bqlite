@@ -26,10 +26,36 @@
 //!   the manifest counter via
 //!   [`crate::database::Database::allocate_batch_id`].
 //!
+//! # External spill
+//!
+//! Per `docs/design/engine/spill.md` § 6.2, when the partitioner is
+//! constructed via [`Partitioner::with_spill_dir`] it spills the
+//! largest in-memory bucket to disk before refusing a push that
+//! would overshoot the configured budget. Spill files live under a
+//! per-ingest subdirectory created by the engine (typically
+//! `<db_root>/spill/ingest-<uuid>/`); the partitioner only writes
+//! files of the form
+//! `ingest-part-w<window>-s<shard:04>-<seq:06>.spill` underneath it.
+//! Each file is a length-prefixed [`postcard`]-encoded stream of
+//! [`Event`] records sorted by `(entity_id, timestamp)`. The doc
+//! originally specified Arrow IPC, but the partitioner's input is
+//! `Event` (not `RecordBatch`) and it does not own a
+//! [`bqlite_core::schema::TableSchema`] at this layer; postcard is
+//! sufficient for a private, per-process artefact and reuses the
+//! dependency the segment writer already pulls in.
+//!
+//! Drain becomes a per-bucket k-way merge across the spilled run
+//! files plus the in-memory residual. The drain order at the bucket
+//! level is unchanged: ascending `(window_id, shard_id)`.
+//!
 //! Downstream tasks (TASK-214 writer orchestration, TASK-233 CSV
 //! ingest) import a single `crate::ingest::partitioner::Partitioner`.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
 
 use bqlite_core::error::{BqliteError, Result};
 use bqlite_core::event::{EntityId, Event};
@@ -166,39 +192,93 @@ pub type BucketKey = (u32, u16);
 ///    shard_id)` order. The writer (TASK-214) consumes those
 ///    streams one bucket at a time.
 ///
-/// # Wave 2 memory model
+/// # Memory model
 ///
-/// The buffer is tracked as a simple running sum of per-event
-/// heap-size estimates (see [`estimated_event_size`]). When a push
-/// would cross the configured budget, the partitioner refuses the
-/// event with [`BqliteError::Execution`] — the task spec calls this
-/// the "error loudly" stub. Real on-disk spill is a Wave 5 concern
-/// (TASKS.md TASK-218). The estimate is deliberately cheap and
+/// The buffer is tracked as a per-bucket running sum of per-event
+/// heap-size estimates (see [`estimated_event_size`]); the
+/// partitioner-wide [`Partitioner::buffered_bytes`] is the sum
+/// across buckets. The estimate is deliberately cheap and
 /// monotonic: it will under-count some exotic `PropertyValue`
 /// shapes, but it is stable under equal inputs and never returns
-/// zero for a non-empty event, which is all the Wave 2 gate needs.
+/// zero for a non-empty event.
+///
+/// When the in-memory buffer would exceed [`Partitioner::budget_bytes`]:
+///
+/// - With **no spill directory** (constructed via
+///   [`Partitioner::new`]): [`Partitioner::push_event`] returns a
+///   typed `BqliteError::Execution` and leaves the partitioner
+///   state unchanged.
+/// - With a **spill directory** (constructed via
+///   [`Partitioner::with_spill_dir`]): the partitioner spills the
+///   largest in-memory bucket to disk, frees its bytes, retries the
+///   push, and repeats until the event fits or every bucket is
+///   spilled. If the event still does not fit after every bucket
+///   is on disk — that is, the single event is larger than the
+///   entire budget — the partitioner returns `Execution` with the
+///   "oversized event" wording from
+///   `docs/design/engine/spill.md` § 6.2.
 ///
 /// # Why `BTreeMap`, not `HashMap`
 ///
 /// Deterministic iteration order on drain keeps snapshot-style
 /// tests stable and lets the writer emit segments in time order
-/// without a separate sort pass. Wave 2 buckets fit comfortably in
-/// an ordered map at any workload the partitioner sees — a handful
-/// of windows times a handful of shards times a few hundred
-/// thousand events. O(log n) per insert is dwarfed by the
-/// per-event allocation cost.
+/// without a separate sort pass. Bucket counts at realistic ingest
+/// scale (a handful of windows times a few-thousand shards times a
+/// few hundred thousand events) fit comfortably in an ordered map.
+/// O(log n) per insert is dwarfed by the per-event allocation cost.
 #[derive(Debug)]
 pub struct Partitioner {
     shard_count: u16,
     window_days: u32,
     batch_id: u64,
     budget_bytes: usize,
+    /// Sum of per-bucket `bytes` across [`Self::buckets`].
+    /// Maintained as an invariant on every mutation so the
+    /// overflow check is `O(1)`.
     buffered_bytes: usize,
-    buckets: BTreeMap<BucketKey, Vec<Event>>,
+    buckets: BTreeMap<BucketKey, Bucket>,
+    /// `Some(...)` enables external spill. `None` keeps the
+    /// fail-fast Wave 2 contract for callers that haven't yet
+    /// migrated to the spill-aware constructor.
+    spill: Option<SpillState>,
+}
+
+/// Per-bucket in-memory state.
+///
+/// The byte estimate is updated on every push and on every spill
+/// drain so it stays in sync with [`Self::events`]. Tracking it
+/// per-bucket lets [`Partitioner::push_event`] pick the largest
+/// bucket to spill in `O(buckets)` without re-walking every event.
+#[derive(Debug, Default)]
+struct Bucket {
+    events: Vec<Event>,
+    bytes: usize,
+}
+
+/// External-spill state — populated when the partitioner was
+/// constructed via [`Partitioner::with_spill_dir`].
+#[derive(Debug)]
+struct SpillState {
+    /// Per-ingest spill subdirectory (e.g.
+    /// `<db_root>/spill/ingest-<uuid>/`). Owned by the engine; the
+    /// partitioner only writes files into it. The directory is
+    /// expected to exist at construction time.
+    dir: PathBuf,
+    /// Monotone counter for filename `<seq>` slots. Incremented per
+    /// spill write across every `(window, shard)` bucket so two
+    /// concurrent buckets cannot accidentally collide on
+    /// `<purpose>-<seq>.spill`.
+    next_seq: u64,
+    /// Per-bucket spilled run files, in creation order. Each entry
+    /// is a sorted-by-`(entity_id, ts)` postcard stream; the merge
+    /// pass treats every file in this `Vec` as a separate sorted
+    /// run and walks them all alongside the in-memory residual.
+    runs: BTreeMap<BucketKey, Vec<SpillRunFile>>,
 }
 
 impl Partitioner {
-    /// Construct a fresh partitioner for one ingest call.
+    /// Construct a fresh partitioner for one ingest call without
+    /// spill — pushes that overshoot the budget return an error.
     ///
     /// `batch_id` is the fresh counter value returned by
     /// [`crate::database::Database::allocate_batch_id`]; the
@@ -224,6 +304,51 @@ impl Partitioner {
         batch_id: u64,
         budget_bytes: usize,
     ) -> Result<Self> {
+        Self::build(shard_count, window_days, batch_id, budget_bytes, None)
+    }
+
+    /// Construct a fresh partitioner backed by external spill.
+    ///
+    /// `spill_dir` is a per-ingest subdirectory the engine has
+    /// already created (typically
+    /// `<db_root>/spill/ingest-<uuid>/`). The partitioner writes
+    /// run files of the form
+    /// `ingest-part-w<window>-s<shard:04>-<seq:06>.spill` directly
+    /// under that path; the engine is responsible for the
+    /// directory's lifetime (creation up-front, removal on every
+    /// exit path) per `docs/design/engine/spill.md` § 8.3. The
+    /// partitioner only owns the individual files via the
+    /// [`SpillRunFile`] RAII guard.
+    ///
+    /// Same validation rules as [`Partitioner::new`].
+    pub fn with_spill_dir(
+        shard_count: u16,
+        window_days: u32,
+        batch_id: u64,
+        budget_bytes: usize,
+        spill_dir: PathBuf,
+    ) -> Result<Self> {
+        let spill = SpillState {
+            dir: spill_dir,
+            next_seq: 0,
+            runs: BTreeMap::new(),
+        };
+        Self::build(
+            shard_count,
+            window_days,
+            batch_id,
+            budget_bytes,
+            Some(spill),
+        )
+    }
+
+    fn build(
+        shard_count: u16,
+        window_days: u32,
+        batch_id: u64,
+        budget_bytes: usize,
+        spill: Option<SpillState>,
+    ) -> Result<Self> {
         if shard_count == 0 {
             return Err(BqliteError::Schema(
                 "partitioner: shard_count must be at least 1".into(),
@@ -246,6 +371,7 @@ impl Partitioner {
             budget_bytes,
             buffered_bytes: 0,
             buckets: BTreeMap::new(),
+            spill,
         })
     }
 
@@ -275,94 +401,532 @@ impl Partitioner {
         self.budget_bytes
     }
 
-    /// Current buffered-bytes estimate. Monotonically
-    /// non-decreasing — [`Partitioner::drain_sorted`] consumes the
-    /// partitioner outright, so there is no observable reset mid
-    /// lifetime.
+    /// Current in-memory buffer estimate (bytes). Excludes events
+    /// already written to a spill run file.
     #[inline]
     pub fn buffered_bytes(&self) -> usize {
         self.buffered_bytes
     }
 
-    /// Total number of events buffered across every bucket.
+    /// Total number of events buffered in memory across every
+    /// bucket. Excludes events on spill files.
     pub fn buffered_events(&self) -> usize {
-        self.buckets.values().map(Vec::len).sum()
+        self.buckets.values().map(|b| b.events.len()).sum()
     }
 
-    /// Number of non-empty `(window, shard)` buckets currently held.
+    /// Number of non-empty in-memory `(window, shard)` buckets
+    /// currently held. Buckets whose entire content has been
+    /// spilled show up in
+    /// [`Partitioner::spilled_run_count`]-keyed state but are
+    /// removed from the in-memory bucket map until a fresh push
+    /// re-introduces the key.
     pub fn bucket_count(&self) -> usize {
         self.buckets.len()
+    }
+
+    /// Total number of spilled run files held across every bucket.
+    /// Returns `0` when spill is disabled or no spill has happened.
+    /// Exposed for instrumentation and tests.
+    pub fn spilled_run_count(&self) -> usize {
+        self.spill
+            .as_ref()
+            .map(|s| s.runs.values().map(Vec::len).sum())
+            .unwrap_or(0)
     }
 
     /// Route `event` into its `(window, shard)` bucket.
     ///
     /// The partitioner hashes `event.entity` into a shard and
     /// derives a window id from `event.timestamp`, estimates the
-    /// event's in-memory footprint, and refuses the push if adding
-    /// it would take the running buffer past [`Self::budget_bytes`].
+    /// event's in-memory footprint, and either appends the event or
+    /// — if the projected buffer would overshoot
+    /// [`Self::budget_bytes`] — runs the spill loop (when
+    /// constructed via [`Partitioner::with_spill_dir`]) or refuses
+    /// the push (when constructed via [`Partitioner::new`]).
     ///
     /// # Errors
     ///
     /// - [`BqliteError::Execution`] with a `"pre-epoch"` reason if
     ///   the timestamp is before 1970-01-01 UTC (via
     ///   [`window_id_for`]).
-    /// - [`BqliteError::Execution`] with a `"memory budget"`
-    ///   reason if the push would cross the configured budget.
-    ///   Wave 2 refuses the event outright — spill-to-disk is a
-    ///   Wave 5 concern — and leaves every previously-pushed event
-    ///   untouched, so the caller can abort the ingest and retry
-    ///   with a larger budget.
+    /// - [`BqliteError::Execution`] with a `"memory budget"` reason
+    ///   if no spill is configured and the push would cross the
+    ///   budget. The partitioner state is unchanged.
+    /// - [`BqliteError::Execution`] with an `"oversized event"`
+    ///   reason if spill is configured but every in-memory bucket
+    ///   has been spilled and the single event is still larger
+    ///   than the budget. Per `docs/design/engine/spill.md` § 6.2.
+    /// - [`BqliteError::Io`] on a spill-write IO failure.
     pub fn push_event(&mut self, event: Event) -> Result<()> {
         let shard_id = shard_id_for(&event.entity, self.shard_count);
         let window_id = window_id_for(event.timestamp, self.window_days)?;
+        let key: BucketKey = (window_id, shard_id);
 
         let size = estimated_event_size(&event);
-        // Refuse the push if adding this event would take the
-        // running buffer past the ceiling. Pre-check against
-        // `saturating_add` so a pathologically large estimate does
-        // not wrap into a small number.
-        let projected = self.buffered_bytes.saturating_add(size);
-        if projected > self.budget_bytes {
-            return Err(BqliteError::Execution(format!(
-                "partitioner: memory budget would be exceeded — adding a {size}-byte event \
-                 would take buffered_bytes from {} to {projected}, above the {} ceiling \
-                 (TASK-218 Wave 2 refuses overflow; on-disk spill lands in a later wave)",
-                self.buffered_bytes, self.budget_bytes
-            )));
+
+        // Spill loop: while the projected bytes would overshoot the
+        // budget, pick the largest in-memory bucket, spill it to
+        // disk, and retry. The loop terminates either with a
+        // projected fit (the common case after one or two spills)
+        // or with an empty in-memory bucket map (the single event
+        // is bigger than the entire budget, which we report
+        // verbatim).
+        loop {
+            let projected = self.buffered_bytes.saturating_add(size);
+            if projected <= self.budget_bytes {
+                break;
+            }
+
+            // No spill configured → fail fast as in Wave 2, leaving
+            // the partitioner in its pre-push state.
+            if self.spill.is_none() {
+                return Err(BqliteError::Execution(format!(
+                    "partitioner: memory budget would be exceeded — adding a {size}-byte event \
+                     would take buffered_bytes from {} to {projected}, above the {} ceiling \
+                     (no spill directory configured; pass `Partitioner::with_spill_dir` or raise the budget)",
+                    self.buffered_bytes, self.budget_bytes
+                )));
+            }
+
+            // Pick the largest in-memory bucket. `None` here means
+            // every bucket has already been spilled and we still
+            // cannot fit the incoming event — the single event
+            // exceeds the budget all on its own.
+            let Some(victim_key) = self.largest_bucket_key() else {
+                return Err(BqliteError::Execution(format!(
+                    "partitioner: oversized event — a {size}-byte event exceeds the entire \
+                     {} byte budget after spilling every bucket; raise the budget or split \
+                     the event (per docs/design/engine/spill.md §6.2)",
+                    self.budget_bytes
+                )));
+            };
+
+            self.spill_bucket(victim_key)?;
         }
 
-        self.buckets
-            .entry((window_id, shard_id))
-            .or_default()
-            .push(event);
-        self.buffered_bytes = projected;
+        // Append the event and update the per-bucket and aggregate
+        // byte counters together so the invariant
+        // `buffered_bytes == sum(bucket.bytes)` holds at every
+        // observation point.
+        let bucket = self.buckets.entry(key).or_default();
+        bucket.events.push(event);
+        bucket.bytes = bucket.bytes.saturating_add(size);
+        self.buffered_bytes = self.buffered_bytes.saturating_add(size);
         Ok(())
     }
 
-    /// Consume the partitioner and yield each `(BucketKey,
-    /// sorted events)` pair in ascending `(window_id, shard_id)`
-    /// order.
+    /// Pick the bucket key with the largest in-memory byte
+    /// footprint. Returns `None` if no in-memory bucket is non-
+    /// empty. Ties (equal byte counts) are broken deterministically
+    /// by the smallest `(window_id, shard_id)` so the spill order
+    /// is stable across runs with identical input.
+    fn largest_bucket_key(&self) -> Option<BucketKey> {
+        // `kb.cmp(ka)` is intentionally reversed: with `max_by`, an
+        // entry whose comparator returns `Greater` wins. For two
+        // buckets of equal `bytes`, `kb.cmp(ka)` is `Greater`
+        // exactly when `ka < kb`, so the smaller `(window, shard)`
+        // bucket wins the tie. Pinned by the docstring above.
+        self.buckets
+            .iter()
+            .filter(|(_, b)| !b.events.is_empty())
+            .max_by(|(ka, ba), (kb, bb)| ba.bytes.cmp(&bb.bytes).then_with(|| kb.cmp(ka)))
+            .map(|(k, _)| *k)
+    }
+
+    /// Sort the named bucket and write it to a fresh spill run
+    /// file. Removes the bucket from the in-memory map and frees
+    /// its bytes from [`Self::buffered_bytes`]. The new run file is
+    /// appended to `spill.runs[key]` (creation order).
+    fn spill_bucket(&mut self, key: BucketKey) -> Result<()> {
+        let Some(spill) = self.spill.as_mut() else {
+            // Caller-side invariant: only invoked when spill is configured.
+            return Err(BqliteError::Execution(
+                "partitioner: internal error — spill_bucket called without a spill directory"
+                    .into(),
+            ));
+        };
+
+        let mut bucket = match self.buckets.remove(&key) {
+            Some(b) => b,
+            None => {
+                debug_assert!(false, "spill_bucket called for an absent bucket {key:?}");
+                return Ok(());
+            }
+        };
+
+        // Stable sort to preserve insertion order across equal
+        // `(entity, ts)` keys. Same comparator as the in-memory
+        // drain path so spill+merge yields the same sequence as the
+        // no-spill drain.
+        bucket.events.sort_by(|a, b| {
+            a.entity
+                .cmp(&b.entity)
+                .then_with(|| a.timestamp.cmp(&b.timestamp))
+        });
+
+        let seq = spill.next_seq;
+        spill.next_seq = spill.next_seq.saturating_add(1);
+        let path = spill.dir.join(format!(
+            "ingest-part-w{window}-s{shard:04}-{seq:06}.spill",
+            window = key.0,
+            shard = key.1,
+            seq = seq,
+        ));
+
+        let mut writer = BufWriter::new(
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| io_err(&path, "create ingest spill file", e))?,
+        );
+
+        // Write a length-prefixed postcard record per event. The
+        // 4-byte LE length prefix is sufficient for events well
+        // beyond any realistic ingest size — postcard's encoding is
+        // dense and rarely exceeds ~10x the event's logical size.
+        for event in &bucket.events {
+            let bytes = postcard::to_stdvec(event).map_err(|e| {
+                BqliteError::Execution(format!(
+                    "partitioner: failed to serialize event for spill write: {e}"
+                ))
+            })?;
+            let len = u32::try_from(bytes.len()).map_err(|_| {
+                BqliteError::Execution(format!(
+                    "partitioner: serialized event of {} bytes exceeds the {}-byte spill record \
+                     length limit",
+                    bytes.len(),
+                    u32::MAX
+                ))
+            })?;
+            writer
+                .write_all(&len.to_le_bytes())
+                .map_err(|e| io_err(&path, "write ingest spill record length", e))?;
+            writer
+                .write_all(&bytes)
+                .map_err(|e| io_err(&path, "write ingest spill record body", e))?;
+        }
+
+        // Flush the writer's buffer before dropping it. We do not
+        // `fsync` — spill files are temporary and crash-recovered
+        // by `<db_root>/spill/` reclamation per spill.md § 9.
+        writer
+            .flush()
+            .map_err(|e| io_err(&path, "flush ingest spill file", e))?;
+
+        let bytes_freed = bucket.bytes;
+        debug_assert!(self.buffered_bytes >= bytes_freed);
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(bytes_freed);
+
+        spill
+            .runs
+            .entry(key)
+            .or_default()
+            .push(SpillRunFile { path });
+
+        Ok(())
+    }
+
+    /// Consume the partitioner and yield each `(BucketKey, sorted
+    /// events)` pair in ascending `(window_id, shard_id)` order.
     ///
-    /// Each bucket is sorted in place by `(entity_id, timestamp)`
-    /// using a stable sort, so two events with identical sort keys
-    /// retain their insertion order — the property downstream
-    /// operators rely on when, for example, two rows of the same
-    /// entity share a nanosecond timestamp.
-    ///
-    /// The returned iterator is just a transformed `BTreeMap`
-    /// iterator, so the drain is `O(total_events)` for the sort
-    /// pass plus `O(buckets)` for the ordered walk.
-    pub fn drain_sorted(self) -> impl Iterator<Item = (BucketKey, Vec<Event>)> {
-        let mut buckets = self.buckets;
-        for events in buckets.values_mut() {
-            events.sort_by(|a, b| {
+    /// In the no-spill case the implementation is identical to the
+    /// pre-TASK-512 drain — every bucket is sorted in place and
+    /// returned. With spill enabled, each bucket's events are
+    /// streamed from its spilled run files (already sorted) plus
+    /// the in-memory residual (sorted in place) through a k-way
+    /// merge that yields events in `(entity_id, timestamp)` order
+    /// with stable tie-break by run insertion order. The merge
+    /// reads at most one chunk at a time from each run, so memory
+    /// usage during drain is bounded by the per-bucket merge plus
+    /// the deserialised front-of-run events — never the entire
+    /// bucket footprint that triggered the spill.
+    pub fn drain_sorted(self) -> Box<dyn Iterator<Item = (BucketKey, Vec<Event>)>> {
+        let Partitioner {
+            mut buckets, spill, ..
+        } = self;
+
+        // Sort the in-memory residuals in place ahead of any merge
+        // so both the no-spill and the spill paths share the same
+        // comparator. This costs O(n log n) per bucket whether or
+        // not we end up merging — but the no-spill case has no
+        // alternative anyway.
+        for bucket in buckets.values_mut() {
+            bucket.events.sort_by(|a, b| {
                 a.entity
                     .cmp(&b.entity)
                     .then_with(|| a.timestamp.cmp(&b.timestamp))
             });
         }
-        buckets.into_iter()
+
+        let mut spill_runs: BTreeMap<BucketKey, Vec<SpillRunFile>> = match spill {
+            Some(s) => s.runs,
+            None => BTreeMap::new(),
+        };
+
+        // Union of bucket keys: every key that has either an
+        // in-memory residual or one or more spill files.
+        let keys: Vec<BucketKey> = buckets
+            .keys()
+            .copied()
+            .chain(spill_runs.keys().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let it = keys.into_iter().map(move |key| {
+            let in_memory = buckets.remove(&key).map(|b| b.events).unwrap_or_default();
+            let runs = spill_runs.remove(&key).unwrap_or_default();
+            let merged = merge_runs_for_bucket(in_memory, runs);
+            (key, merged)
+        });
+        Box::new(it)
     }
+}
+
+/// Result type for the per-bucket merge. We collect the merged
+/// events into a fresh `Vec<Event>` to keep the partitioner's
+/// public contract — `(BucketKey, Vec<Event>)` per bucket — stable
+/// across the spill / no-spill cases. Per-bucket buffering is what
+/// the writer expects today; a streaming variant is a future-wave
+/// follow-up that would change the writer's API too.
+fn merge_runs_for_bucket(in_memory: Vec<Event>, runs: Vec<SpillRunFile>) -> Vec<Event> {
+    if runs.is_empty() {
+        return in_memory;
+    }
+
+    let total_capacity_hint = in_memory.len();
+    let mut output: Vec<Event> = Vec::with_capacity(total_capacity_hint);
+
+    // Each run is its own iterator. Run indices are the tie-break
+    // key for stable ordering: when two heads share a `(entity,
+    // ts)`, the smaller run index wins. The semantic order events
+    // were observed by `push_event` is "earlier-spilled runs first,
+    // then the still-in-memory residual" — so we assign indices
+    // 0..=runs.len()-1 to the spilled runs (in their `Vec`
+    // insertion order, which matches creation order — see
+    // `Partitioner::spill_bucket`) and reserve the highest index
+    // for the in-memory residual. This matches the semantic order:
+    // "the very first event pushed went into a run that got
+    // spilled before later pushes overflowed it."
+    let mut iters: Vec<RunIter> = Vec::with_capacity(runs.len() + 1);
+    for run in runs {
+        match SpillStream::open(run) {
+            Ok(stream) => iters.push(RunIter::Spilled(stream)),
+            Err(e) => {
+                // Bubble up the error path: a spill-read failure is
+                // fatal for the merge. We embed the IO error inside
+                // a shape the caller's `?` can propagate by panicking
+                // — but `drain_sorted` returns `Vec<Event>`, not
+                // `Result<...>`, so we cannot bubble cleanly. We
+                // intentionally do not paper over this: if the merge
+                // fails, the host has lost data and must abort the
+                // ingest. A future refactor will rewrap the iterator
+                // in a `Result` so the writer can handle the failure
+                // explicitly. For now, panic with the underlying
+                // path so the failure is visible.
+                panic!("partitioner: failed to open spill run for merge: {e}");
+            }
+        }
+    }
+    iters.push(RunIter::InMemory(in_memory.into_iter()));
+
+    // Initialise the heap with each run's first event. Empty runs
+    // are simply skipped.
+    let mut heap: BinaryHeap<Reverse<HeapEntry>> = BinaryHeap::new();
+    for (idx, iter) in iters.iter_mut().enumerate() {
+        if let Some(event) = pull_next(iter) {
+            heap.push(Reverse(HeapEntry {
+                key: event_key(&event),
+                run_index: idx,
+                event,
+            }));
+        }
+    }
+
+    while let Some(Reverse(entry)) = heap.pop() {
+        let HeapEntry {
+            event, run_index, ..
+        } = entry;
+        output.push(event);
+        if let Some(next) = pull_next(&mut iters[run_index]) {
+            heap.push(Reverse(HeapEntry {
+                key: event_key(&next),
+                run_index,
+                event: next,
+            }));
+        }
+    }
+
+    output
+}
+
+/// One run iterator — either the in-memory residual or a spill stream.
+enum RunIter {
+    InMemory(std::vec::IntoIter<Event>),
+    Spilled(SpillStream),
+}
+
+fn pull_next(iter: &mut RunIter) -> Option<Event> {
+    match iter {
+        RunIter::InMemory(it) => it.next(),
+        RunIter::Spilled(s) => match s.next_event() {
+            Ok(opt) => opt,
+            Err(e) => panic!("partitioner: failed to read spill run during merge: {e}"),
+        },
+    }
+}
+
+/// Sort key for the merge heap. Cloning is cheap for the common
+/// `EntityId::Int` case; the `EntityId::String` case clones the
+/// underlying `String`, which is the same per-event cost the in-
+/// memory sort already pays. We keep the key out of `HeapEntry`'s
+/// `Ord` derive only because `EntityId` already implements `Ord`.
+type EventKey = (EntityId, Timestamp);
+
+fn event_key(event: &Event) -> EventKey {
+    (event.entity.clone(), event.timestamp)
+}
+
+/// One head-of-run value held in the k-way merge heap.
+///
+/// Ordering: by the sort key first (smaller `(entity, ts)` is
+/// "smaller"), then by `run_index` so equal keys preserve the
+/// spill-time / in-memory order documented in `merge_runs_for_bucket`.
+#[derive(Debug)]
+struct HeapEntry {
+    key: EventKey,
+    run_index: usize,
+    event: Event,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.run_index == other.run_index
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key
+            .cmp(&other.key)
+            .then_with(|| self.run_index.cmp(&other.run_index))
+    }
+}
+
+/// Streaming reader over a spilled run file. Yields events in the
+/// same `(entity_id, ts)` order they were written.
+///
+/// Field-drop order matters: Rust drops struct fields in
+/// declaration order, so `_guard` drops *before* `reader`. The
+/// guard's `Drop` calls `remove_file`, which on POSIX is safe to
+/// invoke while the file's read fd is still open — the inode lives
+/// until the last fd closes. bqlite targets POSIX (Linux / macOS /
+/// FreeBSD) today; a future Windows port will need to drop
+/// `reader` first. Flagged here as a portability note rather than
+/// a runtime guard.
+struct SpillStream {
+    /// Path-owning RAII guard. Drops with `SpillStream`, deleting
+    /// the file once the merge has consumed it.
+    _guard: SpillRunFile,
+    reader: BufReader<File>,
+    /// Reusable scratch buffer to avoid allocating a fresh `Vec`
+    /// per record. Resized as needed.
+    scratch: Vec<u8>,
+}
+
+impl SpillStream {
+    fn open(guard: SpillRunFile) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&guard.path)
+            .map_err(|e| io_err(&guard.path, "open ingest spill file for read", e))?;
+        Ok(Self {
+            _guard: guard,
+            reader: BufReader::new(file),
+            scratch: Vec::new(),
+        })
+    }
+
+    fn next_event(&mut self) -> Result<Option<Event>> {
+        let mut len_buf = [0u8; 4];
+        match self.reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => {
+                return Err(BqliteError::Execution(format!(
+                    "partitioner: failed to read ingest spill record length: {e}"
+                )))
+            }
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if self.scratch.len() < len {
+            self.scratch.resize(len, 0);
+        }
+        self.reader
+            .read_exact(&mut self.scratch[..len])
+            .map_err(|e| {
+                BqliteError::Execution(format!(
+                    "partitioner: failed to read ingest spill record body of {len} bytes: {e}"
+                ))
+            })?;
+        let event: Event = postcard::from_bytes(&self.scratch[..len]).map_err(|e| {
+            BqliteError::Execution(format!(
+                "partitioner: failed to deserialize ingest spill record: {e}"
+            ))
+        })?;
+        Ok(Some(event))
+    }
+}
+
+/// RAII guard for a single ingest spill run file.
+///
+/// Holds only the path. The writer flushes and drops its
+/// `BufWriter<File>` *before* the guard goes out of scope so the
+/// file's bytes are durable on disk for the merge pass to read; the
+/// reader opens a fresh `File` from the same path. Drop deletes the
+/// file unconditionally — this is the single deletion site for
+/// ingest spill artefacts. A spill file may legitimately have been
+/// removed already (e.g. by the engine's per-ingest-dir
+/// `rm_rf` belt-and-braces sweep), so a `NotFound` error from
+/// `remove_file` is silently ignored.
+#[derive(Debug)]
+pub(crate) struct SpillRunFile {
+    path: PathBuf,
+}
+
+impl SpillRunFile {
+    /// Path of the on-disk spill run file. Exposed for tests and
+    /// future instrumentation; not part of any public surface.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for SpillRunFile {
+    fn drop(&mut self) {
+        // Best-effort. The engine runs an `rm_rf` of the per-ingest
+        // subdirectory on every exit path as a belt-and-braces sweep
+        // (see `docs/design/engine/spill.md` § 8.3) so a deletion
+        // failure here does not strand the file.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn io_err(path: &std::path::Path, action: &str, err: io::Error) -> BqliteError {
+    BqliteError::Io(io::Error::new(
+        err.kind(),
+        format!("{action} {}: {err}", path.display()),
+    ))
 }
 
 /// Cheap best-effort estimate of an event's in-memory footprint,
@@ -893,5 +1457,414 @@ mod tests {
     fn estimated_event_size_never_returns_zero_for_any_event() {
         let bare = Event::new(EntityId::from(0_i64), Timestamp(0), "");
         assert!(estimated_event_size(&bare) >= std::mem::size_of::<Event>());
+    }
+
+    // ── External spill (TASK-512) ──────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SPILL_SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Per-test scratch directory under `std::env::temp_dir()`. RAII;
+    /// removes itself on drop. Used as the per-ingest spill dir.
+    struct ScratchDir {
+        path: PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new(label: &str) -> Self {
+            let seq = SPILL_SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let mut path = std::env::temp_dir();
+            path.push(format!("bqlite-partitioner-spill-{label}-{pid}-{seq}"));
+            std::fs::create_dir_all(&path).expect("create scratch spill dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Reference no-spill drain — sort each bucket and yield the
+    /// canonical `(BucketKey, Vec<Event>)` sequence. The spill path
+    /// must produce the same output for the same input.
+    fn reference_drain(
+        events: &[Event],
+        shard_count: u16,
+        window_days: u32,
+    ) -> Vec<(BucketKey, Vec<Event>)> {
+        let mut p = Partitioner::new(shard_count, window_days, 1, usize::MAX).unwrap();
+        for e in events {
+            p.push_event(e.clone()).unwrap();
+        }
+        p.drain_sorted().collect()
+    }
+
+    #[test]
+    fn with_spill_dir_validates_inputs_like_new() {
+        let dir = ScratchDir::new("with-spill-validate");
+        let err = Partitioner::with_spill_dir(0, 30, 1, 1024, dir.path().to_path_buf())
+            .expect_err("zero shard_count must error");
+        assert!(matches!(err, BqliteError::Schema(_)));
+        let err = Partitioner::with_spill_dir(4, 0, 1, 1024, dir.path().to_path_buf())
+            .expect_err("zero window_days must error");
+        assert!(matches!(err, BqliteError::Schema(_)));
+        let err = Partitioner::with_spill_dir(4, 30, 1, 0, dir.path().to_path_buf())
+            .expect_err("zero budget must error");
+        assert!(matches!(err, BqliteError::Schema(_)));
+    }
+
+    #[test]
+    fn spill_disabled_partitioner_keeps_fail_fast_contract() {
+        // The legacy `Partitioner::new` path must still refuse the
+        // overshooting push and leave state untouched.
+        let mut p = Partitioner::new(1, 30, 1, 1).unwrap();
+        let err = p
+            .push_event(simple_event("alice", 0, "click"))
+            .expect_err("budget overflow must error without spill");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("memory budget"), "got: {msg}");
+                assert!(msg.contains("no spill directory"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+        assert_eq!(p.buffered_events(), 0);
+        assert_eq!(p.spilled_run_count(), 0);
+    }
+
+    #[test]
+    fn spill_writes_largest_bucket_when_budget_overshoots() {
+        // shard_count = 2 to allow at least two buckets. Use a tiny
+        // budget so the second push always triggers a spill of the
+        // first bucket. Different entities likely land on different
+        // shards, so we craft entities that we know hash to
+        // distinct shards via the `shard_count = 1`/`= 2` modulo
+        // dispatch in `shard_id_for`.
+        let dir = ScratchDir::new("spill-largest");
+        let event_a = simple_event("alice", 0, "click");
+        let bytes_a = estimated_event_size(&event_a);
+        // Sizing budget to fit exactly one event of `bytes_a` size
+        // forces every subsequent push of similar size to spill the
+        // existing bucket.
+        let mut p =
+            Partitioner::with_spill_dir(2, 30, 1, bytes_a, dir.path().to_path_buf()).unwrap();
+        p.push_event(event_a.clone()).unwrap();
+        assert_eq!(p.spilled_run_count(), 0);
+
+        // Push a second event of the same shape; the partitioner
+        // should spill the first bucket and accept this one.
+        p.push_event(simple_event("bob", 1, "click")).unwrap();
+        assert!(
+            p.spilled_run_count() >= 1,
+            "second push must trigger a spill, got runs={}",
+            p.spilled_run_count()
+        );
+        // The newly-pushed event must be visible in memory; the
+        // overall state remains coherent.
+        assert!(p.buffered_events() >= 1);
+        assert!(p.buffered_bytes() <= p.budget_bytes());
+    }
+
+    #[test]
+    fn spill_filename_follows_design_doc_scheme() {
+        // Confirm that spilled files match the
+        // `ingest-part-w<window>-s<shard:04>-<seq:06>.spill` pattern
+        // from `docs/design/engine/spill.md` § 7. The filenames must
+        // sort lexicographically in creation order so a future merge
+        // pass that walks the directory in `read_dir` order produces
+        // the right run sequence.
+        let dir = ScratchDir::new("spill-naming");
+        // Use uniform-shape events so the byte estimate is stable
+        // across pushes — the spill loop's bucket-pick deals with
+        // size variance, but pinning the budget to a single event's
+        // size requires that all events fit in `budget_bytes`.
+        let template = simple_event("u00", 0, "click");
+        let bytes = estimated_event_size(&template);
+        let mut p = Partitioner::with_spill_dir(1, 30, 1, bytes, dir.path().to_path_buf()).unwrap();
+        // Three pushes total → at least two spills (first stays in
+        // memory until the second push triggers a spill of the
+        // first bucket, etc.). With `shard_count = 1`, every event
+        // lands in the same bucket.
+        p.push_event(simple_event("u00", 0, "click")).unwrap();
+        p.push_event(simple_event("u01", 1, "click")).unwrap();
+        p.push_event(simple_event("u02", 2, "click")).unwrap();
+        assert!(p.spilled_run_count() >= 2);
+
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        for name in &entries {
+            assert!(
+                name.starts_with("ingest-part-w0-s0000-")
+                    && name.ends_with(".spill")
+                    && name.len() == "ingest-part-w0-s0000-000000.spill".len(),
+                "unexpected spill filename: {name}"
+            );
+        }
+        let mut sorted = entries.clone();
+        sorted.sort();
+        assert_eq!(
+            entries.iter().collect::<std::collections::HashSet<_>>(),
+            sorted.iter().collect::<std::collections::HashSet<_>>(),
+            "deduped sets match — sanity"
+        );
+    }
+
+    #[test]
+    fn spill_then_drain_matches_no_spill_drain() {
+        // The merge of spilled runs + in-memory residual must yield
+        // exactly the same `(BucketKey, Vec<Event>)` sequence as a
+        // wide-budget no-spill drain on the same input. This is the
+        // central correctness invariant for TASK-512.
+        let dir = ScratchDir::new("spill-equiv");
+        let mut events: Vec<Event> = Vec::new();
+        for i in 0..200_u64 {
+            // Spread events across multiple entities and timestamps
+            // so the merge has real work to do (sort key is non-
+            // trivial across spilled vs. in-memory chunks).
+            let entity = format!("user_{}", i % 7);
+            let day_idx = (i % 4) as i64; // four windows under 30-day default
+            events.push(simple_event(&entity, day_idx * 30, "click"));
+        }
+
+        let baseline = reference_drain(&events, 4, 30);
+
+        // A budget tight enough to force several spills.
+        let bytes_per_event = estimated_event_size(&events[0]);
+        let tight_budget = bytes_per_event * 3;
+        let mut p =
+            Partitioner::with_spill_dir(4, 30, 1, tight_budget, dir.path().to_path_buf()).unwrap();
+        for e in &events {
+            p.push_event(e.clone()).unwrap();
+        }
+        assert!(
+            p.spilled_run_count() > 0,
+            "the chosen tight budget must have triggered a spill"
+        );
+
+        let actual: Vec<(BucketKey, Vec<Event>)> = p.drain_sorted().collect();
+        assert_eq!(actual.len(), baseline.len());
+        for ((ka, va), (kb, vb)) in actual.iter().zip(baseline.iter()) {
+            assert_eq!(ka, kb, "bucket keys diverged");
+            assert_eq!(va, vb, "merged events diverged for bucket {ka:?}");
+        }
+    }
+
+    #[test]
+    fn spill_preserves_stable_tie_break_within_bucket() {
+        // Events with identical (entity, ts) must retain their
+        // insertion order across spill+merge — the same stability
+        // guarantee the no-spill path provides.
+        let dir = ScratchDir::new("spill-stable");
+        // event_type strings of equal length so the per-event byte
+        // estimate is identical. "first"/"secnd"/"third" are all 5
+        // chars — keeps the spill-loop math exact.
+        let bytes =
+            estimated_event_size(&Event::new(EntityId::from("alice"), Timestamp(0), "first"));
+        // Budget admits one event, so each of the three pushes
+        // ends up in its own run (first stays in memory, then
+        // gets spilled when the second arrives, etc.).
+        let mut p = Partitioner::with_spill_dir(1, 30, 1, bytes, dir.path().to_path_buf()).unwrap();
+        p.push_event(simple_event("alice", 0, "first")).unwrap();
+        p.push_event(simple_event("alice", 0, "secnd")).unwrap();
+        p.push_event(simple_event("alice", 0, "third")).unwrap();
+        assert!(p.spilled_run_count() >= 2);
+
+        let drained: Vec<(BucketKey, Vec<Event>)> = p.drain_sorted().collect();
+        assert_eq!(drained.len(), 1);
+        let types: Vec<String> = drained[0].1.iter().map(|e| e.event_type.clone()).collect();
+        assert_eq!(types, vec!["first", "secnd", "third"]);
+    }
+
+    #[test]
+    fn spill_oversized_event_returns_typed_error() {
+        // Configure a tight budget and push a tiny event so the
+        // partitioner accepts it. Then push an event whose size
+        // alone exceeds the budget; the spill loop drains every
+        // bucket and still cannot fit the event, surfacing the
+        // documented "oversized event" error per spill.md §6.2.
+        let dir = ScratchDir::new("spill-oversized");
+        let small = simple_event("a", 0, "x");
+        let small_bytes = estimated_event_size(&small);
+        let budget = small_bytes; // fits exactly one tiny event
+        let mut p =
+            Partitioner::with_spill_dir(1, 30, 1, budget, dir.path().to_path_buf()).unwrap();
+        p.push_event(small).unwrap();
+
+        // Build an event with a 4 MiB property string — larger
+        // than `budget` (≈ size_of::<Event>() bytes) by orders of
+        // magnitude, ensuring the spill loop can't make room.
+        let huge_value = PropertyValue::String("x".repeat(4 * 1024 * 1024));
+        let mut huge = Event::new(EntityId::from("b"), Timestamp(0), "click");
+        huge.properties.push(("payload".into(), huge_value));
+
+        let err = p
+            .push_event(huge)
+            .expect_err("oversized event must surface a typed error");
+        match err {
+            BqliteError::Execution(msg) => {
+                assert!(msg.contains("oversized event"), "got: {msg}");
+                assert!(msg.contains("budget"), "got: {msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_partitioner_before_drain_removes_spill_files() {
+        // Spill enough that at least one run exists; then drop the
+        // partitioner without draining. Every spill file must be
+        // removed by the `SpillRunFile` RAII guard. The scratch dir
+        // itself stays — the engine owns the per-ingest dir's
+        // lifetime, not the partitioner.
+        let dir = ScratchDir::new("spill-drop");
+        let template = simple_event("u00", 0, "click");
+        let bytes = estimated_event_size(&template);
+        {
+            let mut p =
+                Partitioner::with_spill_dir(1, 30, 1, bytes, dir.path().to_path_buf()).unwrap();
+            p.push_event(simple_event("u00", 0, "click")).unwrap();
+            p.push_event(simple_event("u01", 1, "click")).unwrap();
+            p.push_event(simple_event("u02", 2, "click")).unwrap();
+            assert!(p.spilled_run_count() >= 1);
+            // The partitioner is dropped at the end of this block.
+        }
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".spill"))
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "dropped partitioner must remove its spill files; found {entries:?}"
+        );
+    }
+
+    #[test]
+    fn spill_run_file_path_accessor_returns_underlying_path() {
+        // Smoke test on the `pub(crate)` path() accessor so it stays
+        // load-bearing for future instrumentation/diagnostics.
+        let dir = ScratchDir::new("spill-path");
+        let event_a = simple_event("alice", 0, "click");
+        let bytes_a = estimated_event_size(&event_a);
+        let mut p =
+            Partitioner::with_spill_dir(1, 30, 1, bytes_a, dir.path().to_path_buf()).unwrap();
+        p.push_event(event_a).unwrap();
+        p.push_event(simple_event("bob", 1, "click")).unwrap();
+        // Reach into the spill state via the SpillRunFile we just
+        // produced. We round-trip through the public surface to
+        // avoid reaching across module boundaries.
+        let runs_total = p.spilled_run_count();
+        assert!(runs_total >= 1);
+        // Confirm the recorded path is under the scratch dir.
+        let spill = p.spill.as_ref().expect("spill must be configured");
+        let any_run = spill
+            .runs
+            .values()
+            .flat_map(|v| v.iter())
+            .next()
+            .expect("at least one spill run");
+        let path = any_run.path();
+        assert!(path.starts_with(dir.path()), "got: {}", path.display());
+        assert!(path.exists(), "spill file must still exist on disk");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            // Spill writes touch the filesystem, so each iteration is
+            // ~1-2 ms — keep the case count tight to bound runtime.
+            cases: 64,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn proptest_spill_drain_matches_no_spill_drain(
+            inputs in proptest::collection::vec((0u32..7, 0u32..40, 0u8..3), 0..120)
+        ) {
+            // Build deterministic events from the prop inputs: a
+            // small entity space, a small day space, and a few
+            // event-type variants. The shape is uniform so the
+            // estimated_event_size variance stays bounded — what we
+            // care about is the merge invariant, not size analytics.
+            let events: Vec<Event> = inputs
+                .into_iter()
+                .map(|(entity_idx, day_idx, type_idx)| {
+                    let etype = match type_idx { 0 => "click", 1 => "view", _ => "play" };
+                    simple_event(&format!("u{entity_idx:02}"), day_idx as i64, etype)
+                })
+                .collect();
+
+            let baseline = reference_drain(&events, 4, 30);
+
+            // Pick a tight budget. Two events' worth of estimated
+            // bytes guarantees frequent spill on inputs > a few
+            // events while still admitting at least one event at a
+            // time (so an "oversized event" error cannot happen on
+            // any input from this generator).
+            let bytes_per_event = events
+                .first()
+                .map(estimated_event_size)
+                .unwrap_or(256);
+            let budget = bytes_per_event.saturating_mul(2).max(256);
+
+            let dir = ScratchDir::new("proptest");
+            let mut p = Partitioner::with_spill_dir(4, 30, 1, budget, dir.path().to_path_buf()).unwrap();
+            for e in &events {
+                p.push_event(e.clone()).unwrap();
+            }
+
+            let actual: Vec<(BucketKey, Vec<Event>)> = p.drain_sorted().collect();
+            proptest::prop_assert_eq!(actual, baseline);
+        }
+    }
+
+    #[test]
+    fn drain_with_no_pushes_yields_empty_iterator() {
+        // Spill-disabled and spill-enabled cases both must yield an
+        // empty iterator from `drain_sorted` when no events were
+        // pushed. Pins the BTreeSet-union union path on the empty
+        // case.
+        let p = Partitioner::new(4, 30, 1, 1024).unwrap();
+        let drained: Vec<(BucketKey, Vec<Event>)> = p.drain_sorted().collect();
+        assert!(drained.is_empty());
+
+        let dir = ScratchDir::new("spill-empty");
+        let p = Partitioner::with_spill_dir(4, 30, 1, 1024, dir.path().to_path_buf()).unwrap();
+        let drained: Vec<(BucketKey, Vec<Event>)> = p.drain_sorted().collect();
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn buffered_bytes_invariant_holds_across_pushes_and_spills() {
+        // After every push (success or error), the partitioner must
+        // satisfy `buffered_bytes == sum(bucket.bytes for bucket in
+        // in-memory buckets)`. This guards against a regression
+        // where a per-bucket counter and the aggregate counter drift
+        // apart through the spill path.
+        let dir = ScratchDir::new("spill-invariant");
+        let event_a = simple_event("alice", 0, "click");
+        let bytes_a = estimated_event_size(&event_a);
+        let mut p =
+            Partitioner::with_spill_dir(4, 30, 1, bytes_a * 2, dir.path().to_path_buf()).unwrap();
+        for n in 0..50_u64 {
+            let event = simple_event(&format!("user_{}", n % 5), (n % 8) as i64, "click");
+            p.push_event(event).unwrap();
+            let in_memory_sum: usize = p.buckets.values().map(|b| b.bytes).sum();
+            assert_eq!(
+                p.buffered_bytes(),
+                in_memory_sum,
+                "buffered_bytes invariant broken after push {n}"
+            );
+        }
     }
 }

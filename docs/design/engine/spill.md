@@ -413,9 +413,39 @@ Source: `Partitioner` in `bqlite-storage::ingest::partitioner`
 
 **File contents:** one file per spilled `(window_id, shard_id)`
 bucket. Each file contains the events in that bucket, sorted in
-place by `(entity_id, ts)` before being written, and serialised in
-the same Arrow IPC stream format as sort runs (§ 6.1) using the
-ingest event schema.
+place by `(entity_id, ts)` before being written, then serialised as
+a length-prefixed [`postcard`](https://docs.rs/postcard) stream of
+[`bqlite_core::event::Event`] records: a 4-byte little-endian
+length followed by that many postcard bytes, repeated until end of
+file. The format is private to the partitioner; the run files are
+read back only by the partitioner's own merge pass on the same
+process during the same ingest call.
+
+This is the one deliberate format split between sort and ingest
+spill. Sort operates on `RecordBatch` values that already carry an
+Arrow schema, so Arrow IPC stream is the natural fit (§ 6.1). The
+partitioner's input is `Event` values, and the partitioner does not
+own a [`bqlite_core::schema::TableSchema`] at this layer (the
+schema lives one crate up in the engine, in
+`bqlite-engine::ingest`). Round-tripping through a synthetic Arrow
+schema would either thread the table schema down through the
+partitioner constructor — adding a parameter every existing caller
+would need to update — or wrap the postcard payload inside a
+single-column Arrow Binary array, which gains no debuggability over
+postcard alone. The postcard direct path uses an existing
+`bqlite-storage` dependency, preserves every Event semantic
+(properties bag, `EntityId::String`/`Int` discriminants), and
+keeps the partitioner self-contained. Spill files are private,
+per-process artefacts crash-recovered by reclamation (§ 9), so
+format stability across versions is not a contract.
+
+**Filename scheme:** spill files live at
+`<spill_root>/<query_id>/ingest-part-w<window>-s<shard:04>-<seq:06>.spill`,
+matching the worked example in § 7. The shard slot is zero-padded
+to four digits and the seq slot to six digits so a `read_dir` walk
+in lexicographic order matches the spill creation order — useful
+for ad-hoc inspection and required by the design's "lex order
+matches creation order" rule (§ 7).
 
 The partitioner already builds buckets keyed by `(window_id, shard_id)`
 and sorts each bucket at drain. The spill protocol changes drain
