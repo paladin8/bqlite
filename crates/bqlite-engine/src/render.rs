@@ -117,6 +117,7 @@ pub fn format_result_as_text_limited(
         schema: result.schema.clone(),
         rows: truncated,
         rows_affected: result.rows_affected,
+        peak_memory_bytes: result.peak_memory_bytes,
     };
 
     // Render the truncated result normally, then append the truncation
@@ -239,6 +240,7 @@ mod tests {
             schema: schema_of_table_shape(),
             rows: Vec::new(),
             rows_affected: None,
+            peak_memory_bytes: None,
         };
 
         let rendered = format_result_as_text(&result);
@@ -277,6 +279,7 @@ mod tests {
             schema: OperatorSchema::new(Vec::new()).expect("empty schema is valid"),
             rows: Vec::new(),
             rows_affected: None,
+            peak_memory_bytes: None,
         };
 
         let rendered = format_result_as_text(&result);
@@ -314,6 +317,7 @@ mod tests {
             schema,
             rows: vec![batch],
             rows_affected: None,
+            peak_memory_bytes: None,
         };
 
         let rendered = format_result_as_text(&result);
@@ -351,6 +355,7 @@ mod tests {
                 .expect("schema is unique by construction"),
             rows: vec![batch],
             rows_affected: None,
+            peak_memory_bytes: None,
         };
 
         let rendered = format_result_as_text(&result);
@@ -395,6 +400,7 @@ mod tests {
             schema,
             rows: vec![batch],
             rows_affected: None,
+            peak_memory_bytes: None,
         };
         let plain = format_result_as_text(&result);
         let limited = format_result_as_text_limited(&result, None);
@@ -409,6 +415,7 @@ mod tests {
             schema,
             rows: vec![batch],
             rows_affected: None,
+            peak_memory_bytes: None,
         };
         let out = format_result_as_text_limited(&result, Some(10));
         assert!(
@@ -426,6 +433,7 @@ mod tests {
             schema,
             rows: vec![batch],
             rows_affected: None,
+            peak_memory_bytes: None,
         };
         let out = format_result_as_text_limited(&result, Some(2));
         assert!(
@@ -443,6 +451,7 @@ mod tests {
             schema,
             rows: vec![batch],
             rows_affected: None,
+            peak_memory_bytes: None,
         };
         let out = format_result_as_text_limited(&result, Some(1));
         // The footer must mention "1 row" (singular) and the hint.
@@ -476,6 +485,7 @@ mod tests {
             schema,
             rows: vec![batch],
             rows_affected: None,
+            peak_memory_bytes: None,
         };
         let out = format_result_as_text_limited(&result, Some(2000));
         assert!(
@@ -504,6 +514,7 @@ mod tests {
                 make_batch(vec![7, 8, 9]),
             ],
             rows_affected: None,
+            peak_memory_bytes: None,
         };
         let out = format_result_as_text_limited(&result, Some(5));
         // Values 1-5 present, 6-9 absent.
@@ -547,6 +558,7 @@ mod tests {
                 .expect("schema is unique by construction"),
             rows: vec![a, b],
             rows_affected: None,
+            peak_memory_bytes: None,
         };
 
         let rendered = format_result_as_text(&result);

@@ -85,6 +85,11 @@ pub fn execute_delete_statement(
         schema: plan.output_schema.clone(),
         rows: Vec::new(),
         rows_affected: Some(count),
+        // DELETE runs outside the per-query budget plumbing in v1; the
+        // path will be wired together with the rest of the QueryContext
+        // machinery in TASK-525 stress coverage. For now report the
+        // unbounded-context shape (`None`).
+        peak_memory_bytes: None,
     })
 }
 

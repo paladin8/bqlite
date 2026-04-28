@@ -51,6 +51,7 @@
 //! without importing `bqlite-planner` directly.
 
 pub mod bind;
+pub mod context;
 pub mod ddl;
 pub mod delete;
 pub mod ingest;
@@ -58,6 +59,10 @@ pub mod query;
 pub mod render;
 
 pub use bind::bind_physical;
+pub use context::{
+    EngineConfig, QueryContext, QueryOptions, DEFAULT_COMPACTION_BUDGET_BYTES,
+    DEFAULT_INGEST_BUDGET_BYTES, DEFAULT_QUERY_BUDGET_BYTES, MIN_QUERY_BUDGET_BYTES,
+};
 pub use query::{Engine, ExecutionResult};
 pub use render::{format_result_as_text, format_result_as_text_limited};
 

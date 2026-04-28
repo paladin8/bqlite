@@ -65,6 +65,7 @@ use bqlite_planner::PhysicalPlan;
 use bqlite_storage::Database;
 
 use crate::bind::bind_physical;
+use crate::context::{resolve_query_budget, EngineConfig, QueryContext, QueryOptions};
 
 /// The result of a successfully executed query.
 ///
@@ -83,6 +84,15 @@ use crate::bind::bind_physical;
 /// `docs/design/storage/deletes.md` §11). `None` for SELECT, DDL,
 /// EXPLAIN, and INSERT (which today returns no count). Callers that
 /// want to render "n rows deleted" inspect this field.
+///
+/// `peak_memory_bytes` is `Some(n)` when the query was executed with a
+/// real `MemoryTracker` (TASK-510 / `docs/design/engine/memory-budget.md`
+/// §10) and reports the high-water mark of bytes reserved through the
+/// per-query budget. `None` when the engine was running with the
+/// `UnboundedMemory` stub — in that mode no peak is tracked. The field
+/// is reported even when no operator yet calls `try_reserve`; expect
+/// `Some(0)` for queries whose operators have not been wired against
+/// the budget (operator-side wiring is TASK-512/513/514).
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
     /// Output schema. Matches every batch in `rows`.
@@ -95,6 +105,10 @@ pub struct ExecutionResult {
     /// INSERT). DELETE always populates this with `Some(n)` per
     /// `docs/design/storage/deletes.md` §11.
     pub rows_affected: Option<u64>,
+    /// Peak per-query memory bytes observed by the `MemoryTracker`
+    /// since this query started executing. `None` for the unbounded
+    /// budget path.
+    pub peak_memory_bytes: Option<u64>,
 }
 
 impl ExecutionResult {
@@ -122,24 +136,33 @@ impl ExecutionResult {
 /// The bqlite query engine — a stateless dispatcher that compiles a
 /// text query and drives the resulting operator tree.
 ///
-/// Wave 1 holds no configuration at all: `Engine::new()` and
-/// `Engine::default()` are interchangeable. Later waves add memory
-/// budget, thread-pool handle, warning sink, and metrics hooks as
-/// additional fields with `Default` impls so existing callers keep
-/// compiling unchanged.
+/// `Engine` carries an [`EngineConfig`] (default per
+/// `docs/design/engine/memory-budget.md` § 2.2) used to size each
+/// query's [`QueryContext`]. `Engine::new()` and `Engine::default()`
+/// remain interchangeable — both pick up the default config; hosts
+/// that need a custom budget call `Engine::with_config(...)`. Later
+/// waves add a thread-pool handle, warning sink, and metrics hooks as
+/// additional fields without breaking existing callers.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Engine {
-    // Wave 1: no fields yet. Kept as a struct (not a unit type)
-    // because future waves will add non-Copy state (`Arc<ThreadPool>`,
-    // `Arc<MetricsSink>`, ...) and changing a unit type to a struct
-    // with state is a breaking API change.
-    _private: (),
+    config: EngineConfig,
 }
 
 impl Engine {
-    /// Construct a default `Engine`. Wave 1 has no configuration.
+    /// Construct an engine with default configuration (3 GiB query
+    /// budget, see `docs/design/engine/memory-budget.md` § 2.2).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct an engine with a custom configuration.
+    pub fn with_config(config: EngineConfig) -> Self {
+        Self { config }
+    }
+
+    /// Returns the engine's effective configuration.
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
     }
 
     /// Parse, plan, bind, and execute `text` against `db`, collecting
@@ -148,6 +171,10 @@ impl Engine {
     /// This is the single text-in, rows-out surface every bqlite
     /// caller goes through. See the module-level docs for the full
     /// compiler pipeline and the Wave 1 deferrals.
+    ///
+    /// Runs with the engine-level default [`QueryOptions`]. Use
+    /// [`Engine::query_with_options`] to override per-query settings
+    /// such as `memory_budget_bytes`.
     ///
     /// # Errors
     ///
@@ -160,6 +187,21 @@ impl Engine {
     ///   the engine never signals cancellation, but the error
     ///   variant is still propagated verbatim from the operators.
     pub fn query(&self, text: &str, db: &mut Database) -> Result<ExecutionResult> {
+        self.query_with_options(text, db, &QueryOptions::default())
+    }
+
+    /// Parse, plan, bind, and execute `text` against `db` with
+    /// per-query overrides supplied through `options`.
+    ///
+    /// Validates the requested memory budget against
+    /// [`crate::context::MIN_QUERY_BUDGET_BYTES`]. A budget below the
+    /// floor surfaces as [`BqliteError::Execution`].
+    pub fn query_with_options(
+        &self,
+        text: &str,
+        db: &mut Database,
+        options: &QueryOptions,
+    ) -> Result<ExecutionResult> {
         // 1. Parse. `parse()` returns a Vec: zero or more
         //    `Statement::DefineAlias` items followed by the terminal
         //    statement (query, DDL, …). Its typed `ParseError` is
@@ -189,11 +231,20 @@ impl Engine {
         let catalog = db.catalog();
         let physical = bqlite_planner::plan_script(stmts, &catalog, now_ns)?;
 
+        // Resolve the per-query memory budget, falling back to the
+        // engine-level default when the caller passed no override.
+        // Validation (floor of 512 MiB) lives in `resolve_query_budget`.
+        let budget_bytes = resolve_query_budget(&self.config, options)?;
+        let ctx = QueryContext::new(budget_bytes);
+
         // DELETE is dispatched out-of-band rather than through the
         // bind step because it produces no result rows but does
         // populate `ExecutionResult::rows_affected` (deletes.md §11).
         // Routing through `bind_physical` would lose that count
         // because the trait surface only yields `RecordBatch` values.
+        // The DELETE path does not yet use the QueryContext (TASK-525
+        // wires it together with the rest of the cancellation /
+        // budget plumbing); for now it returns an unbounded peak.
         if let PhysicalPlan::Delete(d) = &physical {
             return crate::delete::execute_delete_statement(d, db);
         }
@@ -211,7 +262,7 @@ impl Engine {
         //    operator tree. Handles data-plane operators (Scan,
         //    Filter, Project, Limit), DDL (which executes during
         //    bind), and metadata queries (Describe, Explain).
-        let mut operator = bind_physical(&physical, db)?;
+        let mut operator = bind_physical(&physical, db, &ctx)?;
 
         // 4. Drive the operator tree to completion. `open` → zero or
         //    more `next_batch` → `close`. `close` runs even on the
@@ -235,6 +286,7 @@ impl Engine {
             schema,
             rows,
             rows_affected: None,
+            peak_memory_bytes: ctx.peak_memory_bytes(),
         })
     }
 }
@@ -269,6 +321,7 @@ mod tests {
     use bqlite_storage::Database;
 
     use super::*;
+    use crate::context::MIN_QUERY_BUDGET_BYTES;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -436,6 +489,82 @@ mod tests {
         let result = engine.query("events", &mut db).expect("events must plan");
 
         assert_eq!(result.row_count(), 0);
+        assert!(result.is_empty());
+    }
+
+    // ── QueryContext / EngineConfig wiring (TASK-510) ───────────────
+
+    #[test]
+    fn engine_default_config_matches_design_defaults() {
+        let engine = Engine::new();
+        // Default per-query budget is 3 GiB per design § 2.2.
+        assert_eq!(engine.config().query_memory_budget_bytes, 3 << 30);
+    }
+
+    #[test]
+    fn query_reports_zero_peak_memory_when_no_operator_reserves() {
+        // No operator yet calls try_reserve against the QueryContext
+        // (operator-side wiring is TASK-512/513/514). Until then,
+        // peak_memory_bytes is `Some(0)` for every query that runs
+        // through the real tracker — the tracker is *present*, just
+        // not yet *charged*.
+        let scratch = Scratch::new("peak-zero");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let result = engine.query("events", &mut db).expect("must succeed");
+        assert_eq!(result.peak_memory_bytes, Some(0));
+    }
+
+    #[test]
+    fn query_with_options_below_floor_is_rejected() {
+        let scratch = Scratch::new("floor-reject");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let opts = QueryOptions {
+            memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES - 1),
+        };
+        match engine.query_with_options("events", &mut db, &opts) {
+            Err(BqliteError::Execution(msg)) => {
+                assert!(
+                    msg.contains("query memory budget too small"),
+                    "error should mention the floor: {msg}"
+                );
+            }
+            other => panic!("expected Execution error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_with_options_at_floor_is_accepted() {
+        let scratch = Scratch::new("floor-accept");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let opts = QueryOptions {
+            memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES),
+        };
+        let result = engine
+            .query_with_options("events", &mut db, &opts)
+            .expect("must succeed at the floor");
+        assert!(result.is_empty());
+        // The peak is still tracked even though no operator reserved.
+        assert_eq!(result.peak_memory_bytes, Some(0));
+    }
+
+    #[test]
+    fn engine_with_config_threads_default_through_query() {
+        // A custom EngineConfig is honoured by both `query` (default
+        // options) and `query_with_options` (no override).
+        let scratch = Scratch::new("custom-config");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::with_config(crate::EngineConfig {
+            query_memory_budget_bytes: MIN_QUERY_BUDGET_BYTES,
+            ..crate::EngineConfig::default()
+        });
+        assert_eq!(
+            engine.config().query_memory_budget_bytes,
+            MIN_QUERY_BUDGET_BYTES
+        );
+        let result = engine.query("events", &mut db).expect("must succeed");
         assert!(result.is_empty());
     }
 }

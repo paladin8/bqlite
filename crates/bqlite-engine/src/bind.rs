@@ -74,10 +74,10 @@ use bqlite_core::{
 use bqlite_operators::matcher::SequenceMatchState;
 use bqlite_operators::operator::EntityOperator;
 use bqlite_operators::{
-    Accumulator, AttributeOperator, CancellationToken, CohortHashSet, DistinctOperator,
-    EventSelectOperator, FilterOperator, HashAccumulator, HashAggregateOperator, LimitOperator,
-    PhysicalOperator, ProjectOperator, ScanOperator, SequenceMatchOperator, SessionizeOperator,
-    SortOperator, SubqueryFilterOperator,
+    Accumulator, AttributeOperator, CohortHashSet, DistinctOperator, EventSelectOperator,
+    FilterOperator, HashAccumulator, HashAggregateOperator, LimitOperator, PhysicalOperator,
+    ProjectOperator, ScanOperator, SequenceMatchOperator, SessionizeOperator, SortOperator,
+    SubqueryFilterOperator,
 };
 use bqlite_planner::compiled::{
     ArrowKernelId, CompareKernel, CompareOp, CompiledExpr, CompiledNode,
@@ -88,6 +88,7 @@ use bqlite_planner::{
 };
 use bqlite_storage::Database;
 
+use crate::context::QueryContext;
 use crate::ddl::{
     build_describe_batch, build_explain_batch, execute_alter_table_add_column,
     execute_create_table, execute_drop_table, ResultOperator,
@@ -366,16 +367,18 @@ impl PhysicalOperator for SequenceMatchAdapter {
 /// non-fused `pending` buffer. The fused path will be added in Wave 5
 /// alongside the operator-side changes that enable it.
 ///
-/// ## TODO(Wave 5 / QueryContext)
+/// ## TODO(Wave 5 follow-up)
 ///
 /// Per `docs/design/execution-model.md §4.1`, the adapter should gain:
 /// - **Output-batch accumulation**: collect per-entity output batches into
 ///   a target-row-count buffer before returning to the caller, avoiding the
 ///   "one-row `RecordBatch` per entity pathology" for high-entity pipelines.
-/// - **Cooperative cancellation**: check `QueryContext::cancelled` between
-///   entities so a cancelled query observes a per-entity latency bound.
+/// - **Cooperative cancellation**: check the [`CancellationToken`] from
+///   `QueryContext` between entities so a cancelled query observes a
+///   per-entity latency bound. The token is now plumbed through
+///   `bind_physical` (TASK-510); the adapter just needs to read it
+///   between sub-batches.
 ///
-/// These are blocked on the `QueryContext` type landing in the engine;
 /// `SequenceMatchAdapter` has the same gap and will be updated at the same
 /// time.
 struct EntityOperatorAdapter<Op: EntityOperator> {
@@ -772,9 +775,13 @@ fn fill_entity_id(batch: RecordBatch, entity: &EntityId) -> Result<RecordBatch> 
 ///
 /// Propagates any error from operator construction, DDL execution,
 /// or catalog lookup.
-pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn PhysicalOperator>> {
+pub fn bind_physical(
+    plan: &PhysicalPlan,
+    db: &mut Database,
+    ctx: &QueryContext,
+) -> Result<Box<dyn PhysicalOperator>> {
     let mut cohorts = CohortCache::default();
-    bind_physical_with_cache(plan, db, &mut cohorts)
+    bind_physical_with_cache(plan, db, ctx, &mut cohorts)
 }
 
 /// Bind a `PhysicalPlan` while threading a [`CohortCache`] through every
@@ -788,14 +795,15 @@ pub fn bind_physical(plan: &PhysicalPlan, db: &mut Database) -> Result<Box<dyn P
 fn bind_physical_with_cache(
     plan: &PhysicalPlan,
     db: &mut Database,
+    ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
     match plan {
         // ── Data-plane operators ─────────────────────────────────
-        PhysicalPlan::Scan(scan) => bind_scan(scan, db),
+        PhysicalPlan::Scan(scan) => bind_scan(scan, db, ctx),
 
         PhysicalPlan::Filter(filter) => {
-            let child = bind_physical_with_cache(&filter.input, db, cohorts)?;
+            let child = bind_physical_with_cache(&filter.input, db, ctx, cohorts)?;
             Ok(Box::new(FilterOperator::new(
                 child,
                 filter.predicate.clone(),
@@ -804,7 +812,7 @@ fn bind_physical_with_cache(
         }
 
         PhysicalPlan::Project(project) => {
-            let child = bind_physical_with_cache(&project.input, db, cohorts)?;
+            let child = bind_physical_with_cache(&project.input, db, ctx, cohorts)?;
             Ok(Box::new(ProjectOperator::from_physical_items(
                 child,
                 project.expressions.clone(),
@@ -813,32 +821,32 @@ fn bind_physical_with_cache(
         }
 
         PhysicalPlan::Limit(limit) => {
-            let child = bind_physical_with_cache(&limit.input, db, cohorts)?;
+            let child = bind_physical_with_cache(&limit.input, db, ctx, cohorts)?;
             Ok(Box::new(LimitOperator::new(child, limit.count)))
         }
 
         // ── Wave 3 operators (TASK-323) ───────────────────────────
         PhysicalPlan::Sort(sort) => {
-            let child = bind_physical_with_cache(&sort.input, db, cohorts)?;
+            let child = bind_physical_with_cache(&sort.input, db, ctx, cohorts)?;
             Ok(Box::new(SortOperator::new(
                 child,
                 sort.keys.clone(),
                 sort.max_rows,
-                CancellationToken::new(),
+                ctx.cancellation().clone(),
             )))
         }
 
         PhysicalPlan::Distinct(distinct) => {
-            let child = bind_physical_with_cache(&distinct.input, db, cohorts)?;
+            let child = bind_physical_with_cache(&distinct.input, db, ctx, cohorts)?;
             Ok(Box::new(DistinctOperator::new(
                 child,
                 distinct.max_groups,
-                CancellationToken::new(),
+                ctx.cancellation().clone(),
             )))
         }
 
         PhysicalPlan::Aggregate(agg) => {
-            let child = bind_physical_with_cache(&agg.input, db, cohorts)?;
+            let child = bind_physical_with_cache(&agg.input, db, ctx, cohorts)?;
             Ok(Box::new(HashAggregateOperator::new(
                 child,
                 agg.aggregates.clone(),
@@ -849,12 +857,12 @@ fn bind_physical_with_cache(
         }
 
         PhysicalPlan::SequenceMatch(seq) => {
-            let child = bind_physical_with_cache(&seq.input, db, cohorts)?;
+            let child = bind_physical_with_cache(&seq.input, db, ctx, cohorts)?;
             Ok(Box::new(SequenceMatchAdapter::new(seq, child)?))
         }
 
         // ── Wave 4 cohort runtime (TASK-437) ──────────────────────
-        PhysicalPlan::SubqueryFilter(sqf) => bind_subquery_filter(sqf, db, cohorts),
+        PhysicalPlan::SubqueryFilter(sqf) => bind_subquery_filter(sqf, db, ctx, cohorts),
 
         // ── DDL ──────────────────────────────────────────────────
         PhysicalPlan::CreateTable(ct) => {
@@ -898,16 +906,16 @@ fn bind_physical_with_cache(
         }
 
         // ── Wave 4 EntityOperator-based operators (TASK-438) ─────
-        PhysicalPlan::Sessionize(sess) => bind_sessionize(sess, db, cohorts),
+        PhysicalPlan::Sessionize(sess) => bind_sessionize(sess, db, ctx, cohorts),
 
-        PhysicalPlan::EventSelect(es) => bind_event_select(es, db, cohorts),
+        PhysicalPlan::EventSelect(es) => bind_event_select(es, db, ctx, cohorts),
 
-        PhysicalPlan::Attribute(attr) => bind_attribute(attr, db, cohorts),
+        PhysicalPlan::Attribute(attr) => bind_attribute(attr, db, ctx, cohorts),
 
         // ── Wave 4 Sample + MergeSources (TASK-438 CP2) ──────────
-        PhysicalPlan::Sample(s) => bind_sample(s, db, cohorts),
+        PhysicalPlan::Sample(s) => bind_sample(s, db, ctx, cohorts),
 
-        PhysicalPlan::MergeSources(merge) => bind_merge_sources(merge, db),
+        PhysicalPlan::MergeSources(merge) => bind_merge_sources(merge, db, ctx),
 
         // DELETE is intentionally not bound through this path —
         // `Engine::query` dispatches it to `crate::delete` directly so
@@ -973,6 +981,7 @@ impl CohortCache {
 fn bind_subquery_filter(
     sqf: &SubqueryFilterPhysical,
     db: &mut Database,
+    ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
     let cohort = match cohorts.get(&sqf.subquery) {
@@ -982,7 +991,7 @@ fn bind_subquery_filter(
             // contain SubqueryFilter — those recursive cohort lookups
             // share the same cache, so nested cohorts also materialize
             // once per top-level execution).
-            let mut op = bind_physical_with_cache(&sqf.subquery, db, cohorts)?;
+            let mut op = bind_physical_with_cache(&sqf.subquery, db, ctx, cohorts)?;
             let drive_result = drive_cohort_subquery(op.as_mut());
             // Match `Engine::query`'s "primary error wins" cleanup
             // convention: close the inner operator on both happy and
@@ -999,7 +1008,7 @@ fn bind_subquery_filter(
         }
     };
 
-    let child = bind_physical_with_cache(&sqf.input, db, cohorts)?;
+    let child = bind_physical_with_cache(&sqf.input, db, ctx, cohorts)?;
     Ok(Box::new(SubqueryFilterOperator::new(
         child,
         sqf.lhs_columns.clone(),
@@ -1019,7 +1028,11 @@ fn drive_cohort_subquery(op: &mut dyn PhysicalOperator) -> Result<Vec<RecordBatc
     Ok(batches)
 }
 
-fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOperator>> {
+fn bind_scan(
+    scan: &ScanPhysical,
+    db: &Database,
+    ctx: &QueryContext,
+) -> Result<Box<dyn PhysicalOperator>> {
     let reader_range = scan.reader_range.unwrap_or_else(TimeRange::unbounded);
 
     // `Database::segment_reader_for_time_range` returns a manifest-backed
@@ -1062,7 +1075,7 @@ fn bind_scan(scan: &ScanPhysical, db: &Database) -> Result<Box<dyn PhysicalOpera
         reader.clone(),
         &scan.projected_columns,
         scan_predicates,
-        CancellationToken::new(),
+        ctx.cancellation().clone(),
         tombstones,
     )?;
 
@@ -1228,9 +1241,10 @@ fn resolve_entity_key_col(
 fn bind_sessionize(
     sess: &SessionizePhysical,
     db: &mut Database,
+    ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let child = bind_physical_with_cache(&sess.input, db, cohorts)?;
+    let child = bind_physical_with_cache(&sess.input, db, ctx, cohorts)?;
     let ek_col_name = entity_key_col_name(&sess.input);
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "SessionizeAdapter")?;
@@ -1256,9 +1270,10 @@ fn bind_sessionize(
 fn bind_event_select(
     es: &EventSelectPhysical,
     db: &mut Database,
+    ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let child = bind_physical_with_cache(&es.input, db, cohorts)?;
+    let child = bind_physical_with_cache(&es.input, db, ctx, cohorts)?;
     let ek_col_name = entity_key_col_name(&es.input);
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "EventSelectAdapter")?;
@@ -1281,9 +1296,10 @@ fn bind_event_select(
 fn bind_attribute(
     attr: &AttributePhysical,
     db: &mut Database,
+    ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let child = bind_physical_with_cache(&attr.input, db, cohorts)?;
+    let child = bind_physical_with_cache(&attr.input, db, ctx, cohorts)?;
     let ek_col_name = entity_key_col_name(&attr.input);
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "AttributeAdapter")?;
@@ -1311,9 +1327,10 @@ fn bind_attribute(
 fn bind_sample(
     sample: &SamplePhysical,
     db: &mut Database,
+    ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let child = bind_physical_with_cache(&sample.input, db, cohorts)?;
+    let child = bind_physical_with_cache(&sample.input, db, ctx, cohorts)?;
     let ek_col_name = entity_key_col_name(&sample.input);
 
     // Resolve the entity-key column index and type in a single schema walk.
@@ -1348,11 +1365,12 @@ fn bind_sample(
 fn bind_merge_sources(
     merge: &MergeSourcesPhysical,
     db: &mut Database,
+    ctx: &QueryContext,
 ) -> Result<Box<dyn PhysicalOperator>> {
     let sub_ops: Vec<Box<dyn PhysicalOperator>> = merge
         .tables
         .iter()
-        .map(|scan| bind_scan(scan, db))
+        .map(|scan| bind_scan(scan, db, ctx))
         .collect::<Result<Vec<_>>>()?;
 
     let sub_entity_key_cols: Vec<String> = merge
@@ -1373,7 +1391,7 @@ fn bind_merge_sources(
         sub_ts_cols,
         merge.output_schema.clone(),
         merge.table_id_map.clone(),
-        CancellationToken::new(),
+        ctx.cancellation().clone(),
     )?))
 }
 
@@ -1451,7 +1469,8 @@ mod tests {
         let mut db = create_db_with_bootstrap(scratch.path());
         let descriptor = bootstrap_scan_descriptor();
 
-        let mut op = bind_physical(&descriptor, &mut db).expect("bind must succeed");
+        let mut op = bind_physical(&descriptor, &mut db, &QueryContext::unbounded())
+            .expect("bind must succeed");
 
         // Full PhysicalOperator lifecycle — the smoke test (TASK-123)
         // will drive this exact path through `Engine::query`.
@@ -1481,7 +1500,8 @@ mod tests {
         let mut db = create_db_with_bootstrap(scratch.path());
         let descriptor = bootstrap_scan_descriptor();
 
-        let op = bind_physical(&descriptor, &mut db).expect("bind must succeed");
+        let op = bind_physical(&descriptor, &mut db, &QueryContext::unbounded())
+            .expect("bind must succeed");
 
         let op_names: Vec<&str> = op
             .output_schema()
@@ -1519,7 +1539,7 @@ mod tests {
             sample: None,
         });
 
-        match bind_physical(&descriptor, &mut db) {
+        match bind_physical(&descriptor, &mut db, &QueryContext::unbounded()) {
             Err(bqlite_core::BqliteError::Plan(msg)) => {
                 assert!(msg.contains("ghost"), "error should name the table: {msg}");
             }
@@ -1551,7 +1571,8 @@ mod tests {
             plan(stmt, &catalog, 0).expect("plan events")
         };
 
-        let mut op = bind_physical(&physical, &mut db).expect("bind succeeds");
+        let mut op =
+            bind_physical(&physical, &mut db, &QueryContext::unbounded()).expect("bind succeeds");
         op.open().unwrap();
         assert!(op.next_batch().unwrap().is_none());
         op.close().unwrap();
@@ -2351,7 +2372,8 @@ mod tests {
             output_schema: merged_schema,
         });
 
-        let mut op = bind_physical(&merge_plan, &mut db).expect("bind_merge_sources must succeed");
+        let mut op = bind_physical(&merge_plan, &mut db, &QueryContext::unbounded())
+            .expect("bind_merge_sources must succeed");
         op.open().expect("open must succeed");
         // Both tables are empty — the merge operator must return None immediately.
         assert!(
