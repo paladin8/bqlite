@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-508",
+  "claimed_at": "2026-04-28T06:02:19Z",
+  "branch": "task/TASK-508",
+  "description": "System-column materialization in scan and joined-source output"
+}
