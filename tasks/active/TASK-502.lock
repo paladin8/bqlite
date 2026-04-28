@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-502",
+  "claimed_at": "2026-04-28T06:03:56Z",
+  "branch": "task/TASK-502",
+  "description": "Spill-to-disk protocol"
+}
