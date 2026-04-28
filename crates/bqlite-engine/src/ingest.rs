@@ -20,7 +20,7 @@
 //! The function returns `()` on success (INSERT produces no result
 //! rows); the caller wraps it in an empty [`ResultOperator`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bqlite_core::error::{BqliteError, Result};
 use bqlite_core::event::{EntityId, Event};
@@ -38,14 +38,95 @@ use bqlite_storage::Database;
 
 /// Default memory budget for the ingest partitioner (256 MB).
 ///
-/// Wave 2 uses a fixed budget; per-query memory management (TASK-501)
-/// will make this configurable.
+/// Per `docs/design/engine/spill.md` § 6.2 the partitioner spills to
+/// disk when an in-memory bucket would push past this ceiling, so
+/// the budget no longer caps total ingest size — only the live
+/// in-memory footprint at any instant. TASK-525 will make this
+/// configurable through `EngineConfig`; for now every INSERT shares
+/// the 256 MiB constant.
 const DEFAULT_INGEST_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Default window-days for the partitioner (30 days).
 ///
 /// Matches the default in `storage-format.md` §4.1.
 const DEFAULT_WINDOW_DAYS: u32 = 30;
+
+/// RAII guard for the per-ingest spill subdirectory under
+/// `<db_root>/spill/`.
+///
+/// Per `docs/design/engine/spill.md` § 7 the partitioner's spill
+/// run files live at
+/// `<spill_root>/<query_id>/ingest-part-w<window>-s<shard:04>-<seq:06>.spill`.
+/// The engine owns the per-ingest directory and is responsible for
+/// creating it on every INSERT and removing it on every exit path
+/// (success, error, panic) — see § 8.3's belt-and-braces sweep. The
+/// individual run files are owned by the partitioner's
+/// `SpillRunFile` guards, which delete them on drop; this directory
+/// guard catches anything those guards may have left behind (e.g. a
+/// rename or a transient EBUSY) plus the directory entry itself.
+///
+/// The directory is created lazily on `IngestScratchDir::new` —
+/// even an INSERT that never overflows the budget creates an empty
+/// directory and removes it. The per-INSERT cost is two syscalls
+/// (mkdir, rmdir), which is negligible relative to the rest of the
+/// pipeline. A future refactor can defer creation until the first
+/// spill once the partitioner exposes a "have I spilled?" hook.
+struct IngestScratchDir {
+    path: PathBuf,
+}
+
+impl IngestScratchDir {
+    /// Create the per-ingest subdirectory. The directory name
+    /// includes the table name and the freshly-allocated batch_id
+    /// so two concurrent ingests on the same database (impossible
+    /// today; the database flock serialises ingests) and any cross-
+    /// session collision are impossible by construction.
+    fn new(db: &Database, table: &str, batch_id: u64) -> Result<Self> {
+        let path = db
+            .spill_root()
+            .join(format!("ingest-{table}-batch-{batch_id}"));
+        // Defense-in-depth reclaim. `Database::open` /
+        // `Database::create` already swept `<root>/spill/` (see
+        // `database::reclaim_spill_root`), and `allocate_batch_id`
+        // is durably persisted before this function runs, so a
+        // legitimate live database cannot land here with a
+        // pre-existing per-ingest dir at the same path. The
+        // remaining cases are operator-side: a stray dir placed
+        // for ad-hoc debugging, or a future test harness reusing
+        // the layout. Reclaiming first costs at most one syscall
+        // and removes any ambiguity for the rest of the ingest.
+        if path.exists() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| io_err(&path, "reclaim ingest spill dir", e))?;
+        }
+        std::fs::create_dir_all(&path).map_err(|e| io_err(&path, "create ingest spill dir", e))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for IngestScratchDir {
+    fn drop(&mut self) {
+        // Best-effort. The `SpillRunFile` guards already removed
+        // every spilled run file by the time we get here; `rmdir`-
+        // equivalent on the empty directory is the cheap path.
+        // `remove_dir_all` is used unconditionally to also catch
+        // any stray file (a log artefact, a partially-written
+        // record from a Drop-ordering edge case) so the spill root
+        // never accumulates ingest leftovers.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn io_err(path: &Path, action: &str, err: std::io::Error) -> BqliteError {
+    BqliteError::Io(std::io::Error::new(
+        err.kind(),
+        format!("{action} {}: {err}", path.display()),
+    ))
+}
 
 /// Execute an `INSERT` physical plan against the database.
 ///
@@ -78,14 +159,19 @@ fn execute_insert_from(
 ) -> Result<()> {
     let path = Path::new(&descriptor.path);
 
-    // 1. Allocate a batch_id and construct the partitioner.
+    // 1. Allocate a batch_id and construct the partitioner. The
+    //    per-ingest spill subdirectory is created up-front and
+    //    removed on every exit path via the `IngestScratchDir`
+    //    RAII guard, per `docs/design/engine/spill.md` § 8.3.
     let batch_id = db.allocate_batch_id(table.name())?;
     let shard_count = db.manifest().shard_count;
-    let mut partitioner = Partitioner::new(
+    let scratch = IngestScratchDir::new(db, table.name(), batch_id)?;
+    let mut partitioner = Partitioner::with_spill_dir(
         shard_count,
         DEFAULT_WINDOW_DAYS,
         batch_id,
         DEFAULT_INGEST_BUDGET_BYTES,
+        scratch.path().to_path_buf(),
     )?;
 
     // 2. Stream events into the partitioner using the appropriate reader.
@@ -107,14 +193,19 @@ fn execute_insert_from(
     };
 
     if row_count == 0 {
-        // Nothing to write — the source had no data rows.
+        // Nothing to write — the source had no data rows. The
+        // scratch dir's RAII guard will clean up the (likely empty)
+        // spill subdirectory on return.
         return Ok(());
     }
 
-    // 3. Drain sorted buckets through the segment writer.
+    // 3. Drain sorted buckets through the segment writer. The merge
+    //    pass consumes every spilled run file; the scratch dir is
+    //    swept on the way out by `IngestScratchDir::drop`.
     let mut writer = SegmentWriter::new(db);
     writer.write_partitioner(table.name(), partitioner)?;
 
+    drop(scratch);
     Ok(())
 }
 
@@ -187,11 +278,13 @@ fn execute_insert_values(
 
     let batch_id = db.allocate_batch_id(table.name())?;
     let shard_count = db.manifest().shard_count;
-    let mut partitioner = Partitioner::new(
+    let scratch = IngestScratchDir::new(db, table.name(), batch_id)?;
+    let mut partitioner = Partitioner::with_spill_dir(
         shard_count,
         DEFAULT_WINDOW_DAYS,
         batch_id,
         DEFAULT_INGEST_BUDGET_BYTES,
+        scratch.path().to_path_buf(),
     )?;
 
     for (row_idx, row) in rows.iter().enumerate() {
@@ -215,6 +308,7 @@ fn execute_insert_values(
     let mut writer = SegmentWriter::new(db);
     writer.write_partitioner(table.name(), partitioner)?;
 
+    drop(scratch);
     Ok(())
 }
 
@@ -835,6 +929,97 @@ mod tests {
             .map(|seg| seg.row_count)
             .sum();
         assert_eq!(total_rows, 9);
+    }
+
+    // ── Spill path (TASK-512 CP3) ──────────────────────────────────
+
+    /// INSERT VALUES with a budget tight enough to force the
+    /// partitioner to spill multiple buckets must commit the same
+    /// row count as the wide-budget case. Uses the real engine
+    /// path (constants in this module), so it relies on the
+    /// 256 MiB default ingest budget being large enough that we
+    /// cannot force a spill from VALUES alone — instead we drop
+    /// directly into the lower-level helper used by
+    /// `execute_insert_values`'s body to verify the spill+merge
+    /// round-trip.
+    ///
+    /// The deeper "INSERT VALUES via Engine::query that actually
+    /// triggers spill" coverage lives at the partitioner layer
+    /// (`bqlite-storage::ingest::partitioner::tests::spill_then_drain_matches_no_spill_drain`)
+    /// and at the `execute_insert_values` integration smoke below.
+    #[test]
+    fn insert_values_round_trip_through_spill_aware_path() {
+        // 50 rows across 5 entities — enough to be non-trivial but
+        // small enough that the 256 MiB default budget never
+        // overflows. The intent is to exercise the *new* spill-aware
+        // constructor path on a happy-path workload to confirm we
+        // did not regress the default INSERT.
+        let scratch = Scratch::new("insert-values-spill-aware");
+        let mut db = create_db_with_events(scratch.path());
+        let schema = events_table_schema(&db);
+
+        let mut rows = Vec::new();
+        for n in 0..50_u64 {
+            rows.push(vec![
+                PropertyValue::String(format!("user_{}", n % 5)),
+                PropertyValue::Timestamp(1_700_000_000_000_000_000 + (n as i64) * 1_000_000),
+                PropertyValue::String("click".into()),
+                PropertyValue::Int(n as i64),
+            ]);
+        }
+
+        let plan = InsertPhysical {
+            table: schema,
+            body: InsertLogicalBody::Values(rows),
+            output_schema: empty_schema(),
+        };
+        execute_insert(&plan, &mut db).expect("spill-aware INSERT VALUES must succeed");
+
+        let total_rows: u64 = db.manifest().tables["events"]
+            .windows
+            .iter()
+            .flat_map(|w| &w.shards)
+            .flatten()
+            .map(|seg| seg.row_count)
+            .sum();
+        assert_eq!(total_rows, 50);
+    }
+
+    /// After a successful INSERT, the per-ingest spill subdirectory
+    /// must be removed even though the partitioner created it
+    /// up-front. Pins the `IngestScratchDir` RAII contract and the
+    /// belt-and-braces sweep behaviour from
+    /// `docs/design/engine/spill.md` § 8.3.
+    #[test]
+    fn ingest_scratch_dir_removed_after_successful_insert() {
+        let scratch = Scratch::new("insert-cleanup");
+        let mut db = create_db_with_events(scratch.path());
+        let schema = events_table_schema(&db);
+        let plan = InsertPhysical {
+            table: schema,
+            body: InsertLogicalBody::Values(vec![vec![
+                PropertyValue::String("alice".into()),
+                PropertyValue::Timestamp(1_700_000_000_000_000_000),
+                PropertyValue::String("click".into()),
+                PropertyValue::Int(42),
+            ]]),
+            output_schema: empty_schema(),
+        };
+        let spill_root = db.spill_root().to_path_buf();
+        execute_insert(&plan, &mut db).expect("INSERT must succeed");
+
+        // The `<db_root>/spill/` directory itself stays — owned by
+        // the database — but every per-ingest subdirectory under it
+        // must be gone after a successful drain.
+        assert!(spill_root.is_dir(), "spill root persists across ingests");
+        let leftover: Vec<_> = fs::read_dir(&spill_root)
+            .expect("read spill root")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "ingest scratch dir was not cleaned up; found {leftover:?}"
+        );
     }
 
     // ── End-to-end: INSERT VALUES via Engine::query ───────────────

@@ -524,7 +524,14 @@ Where:
   counter rendered as a zero-padded decimal (e.g. `000000042`);
   TASK-513 starts here, TASK-541 swaps to UUIDv7. The directory
   name is opaque to the spill protocol; it is just a unique
-  per-query container.
+  per-query container. **Ingest path:** the partitioner uses
+  `ingest-<table>-batch-<batch_id>` instead of a counter — the
+  database's `allocate_batch_id` already mints a globally-unique
+  per-table monotone integer, so re-using it as the directory
+  name keeps the layout self-documenting (a directory name names
+  exactly the ingest call it belongs to). The format will roll
+  into the TASK-541 UUIDv7 surface at the same time the query
+  side does.
 - `<purpose>` — short ASCII tag identifying the spill source:
   - `sort-run` — `SortOperator` runs.
   - `ingest-part-w<window>-s<shard>` — partitioner buckets,
