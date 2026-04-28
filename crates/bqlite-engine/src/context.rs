@@ -259,16 +259,22 @@ mod tests {
 
     #[test]
     fn tracked_context_overflow_surfaces_typed_error() {
+        // Overshoot must surface as the structured variant landed by
+        // TASK-511. The helper folds the requested-bytes count into
+        // `used` (per `BqliteError::MemoryBudgetExceeded` shape — see
+        // `docs/design/engine/cancellation.md` §4.3), so the test
+        // observes `used == requested + live_used == 2048 + 0`.
         let ctx = QueryContext::new(1_024);
         let err = ctx
             .memory()
             .try_reserve(2 * 1024)
             .expect_err("must overshoot");
         match err {
-            BqliteError::Execution(msg) => {
-                assert!(msg.contains("memory budget exceeded"));
+            BqliteError::MemoryBudgetExceeded { used, budget } => {
+                assert_eq!(budget, 1_024);
+                assert_eq!(used, 2 * 1024);
             }
-            other => panic!("expected Execution error, got {other:?}"),
+            other => panic!("expected MemoryBudgetExceeded, got {other:?}"),
         }
     }
 
