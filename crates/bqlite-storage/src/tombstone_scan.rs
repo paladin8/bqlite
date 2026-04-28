@@ -24,7 +24,10 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 
+use std::sync::Arc;
+
 use bqlite_core::error::Result;
+use bqlite_core::metrics::Metrics;
 use bqlite_core::{SegmentScan, ZoneMap};
 
 use crate::tombstone::{EntityDeleteIndex, TombstoneFile, TombstoneFilter};
@@ -85,6 +88,10 @@ impl SegmentScan for TombstoneScanWrapper {
                 Ok(Some(filtered))
             }
         }
+    }
+
+    fn attach_metrics(&mut self, metrics: Arc<dyn Metrics>) {
+        self.inner.attach_metrics(metrics);
     }
 }
 
@@ -235,6 +242,10 @@ impl SegmentScan for CompactionTombstoneScan {
             ))
         })?;
         Ok(Some(filtered))
+    }
+
+    fn attach_metrics(&mut self, metrics: Arc<dyn Metrics>) {
+        self.inner.attach_metrics(metrics);
     }
 }
 

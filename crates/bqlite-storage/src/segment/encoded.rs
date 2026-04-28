@@ -34,6 +34,7 @@ use std::sync::Arc;
 use ::arrow::array::ArrayRef;
 
 use bqlite_core::encoded::{ArcBytes, EncodedBatch, EncodedColumn, EncodedKind, PinnedChunk};
+use bqlite_core::metrics::Metrics;
 use bqlite_core::scalar::ScalarValue;
 use bqlite_core::{BqlType, BqliteError, ColumnDef, Result};
 
@@ -68,6 +69,7 @@ pub struct PinnedColumn {
 /// PlainString / Rle) or a `Materialized` fallback. Callers that
 /// always need a dense array should run the result through
 /// [`crate::segment::materialize::materialize_encoded_column`].
+#[allow(clippy::too_many_arguments)]
 pub fn pin_column_chunk(
     bytes: &[u8],
     meta: &ColumnChunkMeta,
@@ -75,6 +77,7 @@ pub fn pin_column_chunk(
     row_group_row_count: usize,
     segment_dict_bytes: Option<&[ArcBytes]>,
     format_version: u16,
+    metrics: &dyn Metrics,
     materialize_fallback: impl FnOnce() -> Result<ArrayRef>,
 ) -> Result<EncodedColumn> {
     let chunk_start = meta.byte_offset as usize;
@@ -189,6 +192,27 @@ pub fn pin_column_chunk(
         ),
     };
 
+    // 6.5. Per-chunk copy-budget metrics for the encoded fast paths.
+    //
+    // Only the branches below that build `EncodedColumn::Encoded` call
+    // `record_pinned_metrics`. Branches that fall back to
+    // `materialize_fallback()` (which calls `decode_column_chunk`) skip
+    // the call so the bytes are not double-counted — the fallback
+    // closure records the same counters itself, plus
+    // `bytes_materialized_before_filter` for the materialized array
+    // it produces.
+    let chunk_bytes_len = chunk_bytes.len() as u64;
+    let decompressed_bytes: u64 = match compression {
+        CompressionType::None => 0,
+        CompressionType::Lz4 => uncompressed_payload_length as u64,
+    };
+    let record_pinned_metrics = |m: &dyn Metrics| {
+        m.record_bytes_scanned(chunk_bytes_len);
+        if decompressed_bytes > 0 {
+            m.record_bytes_decompressed(decompressed_bytes);
+        }
+    };
+
     // 7. Branch on encoding: build an Encoded view where supported,
     //    else fall through to the materialized fallback.
     //
@@ -207,6 +231,7 @@ pub fn pin_column_chunk(
             let scalar = parse_constant_literal(on_disk_params, &write_time_col.bql_type)?;
             let payload_arc: ArcBytes = Arc::from(uncompressed_payload.as_ref());
             let params_arc: ArcBytes = Arc::from(on_disk_params);
+            record_pinned_metrics(metrics);
             Ok(EncodedColumn::Encoded {
                 chunk: PinnedChunk {
                     payload: payload_arc,
@@ -231,13 +256,15 @@ pub fn pin_column_chunk(
                 BqlType::List(_) | BqlType::Map(_) => {
                     // Nested types stay on the materialized fallback
                     // until the plain-encoding path for them is
-                    // revisited.
+                    // revisited. The fallback closure records its own
+                    // metrics; do not call `record_pinned_metrics`.
                     return Ok(EncodedColumn::Materialized {
                         array: materialize_fallback()?,
                         rows,
                     });
                 }
             };
+            record_pinned_metrics(metrics);
             Ok(EncodedColumn::Encoded {
                 chunk: PinnedChunk {
                     payload: payload_arc,
@@ -251,6 +278,7 @@ pub fn pin_column_chunk(
         EncodingType::Rle => {
             let payload_arc: ArcBytes = Arc::from(uncompressed_payload.as_ref());
             let params_arc: ArcBytes = Arc::from(on_disk_params);
+            record_pinned_metrics(metrics);
             Ok(EncodedColumn::Encoded {
                 chunk: PinnedChunk {
                     payload: payload_arc,
@@ -294,6 +322,7 @@ pub fn pin_column_chunk(
             let values = dict_bytes[dict_id].clone();
             let payload_arc: ArcBytes = Arc::from(uncompressed_payload.as_ref());
             let params_arc: ArcBytes = Arc::from(on_disk_params);
+            record_pinned_metrics(metrics);
             Ok(EncodedColumn::Encoded {
                 chunk: PinnedChunk {
                     payload: payload_arc,

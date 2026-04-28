@@ -58,6 +58,7 @@ use ::arrow::array::{
 use ::arrow::buffer::{BooleanBuffer, NullBuffer};
 use ::arrow::datatypes::{Field, Schema as ArrowSchema};
 use bqlite_core::arrow::bql_type_to_arrow;
+use bqlite_core::metrics::{Metrics, NoopMetrics};
 use bqlite_core::storage::{ColumnProjection, Predicate, SegmentScan, ZoneMap};
 use bqlite_core::{BqlType, BqliteError, ColumnDef, Result, TableSchema};
 
@@ -335,6 +336,7 @@ impl SegmentFileReader {
             dict_bytes: self.dict_bytes.clone(),
             plan,
             predicate,
+            metrics: Arc::new(NoopMetrics::new()),
             next_idx: 0,
             exhausted: false,
         })
@@ -383,6 +385,10 @@ pub struct SegmentFileScan {
     predicate: Option<Arc<dyn Predicate>>,
     next_idx: usize,
     exhausted: bool,
+    /// Copy-budget metrics handle. Defaults to
+    /// [`NoopMetrics`] so callers that do not opt in pay nothing.
+    /// Replaced by [`SegmentScan::attach_metrics`].
+    metrics: Arc<dyn Metrics>,
 }
 
 /// Pre-resolved projection: for every output column, how to
@@ -659,6 +665,10 @@ impl SegmentScan for SegmentFileScan {
             return self.decode_encoded_row_group(idx).map(Some);
         }
     }
+
+    fn attach_metrics(&mut self, metrics: Arc<dyn Metrics>) {
+        self.metrics = metrics;
+    }
 }
 
 impl SegmentFileScan {
@@ -684,6 +694,7 @@ impl SegmentFileScan {
                         &self.dictionaries,
                         self.footer.fsst_symbol_tables(),
                         self.footer.format_version(),
+                        &*self.metrics,
                     )?
                 }
                 PlannedColumnSource::BackfillAllNull => {
@@ -726,6 +737,7 @@ impl SegmentFileScan {
                     let format_version = self.footer.format_version();
                     let fsst_tables: Vec<crate::segment::layout::FsstSymbolTableRef> =
                         self.footer.fsst_symbol_tables().to_vec();
+                    let metrics_for_fallback = self.metrics.clone();
                     crate::segment::encoded::pin_column_chunk(
                         &self.bytes,
                         meta,
@@ -733,6 +745,7 @@ impl SegmentFileScan {
                         row_count,
                         Some(&self.dict_bytes),
                         format_version,
+                        &*self.metrics,
                         move || {
                             decode_column_chunk(
                                 &bytes,
@@ -742,6 +755,7 @@ impl SegmentFileScan {
                                 &dictionaries,
                                 &fsst_tables,
                                 format_version,
+                                &*metrics_for_fallback,
                             )
                         },
                     )?
@@ -769,6 +783,14 @@ impl SegmentFileScan {
 /// (optionally) LZ4-decompress the payload, decode the dense values
 /// either via the [`Encoding`] trait or the loaded segment-level
 /// dictionary, and splice the null bitmap back into the dense result.
+///
+/// Records `bytes_scanned`, `bytes_decompressed`, and
+/// `bytes_materialized_before_filter` on `metrics`. Producing a dense
+/// Arrow array here is "before filter" by definition: the materialized
+/// scan path hands a `RecordBatch` to the predicate filter, and the
+/// encoded path's `EncodedColumn::Materialized` fallback that calls
+/// this function does the same once the filter operator runs.
+#[allow(clippy::too_many_arguments)]
 fn decode_column_chunk(
     bytes: &[u8],
     meta: &ColumnChunkMeta,
@@ -777,6 +799,7 @@ fn decode_column_chunk(
     dictionaries: &[DictionaryValues],
     fsst_symbol_tables: &[crate::segment::layout::FsstSymbolTableRef],
     format_version: u16,
+    metrics: &dyn Metrics,
 ) -> Result<ArrayRef> {
     let chunk_start = meta.byte_offset as usize;
     let chunk_end = chunk_start + meta.byte_length as usize;
@@ -789,6 +812,7 @@ fn decode_column_chunk(
         )));
     }
     let chunk_bytes = &bytes[chunk_start..chunk_end];
+    metrics.record_bytes_scanned(chunk_bytes.len() as u64);
     let mut cursor = 0usize;
 
     // 1. Null bitmap (if the column is nullable).
@@ -880,14 +904,17 @@ fn decode_column_chunk(
             }
             Cow::Borrowed(on_disk_payload)
         }
-        CompressionType::Lz4 => Cow::Owned(
-            decompress_lz4(on_disk_payload, uncompressed_payload_length).map_err(|e| {
-                BqliteError::Corruption(format!(
-                    "segment reader: column chunk for `{}`: lz4 decompress failed: {e}",
-                    write_time_col.name
-                ))
-            })?,
-        ),
+        CompressionType::Lz4 => {
+            let buf =
+                decompress_lz4(on_disk_payload, uncompressed_payload_length).map_err(|e| {
+                    BqliteError::Corruption(format!(
+                        "segment reader: column chunk for `{}`: lz4 decompress failed: {e}",
+                        write_time_col.name
+                    ))
+                })?;
+            metrics.record_bytes_decompressed(buf.len() as u64);
+            Cow::Owned(buf)
+        }
     };
 
     // 7. Decode the dense non-null values. Every encoding except
@@ -1000,13 +1027,13 @@ fn decode_column_chunk(
     };
 
     // 9. Splice nulls back in (if the column is nullable).
-    if let Some(range) = null_bitmap_range {
+    let result = if let Some(range) = null_bitmap_range {
         splice_nulls(
             &dense_array,
             &chunk_bytes[range],
             row_group_row_count,
             &write_time_col.bql_type,
-        )
+        )?
     } else {
         // Non-nullable column: the dense array must already have the
         // correct length.
@@ -1018,8 +1045,10 @@ fn decode_column_chunk(
                 row_group_row_count
             )));
         }
-        Ok(dense_array)
-    }
+        dense_array
+    };
+    metrics.record_bytes_materialized_before_filter(result.get_array_memory_size() as u64);
+    Ok(result)
 }
 
 /// Length in bytes of the on-disk encoding params block, computed
@@ -3190,6 +3219,277 @@ mod tests {
         // Second pull returns None; further pulls stay None.
         assert!(scan.next_row_group().unwrap().is_none());
         assert!(scan.next_row_group().unwrap().is_none());
+    }
+
+    #[test]
+    fn copy_budget_metrics_recorded_on_materialized_path() {
+        // Roundtrip a 4-row segment with one Plain Int column (and three
+        // Plain stub columns), attach an `AtomicMetrics`, and verify the
+        // §3 copy-budget counters fire on `next_row_group`.
+        let schema = roundtrip_schema();
+        let entity_values = ["u1", "u1", "u2", "u2"];
+        let ts_values: Vec<i64> = vec![
+            1_700_000_000_000_000_000,
+            1_700_000_000_100_000_000,
+            1_700_000_000_200_000_000,
+            1_700_000_000_300_000_000,
+        ];
+        let event_values = ["view", "checkout", "view", "click"];
+        let amount_values: Vec<i64> = vec![10, 20, 30, 40];
+        let entity_chunk = encode_plain_string(&entity_values);
+        let ts_chunk = encode_plain_timestamp(&ts_values);
+        let event_chunk = encode_plain_string(&event_values);
+        let amount_chunk = encode_plain_int(&amount_values);
+        let amount_bitmap = build_null_bitmap(&[true, true, true, true]);
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 4,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: entity_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u2".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: ts_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(ts_values[0])),
+                        zone_max: Some(PropertyValue::Timestamp(*ts_values.last().unwrap())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: event_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("checkout".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(amount_bitmap),
+                        encoded: amount_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(10)),
+                        zone_max: Some(PropertyValue::Int(40)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 1_700_000_000_000_000_000,
+            seq_id_range: (0, 3),
+            batch_id: 1,
+            compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
+        };
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let metrics: Arc<dyn Metrics> = Arc::new(bqlite_core::metrics::AtomicMetrics::new());
+        scan.attach_metrics(metrics.clone());
+        let _batch = scan.next_row_group().unwrap().expect("one row group");
+
+        let snap = metrics.snapshot();
+        // 4 columns × 4 rows = 4 chunks scanned. Every chunk's framed
+        // bytes count toward `bytes_scanned`.
+        assert!(
+            snap.bytes_scanned > 0,
+            "bytes_scanned should be non-zero for a non-empty scan, got {}",
+            snap.bytes_scanned
+        );
+        // Compression is `None`, so no LZ4 decompression happened.
+        assert_eq!(
+            snap.bytes_decompressed, 0,
+            "bytes_decompressed must be zero when no chunks are LZ4-compressed",
+        );
+        // Materialized path: every column produces a dense Arrow array
+        // before the (post-)filter runs, so this counter must be > 0.
+        assert!(
+            snap.bytes_materialized_before_filter > 0,
+            "bytes_materialized_before_filter should be non-zero on the materialized scan path",
+        );
+    }
+
+    #[test]
+    fn copy_budget_metrics_records_decompressed_on_lz4() {
+        // Same fixture but the amount column is LZ4-compressed.
+        let schema = roundtrip_schema();
+        let entity_values = ["u1", "u2"];
+        let ts_values: Vec<i64> = vec![1_700_000_000_000_000_000, 1_700_000_000_100_000_000];
+        let event_values = ["view", "view"];
+        let amount_values: Vec<i64> = vec![10, 20];
+        let entity_chunk = encode_plain_string(&entity_values);
+        let ts_chunk = encode_plain_timestamp(&ts_values);
+        let event_chunk = encode_plain_string(&event_values);
+        let amount_chunk = encode_plain_int(&amount_values);
+        let amount_bitmap = build_null_bitmap(&[true, true]);
+
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 2,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: entity_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u2".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: ts_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(ts_values[0])),
+                        zone_max: Some(PropertyValue::Timestamp(*ts_values.last().unwrap())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: event_chunk,
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(amount_bitmap),
+                        encoded: amount_chunk,
+                        compression: CompressionType::Lz4,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(10)),
+                        zone_max: Some(PropertyValue::Int(20)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 1_700_000_000_000_000_000,
+            seq_id_range: (0, 1),
+            batch_id: 1,
+            compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
+        };
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let metrics: Arc<dyn Metrics> = Arc::new(bqlite_core::metrics::AtomicMetrics::new());
+        scan.attach_metrics(metrics.clone());
+        let _ = scan.next_row_group().unwrap().expect("one row group");
+
+        let snap = metrics.snapshot();
+        assert!(
+            snap.bytes_decompressed > 0,
+            "bytes_decompressed should be non-zero when at least one chunk is LZ4-compressed",
+        );
+    }
+
+    #[test]
+    fn copy_budget_metrics_encoded_path_skips_materialized_before_filter() {
+        // On the encoded path, every recognized encoding produces an
+        // `EncodedColumn::Encoded` and skips the row-group-wide
+        // materialization. So `bytes_materialized_before_filter` must
+        // remain zero, while `bytes_scanned` is still recorded.
+        let schema = roundtrip_schema();
+        let entity_values = ["u1", "u2"];
+        let ts_values: Vec<i64> = vec![1_700_000_000_000_000_000, 1_700_000_000_100_000_000];
+        let event_values = ["view", "view"];
+        let amount_values: Vec<i64> = vec![10, 20];
+        let request = SegmentWriteRequest {
+            schema: schema.clone(),
+            schema_version: 0,
+            row_groups: vec![PreparedRowGroup {
+                row_count: 2,
+                columns: vec![
+                    PreparedColumnChunk {
+                        column_ordinal: 0,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&entity_values),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("u1".into())),
+                        zone_max: Some(PropertyValue::String("u2".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 1,
+                        null_bitmap: None,
+                        encoded: encode_plain_timestamp(&ts_values),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Timestamp(ts_values[0])),
+                        zone_max: Some(PropertyValue::Timestamp(*ts_values.last().unwrap())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 2,
+                        null_bitmap: None,
+                        encoded: encode_plain_string(&event_values),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::String("view".into())),
+                        zone_max: Some(PropertyValue::String("view".into())),
+                    },
+                    PreparedColumnChunk {
+                        column_ordinal: 3,
+                        null_bitmap: Some(build_null_bitmap(&[true, true])),
+                        encoded: encode_plain_int(&amount_values),
+                        compression: CompressionType::None,
+                        null_count: 0,
+                        zone_min: Some(PropertyValue::Int(10)),
+                        zone_max: Some(PropertyValue::Int(20)),
+                    },
+                ],
+            }],
+            dictionaries: vec![],
+            creation_timestamp_ns: 1_700_000_000_000_000_000,
+            seq_id_range: (0, 1),
+            batch_id: 1,
+            compaction_level: 0,
+            fsst_symbol_tables: vec![],
+            format_version: 1,
+        };
+        let bytes = encode_segment(&request).unwrap();
+        let reader = SegmentFileReader::from_bytes(bytes, schema.clone()).unwrap();
+        let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
+        let metrics: Arc<dyn Metrics> = Arc::new(bqlite_core::metrics::AtomicMetrics::new());
+        scan.attach_metrics(metrics.clone());
+        let encoded = scan
+            .next_encoded_row_group()
+            .unwrap()
+            .expect("one row group");
+        assert_eq!(encoded.row_count, 2);
+
+        let snap = metrics.snapshot();
+        assert!(
+            snap.bytes_scanned > 0,
+            "bytes_scanned should be recorded on the encoded path too",
+        );
+        assert_eq!(
+            snap.bytes_decompressed, 0,
+            "no LZ4 chunks → bytes_decompressed must be zero",
+        );
+        assert_eq!(
+            snap.bytes_materialized_before_filter, 0,
+            "encoded path with all-recognized encodings must not materialize before filter",
+        );
     }
 
     #[test]

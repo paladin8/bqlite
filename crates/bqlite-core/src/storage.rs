@@ -828,6 +828,25 @@ pub trait SegmentScan: Send {
             }
         }
     }
+
+    /// Attach a copy-budget [`Metrics`] handle.
+    ///
+    /// Implementations that record the
+    /// `docs/design/storage/zero-copy-scan-filter.md` §3 counters
+    /// (`bytes_scanned`, `bytes_decompressed`,
+    /// `bytes_materialized_before_filter`) override this to swap the
+    /// handle in. The default body is a no-op so existing
+    /// implementations stay compiling without behavior change.
+    ///
+    /// Wrapper scans (e.g. the tombstone wrapper) override this to
+    /// forward the handle to the inner scan(s) so the counters
+    /// reach the production `SegmentFileScan` underneath. Future
+    /// wrappers (k-way merge) follow the same pattern.
+    ///
+    /// May be called more than once; the latest call wins. Typically
+    /// invoked by the scan operator immediately after
+    /// [`SegmentReader::open_segment`].
+    fn attach_metrics(&mut self, _metrics: std::sync::Arc<dyn crate::metrics::Metrics>) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
