@@ -87,6 +87,23 @@ pub const MANIFEST_FILE_NAME: &str = "manifest.json";
 /// Name of the transient file written during an atomic manifest update.
 pub const MANIFEST_TMP_FILE_NAME: &str = "manifest.json.tmp";
 
+/// Name of the spill-root subdirectory under the database root.
+///
+/// All query-time and ingest-time spill files for this open of the
+/// database land somewhere under `<root>/<SPILL_DIR_NAME>/`. The
+/// directory is reclaimed (`rm_rf` + recreate) on every
+/// [`Database::create`] / [`Database::open`] call per
+/// `docs/design/engine/spill.md` § 5.4 / § 9.1, so spill artefacts
+/// from a prior crashed or cleanly-exited process never leak into a
+/// fresh database open.
+///
+/// TODO(TASK-525): once `EngineConfig.spill_root` lands, the engine-
+/// level override takes precedence and this default becomes a
+/// fallback. The reclamation hook moves with it; the database hook
+/// then becomes redundant for engine-managed opens. See
+/// `docs/design/engine/spill.md` § 5.2.
+pub const SPILL_DIR_NAME: &str = "spill";
+
 /// An open bqlite database.
 ///
 /// Owns the exclusive advisory lock on the database directory and
@@ -103,6 +120,7 @@ pub const MANIFEST_TMP_FILE_NAME: &str = "manifest.json.tmp";
 #[derive(Debug)]
 pub struct Database {
     root: PathBuf,
+    spill_root: PathBuf,
     manifest: Manifest,
     /// Exclusive advisory lock on `<root>/.lock`. The field is
     /// prefixed with `_` because nothing reads it directly — its only
@@ -191,11 +209,20 @@ impl Database {
         // Clean up any stale tmp file from a prior crashed init.
         clean_stale_tmp(&root);
 
+        // Reclaim the spill root before any ingest can run.
+        // `Database::create` is the freshest possible open, but a
+        // user could have populated `<root>/spill/` between the
+        // `create_dir_all` above and now (or supplied a path that
+        // already had one). The same sweep semantics as `open` apply
+        // — see `docs/design/engine/spill.md` § 5.4 / § 9.1.
+        let spill_root = reclaim_spill_root(&root)?;
+
         let manifest = Manifest::new_empty(shard_count);
         write_manifest_atomic(&root, &manifest)?;
 
         Ok(Self {
             root,
+            spill_root,
             manifest,
             _lock: lock,
             tombstone_locks: Mutex::new(HashMap::new()),
@@ -268,8 +295,17 @@ impl Database {
         // Reconcile on-disk segment files against the manifest.
         let _report = cleanup::reconcile_segments(&root, &manifest)?;
 
+        // Reclaim spill artefacts left over from a prior crashed or
+        // cleanly-exited process. The flock above guarantees no other
+        // bqlite process is currently using `<root>/spill/`, so the
+        // sweep is safe — see `docs/design/engine/spill.md` § 5.4 /
+        // § 9.1. After this returns, `<root>/spill/` exists and is
+        // empty.
+        let spill_root = reclaim_spill_root(&root)?;
+
         Ok(Self {
             root,
+            spill_root,
             manifest,
             _lock: lock,
             tombstone_locks: Mutex::new(HashMap::new()),
@@ -279,6 +315,17 @@ impl Database {
     /// Absolute path of the database root directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Absolute path of the spill-root directory for this database
+    /// open.
+    ///
+    /// Always `<root>/spill/`. The directory exists and is empty
+    /// immediately after [`Database::create`] / [`Database::open`]
+    /// returns; ingest and query code create per-call subdirectories
+    /// underneath it. See `docs/design/engine/spill.md` § 5.1.
+    pub fn spill_root(&self) -> &Path {
+        &self.spill_root
     }
 
     /// In-memory snapshot of the current manifest.
@@ -845,6 +892,61 @@ fn clean_stale_tmp(root: &Path) {
     }
 }
 
+/// Reclaim the spill-root directory under `<root>/`.
+///
+/// `<root>/spill/` is the engine-private scratch tree for query-time
+/// and ingest-time temp files (see `docs/design/engine/spill.md`
+/// § 5.1). The on-open contract is "the spill root is reclaimed and
+/// recreated empty" (§ 5.4 / § 9.1). After this returns successfully
+/// the directory exists and is empty.
+///
+/// Crash safety: any spill file from a prior crashed or cleanly-
+/// exited process has no cross-startup meaning (the owning RAII
+/// guards no longer exist; the in-memory state they referenced is
+/// gone), so deletion is the correct recovery action.
+///
+/// On failure to remove: any non-`NotFound` error from `rm_rf`
+/// (EACCES, EBUSY, …) is treated as fatal. `Database::create` /
+/// `Database::open` surfaces it as a typed [`BqliteError::Io`]
+/// naming the spill root and the underlying IO error, per
+/// `docs/design/engine/spill.md` § 9.3 — proceeding with a
+/// partially-reclaimed tree could mix old and new spill artefacts.
+/// The host is expected to fix the filesystem state and retry.
+///
+/// TODO(TASK-525): when `EngineConfig.spill_root` lands, the engine
+/// invokes the reclamation against its configured path *before* this
+/// function runs, and this hook degrades to recreating the directory
+/// only. The current implementation is the conservative default per
+/// `docs/design/engine/spill.md` § 5.4.
+fn reclaim_spill_root(root: &Path) -> Result<PathBuf> {
+    let spill_root = root.join(SPILL_DIR_NAME);
+    match fs::remove_dir_all(&spill_root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(io_ctx(
+                "reclaim spill root (rm_rf failed; fix filesystem state and retry)",
+                &spill_root,
+                e,
+            ));
+        }
+    }
+    fs::create_dir_all(&spill_root).map_err(|e| io_ctx("create spill root", &spill_root, e))?;
+
+    // POSIX-only: tighten permissions to 0o700 so other local users
+    // cannot peek at spill payloads. Best-effort — symlinks across
+    // filesystems may not honour the chmod, and the spill payloads
+    // are non-durable anyway.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        let _ = fs::set_permissions(&spill_root, perms);
+    }
+
+    Ok(spill_root)
+}
+
 /// Acquire the exclusive advisory lock on `<root>/.lock`.
 ///
 /// A fresh empty file is created if necessary. On success, the
@@ -1213,6 +1315,86 @@ mod tests {
             }
             other => panic!("expected Execution, got {other:?}"),
         }
+    }
+
+    // ── Spill root lifecycle (TASK-512 CP1) ────────────────────────────────
+
+    #[test]
+    fn create_initializes_empty_spill_root() {
+        let scratch = Scratch::new("spill-create");
+        let db = Database::create(scratch.path()).expect("create");
+        assert_eq!(db.spill_root(), scratch.path().join(SPILL_DIR_NAME));
+        assert!(db.spill_root().is_dir(), "spill root must exist");
+        let entries: Vec<_> = fs::read_dir(db.spill_root())
+            .expect("read spill root")
+            .collect::<std::result::Result<_, _>>()
+            .expect("collect dir entries");
+        assert!(
+            entries.is_empty(),
+            "fresh create must leave spill root empty, found {entries:?}"
+        );
+    }
+
+    #[test]
+    fn open_reclaims_stale_spill_files() {
+        // Simulate a prior crash: leave a query subdirectory and some
+        // straggler spill files behind. Open must wipe the lot.
+        let scratch = Scratch::new("spill-reclaim");
+        {
+            let _db = Database::create(scratch.path()).expect("create");
+        }
+        let spill_root = scratch.path().join(SPILL_DIR_NAME);
+        let stale_query_dir = spill_root.join("ingest-stale-uuid");
+        fs::create_dir_all(&stale_query_dir).unwrap();
+        fs::write(
+            stale_query_dir.join("ingest-part-w0-s0-000001.spill"),
+            b"junk",
+        )
+        .unwrap();
+        fs::write(spill_root.join("orphan.spill"), b"junk").unwrap();
+
+        let db = Database::open(scratch.path()).expect("open");
+        assert_eq!(db.spill_root(), spill_root);
+        assert!(db.spill_root().is_dir(), "spill root must be recreated");
+        let entries: Vec<_> = fs::read_dir(db.spill_root())
+            .expect("read spill root")
+            .collect::<std::result::Result<_, _>>()
+            .expect("collect dir entries");
+        assert!(
+            entries.is_empty(),
+            "open must reclaim stale spill artefacts; found {entries:?}"
+        );
+    }
+
+    #[test]
+    fn open_tolerates_missing_spill_root() {
+        // A cleanly-shutdown database may have no spill/ subdirectory
+        // (Engine::close-equivalent could remove it). Open recreates it.
+        let scratch = Scratch::new("spill-missing");
+        {
+            let _db = Database::create(scratch.path()).expect("create");
+        }
+        let spill_root = scratch.path().join(SPILL_DIR_NAME);
+        fs::remove_dir_all(&spill_root).expect("remove spill root");
+        assert!(!spill_root.exists(), "precondition: spill root removed");
+
+        let db = Database::open(scratch.path()).expect("open");
+        assert!(
+            db.spill_root().is_dir(),
+            "open must create spill root even when missing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_spill_root_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("spill-perms");
+        let db = Database::create(scratch.path()).expect("create");
+        let metadata = fs::metadata(db.spill_root()).expect("metadata");
+        // Mode includes file-type bits; mask to the permission bits only.
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "spill root should be owner-only");
     }
 
     #[test]
