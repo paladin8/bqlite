@@ -413,6 +413,12 @@ impl StepCounterSimulator {
         self
     }
 
+    /// Configured active-state cap. Used by `take_pending_warnings`
+    /// to populate `QueryWarning::ActiveStateLimitExceeded`.
+    pub fn active_state_limit(&self) -> usize {
+        self.active_state_limit
+    }
+
     /// Create fresh per-entity state for a new entity.
     pub fn create_state(&self) -> StepCounterState {
         StepCounterState::new()

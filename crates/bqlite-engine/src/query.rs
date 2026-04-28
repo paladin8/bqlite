@@ -60,7 +60,7 @@
 
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::{BqliteError, OperatorSchema, Result};
+use bqlite_core::{BqliteError, OperatorSchema, QueryWarning};
 use bqlite_planner::PhysicalPlan;
 use bqlite_storage::Database;
 
@@ -109,6 +109,58 @@ pub struct ExecutionResult {
     /// since this query started executing. `None` for the unbounded
     /// budget path.
     pub peak_memory_bytes: Option<u64>,
+    /// Per-query warnings recorded during execution. Empty when no
+    /// stateful operator hit a per-entity cap. The order is
+    /// per-`docs/design/engine/cancellation.md` §7.3 (record order,
+    /// with a final `WarningsOverflow` appended when any warnings
+    /// were suppressed).
+    pub warnings: Vec<QueryWarning>,
+}
+
+/// Wrapper attached when the engine surfaces a fatal error alongside
+/// any partial diagnostics the operators recorded before failure.
+///
+/// See `docs/design/engine/cancellation.md` §5.4. `From<BqliteError>`
+/// is implemented so internal `?` propagation continues to work; the
+/// failure case wraps with `warnings: Vec::new()` and the driver
+/// stitches the partial warnings in at the boundary before returning.
+#[derive(Debug)]
+pub struct ExecutionFailure {
+    pub error: BqliteError,
+    pub warnings: Vec<QueryWarning>,
+}
+
+impl ExecutionFailure {
+    pub fn new(error: BqliteError, warnings: Vec<QueryWarning>) -> Self {
+        Self { error, warnings }
+    }
+
+    /// Pattern-friendly extraction for callers that only want the
+    /// inner error. Equivalent to destructuring `failure.error`.
+    pub fn into_error(self) -> BqliteError {
+        self.error
+    }
+}
+
+impl From<BqliteError> for ExecutionFailure {
+    fn from(error: BqliteError) -> Self {
+        Self {
+            error,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ExecutionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 impl ExecutionResult {
@@ -186,7 +238,11 @@ impl Engine {
     /// - [`BqliteError::Cancelled`] — unreachable in Wave 1 because
     ///   the engine never signals cancellation, but the error
     ///   variant is still propagated verbatim from the operators.
-    pub fn query(&self, text: &str, db: &mut Database) -> Result<ExecutionResult> {
+    pub fn query(
+        &self,
+        text: &str,
+        db: &mut Database,
+    ) -> std::result::Result<ExecutionResult, ExecutionFailure> {
         self.query_with_options(text, db, &QueryOptions::default())
     }
 
@@ -195,100 +251,159 @@ impl Engine {
     ///
     /// Validates the requested memory budget against
     /// [`crate::context::MIN_QUERY_BUDGET_BYTES`]. A budget below the
-    /// floor surfaces as [`BqliteError::Execution`].
+    /// floor surfaces as `BqliteError::Execution` wrapped in an
+    /// [`ExecutionFailure`]. Per-query warnings collected before any
+    /// fatal error are stitched into the failure's `warnings` field
+    /// (`docs/design/engine/cancellation.md` §5.4).
     pub fn query_with_options(
         &self,
         text: &str,
         db: &mut Database,
         options: &QueryOptions,
-    ) -> Result<ExecutionResult> {
-        // 1. Parse. `parse()` returns a Vec: zero or more
-        //    `Statement::DefineAlias` items followed by the terminal
-        //    statement (query, DDL, …). Its typed `ParseError` is
-        //    converted to `BqliteError::Parse(String)` because the
-        //    unified error enum uses `String` for parse failures.
-        //    Alias definitions are handled by the planner's
-        //    `plan_script` entrypoint (TASK-425 CP4).
-        let stmts = bqlite_parser::parse(text).map_err(|e| BqliteError::Parse(e.to_string()))?;
-
-        // 2. Plan. The database's `ManifestCatalog<'_>` implements
-        //    `Catalog`, and the planner only needs a `&dyn Catalog` —
-        //    the borrow lives only for this call.
-        //
-        //    Read the current time once here so `LAST <dur>` time ranges are
-        //    resolved to the same instant throughout the entire query.
-        let now_ns = {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| {
-                    BqliteError::Execution(format!("system clock before Unix epoch: {e}"))
-                })?
-                .as_nanos()
-                .try_into()
-                .unwrap_or(i64::MAX)
+    ) -> std::result::Result<ExecutionResult, ExecutionFailure> {
+        // Resolve the per-query budget *before* the catch_unwind
+        // boundary so a configuration error surfaces as a clean
+        // ExecutionFailure with no panic-handling overhead.
+        let budget_bytes = match resolve_query_budget(&self.config, options) {
+            Ok(b) => b,
+            Err(e) => return Err(ExecutionFailure::from(e)),
         };
-        let catalog = db.catalog();
-        let physical = bqlite_planner::plan_script(stmts, &catalog, now_ns)?;
-
-        // Resolve the per-query memory budget, falling back to the
-        // engine-level default when the caller passed no override.
-        // Validation (floor of 512 MiB) lives in `resolve_query_budget`.
-        let budget_bytes = resolve_query_budget(&self.config, options)?;
         let ctx = QueryContext::new(budget_bytes);
 
-        // DELETE is dispatched out-of-band rather than through the
-        // bind step because it produces no result rows but does
-        // populate `ExecutionResult::rows_affected` (deletes.md §11).
-        // Routing through `bind_physical` would lose that count
-        // because the trait surface only yields `RecordBatch` values.
-        // The DELETE path does not yet use the QueryContext (TASK-525
-        // wires it together with the rest of the cancellation /
-        // budget plumbing); for now it returns an unbounded peak.
-        if let PhysicalPlan::Delete(d) = &physical {
-            return crate::delete::execute_delete_statement(d, db);
+        // `AssertUnwindSafe` is required because `&mut Database` is
+        // not `UnwindSafe` by default. This is sound here per
+        // `docs/design/engine/cancellation.md` §4.1: the engine owns
+        // the database for the call's duration, and on unwind the
+        // database is dropped along with the operator tree without
+        // further observation. `QueryContext` is `Clone` and the
+        // `WarningSink` it carries is `Send + Sync`, so observing
+        // it across the unwind boundary is fine.
+        //
+        // The single-threaded driver catches its own panic so a
+        // panic in any operator surfaces as `BqliteError::OperatorPanic`
+        // rather than aborting the process. TASK-541 generalizes this
+        // to per-worker `catch_unwind` boundaries.
+        let inner_ctx = ctx.clone();
+        let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_query_inner(text, db, &inner_ctx)
+        }));
+
+        match inner {
+            // Success: `run_query_inner` already drained its sink
+            // clone into `ExecutionResult.warnings`. The outer ctx
+            // owns a clone of the same sink — `into_warnings` is
+            // idempotent (mem::take), so reading it on the failure
+            // paths below sees the already-drained buffer.
+            Ok(Ok(result)) => Ok(result),
+            // Cooperative failure: pull the partial warnings the
+            // operators recorded before the error fired.
+            Ok(Err(error)) => Err(ExecutionFailure {
+                error,
+                warnings: ctx.warnings().clone().into_warnings(),
+            }),
+            // Worker panic: surface as `OperatorPanic`. `location` is
+            // always `None` until TASK-541 installs the project-local
+            // panic hook, per `cancellation.md` §4.1.
+            Err(payload) => {
+                let message = panic_message(payload);
+                Err(ExecutionFailure {
+                    error: BqliteError::OperatorPanic {
+                        message,
+                        location: None,
+                    },
+                    warnings: ctx.warnings().clone().into_warnings(),
+                })
+            }
         }
-
-        // Snapshot the root schema *before* binding. Binding consumes
-        // the descriptor via `bind_physical` (by reference for Wave 1),
-        // and the returned operator's `output_schema()` is the same
-        // shape, but holding the clone here keeps `ExecutionResult`
-        // construction independent of the operator's lifetime —
-        // important for later waves that may drop the operator
-        // between reading the last batch and returning.
-        let schema = physical.output_schema().clone();
-
-        // 3. Bind the plain-data descriptor into an executable
-        //    operator tree. Handles data-plane operators (Scan,
-        //    Filter, Project, Limit), DDL (which executes during
-        //    bind), and metadata queries (Describe, Explain).
-        let mut operator = bind_physical(&physical, db, &ctx)?;
-
-        // 4. Drive the operator tree to completion. `open` → zero or
-        //    more `next_batch` → `close`. `close` runs even on the
-        //    error path so that mmap / file handles / spill files
-        //    are released promptly; see the `PhysicalOperator`
-        //    lifecycle contract in
-        //    `docs/design/operators/operator-traits.md` §4.2.
-        let drive_result = drive_to_completion(operator.as_mut());
-        // `close` is idempotent and must run regardless of
-        // `drive_result`. We deliberately swallow a `close` error when
-        // the query itself already failed — the caller needs to see
-        // the original error, not a tear-down artifact. This is the
-        // same "primary error wins" convention the standard library
-        // uses in `Drop`-based cleanup paths.
-        let close_result = operator.close();
-
-        let rows = drive_result?;
-        close_result?;
-
-        Ok(ExecutionResult {
-            schema,
-            rows,
-            rows_affected: None,
-            peak_memory_bytes: ctx.peak_memory_bytes(),
-        })
     }
+}
+
+/// Inner pipeline. Returns `bqlite_core::Result<ExecutionResult>` so
+/// `?` propagation works inside the body; the outer `Engine::query`
+/// translates errors into [`ExecutionFailure`] with the partial
+/// warnings stitched in.
+fn run_query_inner(
+    text: &str,
+    db: &mut Database,
+    ctx: &QueryContext,
+) -> bqlite_core::Result<ExecutionResult> {
+    // 1. Parse. `parse()` returns a Vec: zero or more
+    //    `Statement::DefineAlias` items followed by the terminal
+    //    statement (query, DDL, …). Its typed `ParseError` is
+    //    converted to `BqliteError::Parse(String)` because the
+    //    unified error enum uses `String` for parse failures.
+    //    Alias definitions are handled by the planner's
+    //    `plan_script` entrypoint (TASK-425 CP4).
+    let stmts = bqlite_parser::parse(text).map_err(|e| BqliteError::Parse(e.to_string()))?;
+
+    // 2. Plan.
+    let now_ns = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| BqliteError::Execution(format!("system clock before Unix epoch: {e}")))?
+            .as_nanos()
+            .try_into()
+            .unwrap_or(i64::MAX)
+    };
+    let catalog = db.catalog();
+    let physical = bqlite_planner::plan_script(stmts, &catalog, now_ns)?;
+
+    // DELETE is dispatched out-of-band rather than through the
+    // bind step because it produces no result rows but does
+    // populate `ExecutionResult::rows_affected` (deletes.md §11).
+    // The DELETE path does not yet use the QueryContext (TASK-525
+    // wires it together with the rest of the cancellation / budget
+    // plumbing). It also produces no per-entity warnings, so the
+    // sink stays empty.
+    if let PhysicalPlan::Delete(d) = &physical {
+        return crate::delete::execute_delete_statement(d, db);
+    }
+
+    let schema = physical.output_schema().clone();
+
+    // 3. Bind the plain-data descriptor into an executable operator
+    //    tree. The QueryContext threads through both the memory
+    //    budget (per `docs/design/engine/memory-budget.md`) and the
+    //    warning sink (per `cancellation.md` §7) so adapters that
+    //    publish per-entity diagnostics can attach them to the
+    //    per-query stream.
+    let mut operator = bind_physical(&physical, db, ctx)?;
+
+    // 4. Drive to completion with the standard "primary error wins"
+    //    cleanup convention: `close` runs even on the error path so
+    //    mmap handles / spill files are released promptly.
+    let drive_result = drive_to_completion(operator.as_mut());
+    let close_result = operator.close();
+    let rows = drive_result?;
+    close_result?;
+
+    // Drop the operator tree before draining the warning sink so any
+    // adapter clones of the sink are released first (matches
+    // `cancellation.md` §5.1's leaf-first teardown ordering).
+    drop(operator);
+
+    Ok(ExecutionResult {
+        schema,
+        rows,
+        rows_affected: None,
+        peak_memory_bytes: ctx.peak_memory_bytes(),
+        warnings: ctx.warnings().clone().into_warnings(),
+    })
+}
+
+/// Extract a human-readable message from a `catch_unwind` payload.
+/// Panic payloads are commonly `&'static str` or `String`; everything
+/// else stringifies as a placeholder per
+/// `docs/design/engine/cancellation.md` §4.1.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
 }
 
 /// Open the operator and pull every batch until exhaustion.
@@ -299,7 +414,7 @@ impl Engine {
 /// both the happy and sad paths without double-closing here.
 fn drive_to_completion(
     operator: &mut dyn bqlite_operators::PhysicalOperator,
-) -> Result<Vec<RecordBatch>> {
+) -> bqlite_core::Result<Vec<RecordBatch>> {
     operator.open()?;
     let mut rows = Vec::new();
     while let Some(batch) = operator.next_batch()? {
@@ -419,13 +534,10 @@ mod tests {
         let engine = Engine::new();
 
         match engine.query("", &mut db) {
-            Err(BqliteError::Parse(msg)) => {
-                // Wave 2's parser surfaces the empty-input case as an
-                // UnexpectedEof with the hint "expected a table name" —
-                // more actionable than the Wave 1 stub's "empty input"
-                // wording, but still satisfies the engine contract that
-                // the parse error propagates cleanly as
-                // `BqliteError::Parse`.
+            Err(ExecutionFailure {
+                error: BqliteError::Parse(msg),
+                ..
+            }) => {
                 assert!(
                     msg.contains("table name"),
                     "error should describe the expected source: {msg}"
@@ -442,7 +554,10 @@ mod tests {
         let engine = Engine::new();
 
         match engine.query("42events", &mut db) {
-            Err(BqliteError::Parse(_)) => {}
+            Err(ExecutionFailure {
+                error: BqliteError::Parse(_),
+                ..
+            }) => {}
             other => panic!("expected Parse error, got {other:?}"),
         }
     }
@@ -456,7 +571,10 @@ mod tests {
         let engine = Engine::new();
 
         match engine.query("ghost", &mut db) {
-            Err(BqliteError::Plan(msg)) => {
+            Err(ExecutionFailure {
+                error: BqliteError::Plan(msg),
+                ..
+            }) => {
                 assert!(msg.contains("ghost"), "error should name the table: {msg}");
                 assert!(
                     msg.contains("unknown table"),
@@ -524,7 +642,10 @@ mod tests {
             memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES - 1),
         };
         match engine.query_with_options("events", &mut db, &opts) {
-            Err(BqliteError::Execution(msg)) => {
+            Err(ExecutionFailure {
+                error: BqliteError::Execution(msg),
+                ..
+            }) => {
                 assert!(
                     msg.contains("query memory budget too small"),
                     "error should mention the floor: {msg}"

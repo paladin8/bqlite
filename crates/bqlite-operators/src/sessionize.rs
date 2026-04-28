@@ -682,6 +682,25 @@ impl EntityOperator for SessionizeOperator {
             ..DemandCapabilities::none()
         }
     }
+
+    fn take_pending_warnings(
+        &self,
+        state: &mut SessionizeState,
+        _entity_id: &EntityId,
+    ) -> Vec<bqlite_core::QueryWarning> {
+        if !state.cap_exceeded {
+            return Vec::new();
+        }
+        // Latch reset so a re-drain yields nothing — matches the
+        // single-shot semantics §7.4 implies (the trigger fires once
+        // per entity).
+        state.cap_exceeded = false;
+        vec![bqlite_core::QueryWarning::SessionEventCapExceeded {
+            entity_id: state.entity_id().to_string(),
+            event_count: state.entity_event_count(),
+            cap: self.session_event_cap as u64,
+        }]
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1364,6 +1383,63 @@ mod tests {
         assert_eq!(sids, vec![1, 1, 1, 1]);
         assert!(sdurs.iter().all(|&d| d == 30));
         assert_eq!(out.num_rows(), 4);
+    }
+
+    #[test]
+    fn take_pending_warnings_emits_session_event_cap_warning() {
+        let schema = events_schema_no_amount();
+        let phys = build_physical(schema.clone(), 1_000_000, vec![], vec![]);
+        let mut op = SessionizeOperator::new(&phys);
+        op.session_event_cap = 3;
+        let arrow_schema = input_arrow(&schema);
+
+        let mut state = op.create_state(&EntityId::from("e1"));
+        op.process_sub_batch(
+            &mut state,
+            &make_batch(
+                &arrow_schema,
+                "e1",
+                vec![0, 10, 20, 30, 40, 50],
+                vec!["a", "b", "c", "d", "e", "f"],
+                None,
+            ),
+        );
+        assert!(state.cap_exceeded());
+
+        let warnings = op.take_pending_warnings(&mut state, &EntityId::from("e1"));
+        assert_eq!(warnings.len(), 1);
+        match &warnings[0] {
+            bqlite_core::QueryWarning::SessionEventCapExceeded {
+                entity_id,
+                event_count,
+                cap,
+            } => {
+                assert_eq!(entity_id, "e1");
+                assert!(*event_count >= 4);
+                assert_eq!(*cap, 3);
+            }
+            other => panic!("expected SessionEventCapExceeded, got {other:?}"),
+        }
+
+        // Latch reset — second drain yields nothing.
+        let again = op.take_pending_warnings(&mut state, &EntityId::from("e1"));
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn take_pending_warnings_returns_empty_when_cap_not_exceeded() {
+        let schema = events_schema_no_amount();
+        let phys = build_physical(schema.clone(), 1_000_000, vec![], vec![]);
+        let op = SessionizeOperator::new(&phys);
+        let arrow_schema = input_arrow(&schema);
+
+        let mut state = op.create_state(&EntityId::from("e1"));
+        op.process_sub_batch(
+            &mut state,
+            &make_batch(&arrow_schema, "e1", vec![0, 5], vec!["a", "b"], None),
+        );
+        let warnings = op.take_pending_warnings(&mut state, &EntityId::from("e1"));
+        assert!(warnings.is_empty());
     }
 
     // ── Schema / column forwarding ───────────────────────────────────────

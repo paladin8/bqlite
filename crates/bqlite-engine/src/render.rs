@@ -118,6 +118,7 @@ pub fn format_result_as_text_limited(
         rows: truncated,
         rows_affected: result.rows_affected,
         peak_memory_bytes: result.peak_memory_bytes,
+        warnings: result.warnings.clone(),
     };
 
     // Render the truncated result normally, then append the truncation
@@ -168,6 +169,7 @@ pub fn format_result_as_text(result: &ExecutionResult) -> String {
         out.push_str(&header);
         out.push('\n');
         out.push_str("(0 rows)\n");
+        append_warning_footer(&mut out, &result.warnings);
         return out;
     }
 
@@ -199,7 +201,24 @@ pub fn format_result_as_text(result: &ExecutionResult) -> String {
     // Use format_count for comma-separated thousands, consistent with
     // the truncation footer ("showing 1,000 rows; use ...").
     out.push_str(&format!("({} {unit})\n", format_count(count)));
+    append_warning_footer(&mut out, &result.warnings);
     out
+}
+
+/// Append a per-`docs/design/engine/cancellation.md` §7.5 warning
+/// footer when `warnings` is non-empty. No-op when the list is empty.
+fn append_warning_footer(out: &mut String, warnings: &[bqlite_core::QueryWarning]) {
+    if warnings.is_empty() {
+        return;
+    }
+    let n = warnings.len();
+    let unit = if n == 1 { "warning" } else { "warnings" };
+    out.push_str(&format!("{n} {unit}:\n"));
+    for w in warnings {
+        out.push_str("  - ");
+        out.push_str(&w.to_string());
+        out.push('\n');
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,6 +260,7 @@ mod tests {
             rows: Vec::new(),
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
 
         let rendered = format_result_as_text(&result);
@@ -280,6 +300,7 @@ mod tests {
             rows: Vec::new(),
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
 
         let rendered = format_result_as_text(&result);
@@ -318,6 +339,7 @@ mod tests {
             rows: vec![batch],
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
 
         let rendered = format_result_as_text(&result);
@@ -356,6 +378,7 @@ mod tests {
             rows: vec![batch],
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
 
         let rendered = format_result_as_text(&result);
@@ -401,6 +424,7 @@ mod tests {
             rows: vec![batch],
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
         let plain = format_result_as_text(&result);
         let limited = format_result_as_text_limited(&result, None);
@@ -416,6 +440,7 @@ mod tests {
             rows: vec![batch],
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
         let out = format_result_as_text_limited(&result, Some(10));
         assert!(
@@ -434,6 +459,7 @@ mod tests {
             rows: vec![batch],
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
         let out = format_result_as_text_limited(&result, Some(2));
         assert!(
@@ -452,6 +478,7 @@ mod tests {
             rows: vec![batch],
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
         let out = format_result_as_text_limited(&result, Some(1));
         // The footer must mention "1 row" (singular) and the hint.
@@ -486,6 +513,7 @@ mod tests {
             rows: vec![batch],
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
         let out = format_result_as_text_limited(&result, Some(2000));
         assert!(
@@ -515,6 +543,7 @@ mod tests {
             ],
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
         let out = format_result_as_text_limited(&result, Some(5));
         // Values 1-5 present, 6-9 absent.
@@ -559,6 +588,7 @@ mod tests {
             rows: vec![a, b],
             rows_affected: None,
             peak_memory_bytes: None,
+            warnings: Vec::new(),
         };
 
         let rendered = format_result_as_text(&result);

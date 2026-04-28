@@ -93,6 +93,7 @@ use crate::ddl::{
     build_describe_batch, build_explain_batch, execute_alter_table_add_column,
     execute_create_table, execute_drop_table, ResultOperator,
 };
+use crate::warning_sink::WarningSink;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SequenceMatchAdapter
@@ -143,10 +144,19 @@ struct SequenceMatchAdapter {
     /// finalized.
     exhausted: bool,
     fused: Option<FusedAccState>,
+    /// Per-query warning sink. Drained once per entity at
+    /// `finalize_entity` so cap-exceeded events surface in
+    /// `ExecutionResult.warnings`. `None` for stand-alone tests
+    /// constructed via the legacy single-arg path.
+    warnings: Option<WarningSink>,
 }
 
 impl SequenceMatchAdapter {
-    fn new(desc: &SequenceMatchPhysical, child: Box<dyn PhysicalOperator>) -> Result<Self> {
+    fn new_with_sink(
+        desc: &SequenceMatchPhysical,
+        child: Box<dyn PhysicalOperator>,
+        warnings: Option<WarningSink>,
+    ) -> Result<Self> {
         // The entity key column in the child's output uses the original name
         // from the table schema (e.g. "user_id"), not the "entity_id" alias
         // that the SequenceMatch output schema uses.
@@ -219,12 +229,21 @@ impl SequenceMatchAdapter {
             pending: VecDeque::new(),
             exhausted: false,
             fused,
+            warnings,
         })
     }
 
     /// Finalize a completed entity: route its match output to the pending
     /// batch queue (non-fused) or into the aggregate accumulator (fused).
-    fn finalize_entity(&mut self, entity: EntityId, state: SequenceMatchState) -> Result<()> {
+    fn finalize_entity(&mut self, entity: EntityId, mut state: SequenceMatchState) -> Result<()> {
+        // Drain per-entity diagnostics into the per-query warning sink
+        // (if one is wired). Must happen before we move `state` into
+        // the fused or non-fused finishers, both of which consume it.
+        // See `docs/design/engine/cancellation.md` §7.4.
+        if let Some(sink) = &self.warnings {
+            sink.record_many(self.operator.take_pending_warnings(&mut state, &entity));
+        }
+
         if let Some(fused) = &mut self.fused {
             // Fused path: SequenceMatchOperator::finish_entity_into builds
             // an intermediate match-output batch (using the saved
@@ -396,14 +415,20 @@ struct EntityOperatorAdapter<Op: EntityOperator> {
     /// Set once the child has been fully drained and the last entity
     /// finalized.
     exhausted: bool,
+    /// Per-query warning sink. Drained at every `finalize_entity` so
+    /// per-entity diagnostics (cap-exceeded, etc.) reach the
+    /// `ExecutionResult.warnings` surface. `None` for stand-alone
+    /// tests constructed via the legacy single-arg path.
+    warnings: Option<WarningSink>,
 }
 
 impl<Op: EntityOperator> EntityOperatorAdapter<Op> {
-    fn new(
+    fn new_with_sink(
         operator: Op,
         child: Box<dyn PhysicalOperator>,
         output_schema: OperatorSchema,
         entity_id_col_idx: usize,
+        warnings: Option<WarningSink>,
     ) -> Self {
         Self {
             operator,
@@ -414,17 +439,23 @@ impl<Op: EntityOperator> EntityOperatorAdapter<Op> {
             current_state: None,
             pending: VecDeque::new(),
             exhausted: false,
+            warnings,
         }
     }
 
-    /// Finalize the in-flight entity: call `finish_entity` and buffer the result.
+    /// Finalize the in-flight entity: drain warnings, call `finish_entity`,
+    /// and buffer the result.
     ///
-    /// Unlike `SequenceMatchAdapter::finalize_entity`, we do not need the entity
-    /// id here: Wave 4 operators fill the entity-id column themselves from their
-    /// buffered input rows (e.g. `SessionizeOperator` always writes the entity id
-    /// it received in `create_state` into every output row). No post-finalization
-    /// id-fill step is required.
-    fn finalize_entity(&mut self, state: Op::State) -> Result<()> {
+    /// Unlike `SequenceMatchAdapter::finalize_entity`, the entity-id column
+    /// is filled by the operator itself (Wave 4 operators always write the
+    /// entity id into their output rows). The id is still required as an
+    /// argument because [`EntityOperator::take_pending_warnings`] uses it
+    /// to attribute the warning when the operator's state does not carry
+    /// the id. See `docs/design/engine/cancellation.md` §7.4.
+    fn finalize_entity(&mut self, entity: &EntityId, mut state: Op::State) -> Result<()> {
+        if let Some(sink) = &self.warnings {
+            sink.record_many(self.operator.take_pending_warnings(&mut state, entity));
+        }
         if let Some(batch) = self.operator.finish_entity(state) {
             self.pending.push_back(batch);
         }
@@ -443,10 +474,10 @@ impl<Op: EntityOperator> EntityOperatorAdapter<Op> {
 
             // Detect entity boundary.
             if self.current_entity.as_ref() != Some(&row_entity) {
-                if let (Some(_prev_entity), Some(prev_state)) =
+                if let (Some(prev_entity), Some(prev_state)) =
                     (self.current_entity.take(), self.current_state.take())
                 {
-                    self.finalize_entity(prev_state)?;
+                    self.finalize_entity(&prev_entity, prev_state)?;
                 }
                 let new_state = self.operator.create_state(&row_entity);
                 self.current_entity = Some(row_entity.clone());
@@ -491,10 +522,10 @@ impl<Op: EntityOperator> PhysicalOperator for EntityOperatorAdapter<Op> {
             match self.child.next_batch()? {
                 None => {
                     // Child exhausted: finalize the last in-flight entity.
-                    if let (Some(_entity), Some(state)) =
+                    if let (Some(entity), Some(state)) =
                         (self.current_entity.take(), self.current_state.take())
                     {
-                        self.finalize_entity(state)?;
+                        self.finalize_entity(&entity, state)?;
                     }
                     self.exhausted = true;
                     // Loop once more to drain `pending`.
@@ -858,7 +889,11 @@ fn bind_physical_with_cache(
 
         PhysicalPlan::SequenceMatch(seq) => {
             let child = bind_physical_with_cache(&seq.input, db, ctx, cohorts)?;
-            Ok(Box::new(SequenceMatchAdapter::new(seq, child)?))
+            Ok(Box::new(SequenceMatchAdapter::new_with_sink(
+                seq,
+                child,
+                Some(ctx.warnings().clone()),
+            )?))
         }
 
         // ── Wave 4 cohort runtime (TASK-437) ──────────────────────
@@ -1249,11 +1284,12 @@ fn bind_sessionize(
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "SessionizeAdapter")?;
     let operator = SessionizeOperator::new(sess);
-    Ok(Box::new(EntityOperatorAdapter::new(
+    Ok(Box::new(EntityOperatorAdapter::new_with_sink(
         operator,
         child,
         sess.output_schema.clone(),
         entity_id_col_idx,
+        Some(ctx.warnings().clone()),
     )))
 }
 
@@ -1278,11 +1314,12 @@ fn bind_event_select(
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "EventSelectAdapter")?;
     let operator = EventSelectOperator::new(es, es.input.output_schema());
-    Ok(Box::new(EntityOperatorAdapter::new(
+    Ok(Box::new(EntityOperatorAdapter::new_with_sink(
         operator,
         child,
         es.output_schema.clone(),
         entity_id_col_idx,
+        Some(ctx.warnings().clone()),
     )))
 }
 
@@ -1304,11 +1341,12 @@ fn bind_attribute(
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "AttributeAdapter")?;
     let operator = AttributeOperator::from_physical(attr)?;
-    Ok(Box::new(EntityOperatorAdapter::new(
+    Ok(Box::new(EntityOperatorAdapter::new_with_sink(
         operator,
         child,
         attr.output_schema.clone(),
         entity_id_col_idx,
+        Some(ctx.warnings().clone()),
     )))
 }
 
@@ -2089,7 +2127,10 @@ mod tests {
         let (mut db, engine) = create_db_with_events_table(scratch.path());
 
         match engine.query("events | where user_id in ghost", &mut db) {
-            Err(BqliteError::Plan(msg)) => {
+            Err(crate::query::ExecutionFailure {
+                error: BqliteError::Plan(msg),
+                ..
+            }) => {
                 assert!(
                     msg.contains("ghost"),
                     "error should name the unknown alias: {msg}"

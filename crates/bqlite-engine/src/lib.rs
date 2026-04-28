@@ -57,14 +57,16 @@ pub mod delete;
 pub mod ingest;
 pub mod query;
 pub mod render;
+pub mod warning_sink;
 
 pub use bind::bind_physical;
 pub use context::{
     EngineConfig, QueryContext, QueryOptions, DEFAULT_COMPACTION_BUDGET_BYTES,
     DEFAULT_INGEST_BUDGET_BYTES, DEFAULT_QUERY_BUDGET_BYTES, MIN_QUERY_BUDGET_BYTES,
 };
-pub use query::{Engine, ExecutionResult};
+pub use query::{Engine, ExecutionFailure, ExecutionResult};
 pub use render::{format_result_as_text, format_result_as_text_limited};
+pub use warning_sink::{WarningSink, WorkerContext};
 
 // Convenience re-exports so downstream crates only need to depend on
 // `bqlite-engine`. This matches the architecture.md rule

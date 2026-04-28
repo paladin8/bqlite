@@ -324,6 +324,35 @@ pub trait EntityOperator: Send + Sync {
         Ok(())
     }
 
+    /// Drain any per-entity diagnostics the operator stashed on its
+    /// state during `process_sub_batch` (e.g. cap-exceeded events).
+    /// The adapter calls this **before** consuming the state via
+    /// [`finish_entity`](Self::finish_entity) /
+    /// [`finish_entity_into`](Self::finish_entity_into), then forwards
+    /// each returned warning to the per-query `WarningSink` in
+    /// `bqlite-engine`.
+    ///
+    /// The default implementation returns an empty vec — stateless
+    /// operators and stateful operators with no diagnostic channel
+    /// inherit zero overhead. Sessionize, Attribute, and SequenceMatch
+    /// override to report their cap-exceeded events.
+    ///
+    /// `entity_id` is supplied by the adapter so operators do not
+    /// need to thread the EntityId through their state purely for
+    /// attribution. Operators that already carry the EntityId on
+    /// their state (Sessionize, Attribute) may ignore the argument;
+    /// operators that don't (the matcher's StepCounterState) populate
+    /// the warning from this argument.
+    ///
+    /// See `docs/design/engine/cancellation.md` §7.4.
+    fn take_pending_warnings(
+        &self,
+        _state: &mut Self::State,
+        _entity_id: &EntityId,
+    ) -> Vec<bqlite_core::QueryWarning> {
+        Vec::new()
+    }
+
     /// The set of input columns this operator actually reads.
     ///
     /// Drives projection pruning at the scan layer. Returning an empty
@@ -680,6 +709,14 @@ mod tests {
     }
 
     // ── supported_demands (TASK-110 / TASK-427) ──────────────────────────
+
+    #[test]
+    fn entity_operator_default_take_pending_warnings_is_empty() {
+        let op = sum_op();
+        let mut state = op.create_state(&EntityId::from("u1"));
+        let warnings = op.take_pending_warnings(&mut state, &EntityId::from("u1"));
+        assert!(warnings.is_empty());
+    }
 
     #[test]
     fn entity_operator_default_supported_demands_is_none() {

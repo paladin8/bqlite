@@ -90,6 +90,9 @@ pub fn execute_delete_statement(
         // machinery in TASK-525 stress coverage. For now report the
         // unbounded-context shape (`None`).
         peak_memory_bytes: None,
+        // DELETE does not run stateful operators that produce warnings
+        // (`cancellation.md` §7.4); the sink stays empty.
+        warnings: Vec::new(),
     })
 }
 

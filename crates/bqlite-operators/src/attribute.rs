@@ -750,6 +750,21 @@ impl EntityOperator for AttributeOperator {
     fn supported_demands(&self) -> DemandCapabilities {
         AttributePhysical::DEMAND_CAPS
     }
+
+    fn take_pending_warnings(
+        &self,
+        state: &mut Self::State,
+        _entity_id: &EntityId,
+    ) -> Vec<bqlite_core::QueryWarning> {
+        match state.take_diagnostic() {
+            Some(diag) => vec![bqlite_core::QueryWarning::AttributeTouchpointCapExceeded {
+                entity_id: diag.entity_id.to_string(),
+                touchpoint_count: diag.event_count,
+                cap: diag.cap,
+            }],
+            None => Vec::new(),
+        }
+    }
 }
 
 impl AttributeOperator {
@@ -1305,6 +1320,55 @@ mod tests {
         let out = op.finish_entity(state).unwrap();
         // The first purchase emitted 2 rows; everything after was dropped.
         assert_eq!(out.num_rows(), 2);
+    }
+
+    #[test]
+    fn take_pending_warnings_emits_attribute_touchpoint_warning() {
+        let op =
+            build_operator(&["purchase"], &["click"], 10_000, &[], &[], None).with_deque_cap(2);
+        let mut state = op.create_state(&EntityId::String("user-1".into()));
+        op.process_sub_batch(
+            &mut state,
+            &batch_from(&[
+                (10, "click", Some("a"), None),
+                (20, "click", Some("b"), None),
+                (30, "purchase", None, None),
+                (40, "click", Some("c"), None),
+                (50, "purchase", None, None),
+            ]),
+        );
+        assert!(state.is_capped());
+
+        let warnings = op.take_pending_warnings(&mut state, &EntityId::String("user-1".into()));
+        assert_eq!(warnings.len(), 1);
+        match &warnings[0] {
+            bqlite_core::QueryWarning::AttributeTouchpointCapExceeded {
+                entity_id,
+                touchpoint_count,
+                cap,
+            } => {
+                assert_eq!(entity_id, "user-1");
+                assert!(*touchpoint_count >= 4);
+                assert_eq!(*cap, 2);
+            }
+            other => panic!("expected AttributeTouchpointCapExceeded, got {other:?}"),
+        }
+
+        // Diagnostic latch was consumed by the first drain.
+        let again = op.take_pending_warnings(&mut state, &EntityId::String("user-1".into()));
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn take_pending_warnings_empty_when_no_cap_diagnostic() {
+        let op = build_operator(&["purchase"], &["click"], 10_000, &[], &[], None);
+        let mut state = op.create_state(&EntityId::String("u".into()));
+        op.process_sub_batch(
+            &mut state,
+            &batch_from(&[(10, "click", Some("a"), None), (20, "purchase", None, None)]),
+        );
+        let warnings = op.take_pending_warnings(&mut state, &EntityId::String("u".into()));
+        assert!(warnings.is_empty());
     }
 
     // ── Forwarded conversion property ─────────────────────────────────────

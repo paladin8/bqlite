@@ -421,6 +421,39 @@ impl EntityOperator for SequenceMatchOperator {
             supports_eager_group_emit: false,
         }
     }
+
+    fn take_pending_warnings(
+        &self,
+        state: &mut Self::State,
+        entity_id: &EntityId,
+    ) -> Vec<bqlite_core::QueryWarning> {
+        // Only the StepCounter strategy carries an active-state cap
+        // today (sequence-matching.md §16.1). The NFA paths inherit
+        // unbounded growth and will land their own cap in a later wave;
+        // when they do, this branch needs to learn about their state.
+        let SequenceMatchState::StepCounter(sc_state) = state else {
+            return Vec::new();
+        };
+        if !sc_state.cap_exceeded {
+            return Vec::new();
+        }
+        // Resolve the cap up front. A `StepCounter` state paired with a
+        // non-StepCounter strategy is a programming error, but defending
+        // against it here avoids leaving the latch reset without
+        // emitting (which would silently swallow the warning).
+        let StrategyDriver::StepCounter(sim) = &self.strategy else {
+            debug_assert!(false, "StepCounter state with non-StepCounter strategy");
+            return Vec::new();
+        };
+        let cap = sim.active_state_limit() as u64;
+        sc_state.cap_exceeded = false;
+        let active = sc_state.tracks.len() as u64 + sc_state.dropped_count;
+        vec![bqlite_core::QueryWarning::ActiveStateLimitExceeded {
+            entity_id: entity_id.to_string(),
+            active_states: active,
+            cap,
+        }]
+    }
 }
 
 impl SequenceMatchOperator {
@@ -886,6 +919,58 @@ mod tests {
 
         let result = op.finish_entity(state);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn take_pending_warnings_emits_active_state_warning_for_step_counter() {
+        let nfa = linear_nfa(&["signup", "purchase"]);
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, match_output_schema());
+
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+
+        // Manually flip the StepCounter state's cap-exceeded latch and
+        // dropped count to simulate a runtime cap fire — exercising the
+        // operator-level conversion to QueryWarning without needing the
+        // full LinearWithBindings setup that the step_counter unit test
+        // already covers.
+        if let SequenceMatchState::StepCounter(sc) = &mut state {
+            sc.cap_exceeded = true;
+            sc.dropped_count = 7;
+        } else {
+            panic!("LinearSimple should pick StepCounter strategy");
+        }
+
+        let warnings = op.take_pending_warnings(&mut state, &entity);
+        assert_eq!(warnings.len(), 1);
+        match &warnings[0] {
+            bqlite_core::QueryWarning::ActiveStateLimitExceeded {
+                entity_id,
+                active_states,
+                cap,
+            } => {
+                assert_eq!(entity_id, "user1");
+                // active_states = tracks.len() (0 here) + dropped_count (7).
+                assert_eq!(*active_states, 7);
+                // Default `with_active_state_limit` is 10_000.
+                assert_eq!(*cap, 10_000);
+            }
+            other => panic!("expected ActiveStateLimitExceeded, got {other:?}"),
+        }
+
+        // Latch reset.
+        let again = op.take_pending_warnings(&mut state, &entity);
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn take_pending_warnings_empty_when_cap_not_exceeded() {
+        let nfa = linear_nfa(&["signup", "purchase"]);
+        let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, match_output_schema());
+        let entity = EntityId::String("user1".into());
+        let mut state = op.create_state(&entity);
+        let warnings = op.take_pending_warnings(&mut state, &entity);
+        assert!(warnings.is_empty());
     }
 
     #[test]

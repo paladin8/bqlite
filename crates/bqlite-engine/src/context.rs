@@ -133,6 +133,12 @@ pub struct QueryContext {
     /// `ExecutionResult::peak_memory_bytes` without exposing
     /// `peak_bytes` on the public trait.
     tracker: Option<Arc<MemoryTracker>>,
+    /// Per-query warning sink. Operators publish per-entity
+    /// diagnostics here through the EntityOperatorAdapter; the engine
+    /// drains it into `ExecutionResult.warnings` on success or
+    /// `ExecutionFailure.warnings` on failure. See
+    /// `docs/design/engine/cancellation.md` §7.
+    warnings: crate::warning_sink::WarningSink,
 }
 
 impl std::fmt::Debug for QueryContext {
@@ -154,6 +160,7 @@ impl QueryContext {
             cancellation: CancellationToken::new(),
             memory: tracker.clone(),
             tracker: Some(tracker),
+            warnings: crate::warning_sink::WarningSink::new(),
         }
     }
 
@@ -165,6 +172,7 @@ impl QueryContext {
             cancellation: CancellationToken::new(),
             memory: Arc::new(UnboundedMemory::new()),
             tracker: None,
+            warnings: crate::warning_sink::WarningSink::new(),
         }
     }
 
@@ -186,6 +194,14 @@ impl QueryContext {
     /// `ExecutionResult::peak_memory_bytes`.
     pub fn peak_memory_bytes(&self) -> Option<u64> {
         self.tracker.as_ref().map(|t| t.peak_bytes())
+    }
+
+    /// Per-query warning sink. Bind helpers clone this into adapters
+    /// that need to publish per-entity diagnostics. Cloning is cheap
+    /// (an `Arc<Mutex<...>>` clone). See
+    /// `docs/design/engine/cancellation.md` §7.
+    pub fn warnings(&self) -> &crate::warning_sink::WarningSink {
+        &self.warnings
     }
 }
 
