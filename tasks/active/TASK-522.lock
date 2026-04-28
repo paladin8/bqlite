@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-522",
+  "claimed_at": "2026-04-28T08:40:34Z",
+  "branch": "task/TASK-522",
+  "description": "Cohort/entity pushdown into scan"
+}
