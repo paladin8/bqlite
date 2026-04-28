@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-511",
+  "claimed_at": "2026-04-28T06:17:46Z",
+  "branch": "task/TASK-511",
+  "description": "Structured execution errors and warning channel"
+}
