@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-510",
   "claimed_at": "2026-04-28T06:14:49Z",
+  "completed_at": "2026-04-28T07:09:01Z",
   "branch": "task/TASK-510",
   "description": "Memory tracker enforcement scaffold"
 }
