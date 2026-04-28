@@ -328,13 +328,25 @@ pub fn compact_one(
     // ── 2. Build the canonical Arrow schema from the table schema. ──
     // Matches `writer::events_to_record_batch` and the reader's scan
     // plan, so every scan's output batch and the merger's output batch
-    // all carry identical schemas.
+    // all carry identical schemas. System columns
+    // (`__seq_id` / `__batch_id`) are intentionally excluded from this
+    // schema and from the per-segment projection below — compaction
+    // derives per-row `__seq_id` from the segment's manifest metadata
+    // (via `CompactionTombstoneScan`), and the merged output is then
+    // assigned a fresh contiguous range by `Database::write_partitioner`,
+    // so the input system columns are never read or rewritten through
+    // the merge path. Including them would force this code to teach
+    // the writer how to ignore them; excluding them via an explicit
+    // projection keeps the merge schema and the on-disk segment shape
+    // 1:1.
     let arrow_fields: Vec<Field> = table_schema
         .columns()
         .iter()
         .map(|c| Field::new(&c.name, bql_type_to_arrow(&c.bql_type), c.nullable))
         .collect();
     let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
+    let declared_projection =
+        ColumnProjection::with_columns(table_schema.columns().iter().map(|c| c.name.clone()));
 
     // ── 3. Open each input and build a SegmentScan. ─────────────────
     // Every input scan is wrapped in a `CompactionTombstoneScan` so
@@ -349,7 +361,7 @@ pub fn compact_one(
     for seg in &shard_segments {
         let path = segment_path(&db_root, table, window_id, shard_id, seg.segment_id);
         let reader = SegmentFileReader::open_shared(&path, shared_schema.clone())?;
-        let scan = reader.scan(&ColumnProjection::all(), None)?;
+        let scan = reader.scan(&declared_projection, None)?;
         let wrapped: Box<dyn bqlite_core::storage::SegmentScan> =
             Box::new(crate::tombstone_scan::CompactionTombstoneScan::new(
                 Box::new(scan),

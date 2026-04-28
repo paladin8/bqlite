@@ -64,9 +64,11 @@ fn write_segment_with_rg(
 }
 
 fn types_for(schema: &bqlite_core::schema::TableSchema) -> Vec<BqlType> {
+    // Mirrors the segment reader's `ColumnProjection::all()`
+    // expansion (declared columns + implicit `__seq_id` /
+    // `__batch_id`) per `docs/design/storage/system-columns.md` §3.
     schema
-        .columns()
-        .iter()
+        .logical_columns()
         .map(|c| c.bql_type.clone())
         .collect()
 }

@@ -306,16 +306,29 @@ impl SegmentFileReader {
     /// projection.
     ///
     /// `projection.is_all()` returns every column in the segment's
-    /// write-time schema in ordinal order; an explicit column list
-    /// returns exactly those columns in the requested order. Column
-    /// names are resolved against the current manifest schema first;
-    /// columns that don't exist in the current schema error with
-    /// [`BqliteError::Schema`]. Columns that exist in the current
-    /// schema but not in the segment's write-time schema are
+    /// write-time schema in ordinal order, followed by the implicit
+    /// `__seq_id` and `__batch_id` system columns; an explicit column
+    /// list returns exactly those columns in the requested order
+    /// (declared columns appear in table-schema order; system columns
+    /// follow in request order). Column names are resolved against
+    /// the current manifest schema first; columns that don't exist in
+    /// the current schema and are not recognised system columns error
+    /// with [`BqliteError::Schema`]. Columns that exist in the
+    /// current schema but not in the segment's write-time schema are
     /// **backfilled with all-null values** — matching the schema
     /// evolution rule from `segment-format-v1.md` §14. Default
     /// values for backfilled columns are **not yet supported** (see
     /// the module-level TODO note).
+    ///
+    /// # System columns
+    ///
+    /// `__seq_id` and `__batch_id` (see `bqlite_core::schema`) are
+    /// recognised by name and synthesised from segment-footer
+    /// metadata per `docs/design/storage/system-columns.md` §3:
+    /// `__seq_id(n) = footer.seq_id_range.0 + cumulative_row_offset(n)`
+    /// and `__batch_id = footer.batch_id` (constant per segment).
+    /// Both columns are non-nullable `Int64`. They are not stored
+    /// as on-disk column chunks.
     ///
     /// # Errors
     ///
@@ -329,6 +342,24 @@ impl SegmentFileReader {
         predicate: Option<Arc<dyn Predicate>>,
     ) -> Result<SegmentFileScan> {
         let plan = build_scan_plan(&self.current_schema, self.footer.schema(), projection)?;
+        // Prefix-sum of row-group row counts. Used by
+        // `decode_row_group` / `decode_encoded_row_group` to derive
+        // synthesised `__seq_id` values per
+        // `docs/design/storage/system-columns.md` §3. Built once here
+        // because zone-map pruning may skip row groups but does not
+        // shift the in-segment row offset of subsequent groups.
+        let row_group_start: Vec<u64> = {
+            let mut acc: u64 = 0;
+            self.footer
+                .row_groups()
+                .iter()
+                .map(|rg| {
+                    let s = acc;
+                    acc = acc.saturating_add(rg.row_count);
+                    s
+                })
+                .collect()
+        };
         Ok(SegmentFileScan {
             bytes: self.bytes.clone(),
             footer: self.footer.clone(),
@@ -339,6 +370,7 @@ impl SegmentFileReader {
             metrics: Arc::new(NoopMetrics::new()),
             next_idx: 0,
             exhausted: false,
+            row_group_start,
         })
     }
 }
@@ -389,6 +421,15 @@ pub struct SegmentFileScan {
     /// [`NoopMetrics`] so callers that do not opt in pay nothing.
     /// Replaced by [`SegmentScan::attach_metrics`].
     metrics: Arc<dyn Metrics>,
+    /// Prefix sum of `row_group.row_count` values:
+    /// `row_group_start[i]` is the cumulative row offset of row group
+    /// `i` within the segment's storage order. Computed once at
+    /// construction so synthesised `__seq_id` is correct even when
+    /// zone-map pruning skips earlier row groups
+    /// (`docs/design/storage/system-columns.md` §3). Robust against
+    /// future out-of-order row-group APIs; a single running cursor
+    /// would also work today because `next_idx` is monotonic.
+    row_group_start: Vec<u64>,
 }
 
 /// Pre-resolved projection: for every output column, how to
@@ -427,6 +468,16 @@ enum PlannedColumnSource {
     /// write-time schema, so the segment predates the `ALTER TABLE
     /// ADD COLUMN` that introduced it.
     BackfillAllNull,
+    /// Synthesise the implicit `__seq_id` system column. For row
+    /// group `idx`, every row `n` gets
+    /// `seq_id_first + row_group_start[idx] + n`. Per
+    /// `docs/design/storage/system-columns.md` §3, the column is
+    /// non-nullable `Int64`.
+    SystemSeqId,
+    /// Synthesise the implicit `__batch_id` system column —
+    /// constant `Int64Array` of length `row_count` filled with
+    /// `footer.batch_id`. Per `system-columns.md` §3.
+    SystemBatchId,
 }
 
 fn build_scan_plan(
@@ -434,6 +485,9 @@ fn build_scan_plan(
     write_time_schema: &TableSchema,
     projection: &ColumnProjection,
 ) -> Result<ScanPlan> {
+    use ::arrow::datatypes::DataType;
+    use bqlite_core::schema::{BATCH_ID_COLUMN, SEQ_ID_COLUMN};
+
     let mut entries: Vec<PlannedColumn> = Vec::new();
     let mut arrow_fields: Vec<Field> = Vec::new();
 
@@ -441,33 +495,54 @@ fn build_scan_plan(
     // `CompiledNode::Column { index }` values (which are compiled
     // against the full table-schema ordinals) remain valid for any
     // pruned subset. For the "all columns" case this is the natural
-    // order; for an explicit projection we filter the full schema
-    // to the requested names, preserving schema order rather than
-    // the projection's (potentially sorted) order.
+    // order followed by the implicit system columns; for an explicit
+    // projection we filter the full schema to the requested names,
+    // preserving schema order rather than the projection's
+    // (potentially sorted) order, and append any explicitly named
+    // system columns at the end.
+    //
+    // Per `docs/design/storage/system-columns.md` §3, the system
+    // columns `__seq_id` / `__batch_id` are recognised by name and
+    // synthesised from segment-footer metadata; they are not stored
+    // as on-disk column chunks.
     let column_names: Vec<String> = if projection.is_all() {
-        current_schema
+        let mut v: Vec<String> = current_schema
             .columns()
             .iter()
             .map(|c| c.name.clone())
-            .collect()
+            .collect();
+        v.push(SEQ_ID_COLUMN.to_string());
+        v.push(BATCH_ID_COLUMN.to_string());
+        v
     } else {
         let projected: std::collections::HashSet<&str> =
             projection.columns().iter().map(String::as_str).collect();
-        current_schema
+        let mut v: Vec<String> = current_schema
             .columns()
             .iter()
             .filter(|c| projected.contains(c.name.as_str()))
             .map(|c| c.name.clone())
-            .collect()
+            .collect();
+        // Append explicitly requested system columns in request
+        // order (preserves call-site intent when the caller writes
+        // `["__batch_id", "__seq_id"]`).
+        for name in projection.columns() {
+            if name == SEQ_ID_COLUMN || name == BATCH_ID_COLUMN {
+                v.push(name.clone());
+            }
+        }
+        v
     };
-    // Validate that every explicitly requested name appears in the
-    // current schema (the schema-order iteration above silently drops
-    // unknown names, so we need an explicit check).
+    // Validate that every explicitly requested name resolves to either
+    // a declared column or one of the two recognised system columns.
     if !projection.is_all() {
         for name in projection.columns() {
-            if current_schema.columns().iter().all(|c| c.name != *name) {
+            let is_declared = current_schema.columns().iter().any(|c| c.name == *name);
+            let is_system = name == SEQ_ID_COLUMN || name == BATCH_ID_COLUMN;
+            if !is_declared && !is_system {
                 return Err(BqliteError::Schema(format!(
-                    "segment reader: column `{name}` not found in current schema `{}`",
+                    "segment reader: column `{name}` not found in current schema `{}` \
+                     and is not a recognised system column",
                     current_schema.name()
                 )));
             }
@@ -475,6 +550,22 @@ fn build_scan_plan(
     }
 
     for name in column_names {
+        if name == SEQ_ID_COLUMN {
+            arrow_fields.push(Field::new(&name, DataType::Int64, false));
+            entries.push(PlannedColumn {
+                output_type: BqlType::Int,
+                source: PlannedColumnSource::SystemSeqId,
+            });
+            continue;
+        }
+        if name == BATCH_ID_COLUMN {
+            arrow_fields.push(Field::new(&name, DataType::Int64, false));
+            entries.push(PlannedColumn {
+                output_type: BqlType::Int,
+                source: PlannedColumnSource::SystemBatchId,
+            });
+            continue;
+        }
         // `column_names` is built by filtering `current_schema.columns()` in
         // both the `is_all()` and explicit projection paths, so every name
         // here is guaranteed to be present in `current_schema`. The
@@ -677,10 +768,18 @@ impl SegmentFileScan {
     fn decode_row_group(&self, idx: usize) -> Result<RecordBatch> {
         let rg = &self.footer.row_groups()[idx];
         let row_count = rg.row_count as usize;
+        // Per `docs/design/storage/system-columns.md` §3, system
+        // columns are synthesised from the segment footer's
+        // `seq_id_range` and `batch_id`. Reading these once before
+        // the per-column loop avoids repeated method dispatch and
+        // keeps the per-row Vec construction tight.
+        let seq_id_first = self.footer.seq_id_range().0;
+        let batch_id_const = self.footer.batch_id() as i64;
+        let start_offset = self.row_group_start[idx];
 
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.plan.entries.len());
         for entry in &self.plan.entries {
-            let array = match &entry.source {
+            let array: ArrayRef = match &entry.source {
                 PlannedColumnSource::FromSegment {
                     write_time_ordinal,
                     write_time_col,
@@ -699,6 +798,12 @@ impl SegmentFileScan {
                 }
                 PlannedColumnSource::BackfillAllNull => {
                     backfill_all_null(&entry.output_type, row_count)?
+                }
+                PlannedColumnSource::SystemSeqId => {
+                    synthesise_seq_id_array(seq_id_first, start_offset, row_count)?
+                }
+                PlannedColumnSource::SystemBatchId => {
+                    synthesise_batch_id_array(batch_id_const, row_count)
                 }
             };
             columns.push(array);
@@ -721,6 +826,9 @@ impl SegmentFileScan {
 
         let rg = &self.footer.row_groups()[idx];
         let row_count = rg.row_count as usize;
+        let seq_id_first = self.footer.seq_id_range().0;
+        let batch_id_const = self.footer.batch_id() as i64;
+        let start_offset = self.row_group_start[idx];
 
         let mut columns: Vec<EncodedColumn> = Vec::with_capacity(self.plan.entries.len());
         for entry in &self.plan.entries {
@@ -764,6 +872,14 @@ impl SegmentFileScan {
                     array: backfill_all_null(&entry.output_type, row_count)?,
                     rows: row_count as u32,
                 },
+                PlannedColumnSource::SystemSeqId => EncodedColumn::Materialized {
+                    array: synthesise_seq_id_array(seq_id_first, start_offset, row_count)?,
+                    rows: row_count as u32,
+                },
+                PlannedColumnSource::SystemBatchId => EncodedColumn::Materialized {
+                    array: synthesise_batch_id_array(batch_id_const, row_count),
+                    rows: row_count as u32,
+                },
             };
             columns.push(col);
         }
@@ -773,6 +889,62 @@ impl SegmentFileScan {
             columns,
         ))
     }
+}
+
+/// Synthesise the implicit `__seq_id` array for one row group.
+///
+/// `seq_id_first` is the segment footer's `seq_id_range.0`,
+/// `start_offset` is the cumulative row count of preceding row
+/// groups, and `row_count` is the row group's row count. Each row
+/// `n` gets `seq_id_first + start_offset + n`. Per
+/// `docs/design/storage/system-columns.md` §3.
+///
+/// Bounds-checks the upper edge once; the per-row arithmetic then
+/// runs without further checked arithmetic.
+fn synthesise_seq_id_array(
+    seq_id_first: u64,
+    start_offset: u64,
+    row_count: usize,
+) -> Result<ArrayRef> {
+    // `seq_id_first + start_offset + row_count` must fit in u64.
+    // A segment whose seq_ids overflow `u64::MAX` would already have
+    // tripped `Database::allocate_sequence_id_range`'s overflow
+    // guard at write time, so this branch is defence in depth.
+    let base = seq_id_first.checked_add(start_offset).ok_or_else(|| {
+        BqliteError::Execution(
+            "segment reader: __seq_id base overflows u64 \
+             (seq_id_first + cumulative_offset)"
+                .into(),
+        )
+    })?;
+    let _upper = base.checked_add(row_count as u64).ok_or_else(|| {
+        BqliteError::Execution(
+            "segment reader: __seq_id range overflows u64 \
+             (seq_id_first + cumulative_offset + row_count)"
+                .into(),
+        )
+    })?;
+    let mut buf: Vec<i64> = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        // `base + i` is bounded by `_upper` above, so wrapping cannot
+        // happen; the `as i64` cast preserves the bit pattern. Per
+        // `docs/design/type-system.md` §7.1, `BqlType::Int` maps to
+        // Arrow `Int64`.
+        buf.push((base + i as u64) as i64);
+    }
+    Ok(Arc::new(Int64Array::from(buf)) as ArrayRef)
+}
+
+/// Synthesise the implicit `__batch_id` array for one row group.
+///
+/// Constant `Int64Array` of length `row_count` filled with
+/// `batch_id`. Allocates `row_count * 8` bytes per row group; this
+/// matches the existing `BackfillAllNull` path. A future
+/// optimisation can dictionary-encode this (one entry, length-N
+/// keys), tracked in `system-columns.md` §7.
+fn synthesise_batch_id_array(batch_id: i64, row_count: usize) -> ArrayRef {
+    let buf: Vec<i64> = vec![batch_id; row_count];
+    Arc::new(Int64Array::from(buf)) as ArrayRef
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3176,7 +3348,9 @@ mod tests {
         let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
         let batch = scan.next_row_group().unwrap().expect("one row group");
         assert_eq!(batch.num_rows(), 4);
-        assert_eq!(batch.num_columns(), 4);
+        // 4 declared columns + 2 system columns (__seq_id, __batch_id)
+        // per `docs/design/storage/system-columns.md` §3.
+        assert_eq!(batch.num_columns(), 6);
 
         // Check each column's values.
         let entity_out = batch
@@ -3964,7 +4138,10 @@ mod tests {
         let reader = SegmentFileReader::from_bytes(bytes, current_schema.clone()).unwrap();
         let mut scan = reader.scan(&ColumnProjection::all(), None).unwrap();
         let batch = scan.next_row_group().unwrap().unwrap();
-        assert_eq!(batch.num_columns(), 5);
+        // 4 declared from segment + 1 backfilled NULL + 2 synthesised
+        // system columns (`__seq_id`, `__batch_id`) per
+        // `docs/design/storage/system-columns.md` §3.
+        assert_eq!(batch.num_columns(), 7);
 
         // The first 4 columns come from the segment.
         assert_eq!(
@@ -5056,6 +5233,10 @@ mod tests {
             BqlType::Timestamp,
             BqlType::String,
             BqlType::Int,
+            // Synthesised system columns appear at the end of
+            // `ColumnProjection::all()` per `system-columns.md` §3.
+            BqlType::Int, // __seq_id
+            BqlType::Int, // __batch_id
         ];
 
         // Materialized path.
@@ -5170,5 +5351,160 @@ mod tests {
             }
             other => panic!("expected entity_id as Encoded::Constant, got {other:?}"),
         }
+    }
+
+    // ── TASK-508: __seq_id / __batch_id synthesis ──────────────────────
+
+    /// Build a single-segment file with three rows of the simple_int
+    /// schema, parameterised by `seq_id_first` and `batch_id`. Used by
+    /// the system-column tests below.
+    fn write_three_row_segment_systemcols(
+        seq_id_first: u64,
+        batch_id: u64,
+    ) -> (Vec<u8>, TableSchema) {
+        let schema = simple_int_schema();
+        let (mut footer, row_group) = build_minimal_parts(schema.clone(), &[10, 20, 30]);
+        footer.seq_id_range = (seq_id_first, seq_id_first.saturating_add(2));
+        footer.batch_id = batch_id;
+        let bytes = build_segment(&footer, &row_group, &[]);
+        (bytes, schema)
+    }
+
+    #[test]
+    fn scan_with_system_columns_synthesises_correct_values() {
+        // Per docs/design/storage/system-columns.md §3, system columns
+        // are synthesised from segment footer metadata. The minimal
+        // fixture only carries the `amount` chunk with real rows
+        // (other columns are zero-row stubs), so we project
+        // `["amount", "__seq_id", "__batch_id"]` to exercise the
+        // synthesis path against real rows.
+        let (bytes, schema) = write_three_row_segment_systemcols(1000, 7);
+        let reader = SegmentFileReader::from_bytes(bytes, schema).unwrap();
+        let proj = ColumnProjection::with_columns(["amount", "__seq_id", "__batch_id"]);
+        let mut scan = reader.scan(&proj, None).unwrap();
+        let batch = scan.next_row_group().unwrap().expect("one row group");
+
+        assert_eq!(batch.num_columns(), 3);
+        let batch_schema = batch.schema();
+        let names: Vec<&str> = batch_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(&names, &["amount", "__seq_id", "__batch_id"]);
+
+        let seq = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("__seq_id is Int64");
+        assert_eq!(seq.values(), &[1000, 1001, 1002]);
+
+        let bid = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("__batch_id is Int64");
+        assert_eq!(bid.values(), &[7, 7, 7]);
+
+        // execution-model.md §3.7: system columns are non-nullable.
+        assert_eq!(seq.null_count(), 0);
+        assert_eq!(bid.null_count(), 0);
+        assert!(!batch_schema.field(1).is_nullable());
+        assert!(!batch_schema.field(2).is_nullable());
+    }
+
+    #[test]
+    fn scan_explicit_projection_can_request_system_columns_only() {
+        let (bytes, schema) = write_three_row_segment_systemcols(1000, 7);
+        let reader = SegmentFileReader::from_bytes(bytes, schema).unwrap();
+        let proj = ColumnProjection::with_columns(["__seq_id", "__batch_id"]);
+        let mut scan = reader.scan(&proj, None).unwrap();
+        let batch = scan.next_row_group().unwrap().expect("one row group");
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.schema().field(0).name(), "__seq_id");
+        assert_eq!(batch.schema().field(1).name(), "__batch_id");
+    }
+
+    #[test]
+    fn scan_explicit_projection_request_order_is_preserved_for_system_columns() {
+        // When a caller writes `["__batch_id", "__seq_id"]`, the
+        // `system-columns.md` §3 reader contract preserves request
+        // order for system columns explicitly named after the
+        // declared-column slot.
+        let (bytes, schema) = write_three_row_segment_systemcols(1000, 7);
+        let reader = SegmentFileReader::from_bytes(bytes, schema).unwrap();
+        let proj = ColumnProjection::with_columns(["__batch_id", "__seq_id"]);
+        let mut scan = reader.scan(&proj, None).unwrap();
+        let batch = scan.next_row_group().unwrap().expect("one row group");
+        assert_eq!(batch.schema().field(0).name(), "__batch_id");
+        assert_eq!(batch.schema().field(1).name(), "__seq_id");
+    }
+
+    #[test]
+    fn scan_unknown_projection_name_still_errors() {
+        let (bytes, schema) = write_three_row_segment_systemcols(0, 0);
+        let reader = SegmentFileReader::from_bytes(bytes, schema).unwrap();
+        let proj = ColumnProjection::with_columns(["__nope"]);
+        let err = match reader.scan(&proj, None) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for unknown projection name"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(
+            msg.contains("system column"),
+            "error must point at the system-column carve-out: {msg}"
+        );
+    }
+
+    #[test]
+    fn scan_encoded_path_synthesises_system_columns() {
+        // The encoded path emits system columns as
+        // `EncodedColumn::Materialized` per system-columns.md §3.
+        use bqlite_core::encoded::EncodedColumn;
+        let (bytes, schema) = write_three_row_segment_systemcols(1000, 7);
+        let reader = SegmentFileReader::from_bytes(bytes, schema).unwrap();
+        let proj = ColumnProjection::with_columns(["amount", "__seq_id", "__batch_id"]);
+        let mut scan = reader.scan(&proj, None).unwrap();
+        let encoded = scan
+            .next_encoded_row_group()
+            .unwrap()
+            .expect("one row group");
+
+        let seq_col = &encoded.columns[1];
+        let bid_col = &encoded.columns[2];
+        let EncodedColumn::Materialized {
+            array: seq_arr,
+            rows: seq_rows,
+        } = seq_col
+        else {
+            panic!("expected Materialized __seq_id, got {seq_col:?}");
+        };
+        let EncodedColumn::Materialized {
+            array: bid_arr,
+            rows: bid_rows,
+        } = bid_col
+        else {
+            panic!("expected Materialized __batch_id, got {bid_col:?}");
+        };
+        assert_eq!(*seq_rows, 3);
+        assert_eq!(*bid_rows, 3);
+        assert_eq!(
+            seq_arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[1000, 1001, 1002]
+        );
+        assert_eq!(
+            bid_arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[7, 7, 7]
+        );
     }
 }

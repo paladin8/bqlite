@@ -1468,17 +1468,15 @@ mod tests {
     }
 
     #[test]
-    fn bind_scan_output_schema_reflects_declared_columns() {
-        // The descriptor's `output_schema` widens to
-        // `OperatorSchema::from_table` (declared columns + implicit
-        // `__seq_id` / `__batch_id` system columns) because that's
-        // the shape the planner uses to compose downstream
-        // operators. The Wave 2 scan operator, however, narrows to
-        // **declared columns only** — the segment reader does not
-        // yet materialize system columns, and the k-way merge would
-        // reject batches whose schema did not match the one passed
-        // at construction. This test pins both facts explicitly so a
-        // regression in either side surfaces as a clean assertion.
+    fn bind_scan_output_schema_matches_descriptor_with_system_columns() {
+        // Per `docs/design/storage/system-columns.md` §4.1, the scan
+        // operator's `output_schema` now matches the planner's
+        // descriptor: declared columns followed by the implicit
+        // `__seq_id` / `__batch_id` system columns synthesised at
+        // segment-read time from the footer's `seq_id_range` and
+        // `batch_id`. Pre-TASK-508 the bound operator narrowed to
+        // declared columns only because the reader did not synthesise
+        // system columns yet; that carve-out is now closed.
         let scratch = Scratch::new("schema");
         let mut db = create_db_with_bootstrap(scratch.path());
         let descriptor = bootstrap_scan_descriptor();
@@ -1491,7 +1489,10 @@ mod tests {
             .iter()
             .map(|c| c.name.as_str())
             .collect();
-        assert_eq!(op_names, vec!["entity_id", "ts", "event_type"]);
+        assert_eq!(
+            op_names,
+            vec!["entity_id", "ts", "event_type", "__seq_id", "__batch_id"]
+        );
 
         let descriptor_names: Vec<&str> = descriptor
             .output_schema()
@@ -1499,10 +1500,7 @@ mod tests {
             .iter()
             .map(|c| c.name.as_str())
             .collect();
-        assert_eq!(
-            descriptor_names,
-            vec!["entity_id", "ts", "event_type", "__seq_id", "__batch_id"]
-        );
+        assert_eq!(descriptor_names, op_names);
     }
 
     #[test]

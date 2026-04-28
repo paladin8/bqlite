@@ -47,17 +47,16 @@
 //!
 //! ## Output schema
 //!
-//! The scan's [`OperatorSchema`] reflects the **declared columns**
-//! the reader actually materialises — the same set that
-//! `SegmentFileScan::build_scan_plan` constructs from
-//! `current_schema.columns()`. Implicit system columns (`__seq_id`,
-//! `__batch_id`) are **not** included; the Wave 2 segment reader
-//! does not yet expose them to the scan plan, and declaring them in
-//! `output_schema` would cause the k-way merge to reject real
-//! batches that carry only the three declared columns. A future
-//! extension may materialise system columns as a per-row counter,
-//! at which point the scan's contract widens without breaking this
-//! task's reader/merge pipeline.
+//! The scan's [`OperatorSchema`] reflects the declared columns the
+//! reader materialises followed by the implicit `__seq_id` and
+//! `__batch_id` system columns, in that order. Empty
+//! `projected_columns` produces the full set
+//! (`OperatorSchema::from_table(table)` shape). Explicit projections
+//! may name the system columns and they pass through; the segment
+//! reader synthesises both columns from the segment footer's
+//! `seq_id_range` and `batch_id` (storage-format.md §6.2). See
+//! `docs/design/storage/system-columns.md` §4.1 for the full
+//! contract.
 //!
 //! ## Tombstone-aware scan (TASK-434)
 //!
@@ -1042,15 +1041,30 @@ fn build_output_schema(
     table: &TableSchema,
     projection: &ColumnProjection,
 ) -> Result<OperatorSchema> {
+    use bqlite_core::schema::{BATCH_ID_COLUMN, SEQ_ID_COLUMN};
+
     let columns: Vec<ColumnDef> = if projection.is_all() {
-        table.columns().to_vec()
+        // Empty projection means "every column" — declared in
+        // table-schema order followed by the implicit `__seq_id` and
+        // `__batch_id` system columns. Mirrors the segment reader's
+        // `build_scan_plan` expansion in
+        // `bqlite-storage::segment::reader` so per-segment batches
+        // round-trip through the k-way merge without a schema
+        // mismatch (`docs/design/storage/system-columns.md` §4.1).
+        table.logical_columns().collect()
     } else {
         // Validate every requested name first so callers get a clear
-        // error before we iterate the table schema.
+        // error before we iterate the table schema. System columns
+        // are recognised in addition to declared columns
+        // (system-columns.md §3 reader contract / §4.1 operator
+        // contract).
         for name in projection.columns() {
-            if table.column(name).is_none() {
+            let is_declared = table.column(name).is_some();
+            let is_system = name == SEQ_ID_COLUMN || name == BATCH_ID_COLUMN;
+            if !is_declared && !is_system {
                 return Err(BqliteError::Schema(format!(
-                    "scan: projected column `{name}` not in table `{}`",
+                    "scan: projected column `{name}` not in table `{}` \
+                     and is not a recognised system column",
                     table.name()
                 )));
             }
@@ -1059,15 +1073,25 @@ fn build_output_schema(
         // appear in `projected_columns`. This preserves the column indices
         // that `CompiledNode::Column { index }` was compiled against (the
         // full-schema position), so pushed-down predicates and project
-        // expressions remain correct after the pruning pass trims the set.
+        // expressions remain correct after the pruning pass trims the
+        // set. System columns, if requested, follow the declared block
+        // in request order — matching the reader.
         let projected: std::collections::HashSet<&str> =
             projection.columns().iter().map(String::as_str).collect();
-        table
+        let mut out: Vec<ColumnDef> = table
             .columns()
             .iter()
             .filter(|col| projected.contains(col.name.as_str()))
             .cloned()
-            .collect()
+            .collect();
+        for name in projection.columns() {
+            if name == SEQ_ID_COLUMN {
+                out.push(ColumnDef::required(SEQ_ID_COLUMN, BqlType::Int));
+            } else if name == BATCH_ID_COLUMN {
+                out.push(ColumnDef::required(BATCH_ID_COLUMN, BqlType::Int));
+            }
+        }
+        out
     };
     OperatorSchema::new(columns)
 }
@@ -1896,6 +1920,10 @@ mod tests {
     }
 
     fn minimal_arrow_schema() -> Arc<ArrowSchema> {
+        // Mirrors `OperatorSchema::from_table(minimal_schema())` —
+        // declared columns followed by the implicit `__seq_id` /
+        // `__batch_id` system columns per
+        // `docs/design/storage/system-columns.md` §4.1.
         Arc::new(ArrowSchema::new(vec![
             Field::new("entity_id", DataType::Utf8View, false),
             Field::new(
@@ -1904,17 +1932,48 @@ mod tests {
                 false,
             ),
             Field::new("event_type", DataType::Utf8View, false),
+            Field::new("__seq_id", DataType::Int64, false),
+            Field::new("__batch_id", DataType::Int64, false),
         ]))
     }
 
+    /// Build a batch using sequential `__seq_id`s starting at 0 and
+    /// `__batch_id = 0`. Most tests do not care about specific values
+    /// for these columns; they just need them to exist so the merge
+    /// validator accepts the per-segment schema.
     fn make_batch(ids: &[&str], tss: &[i64], evts: &[&str]) -> RecordBatch {
-        let ids: ArrayRef = Arc::new(StringViewArray::from(ids.to_vec()));
-        let tss: ArrayRef = Arc::new(
+        make_batch_at(ids, tss, evts, 0, 0)
+    }
+
+    /// Build a batch with the explicitly specified `__seq_id` first
+    /// value and `__batch_id` constant. Used by tombstone-aware tests
+    /// that check filtering on synthesised system column values.
+    fn make_batch_at(
+        ids: &[&str],
+        tss: &[i64],
+        evts: &[&str],
+        seq_id_first: u64,
+        batch_id: u64,
+    ) -> RecordBatch {
+        use arrow::array::Int64Array;
+        let n = ids.len();
+        let ids_arr: ArrayRef = Arc::new(StringViewArray::from(ids.to_vec()));
+        let tss_arr: ArrayRef = Arc::new(
             TimestampNanosecondArray::from(tss.iter().copied().map(Some).collect::<Vec<_>>())
                 .with_timezone("UTC"),
         );
-        let evts: ArrayRef = Arc::new(StringViewArray::from(evts.to_vec()));
-        RecordBatch::try_new(minimal_arrow_schema(), vec![ids, tss, evts]).unwrap()
+        let evts_arr: ArrayRef = Arc::new(StringViewArray::from(evts.to_vec()));
+        let seq_arr: ArrayRef = Arc::new(Int64Array::from(
+            (0..n)
+                .map(|i| (seq_id_first + i as u64) as i64)
+                .collect::<Vec<_>>(),
+        ));
+        let bid_arr: ArrayRef = Arc::new(Int64Array::from(vec![batch_id as i64; n]));
+        RecordBatch::try_new(
+            minimal_arrow_schema(),
+            vec![ids_arr, tss_arr, evts_arr, seq_arr, bid_arr],
+        )
+        .unwrap()
     }
 
     fn make_handle(segment_id: u64, row_count: u64) -> SegmentHandle {
@@ -2195,7 +2254,10 @@ mod tests {
     // ── Construction and schema ─────────────────────────────────────────────
 
     #[test]
-    fn output_schema_reflects_declared_columns_for_full_scan() {
+    fn output_schema_reflects_declared_and_system_columns_for_full_scan() {
+        // Per `docs/design/storage/system-columns.md` §4.1 the empty
+        // projection emits every declared column followed by the
+        // implicit `__seq_id` and `__batch_id` system columns.
         let reader: Arc<dyn SegmentReader> = Arc::new(VecReader::empty(minimal_schema()));
         let scan = ScanOperator::full_scan(reader).expect("ok");
         let names: Vec<&str> = scan
@@ -2204,7 +2266,10 @@ mod tests {
             .iter()
             .map(|c| c.name.as_str())
             .collect();
-        assert_eq!(names, vec!["entity_id", "ts", "event_type"]);
+        assert_eq!(
+            names,
+            vec!["entity_id", "ts", "event_type", "__seq_id", "__batch_id"]
+        );
     }
 
     #[test]
@@ -3486,18 +3551,18 @@ mod tests {
     }
 
     #[test]
-    fn row_tombstones_error_when_seq_id_column_missing() {
-        // Documents the current scope limit: `__seq_id` / `__batch_id`
-        // system columns are not yet exposed to the scan's materialized
-        // output (see the module docs on Output schema), so row-level
-        // tombstones cannot filter against per-row IDs. The
-        // `TombstoneFilter` surfaces this as a clear error rather than
-        // silently passing deleted rows through — if a future task
-        // wires system columns into the scan output, this error goes
-        // away without code changes here.
+    fn row_tombstones_filter_via_materialised_seq_id() {
+        // Per `docs/design/storage/system-columns.md` §4.1 the scan
+        // output now carries `__seq_id`, so a row-level tombstone
+        // (TombstoneFile::for_rows) filters out exactly the row whose
+        // synthesised `__seq_id` matches. This test was previously a
+        // negative carve-out (`row_tombstones_error_when_seq_id_column_missing`)
+        // and is flipped to assert the correctness contract.
         let segments = vec![(
             handle_for(1, 0, 0, 1),
-            vec![make_batch(&["alice"], &[100], &["e1"])],
+            // Seq_id_first = 42, batch_id = 1 → the single row's
+            // synthesised __seq_id is 42; the tombstone targets that.
+            vec![make_batch_at(&["alice"], &[100], &["e1"], 42, 1)],
             vec![zones_for("alice", "alice", 100, 100)],
         )];
         let reader: Arc<dyn SegmentReader> =
@@ -3512,11 +3577,14 @@ mod tests {
         )
         .unwrap();
         op.open().unwrap();
-        let err = op
-            .next_batch()
-            .expect_err("row tombstone without __seq_id column errors");
-        let msg = err.to_string();
-        assert!(msg.contains("__seq_id"), "got: {msg}");
+        let mut total_rows: usize = 0;
+        while let Some(b) = op.next_batch().unwrap() {
+            total_rows += b.num_rows();
+        }
+        assert_eq!(
+            total_rows, 0,
+            "row tombstone for __seq_id=42 should drop the only row"
+        );
     }
 
     #[test]
@@ -3795,14 +3863,18 @@ mod tests {
 
     use super::MergeSourcesOperator;
 
-    /// Build a minimal three-column RecordBatch (`entity_id`, `ts`,
-    /// `event_type`) for feeding a joined-source sub-scan.
+    /// Build a minimal RecordBatch (`entity_id`, `ts`, `event_type`,
+    /// `__seq_id`, `__batch_id`) for feeding a joined-source sub-scan.
+    /// System columns are synthesised at fixture-build time per
+    /// `docs/design/storage/system-columns.md` §3 (sequential
+    /// `__seq_id` starting at 0, `__batch_id` constant 0).
     ///
     /// The `event_type` column is filled with a constant value
     /// (`"e"`) because these tests don't exercise event-type
     /// semantics; `TableSchema::new` requires the entity-key, ts, and
     /// event-type role columns to be three distinct columns.
     fn merge_sources_batch(entity_ids: &[&str], tss: &[i64]) -> RecordBatch {
+        use arrow::array::Int64Array;
         assert_eq!(entity_ids.len(), tss.len());
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("entity_id", DataType::Utf8View, false),
@@ -3812,7 +3884,10 @@ mod tests {
                 false,
             ),
             Field::new("event_type", DataType::Utf8View, false),
+            Field::new("__seq_id", DataType::Int64, false),
+            Field::new("__batch_id", DataType::Int64, false),
         ]));
+        let n = entity_ids.len();
         let eid: ArrayRef = Arc::new(StringViewArray::from(entity_ids.to_vec()));
         let ts: ArrayRef = Arc::new(
             TimestampNanosecondArray::from(tss.iter().copied().map(Some).collect::<Vec<_>>())
@@ -3821,7 +3896,9 @@ mod tests {
         let et: ArrayRef = Arc::new(StringViewArray::from(
             entity_ids.iter().map(|_| "e").collect::<Vec<_>>(),
         ));
-        RecordBatch::try_new(arrow_schema, vec![eid, ts, et]).unwrap()
+        let seq: ArrayRef = Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()));
+        let bid: ArrayRef = Arc::new(Int64Array::from(vec![0i64; n]));
+        RecordBatch::try_new(arrow_schema, vec![eid, ts, et, seq, bid]).unwrap()
     }
 
     /// Build a table schema with (entity_id, ts, event_type) columns.
