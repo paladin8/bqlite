@@ -152,7 +152,9 @@ memory ≈ total_input_bytes × 2
 
 (×2 for the `take` indices plus the rearranged output batch). At `max_rows = 10M` rows and a representative row width of ~100 bytes, peak memory is ~2 GB — within the query memory budget.
 
-The operator **does not** register with a `MemoryBudget` tracker in Wave 3 (the trait shipped in TASK-111; the production `MemoryTracker` implementation lands with TASK-510 per `engine/memory-budget.md`). The `max_rows` hard cap is the sole protection against unbounded memory growth in Wave 3.
+**Wave 3** ships the operator without `MemoryBudget` integration; the `max_rows` hard cap is the sole protection against unbounded memory growth.
+
+**Wave 5** (TASK-513) wires the operator against the per-query `Arc<dyn MemoryBudget>`: each accumulated batch's Arrow array bytes are reserved through `MemoryBudget::try_reserve`. The operator registers a `SortSpillHandler` that, on `try_reserve` overshoot, sorts the in-memory buffer, writes one Arrow IPC stream-format run to disk via `bqlite_core::SpillFs`, drops the reservations the run held, and returns the *reservation* bytes freed (per `engine/spill.md` §10.2 step 6). At child exhaustion the operator builds a k-way merger over every spilled run plus the sorted in-memory residual and emits output via `arrow::compute::interleave_record_batch`, preserving `Utf8View` / dictionary representations end-to-end. The `max_rows` cap is preserved as the absolute upper bound across in-memory + spilled rows.
 
 ### 3.7 Cancellation
 
@@ -311,7 +313,7 @@ On error (either cap overflow or upstream error), the engine calls `close()` whi
 
 | Wave | Task | Change |
 |---|---|---|
-| Wave 5 | TASK-513 (protocol: TASK-502 / `engine/spill.md`) | Sort spill: sorted runs to temp files (Arrow IPC stream per `engine/spill.md` § 6.1), merge-sort pass at end-of-input. No `SortPhysical` opt-in field — every Sort participates by construction once TASK-513 lands; spill root configured engine-wide via `EngineConfig::spill_root`. |
+| Wave 5 | TASK-513 *(landed)* | Sort spill: sorted runs to temp files (Arrow IPC stream per `engine/spill.md` § 6.1), k-way merge at end-of-input via `arrow::compute::interleave_record_batch`. No `SortPhysical` opt-in field — every Sort participates by construction; spill root threaded from `Database` via `QueryContext`. |
 | Wave 5 | — | `NULLS FIRST` / `NULLS LAST` modifiers in `ORDER BY` syntax. `SortDirection` gains a `null_position` field. |
 | Wave 5+ | — | Unstable sort variant for performance when key uniqueness is known. Controlled by a flag on `SortPhysical`. |
-| Wave 5 | TASK-510 (per `engine/memory-budget.md`) | `MemoryBudget` integration: both operators reserve through the query's `MemoryBudget` (TASK-111 trait, `MemoryTracker` impl) instead of relying solely on the hard cap. Sort registers a spill handler (TASK-513); Distinct fails fast on overflow. |
+| Wave 5 | TASK-510 / TASK-513 *(landed)* | `MemoryBudget` integration: Sort reserves through the query budget and registers a `SortSpillHandler`; Distinct fails fast on overflow (no spill). |

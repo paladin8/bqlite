@@ -859,12 +859,14 @@ fn bind_physical_with_cache(
         // ── Wave 3 operators (TASK-323) ───────────────────────────
         PhysicalPlan::Sort(sort) => {
             let child = bind_physical_with_cache(&sort.input, db, ctx, cohorts)?;
-            Ok(Box::new(SortOperator::new(
+            Ok(Box::new(SortOperator::with_spill(
                 child,
                 sort.keys.clone(),
                 sort.max_rows,
                 ctx.cancellation().clone(),
                 ctx.memory().clone(),
+                ctx.spill_fs().cloned(),
+                ctx.spill_query_id(),
             )))
         }
 
