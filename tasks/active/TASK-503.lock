@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-503",
+  "claimed_at": "2026-04-28T05:37:47Z",
+  "branch": "task/TASK-503",
+  "description": "Fused stateless segment and operator-fusion contract"
+}
