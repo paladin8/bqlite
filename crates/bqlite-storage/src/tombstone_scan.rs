@@ -151,12 +151,13 @@ impl SegmentScan for TombstoneScanWrapper {
         let has_batch_id = batch.schema().column_with_name(BATCH_ID_COLUMN).is_some();
 
         let need_seq = !has_seq_id && !self.tombstones.row_deletes.is_empty();
-        // `all_batch_dropped` already fast-paths when this segment's batch_id is in
-        // batch_deletes, so we only need to synthesise `__batch_id` when it is absent
-        // AND this segment's own batch_id is targeted — which is already handled above.
-        // This condition is therefore always false past the `all_batch_dropped` guard,
-        // but is written explicitly to document the intent.
-        let need_batch = !has_batch_id && self.tombstones.batch_deletes.contains(&self.batch_id);
+        // Synthesise `__batch_id` whenever batch deletes exist and the column is absent.
+        // `TombstoneFilter::apply_batch_deletes` errors when the column is missing, even
+        // for segments whose batch_id is not among the deletes.  The `all_batch_dropped`
+        // fast-path above already handles the case where this segment IS targeted, so
+        // synthesis here produces a constant array of a non-matching value — zero rows
+        // are removed, but the filter runs without error.
+        let need_batch = !has_batch_id && !self.tombstones.batch_deletes.is_empty();
 
         if !need_seq && !need_batch {
             // All required system columns are already present (or no deletes
