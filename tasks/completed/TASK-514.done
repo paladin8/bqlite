@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-514",
   "claimed_at": "2026-04-28T07:38:09Z",
+  "completed_at": "2026-04-28T07:59:17Z",
   "branch": "task/TASK-514",
   "description": "Cohort materialization memory enforcement"
 }
