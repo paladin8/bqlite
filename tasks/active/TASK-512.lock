@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-512",
+  "claimed_at": "2026-04-28T07:09:51Z",
+  "branch": "task/TASK-512",
+  "description": "Ingest partitioner external spill"
+}
