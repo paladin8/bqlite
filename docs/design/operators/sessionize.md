@@ -588,7 +588,7 @@ When the adapter and warning channel land (TASK-410 ecosystem), the adapter will
 
 ### 11.5 Memory Bound
 
-Worst case before cap fires: 1,000,000 events x ~100 bytes (demanded columns) = ~100 MB for a single session buffer. This is within the 3 GB query budget (execution-model.md §10.1). The cap exists to prevent pathological entities (malicious, buggy producer, or mega-user) from consuming unbounded memory. Spill-to-disk is out of scope for v1 (Wave 5, TASK-502).
+Worst case before cap fires: 1,000,000 events x ~100 bytes (demanded columns) = ~100 MB for a single session buffer. This is within the 3 GiB query budget (`engine/memory-budget.md` § 2 / execution-model.md §10.1). The cap exists to prevent pathological entities (malicious, buggy producer, or mega-user) from consuming unbounded memory. Spill-to-disk is out of scope for v1 (Wave 5, TASK-502); session-buffer overflow fails with `MemoryBudgetExceeded` per `engine/memory-budget.md` § 7.
 
 ---
 

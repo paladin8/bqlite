@@ -4,7 +4,7 @@ Operational requirements that all components must satisfy.
 
 ## Memory Budget
 
-All operators must respect the configured memory budget. When an operator's intermediate state exceeds its allocation, it must spill to disk rather than grow unbounded. The default memory budget is 4 GB.
+All operators must respect the configured memory budget. When an operator's intermediate state exceeds its allocation, it must either spill to disk or fail with a typed `MemoryBudgetExceeded` error per the per-operator policy in `docs/design/engine/memory-budget.md` § 7. The default query memory budget is 3 GiB; the engine-wide aggregate (query + compaction + ingest sub-budgets) defaults to ~4 GiB. The three sub-budgets are independent allocators, not a single shared pool — see `docs/design/engine/memory-budget.md` § 2 for the canonical numbers and the rationale.
 
 ## Typed, Recoverable Errors
 

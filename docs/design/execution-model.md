@@ -15,7 +15,7 @@ The execution model serves four constraints from [core-beliefs.md](../core-belie
 
 **Entity-first data model (Belief 3).** Every query implicitly operates per-entity. The execution model partitions work by entity so that temporal operators (sequence matching, sessionization) see one entity's events at a time in timestamp order — no hash lookups, no out-of-order assembly.
 
-**Memory-conscious (Belief 6).** Queries execute within a bounded memory budget (default 3 GB for query execution, see storage-format.md Section 13). Sub-batch streaming ensures that even entities with millions of events never blow the budget. Operators that exceed their allocation spill to disk.
+**Memory-conscious (Belief 6).** Queries execute within a bounded memory budget (default 3 GiB for query execution, see [`engine/memory-budget.md`](engine/memory-budget.md) — the canonical source — and storage-format.md Section 13 for the operational summary). Sub-batch streaming ensures that even entities with millions of events never blow the budget. Operators either spill (sort, cohort) or fail with `MemoryBudgetExceeded` per the per-operator policy table in `engine/memory-budget.md` § 7.
 
 **Strongly-typed pipelines (Belief 8).** Every operator declares its output schema at plan time. The planner validates schema compatibility across the entire pipeline before execution begins. There are no runtime type errors.
 
@@ -856,33 +856,32 @@ For fused entity operators that use `finish_entity_into()`, each shard maintains
 
 ## 10. Memory Management
 
+> The reservation/release contract, tracked allocation classes,
+> per-operator spill-vs-fail policy, and the `MemoryBudget` ↔
+> `QueryContext` wiring are canonical in
+> [`engine/memory-budget.md`](engine/memory-budget.md). This section
+> sketches the surface and the per-worker working-set arithmetic; for
+> the authoritative trait shape, defaults, and policy table see that
+> doc.
+
 ### 10.1 Memory Tracking
 
-The engine uses a **hierarchical memory tracker** that enforces the query budget at runtime:
+Every query carries an `Arc<dyn MemoryBudget>` on its `QueryContext`. In production the concrete implementation is a `MemoryTracker` (TASK-510) backed by a single `AtomicU64` used-bytes counter and a fixed `budget`. In tests the `UnboundedMemory` stub is used (`bqlite-core::memory`).
 
 ```rust
-pub struct MemoryTracker {
-    /// Total bytes currently allocated by this query.
-    used: AtomicU64,
-    /// Maximum bytes this query may allocate.
-    budget: u64,
-}
-
-impl MemoryTracker {
-    /// Try to reserve `bytes` of memory. Returns Err if budget would be exceeded.
-    /// Callers should attempt to spill before propagating the error.
-    pub fn try_reserve(&self, bytes: u64) -> Result<MemoryReservation, OperatorError>;
-
-    /// Release a reservation, returning memory to the budget.
-    pub fn release(&self, reservation: MemoryReservation);
+pub trait MemoryBudget: Send + Sync {
+    fn try_reserve(&self, bytes: u64) -> Result<MemoryReservation>;
+    fn register_spill_handler(&self, handler: Arc<dyn SpillNotification>);
+    fn used_bytes(&self) -> u64;
+    fn budget_bytes(&self) -> u64;
 }
 ```
 
-Every allocation that grows with data size — aggregation hash tables, hash sets for IN subqueries, sort buffers for ORDER BY, decoded column buffers — goes through `MemoryTracker::try_reserve()`. Small fixed-size allocations (operator structs, NFA state) are not tracked individually.
+Every allocation that grows with data size — aggregation hash tables, hash sets for IN subqueries, sort buffers for ORDER BY, decoded column buffers, sequence-match output buffers — goes through `MemoryBudget::try_reserve()`. Small fixed-size allocations (operator structs, compiled NFA, per-entity state, per-tile scratch) are not tracked individually. The tracked/untracked classification is enumerated in `engine/memory-budget.md` § 5.
 
-**Spill protocol.** When `try_reserve()` returns `Err`, the operator should attempt to spill some of its state to disk (Section 10.3) and retry. If the operator does not support spilling (or spilling fails to free enough memory), it propagates the `MemoryBudgetExceeded` error, which aborts the query. This means spill is the *preferred* response to memory pressure, but error is the *fallback* for operators that cannot spill.
+**Spill-vs-fail.** When `try_reserve()` returns `Err`, the budget itself first invokes any registered spill handlers (§ 10.3, `engine/memory-budget.md` § 4). If no handler frees enough bytes, the call fails and the operator propagates `MemoryBudgetExceeded`, aborting the query. Spill is the preferred response only for operators that explicitly opt in (sort, cohort/IN-subquery once TASK-502 freezes the protocol). All other operators fail fast — the per-operator policy table is in `engine/memory-budget.md` § 7.
 
-Every worker draining a morsel of this query shares the same `MemoryTracker` instance (via `QueryContext`). The atomic counter provides contention-free tracking across threads. The tracker is hierarchical: the query budget is a child of the engine-wide budget, which is itself bounded by the configured memory limit.
+There is one tracker per query, shared across every worker draining that query's morsels via `Arc`. Contention is one atomic on the success path. There is no engine-wide parent tracker in v1; concurrent queries each carry their own budget. Adding cross-query global accounting is a future-wave addendum to `engine/memory-budget.md`.
 
 ### 10.2 Per-Worker Memory
 
@@ -899,7 +898,7 @@ Each *worker* (not each morsel, not each shard) holds the live working set for o
 
 Per-worker memory is dominated by the merge read buffers and the current batch — together ~29 MB. Multiplied by `num_cores` workers and added to the per-shard accumulator state, the working set for a query is `num_cores × 29 MB + num_shards × accumulator_bytes`, which is independent of how many morsels the query produces.
 
-On a 16-core machine: `16 × 29 MB + 32 × ~3 MB ≈ 560 MB`. On a 32-core machine: `32 × 29 MB + 32 × ~3 MB ≈ 1.0 GB`. Both fit within the 3 GB query budget with headroom for the worst-case accumulator. The per-worker budget (`3 GB / num_cores`) provides a stable upper bound regardless of how many morsels the query schedules — adding more morsels does not add to the live working set, because the worker pool's `num_cores` ceiling caps in-flight morsels at `num_cores`.
+On a 16-core machine: `16 × 29 MB + 32 × ~3 MB ≈ 560 MB`. On a 32-core machine: `32 × 29 MB + 32 × ~3 MB ≈ 1.0 GB`. Both fit within the 3 GiB query budget with headroom for the worst-case accumulator. The per-worker working set (`3 GiB / num_cores`) is an **arithmetic decomposition** for planning, not a runtime sub-budget; all reservations land in the single per-query `MemoryBudget` (see `engine/memory-budget.md` § 6). Adding more morsels does not add to the live working set, because the worker pool's `num_cores` ceiling caps in-flight morsels at `num_cores`.
 
 Per-shard accumulator state is bounded by `max_groups × ~100 bytes ≈ 100 MB` per shard, but in practice the partial accumulators are much smaller because each shard sees only its slice of group keys.
 
@@ -922,7 +921,7 @@ Spill files (sort, IN subquery) are written to a configurable temp directory (de
 
 ### 10.4 Aggregation State Bounds
 
-Running aggregation state is small per group (counts, sums, min/max — see `AggState` in Section 9.5). The `max_groups` hard cap (default 1M) is enforced inside `HashAccumulator::update()` and is the only defense against runaway cardinality. When the cap is hit, the query fails with `OperatorError::MaxGroupsExceeded { limit }`, not a spill. 1M groups × ~100 bytes = ~100 MB — well within the 3 GB query budget, with no spill complexity to manage.
+Running aggregation state is small per group (counts, sums, min/max — see `AggState` in Section 9.5). The `max_groups` hard cap (default 1M) is enforced inside `HashAccumulator::update()` and is the only defense against runaway cardinality. When the cap is hit, the query fails with `OperatorError::MaxGroupsExceeded { limit }`, not a spill. 1M groups × ~100 bytes = ~100 MB — well within the 3 GiB query budget, with no spill complexity to manage.
 
 ---
 
@@ -1126,7 +1125,7 @@ Each worker maintains its own `QueryMetrics` in its `WorkerContext` (Section 3.3
 | `QueryContext` / `QueryMetrics` | `bqlite-engine` | Execution-time state and metrics |
 | `WorkerContext` | `bqlite-engine` | Per-(worker, shard) state — metrics, warnings, current shard identity (Section 3.3) |
 | `MorselGenerator`, `MorselQueue` | `bqlite-engine` | Morsel-driven execution scheduler (Section 9.4) |
-| `MemoryTracker` | `bqlite-engine` | Memory budget enforcement |
+| `MemoryTracker` (impl of `MemoryBudget`) | `bqlite-engine` | Memory budget enforcement; trait surface in `bqlite-core::memory`, contract in `engine/memory-budget.md` |
 | Thread pool, query scheduler | `bqlite-engine` | Orchestration |
 | Shard-task coordinator | `bqlite-engine` | Parallel execution — drives morsel queues per shard |
 
@@ -1155,7 +1154,7 @@ This follows the dependency direction in CLAUDE.md: `bqlite-engine` depends on `
 | Thread pool | Rayon, fixed size = num_cores, queries queue FIFO | All cores utilized; concurrent queries share the pool |
 | Default shard count | 32 | Distributed-ready partitioning unit; the worker pool drains shards via morsels |
 | Compaction scheduling | Up to num_cores threads, bounded by spare capacity | Uses idle cores; scales down under query load |
-| Memory management | Hierarchical MemoryTracker; per-worker budget = query_budget / num_cores | Runtime enforcement with stable per-worker bounds, independent of morsel count |
+| Memory management | Single per-query `MemoryBudget` (TASK-111 trait, `MemoryTracker` impl in TASK-510), shared across workers via `Arc`; per-worker working set is a planning hint = query_budget / num_cores. See `engine/memory-budget.md` (canonical). | Runtime enforcement with stable per-worker bounds, independent of morsel count |
 | Spill-to-disk | Sort spill and IN subquery spill only; aggregation has hard `max_groups` cap | Aggregation spill deferred to v2; hard cap keeps the v1 engine small |
 | Query timeout | Timer sets AtomicBool cancel flag; cooperative checking | Fast stopping, no polling overhead |
 | Error handling | `OperatorError` in operators, wrapped by engine `ExecutionError`; warnings for non-fatal conditions | Keeps crate boundaries clean while preserving typed failures |

@@ -1125,7 +1125,7 @@ Type rules: see type-system.md Section 6.9.
 
 ### 17.5 Memory Budget for IN QUERY
 
-Subquery results used in `IN QUERY` and alias-based `IN` expressions are materialized as hash sets in memory. Materialization draws from the query's memory budget (configured at engine initialization). If the hash set exceeds the budget, the entire query fails with an out-of-budget error — there is no partial-result mode and the set is never silently truncated.
+Subquery results used in `IN QUERY` and alias-based `IN` expressions are materialized as hash sets in memory. Materialization draws from the query's memory budget (configured at engine initialization; default 3 GiB — see [`engine/memory-budget.md`](engine/memory-budget.md)). If the hash set exceeds the budget, the entire query fails with an out-of-budget error — there is no partial-result mode and the set is never silently truncated.
 
 ---
 

@@ -152,7 +152,7 @@ memory ≈ total_input_bytes × 2
 
 (×2 for the `take` indices plus the rearranged output batch). At `max_rows = 10M` rows and a representative row width of ~100 bytes, peak memory is ~2 GB — within the query memory budget.
 
-The operator **does not** register with a `MemoryBudget` tracker in Wave 3 (that infrastructure lands with TASK-111 / later waves). The `max_rows` hard cap is the sole protection against unbounded memory growth.
+The operator **does not** register with a `MemoryBudget` tracker in Wave 3 (the trait shipped in TASK-111; the production `MemoryTracker` implementation lands with TASK-510 per `engine/memory-budget.md`). The `max_rows` hard cap is the sole protection against unbounded memory growth in Wave 3.
 
 ### 3.7 Cancellation
 
@@ -247,7 +247,7 @@ The output schema is **identical to the input schema**: same columns, same types
 
 Memory is dominated by the `HashSet<GroupKey>`. At `max_groups = 1M` and ~80 bytes per `GroupKey` entry (SmallVec inline storage + hash table overhead), peak memory is ~80 MB — well within the query budget.
 
-Like `SortOperator`, `DistinctOperator` does not register with a `MemoryBudget` tracker in Wave 3. The `max_groups` hard cap is the sole overflow protection.
+Like `SortOperator`, `DistinctOperator` does not register with a `MemoryBudget` tracker in Wave 3. The `max_groups` hard cap is the sole overflow protection. Wave 5 (TASK-510 per `engine/memory-budget.md` § 7) wires Distinct into the per-query budget; on overflow Distinct fails fast with `MemoryBudgetExceeded` (no spill).
 
 ### 4.7 Entity Ordering
 
@@ -292,7 +292,7 @@ Both errors are fatal — the query is aborted. There is no partial output and n
 
 | Operator | Cap name | Default | Rationale |
 |---|---|---|---|
-| `SortOperator` | `max_rows` | 10,000,000 | 10M rows at ~100 bytes each = ~1 GB; headroom in a 3 GB query budget |
+| `SortOperator` | `max_rows` | 10,000,000 | 10M rows at ~100 bytes each = ~1 GB; headroom in a 3 GiB query budget |
 | `DistinctOperator` | `max_groups` | 1,000,000 | Matches the aggregate operator default; same GroupKey overhead |
 
 Caps are specified in the physical descriptor, not hardcoded in the operator. The engine bind step reads them from the descriptor, allowing query-level overrides (future `WITH (max_rows = N)` hint or engine config).
@@ -314,4 +314,4 @@ On error (either cap overflow or upstream error), the engine calls `close()` whi
 | Wave 5 | TASK-502 | Sort spill: sorted runs to temp files, merge-sort pass. `SortPhysical` gains `spill_dir: Option<PathBuf>`. `None` → current in-memory path. |
 | Wave 5 | — | `NULLS FIRST` / `NULLS LAST` modifiers in `ORDER BY` syntax. `SortDirection` gains a `null_position` field. |
 | Wave 5+ | — | Unstable sort variant for performance when key uniqueness is known. Controlled by a flag on `SortPhysical`. |
-| Wave 4+ | TASK-111 | `MemoryBudget` integration: both operators register allocations with the query memory tracker instead of relying solely on the hard cap. |
+| Wave 5 | TASK-510 (per `engine/memory-budget.md`) | `MemoryBudget` integration: both operators reserve through the query's `MemoryBudget` (TASK-111 trait, `MemoryTracker` impl) instead of relying solely on the hard cap. Sort registers a spill handler (TASK-513); Distinct fails fast on overflow. |

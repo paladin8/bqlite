@@ -91,11 +91,11 @@ Follows directly from § 2.4 -- the engine is alias-stateless, so there is nowhe
 
 ### 2.7 Cohort Size Accounting (A6)
 
-Cohort materialization (both alias caches per § 2.5 and inline `IN QUERY` subqueries per § 4.1) does **not** have a dedicated size cap in v1. Memory pressure is enforced by the general memory budget layer (TASK-501).
+Cohort materialization (both alias caches per § 2.5 and inline `IN QUERY` subqueries per § 4.1) does **not** have a dedicated size cap in v1. Memory pressure is enforced by the general memory budget layer ([`engine/memory-budget.md`](../engine/memory-budget.md), § 5 / § 7 — the cohort `HashSet` is a tracked allocation class).
 
 A cohort that exceeds the memory budget causes the whole query to fail with the standard out-of-budget error. There is no "silently truncated cohort" failure mode -- the only possible outcomes are "cohort fits, query succeeds" and "cohort doesn't fit, query errors."
 
-**Implication for TASK-501:** the memory-budget model must account for the cohort's materialized `HashSet` as a named memory consumer.
+The spill-vs-fail decision for cohort materialization specifically is owned by TASK-502 (`engine/spill.md`); TASK-514 implements whichever policy that doc settles on. Until TASK-502 lands, the user-visible behaviour is "fail with `MemoryBudgetExceeded`".
 
 **User-facing documentation requirement:** the exceeds-budget error path must be documented in `query-language.md` § 17 / § 18.
 
@@ -500,7 +500,7 @@ spec; semantics are unchanged.
 
 **TASK-430 (SAMPLE pushdown):** honor § 3.4's value-based hash when the source is a `MergeSources`.
 
-**TASK-501 (memory budget):** account for cohort `HashSet` as a named memory consumer per § 2.7.
+**TASK-501 (memory budget):** the cohort `HashSet` is a tracked allocation class in `engine/memory-budget.md` § 5.1; spill-vs-fail policy for cohort materialization is owned by TASK-502 (`engine/spill.md`) and implemented by TASK-514 per § 2.7.
 
 ---
 

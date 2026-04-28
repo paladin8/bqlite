@@ -12,7 +12,7 @@ These are the design principles that guide all decisions in bqlite.
 
 5. **Embeddable, not a server.** bqlite is a library — `pip install bqlite` or a Rust crate dependency. No server process, no deployment, no configuration beyond pointing at a database directory. Think SQLite, not PostgreSQL.
 
-6. **Memory-conscious.** Explicit memory budgets (default 4 GB), spill-to-disk for large intermediate results, streaming evaluation where possible. Queries over billions of events should work with bounded memory.
+6. **Memory-conscious.** Explicit memory budgets — engine-wide aggregate ~4 GiB by default, with the query share defaulting to 3 GiB (see `docs/design/engine/memory-budget.md`) — spill-to-disk for large intermediate results, streaming evaluation where possible. Queries over billions of events should work with bounded memory.
 
 7. **Distributed-ready architecture.** We are not building distributed execution in v1, but the architecture should not preclude it. Physical plans should be partitionable. State should be serializable. Nothing should assume single-node.
 

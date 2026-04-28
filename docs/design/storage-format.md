@@ -17,7 +17,7 @@ The storage engine serves three constraints from [core-beliefs.md](../core-belie
 
 **Embeddable, not a server (Belief 5).** No background daemon. Ingestion is a batch call that produces segment files directly. Compaction runs inline or as an explicit maintenance operation. The database is a directory that can be opened, queried, and closed without lifecycle management.
 
-**Memory-conscious (Belief 6).** Scans, compaction, and ingestion all operate within the configured memory budget (default 4 GB). Buffer sizes are bounded and explicit. The read path streams entity batches rather than materializing full result sets.
+**Memory-conscious (Belief 6).** Scans, compaction, and ingestion all operate within configured per-subsystem memory budgets (default 3 GiB query / 800 MiB compaction / 256 MiB ingest, ~4 GiB aggregate; see § 13 and [`engine/memory-budget.md`](engine/memory-budget.md)). Buffer sizes are bounded and explicit. The read path streams entity batches rather than materializing full result sets.
 
 ---
 
@@ -392,7 +392,7 @@ Apple targets do not expose `posix_fadvise(2)`. On those platforms, the sequenti
 
 This is a small but cheap win: the advisory calls are only a syscall or two, the hints save the kernel from having to detect the pattern via cache misses, and the embeddable-engine constraint (Belief 5) means we cannot tune `vm.dirty_ratio` or other system-wide knobs — explicit hints are the only lever we have.
 
-**Bounded buffers.** 4 MB read buffer per merge input stream. Modern SSDs deliver peak throughput at ≥128 KB I/O sizes, but larger buffers (2-4 MB) reduce syscall overhead and amortize seek latency on spinning disks. With k=6 (30-day windows, 6-month query) and 32 shards, total buffer memory is 192 streams * 4 MB = 768 MB — within the 3 GB query budget. Note that not all shards read simultaneously — the thread pool (sized to num_cores) limits concurrency, so actual buffer usage at any instant is `num_cores * k * 4 MB`.
+**Bounded buffers.** 4 MB read buffer per merge input stream. Modern SSDs deliver peak throughput at ≥128 KB I/O sizes, but larger buffers (2-4 MB) reduce syscall overhead and amortize seek latency on spinning disks. With k=6 (30-day windows, 6-month query) and 32 shards, total buffer memory is 192 streams * 4 MB = 768 MB — within the 3 GiB query budget. Note that not all shards read simultaneously — the thread pool (sized to num_cores) limits concurrency, so actual buffer usage at any instant is `num_cores * k * 4 MB`.
 
 **Entity-batch handoff.** The merge produces entity batches: "here are all N events for entity X, in timestamp order." The temporal operator consumes the batch, produces a result, the merge advances. Only one entity's data is in memory at a time.
 
@@ -1077,15 +1077,23 @@ A future version may switch to a binary manifest format if manifest load time be
 
 ## 13. Memory Budget Allocation
 
-The default 4 GB memory budget is split across concurrent activities:
+> The query-side enforcement model — reservation/release contract,
+> tracked allocation classes, per-operator spill-vs-fail policy, the
+> `MemoryBudget` ↔ `QueryContext` wiring — is owned by
+> [`engine/memory-budget.md`](engine/memory-budget.md). This section
+> only fixes the absolute defaults the storage layer cares about.
 
-| Activity | Default allocation | Notes |
-|---|---|---|
-| Query execution | 75% (3 GB) | Shared across the fixed query worker pool |
-| Compaction | 20% (800 MB) | One compaction at a time per table |
-| Ingest buffering | 5% (200 MB) | Sort buffer for batch ingest |
+bqlite ships three independent memory budgets, one per subsystem. They do **not** share an allocator and do **not** contend for bytes — each subsystem enforces its own ceiling against its own counter.
 
-Within query execution, the 3 GB budget is fixed for the process's query worker pool. Only shard-tasks that have actually started work reserve memory against it; queued tasks do not. Admission control and runtime reservations prevent the pool from exceeding the budget (returning a clear error rather than OOM when necessary).
+| Subsystem | Default budget | Owner | Notes |
+|---|---:|---|---|
+| Query execution | **3 GiB** | `MemoryBudget` per query (`engine/memory-budget.md`) | Shared across the fixed query worker pool |
+| Compaction | **800 MiB** | Compaction worker pool ceiling | One compaction at a time per `(window, shard)` |
+| Ingest buffering | **256 MiB** | `Partitioner::new(.., budget_bytes)` | Sort buffer for batch ingest; matches the engine's `DEFAULT_INGEST_BUDGET_BYTES` |
+
+The aggregate ceiling — the user-facing summary "bqlite uses up to ~4 GiB by default" — is the sum of these three sub-budgets (~4.06 GiB at simultaneous peak). It is a capacity-planning number, not a runtime invariant; see `engine/memory-budget.md` § 2 for why three independent budgets rather than one parent allocator.
+
+Within query execution, the 3 GiB budget is fixed for the query at submission time. Only operators that have actually allocated state reserve memory against it; queued morsels do not. Reservations are checked against the budget at the allocation site (`MemoryBudget::try_reserve`), returning a typed `MemoryBudgetExceeded` error rather than OOM when the budget would be exceeded.
 
 **Per-shard read buffers** for the k-way merge: 4 MB per input stream. Active buffer usage is bounded by `num_concurrent_shard_tasks * k * 4 MB` since the thread pool limits how many shards read simultaneously.
 
@@ -1183,7 +1191,7 @@ Encoded as three components:
 | Delete mechanism | Per-shard `tombstones.json` with row/batch/entity/time-range deletes; **not** in the manifest | Re-inserted entities get the right semantics; local writes for per-shard deletes |
 | Decode strategy | Near-zero-copy to Arrow, late materialization | DictionaryArray/RunEndEncoded propagate through pipeline |
 | Concurrency | Lock file for writes, core-budget semaphore for query/compaction interleaving, `Arc`-refcount reclamation sweep | Lock-free read path; see [compaction-concurrency.md](storage/compaction-concurrency.md) |
-| Memory budget split | 75% query / 20% compaction / 5% ingest | Query-dominant workload |
+| Memory budget split | Independent sub-budgets: 3 GiB query / 800 MiB compaction / 256 MiB ingest (~4 GiB aggregate) | Query-dominant workload; sub-budgets do not share an allocator (see `engine/memory-budget.md` § 2) |
 
 ---
 

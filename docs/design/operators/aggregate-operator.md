@@ -13,7 +13,7 @@ The aggregate framework serves three constraints from execution-model.md:
 
 **Zero intermediate allocation on the fused path (Belief 1).** When a stateful entity operator (MATCH, SESSIONIZE, ATTRIBUTE) feeds directly into an aggregation, the fused path updates accumulators without materializing per-entity rows. This is the dominant performance win for funnel and retention queries.
 
-**Bounded memory with no spill (v1 constraint).** Group cardinality is hard-capped at `max_groups` (default 1,000,000). At ~100 bytes per group, 1M groups fit within the 3 GB query budget. Spill-to-disk is deferred to v2. The cap is enforced inside `HashAccumulator::update` and surfaces as a typed error.
+**Bounded memory with no spill (v1 constraint).** Group cardinality is hard-capped at `max_groups` (default 1,000,000). At ~100 bytes per group, 1M groups fit within the 3 GiB query budget. Spill-to-disk is deferred to v2. The cap is enforced inside `HashAccumulator::update` and surfaces as a typed error.
 
 **Extensibility for new accumulators.** TASK-327 adds DDSketch-based percentile accumulators (`P50`, `P90`, `P95`, `P99`) by extending `AggState` with a `Percentile` variant. The `Accumulator` trait surface does not change — extensibility flows through `AggState` variants and `AggFunction` enum members.
 
@@ -124,7 +124,7 @@ The physical planner constructs a `HashAccumulator` from the `AggregatePhysical`
 
 The `max_groups` cap (default `DEFAULT_MAX_GROUPS = 1_000_000`) is enforced inside `get_or_create_group()`. When the cap is reached and a new group arrives, the method returns `Err(BqliteError::Execution(...))`. The error propagates upward through the operator tree and aborts the query.
 
-There is no spill-to-disk for aggregation state in v1. At ~100 bytes per group, 1M groups occupy ~100 MB — well within the 3 GB query budget.
+There is no spill-to-disk for aggregation state in v1. At ~100 bytes per group, 1M groups occupy ~100 MB — well within the 3 GiB query budget.
 
 ---
 
