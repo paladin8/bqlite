@@ -2,6 +2,7 @@
   "agent_id": "agent-4",
   "task_id": "TASK-504",
   "claimed_at": "2026-04-28T05:37:50Z",
+  "completed_at": "2026-04-28T06:01:48Z",
   "branch": "task/TASK-504",
   "description": "Optimizer direction reconciliation + statistics source"
 }
