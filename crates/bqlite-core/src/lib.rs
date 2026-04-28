@@ -21,7 +21,9 @@ pub mod time;
 pub use time::{duration, TimeRange, Timestamp};
 
 pub mod memory;
-pub use memory::{MemoryBudget, MemoryReservation, SpillNotification, UnboundedMemory};
+pub use memory::{
+    MemoryBudget, MemoryReservation, MemoryTracker, SpillNotification, UnboundedMemory,
+};
 
 pub mod metrics;
 pub use metrics::{AtomicMetrics, Metrics, MetricsSnapshot, MetricsTimer, NoopMetrics};
