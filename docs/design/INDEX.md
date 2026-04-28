@@ -40,6 +40,10 @@ Implementation-level design notes that refine a Wave 0 direction doc for a speci
 - **planner/wave3-lowering.md** — AST→logical lowering rules for Match/Stats/OrderBy/Distinct, `DemandSet` type definition, backward demand propagation algorithm, step-property resolution, fusion setup protocol, schema validation rules for step references and variable bindings through aggregates (TASK-309, Wave 3)
 - **planner/demand-protocol.md** — `DemandCapabilities` protocol: operator-side capability advertisement struct (plain struct with bool fields), `DemandPropagation` trait, crate placement in `bqlite-planner::demand`, capability matching during physical planning, `const DEMAND_CAPS` on physical descriptors, unmet-demand error policy, scaffold retirement plan (TASK-409, Wave 4)
 
+### Engine
+
+- **engine/cancellation.md** — Cancellation, timeout, panic, spill cleanup, and warning protocol: `CancellationToken` first-fire reason CAS, batch/sub-batch/morsel yield-point latency bounds, per-`(worker, morsel)` `catch_unwind` boundary, `TempSpillFile` RAII guard with per-query subdirectory layout, `QueryWarning` enum with per-worker 1,000-entry cap and `WarningsOverflow` aggregation, `BqliteError::{Timeout, OperatorPanic}` extensions, reconciliation with execution-model.md §12 (TASK-505, Wave 5)
+
 ### Storage
 
 - **storage/reader-trait.md** — `SegmentReader` + `SegmentScan` trait surface, segment enumeration, column projection, row-group iteration, zone-map access, predicate pushdown (TASK-109, Wave 1)
