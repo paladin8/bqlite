@@ -1,7 +1,0 @@
-{
-  "agent_id": "agent-4",
-  "task_id": "TASK-509",
-  "claimed_at": "2026-04-28T07:15:19Z",
-  "branch": "task/TASK-509",
-  "description": "System-column follow-up correctness suite"
-}
