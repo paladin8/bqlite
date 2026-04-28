@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-506",
   "claimed_at": "2026-04-28T05:51:14Z",
+  "completed_at": "2026-04-28T06:17:20Z",
   "branch": "task/TASK-506",
   "description": "Morsel scheduler and query/compaction sharing"
 }
