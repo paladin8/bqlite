@@ -165,15 +165,16 @@ This is unchanged from before — the scan still produces entity-aligned `Record
 
 All `RecordBatch` values flowing through the pipeline obey a small set of conventions that operators can rely on without re-deriving them per-query.
 
-**Column ordering.** Batches produced by the scan layer lay out columns in a fixed order:
+**Column ordering.** Batches produced by the scan layer lay out columns in a fixed order — declared columns in table-schema order followed by the implicit system columns:
 
 1. `entity_id` (first)
 2. `ts` — timestamp (second)
 3. `event_type` (third)
-4. `__seq_id` — sequence identifier (fourth)
-5. Remaining property columns sorted by **encoded size ascending** — the narrowest columns first, for cache efficiency in vectorized scans.
+4. Remaining property columns sorted by **encoded size ascending** — the narrowest columns first, for cache efficiency in vectorized scans.
+5. `__seq_id` — sequence identifier (synthesised from segment-footer `seq_id_range`).
+6. `__batch_id` — ingest batch identifier (synthesised from segment-footer `batch_id`).
 
-The property column ordering is decided at ingest/compaction time by the storage layer (storage-format.md §3.4 encoding selection has access to per-chunk sizes), not at plan time. Smaller columns first means more columns fit in cache lines during vectorized filter and project passes.
+The property column ordering is decided at ingest/compaction time by the storage layer (storage-format.md §3.4 encoding selection has access to per-chunk sizes), not at plan time. Smaller columns first means more columns fit in cache lines during vectorized filter and project passes. The two system columns appear at the end of the projected batch (matching `OperatorSchema::from_table`), per `docs/design/storage/system-columns.md` §3 — they are not stored as on-disk column chunks and are synthesised at row-group decode time.
 
 **Reference columns by name, not position.** Projection pruning removes and reorders columns between the scan and the first operator that references them, so any operator that hard-codes column indices is fragile. Every operator looks up columns by name through its `OperatorSchema`. The one exception is the `EntityOperatorAdapter`, which caches `entity_id_col_idx` once at construction.
 
@@ -205,7 +206,7 @@ The `bqlite-storage` decoders already produce `StringViewArray` (see `crates/bql
 
 **Timestamp format.** The `ts` column is always `Int64` nanoseconds (Arrow `Timestamp(Nanosecond, UTC)`). No timezone conversion at query time — all conversion happens at ingest (type-system.md §7.2 width consolidation).
 
-**Null bitmaps.** Nullable columns always carry an Arrow-compatible null bitmap. Non-nullable columns (`entity_id`, `ts`, `event_type`, `__seq_id`) never do — operators skip the null check entirely on these columns, and the storage layer does not allocate bitmaps for them. The schema declares which columns are nullable; the decoder trusts the schema and does not insert defensive checks.
+**Null bitmaps.** Nullable columns always carry an Arrow-compatible null bitmap. Non-nullable columns (`entity_id`, `ts`, `event_type`, `__seq_id`, `__batch_id`) never do — operators skip the null check entirely on these columns, and the storage layer does not allocate bitmaps for them (the synthesised system-column arrays are built without a null buffer). The schema declares which columns are nullable; the decoder trusts the schema and does not insert defensive checks.
 
 ### 3.8 Selection Vectors
 
