@@ -28,6 +28,9 @@ pub use memory::{
     MemoryBudget, MemoryReservation, MemoryTracker, SpillNotification, UnboundedMemory,
 };
 
+pub mod spill;
+pub use spill::{SpillFs, SpillQueryId, TempSpillFile};
+
 pub mod metrics;
 pub use metrics::{AtomicMetrics, Metrics, MetricsSnapshot, MetricsTimer, NoopMetrics};
 

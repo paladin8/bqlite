@@ -66,6 +66,7 @@ use std::sync::{Arc, Mutex};
 
 use bqlite_core::error::{BqliteError, Result};
 use bqlite_core::schema::{ColumnDef, TableSchema};
+use bqlite_core::spill::SpillFs;
 use bqlite_core::storage::{
     ColumnProjection, Predicate, SegmentHandle, SegmentReader, SegmentScan,
 };
@@ -120,7 +121,6 @@ pub const SPILL_DIR_NAME: &str = "spill";
 #[derive(Debug)]
 pub struct Database {
     root: PathBuf,
-    spill_root: PathBuf,
     manifest: Manifest,
     /// Exclusive advisory lock on `<root>/.lock`. The field is
     /// prefixed with `_` because nothing reads it directly — its only
@@ -146,6 +146,12 @@ pub struct Database {
     /// Multi-process serialization (SS9.2) remains deferred — would
     /// require promoting these to `flock` on the tombstone files.
     tombstone_locks: TombstoneLockPool,
+    /// Per-database spill filesystem helper. Owns the spill root
+    /// (`<root>/spill/` by default), runs the engine-open
+    /// `rm_rf` + `mkdir` sweep on construction, and tears down the
+    /// spill root + the process-global registry entry on `Drop`.
+    /// See `docs/design/engine/spill.md` § 5.
+    spill_fs: Arc<SpillFs>,
 }
 
 /// Lazy pool of per-`(table, window_id, shard_id)` tombstone-write
@@ -190,8 +196,16 @@ impl Database {
             return Err(BqliteError::Schema("shard_count must be at least 1".into()));
         }
 
-        let root = path.as_ref().to_path_buf();
-        fs::create_dir_all(&root).map_err(|e| io_ctx("create database directory", &root, e))?;
+        let raw_root = path.as_ref();
+        fs::create_dir_all(raw_root)
+            .map_err(|e| io_ctx("create database directory", raw_root, e))?;
+        // Canonicalise the database root so downstream code (e.g. the
+        // spill filesystem, which requires an absolute path per
+        // `engine/spill.md` § 12.2) sees a stable absolute path even if
+        // the host passed a relative one.
+        let root = raw_root
+            .canonicalize()
+            .map_err(|e| io_ctx("canonicalize database directory", raw_root, e))?;
 
         let lock = acquire_lock(&root)?;
 
@@ -209,23 +223,22 @@ impl Database {
         // Clean up any stale tmp file from a prior crashed init.
         clean_stale_tmp(&root);
 
-        // Reclaim the spill root before any ingest can run.
-        // `Database::create` is the freshest possible open, but a
-        // user could have populated `<root>/spill/` between the
-        // `create_dir_all` above and now (or supplied a path that
-        // already had one). The same sweep semantics as `open` apply
-        // — see `docs/design/engine/spill.md` § 5.4 / § 9.1.
-        let spill_root = reclaim_spill_root(&root)?;
-
         let manifest = Manifest::new_empty(shard_count);
         write_manifest_atomic(&root, &manifest)?;
 
+        // Spill root: default to `<root>/spill/`. `SpillFs::open` runs
+        // the rm_rf + mkdir sweep mandated by `engine/spill.md` § 5.4
+        // / § 9.1 (so a user-populated stale tree is reclaimed) and
+        // registers the canonicalised root in the process-global
+        // registry from § 5.3.
+        let spill_fs = SpillFs::open(default_spill_root(&root), &root)?;
+
         Ok(Self {
             root,
-            spill_root,
             manifest,
             _lock: lock,
             tombstone_locks: Mutex::new(HashMap::new()),
+            spill_fs,
         })
     }
 
@@ -247,14 +260,21 @@ impl Database {
     ///   by another process.
     /// - [`BqliteError::Io`] on I/O failures.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let root = path.as_ref().to_path_buf();
+        let raw_root = path.as_ref();
 
-        if !root.exists() {
+        if !raw_root.exists() {
             return Err(BqliteError::Execution(format!(
                 "database not found at {}: directory does not exist (run `bqlite init` to create a new database)",
-                root.display()
+                raw_root.display()
             )));
         }
+        // Canonicalise so the spill filesystem sees an absolute path
+        // (`engine/spill.md` § 12.2). The directory exists at this
+        // point, so canonicalize cannot fail for the missing-directory
+        // reason.
+        let root = raw_root
+            .canonicalize()
+            .map_err(|e| io_ctx("canonicalize database directory", raw_root, e))?;
 
         let lock = acquire_lock(&root)?;
 
@@ -295,20 +315,19 @@ impl Database {
         // Reconcile on-disk segment files against the manifest.
         let _report = cleanup::reconcile_segments(&root, &manifest)?;
 
-        // Reclaim spill artefacts left over from a prior crashed or
-        // cleanly-exited process. The flock above guarantees no other
-        // bqlite process is currently using `<root>/spill/`, so the
-        // sweep is safe — see `docs/design/engine/spill.md` § 5.4 /
-        // § 9.1. After this returns, `<root>/spill/` exists and is
-        // empty.
-        let spill_root = reclaim_spill_root(&root)?;
+        // Reclaim the spill root from any prior process that exited
+        // without running its `Engine::close` sweep (`spill.md`
+        // § 9.1). `SpillFs::open` performs the rm_rf + mkdir sweep
+        // and registers the canonicalised root. The database lock
+        // guarantees no other live process is using this tree.
+        let spill_fs = SpillFs::open(default_spill_root(&root), &root)?;
 
         Ok(Self {
             root,
-            spill_root,
             manifest,
             _lock: lock,
             tombstone_locks: Mutex::new(HashMap::new()),
+            spill_fs,
         })
     }
 
@@ -323,9 +342,21 @@ impl Database {
     /// Always `<root>/spill/`. The directory exists and is empty
     /// immediately after [`Database::create`] / [`Database::open`]
     /// returns; ingest and query code create per-call subdirectories
-    /// underneath it. See `docs/design/engine/spill.md` § 5.1.
+    /// underneath it via [`Database::spill_fs`]. See
+    /// `docs/design/engine/spill.md` § 5.1.
     pub fn spill_root(&self) -> &Path {
-        &self.spill_root
+        self.spill_fs.root()
+    }
+
+    /// Per-database spill filesystem helper.
+    ///
+    /// Cloned via [`Arc::clone`] into every operator that may spill —
+    /// in v1, [`bqlite_operators::SortOperator`] (TASK-513) and the
+    /// ingest partitioner (TASK-512). The handle is invalidated when
+    /// the [`Database`] is dropped; callers that need to outlive the
+    /// database must clone the [`Arc`].
+    pub fn spill_fs(&self) -> &Arc<SpillFs> {
+        &self.spill_fs
     }
 
     /// In-memory snapshot of the current manifest.
@@ -876,6 +907,18 @@ pub fn empty_segment_reader(schema: TableSchema) -> Box<dyn SegmentReader> {
     Box::new(EmptySegmentReader { schema })
 }
 
+/// Default per-database spill root: `<db_root>/spill/`.
+///
+/// `engine/spill.md` § 5.1 — placing the spill root inside the
+/// database directory means the database lock automatically scopes the
+/// spill tree to one process at a time without introducing a second
+/// flock. The directory name is the [`SPILL_DIR_NAME`] constant so
+/// callers (e.g. tests) can re-derive the same path without hardcoding
+/// the literal.
+fn default_spill_root(db_root: &Path) -> PathBuf {
+    db_root.join(SPILL_DIR_NAME)
+}
+
 /// Best-effort removal of any stale `manifest.json.tmp` left over
 /// from a crash during a prior atomic update. The rename in
 /// `write_manifest_atomic` is atomic, so a stale temp file
@@ -890,61 +933,6 @@ fn clean_stale_tmp(root: &Path) {
             // harmless — the next atomic write will overwrite it.
         }
     }
-}
-
-/// Reclaim the spill-root directory under `<root>/`.
-///
-/// `<root>/spill/` is the engine-private scratch tree for query-time
-/// and ingest-time temp files (see `docs/design/engine/spill.md`
-/// § 5.1). The on-open contract is "the spill root is reclaimed and
-/// recreated empty" (§ 5.4 / § 9.1). After this returns successfully
-/// the directory exists and is empty.
-///
-/// Crash safety: any spill file from a prior crashed or cleanly-
-/// exited process has no cross-startup meaning (the owning RAII
-/// guards no longer exist; the in-memory state they referenced is
-/// gone), so deletion is the correct recovery action.
-///
-/// On failure to remove: any non-`NotFound` error from `rm_rf`
-/// (EACCES, EBUSY, …) is treated as fatal. `Database::create` /
-/// `Database::open` surfaces it as a typed [`BqliteError::Io`]
-/// naming the spill root and the underlying IO error, per
-/// `docs/design/engine/spill.md` § 9.3 — proceeding with a
-/// partially-reclaimed tree could mix old and new spill artefacts.
-/// The host is expected to fix the filesystem state and retry.
-///
-/// TODO(TASK-525): when `EngineConfig.spill_root` lands, the engine
-/// invokes the reclamation against its configured path *before* this
-/// function runs, and this hook degrades to recreating the directory
-/// only. The current implementation is the conservative default per
-/// `docs/design/engine/spill.md` § 5.4.
-fn reclaim_spill_root(root: &Path) -> Result<PathBuf> {
-    let spill_root = root.join(SPILL_DIR_NAME);
-    match fs::remove_dir_all(&spill_root) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(io_ctx(
-                "reclaim spill root (rm_rf failed; fix filesystem state and retry)",
-                &spill_root,
-                e,
-            ));
-        }
-    }
-    fs::create_dir_all(&spill_root).map_err(|e| io_ctx("create spill root", &spill_root, e))?;
-
-    // POSIX-only: tighten permissions to 0o700 so other local users
-    // cannot peek at spill payloads. Best-effort — symlinks across
-    // filesystems may not honour the chmod, and the spill payloads
-    // are non-durable anyway.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o700);
-        let _ = fs::set_permissions(&spill_root, perms);
-    }
-
-    Ok(spill_root)
 }
 
 /// Acquire the exclusive advisory lock on `<root>/.lock`.
@@ -1369,13 +1357,18 @@ mod tests {
     #[test]
     fn open_tolerates_missing_spill_root() {
         // A cleanly-shutdown database may have no spill/ subdirectory
-        // (Engine::close-equivalent could remove it). Open recreates it.
+        // (Engine::close-equivalent / SpillFs::Drop removes it). Open
+        // recreates it.
         let scratch = Scratch::new("spill-missing");
         {
             let _db = Database::create(scratch.path()).expect("create");
         }
         let spill_root = scratch.path().join(SPILL_DIR_NAME);
-        fs::remove_dir_all(&spill_root).expect("remove spill root");
+        // After Database::Drop the SpillFs guard already removed the
+        // spill root (TASK-513 CP1). The precondition for this test
+        // is just "spill root absent" — don't fail if Drop already
+        // beat us to it.
+        let _ = fs::remove_dir_all(&spill_root);
         assert!(!spill_root.exists(), "precondition: spill root removed");
 
         let db = Database::open(scratch.path()).expect("open");
@@ -2542,5 +2535,67 @@ mod tests {
                 "orphan .tmp must be removed"
             );
         }
+    }
+
+    // ── SpillFs handle + lifecycle (TASK-513 CP1) ───────────────────
+
+    #[test]
+    fn database_exposes_spill_fs_handle() {
+        // TASK-513 promotes the spill_root storage to an `Arc<SpillFs>`
+        // helper. The path-shaped accessor (`spill_root`) continues to
+        // round-trip the same value via `SpillFs::root()`.
+        let scratch = Scratch::new("spill-handle");
+        let db = Database::create(scratch.path()).expect("create");
+        assert_eq!(db.spill_fs().root(), db.spill_root());
+        // Cloning the Arc must not break the Database's Drop sweep.
+        let _arc = std::sync::Arc::clone(db.spill_fs());
+    }
+
+    #[test]
+    fn spill_fs_drop_reclaims_root_when_database_drops() {
+        let scratch = Scratch::new("spill-drop");
+        let spill_dir = scratch.path().join(SPILL_DIR_NAME);
+        {
+            let _db = Database::create(scratch.path()).expect("create");
+            assert!(spill_dir.exists());
+        }
+        // SpillFs::Drop fires once the Arc count hits zero (the
+        // Database held the only Arc). Spill root is reclaimed.
+        assert!(
+            !spill_dir.exists(),
+            "spill root must be removed when Database drops"
+        );
+    }
+
+    #[test]
+    fn second_open_after_drop_is_allowed() {
+        // The process-global registry releases the entry on Database
+        // drop so a fresh open of the same path succeeds.
+        let scratch = Scratch::new("spill-reopen");
+        {
+            let _db = Database::create(scratch.path()).expect("create");
+        }
+        let _db = Database::open(scratch.path()).expect("reopen-after-drop");
+    }
+
+    #[test]
+    fn create_canonicalises_db_root_before_spill_fs_validation() {
+        // Hosts may pass paths with `.` or symlinked components. The
+        // canonical form must reach `SpillFs::open` (which requires an
+        // absolute path per `engine/spill.md` § 12.2). A regression
+        // that drops the canonicalize step in `create_with_shards`
+        // makes `SpillFs::open` reject the spill root.
+        let scratch = Scratch::new("non-canonical-db");
+        std::fs::create_dir_all(scratch.path()).unwrap();
+        let mut path = scratch.path().to_path_buf();
+        path.push(".");
+        let db = Database::create(&path).expect("create with `.` segment must succeed");
+        assert!(db.root().is_absolute());
+        assert!(
+            !db.root().to_string_lossy().contains("/./"),
+            "stored root must be canonicalised: {}",
+            db.root().display()
+        );
+        assert!(db.spill_root().exists());
     }
 }

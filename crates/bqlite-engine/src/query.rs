@@ -268,7 +268,7 @@ impl Engine {
             Ok(b) => b,
             Err(e) => return Err(ExecutionFailure::from(e)),
         };
-        let ctx = QueryContext::new(budget_bytes);
+        let ctx = QueryContext::new(budget_bytes).with_spill_fs(db.spill_fs().clone());
 
         // `AssertUnwindSafe` is required because `&mut Database` is
         // not `UnwindSafe` by default. This is sound here per

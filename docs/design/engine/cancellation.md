@@ -316,10 +316,14 @@ sequences.
 ```rust
 /// Owns an on-disk spill file and removes it when dropped.
 ///
-/// Created via `MemoryTracker::open_spill(path_hint)` so the engine
-/// controls the directory and the per-query bytes counter. Drop is
-/// best-effort: a deletion failure is logged but does not panic
-/// (because Drop must not unwind during another unwind).
+/// Created via `QueryContext::open_spill(purpose)` (which delegates to
+/// `bqlite_core::spill::SpillFs::open_spill`) so the engine controls
+/// the directory layout and the per-query subdirectory lifecycle. Drop
+/// is best-effort: a deletion failure is silently swallowed (because
+/// Drop must not unwind during another unwind); residual files are
+/// reclaimed by the belt-and-braces per-query sweep
+/// (`engine/spill.md` § 8.3) and the engine-open root sweep
+/// (`engine/spill.md` § 5.4 / § 9.1).
 pub struct TempSpillFile {
     path: PathBuf,
     file: File,

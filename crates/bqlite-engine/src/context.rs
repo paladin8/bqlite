@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use bqlite_core::spill::{SpillFs, SpillQueryId, TempSpillFile};
 use bqlite_core::{memory::MemoryTracker, BqliteError, MemoryBudget, Result, UnboundedMemory};
 use bqlite_operators::CancellationToken;
 
@@ -123,6 +124,16 @@ pub struct QueryOptions {
 /// The context is intentionally `Clone` (cheap — every field is
 /// already `Arc` or zero-cost-clone) so bind helpers can hand sub-trees
 /// their own context references without lifetime games.
+///
+/// ## Spill cleanup
+///
+/// When the *last* clone drops, the inner [`SpillCleanup`] guard runs
+/// `SpillFs::cleanup_query(qid)` so any spill files that survived
+/// their owning [`TempSpillFile`] guard's `Drop` (e.g. an `EBUSY` we
+/// did not log) are reclaimed. This is the belt-and-braces sweep
+/// mandated by `engine/spill.md` § 8.3, ordered after the
+/// operator-tree drop because `Engine::query` drops the operator
+/// tree first and the context last.
 #[derive(Clone)]
 pub struct QueryContext {
     cancellation: CancellationToken,
@@ -139,6 +150,33 @@ pub struct QueryContext {
     /// `ExecutionFailure.warnings` on failure. See
     /// `docs/design/engine/cancellation.md` §7.
     warnings: crate::warning_sink::WarningSink,
+    /// Per-database spill filesystem. Cloned from the [`Database`] at
+    /// `Engine::query` construction time. `None` for unbounded /
+    /// test-only contexts that never spill.
+    spill_fs: Option<Arc<SpillFs>>,
+    /// Per-query identifier paired with `spill_fs`. Allocated lazily
+    /// the first time a `SpillFs` is attached to the context.
+    spill_query_id: Option<SpillQueryId>,
+    /// RAII guard whose `Drop` runs `cleanup_query` on the spill tree
+    /// once the last clone of this context goes out of scope. `None`
+    /// when no `spill_fs` is attached.
+    _cleanup: Option<Arc<SpillCleanup>>,
+}
+
+/// Belt-and-braces sweep: when the last `Arc<SpillCleanup>` drops, the
+/// per-query subdirectory is reclaimed. Operators' `TempSpillFile`
+/// guards delete individual files on drop already; this is the
+/// safety net for guards whose `Drop` failed silently (e.g. EBUSY
+/// not logged). See `docs/design/engine/spill.md` § 8.3.
+struct SpillCleanup {
+    spill_fs: Arc<SpillFs>,
+    query_id: SpillQueryId,
+}
+
+impl Drop for SpillCleanup {
+    fn drop(&mut self) {
+        self.spill_fs.cleanup_query(self.query_id);
+    }
 }
 
 impl std::fmt::Debug for QueryContext {
@@ -148,6 +186,8 @@ impl std::fmt::Debug for QueryContext {
             .field("memory_used_bytes", &self.memory.used_bytes())
             .field("memory_budget_bytes", &self.memory.budget_bytes())
             .field("has_tracker", &self.tracker.is_some())
+            .field("has_spill_fs", &self.spill_fs.is_some())
+            .field("spill_query_id", &self.spill_query_id)
             .finish()
     }
 }
@@ -161,6 +201,9 @@ impl QueryContext {
             memory: tracker.clone(),
             tracker: Some(tracker),
             warnings: crate::warning_sink::WarningSink::new(),
+            spill_fs: None,
+            spill_query_id: None,
+            _cleanup: None,
         }
     }
 
@@ -173,7 +216,29 @@ impl QueryContext {
             memory: Arc::new(UnboundedMemory::new()),
             tracker: None,
             warnings: crate::warning_sink::WarningSink::new(),
+            spill_fs: None,
+            spill_query_id: None,
+            _cleanup: None,
         }
+    }
+
+    /// Attach a per-database `SpillFs` to this context, allocating a
+    /// fresh per-query identifier and registering the belt-and-braces
+    /// `cleanup_query` sweep that fires when the last clone drops.
+    ///
+    /// Idempotent at most once per context — the engine constructs a
+    /// fresh `QueryContext` for every `Engine::query` call, so this is
+    /// only ever called from the engine's query path.
+    pub fn with_spill_fs(mut self, spill_fs: Arc<SpillFs>) -> Self {
+        let query_id = spill_fs.new_query_id();
+        let cleanup = Arc::new(SpillCleanup {
+            spill_fs: Arc::clone(&spill_fs),
+            query_id,
+        });
+        self.spill_fs = Some(spill_fs);
+        self.spill_query_id = Some(query_id);
+        self._cleanup = Some(cleanup);
+        self
     }
 
     /// Cancellation token shared across every operator in this query.
@@ -185,6 +250,29 @@ impl QueryContext {
     /// hold an `Arc<dyn MemoryBudget>` clone via this accessor.
     pub fn memory(&self) -> &Arc<dyn MemoryBudget> {
         &self.memory
+    }
+
+    /// Per-database spill filesystem, when attached. `None` for
+    /// unbounded / test contexts.
+    pub fn spill_fs(&self) -> Option<&Arc<SpillFs>> {
+        self.spill_fs.as_ref()
+    }
+
+    /// Per-query spill identifier, when a [`SpillFs`] is attached.
+    pub fn spill_query_id(&self) -> Option<SpillQueryId> {
+        self.spill_query_id
+    }
+
+    /// Open a fresh spill file under the per-query subdirectory,
+    /// tagged with `purpose`. Returns `None` if the context has no
+    /// attached `SpillFs` (test contexts).
+    ///
+    /// Lazily creates the per-query subdirectory on the first call.
+    pub fn open_spill(&self, purpose: &str) -> Option<Result<TempSpillFile>> {
+        match (&self.spill_fs, self.spill_query_id) {
+            (Some(fs), Some(qid)) => Some(fs.open_spill(qid, purpose)),
+            _ => None,
+        }
     }
 
     /// Peak `used_bytes()` observed since this context was constructed.
@@ -338,5 +426,85 @@ mod tests {
         assert!(!clone.cancellation().is_cancelled());
         ctx.cancellation().cancel();
         assert!(clone.cancellation().is_cancelled());
+    }
+
+    // ── SpillFs plumbing (TASK-513 CP1) ─────────────────────────────
+
+    fn scratch_db_root(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering as O};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, O::Relaxed);
+        let pid = std::process::id();
+        let mut p = std::env::temp_dir();
+        p.push(format!("bqlite-engine-context-{label}-{pid}-{seq}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn unbounded_context_has_no_spill_fs() {
+        let ctx = QueryContext::unbounded();
+        assert!(ctx.spill_fs().is_none());
+        assert!(ctx.spill_query_id().is_none());
+        assert!(ctx.open_spill("sort-run").is_none());
+    }
+
+    #[test]
+    fn with_spill_fs_attaches_query_id_and_handle() {
+        let db_root = scratch_db_root("attach");
+        let spill_root = db_root.join("spill");
+        let fs = SpillFs::open(spill_root.clone(), &db_root).unwrap();
+        let ctx = QueryContext::new(MIN_QUERY_BUDGET_BYTES).with_spill_fs(fs);
+        assert!(ctx.spill_fs().is_some());
+        assert!(ctx.spill_query_id().is_some());
+        let _ = std::fs::remove_dir_all(&db_root);
+    }
+
+    #[test]
+    fn open_spill_returns_writer_under_per_query_subdir() {
+        let db_root = scratch_db_root("open-spill");
+        let spill_root = db_root.join("spill");
+        let fs = SpillFs::open(spill_root.clone(), &db_root).unwrap();
+        let ctx = QueryContext::new(MIN_QUERY_BUDGET_BYTES).with_spill_fs(fs);
+
+        let qid = ctx.spill_query_id().expect("qid attached");
+        let guard = ctx
+            .open_spill("sort-run")
+            .expect("spill_fs attached")
+            .expect("open_spill must succeed");
+        let expected_dir = spill_root.join(qid.to_string());
+        assert_eq!(guard.path().parent(), Some(expected_dir.as_path()));
+        assert!(guard
+            .path()
+            .to_string_lossy()
+            .ends_with("sort-run-000000.spill"));
+        let _ = std::fs::remove_dir_all(&db_root);
+    }
+
+    #[test]
+    fn dropping_last_clone_runs_belt_and_braces_cleanup() {
+        let db_root = scratch_db_root("cleanup");
+        let spill_root = db_root.join("spill");
+        let fs = SpillFs::open(spill_root.clone(), &db_root).unwrap();
+        let ctx = QueryContext::new(MIN_QUERY_BUDGET_BYTES).with_spill_fs(Arc::clone(&fs));
+        let qid = ctx.spill_query_id().unwrap();
+
+        // Open and *forget* a guard to simulate a leaked TempSpillFile
+        // (the file system path stays on disk past Drop).
+        let guard = ctx.open_spill("sort-run").unwrap().unwrap();
+        let leaked_path = guard.path().to_path_buf();
+        std::mem::forget(guard);
+        assert!(leaked_path.exists());
+
+        // Cloned context: cleanup should NOT fire while a clone lives.
+        let clone = ctx.clone();
+        drop(ctx);
+        assert!(leaked_path.exists(), "cleanup must wait for last clone");
+        drop(clone);
+        // Last clone dropped — belt-and-braces sweep deletes the
+        // per-query subdir, taking the leaked file with it.
+        let qdir = spill_root.join(qid.to_string());
+        assert!(!qdir.exists(), "per-query subdir must be reclaimed");
+        let _ = std::fs::remove_dir_all(&db_root);
     }
 }
