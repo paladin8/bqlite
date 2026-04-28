@@ -904,20 +904,20 @@ Per-shard accumulator state is bounded by `max_groups × ~100 bytes ≈ 100 MB` 
 
 ### 10.3 Spill-to-Disk
 
-When an operator's memory reservation exceeds the remaining budget, it spills intermediate state to disk. Two operators support spill in v1; a third has a hard cap instead.
+> The on-disk file layout, naming, spill-root configuration, RAII
+> cleanup contract, and crash-recovery sweep are owned by
+> [`engine/spill.md`](engine/spill.md) (TASK-502). This section
+> sketches the surface and which operators participate; for the
+> authoritative protocol see that doc.
 
-**Sort spill (for ORDER BY).** When the sort buffer exceeds its allocation:
-1. Sort the current buffer in memory.
-2. Write the sorted run to a temporary file.
-3. After all input is consumed, merge-sort the sorted runs from disk.
+The v1 spill surface is small and deliberately so:
 
-**IN subquery spill.** When the hash set for IN filtering exceeds memory:
-1. Write the hash set to a temporary on-disk hash table (sorted file with binary search).
-2. Probe the on-disk table for each entity during the outer query scan.
+- **Sort spill (ORDER BY).** When `MemoryBudget::try_reserve` would otherwise return `Err`, `SortOperator` writes the in-memory run to a temporary file as an Arrow IPC stream, drops the in-memory copy and its reservation, and at end-of-input k-way-merges the spilled runs (and any in-memory residual) into the output stream. Implementation: TASK-513.
+- **Ingest partitioner spill.** The `(window_id, shard_id)` partitioner self-triggers spill against its own `Partitioner::budget_bytes` ceiling (256 MiB default; outside `QueryContext`). Each spilled bucket is sorted by `(entity_id, ts)` before being written; `drain_sorted` becomes a k-way merge that preserves the original ordering and `batch_id` contract. Implementation: TASK-512.
+- **Cohort / IN-subquery: no spill in v1.** Cohort hash sets (`MergeSources`, `SubqueryFilter`) are tracked allocation classes per `engine/memory-budget.md` § 5.1; if `try_reserve` fails during materialisation the query aborts with `BqliteError::MemoryBudgetExceeded`. The on-disk hash-set sketch in earlier drafts of this section is retired — `engine/spill.md` § 4.3 documents why an on-disk binary-search probe is the wrong v1 trade. TASK-514 wires the budget integration with no spill code path.
+- **Aggregation: no spill in v1.** `HashAccumulator` enforces a hard cap (`max_groups`, default 1M) at `update()` time and returns an error on overflow — see Section 9.5 and `engine/memory-budget.md` § 7. External hash aggregation is deferred past v1; the cap is the v1 backstop.
 
-**Aggregation: no spill in v1.** `HashAccumulator` enforces a hard cap (`max_groups`, default 1M) at `update()` time and returns an error on overflow — see Section 9.5. At ~100 bytes per group, 1M groups fit comfortably in the query budget, and analytics queries rarely exceed that. External hash aggregation is deferred to v2; the cap is the v1 backstop.
-
-Spill files (sort, IN subquery) are written to a configurable temp directory (default: the database directory). They are cleaned up when the query completes or is cancelled.
+Every spill file lives under `<spill_root>/<query_id>/<purpose>-<seq>.spill`, with `<spill_root>` defaulting to `<db_root>/spill/`. Cleanup is RAII (`TempSpillFile` per `engine/cancellation.md` § 5.2), with a per-query belt-and-braces `rm_rf` after the operator tree drops and a whole-spill-root reclamation at engine open as crash recovery (`engine/spill.md` § 5.4 / § 9).
 
 ### 10.4 Aggregation State Bounds
 

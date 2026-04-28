@@ -360,9 +360,9 @@ allocation's lifetime:
 | Allocation class | Owner | Lifetime | Wave 5 spill behaviour |
 |------------------|-------|----------|-----------------------|
 | Hash-aggregate state (`HashAccumulator` groups + values) | Aggregate operator (per-shard) | Operator open → close | Hard cap (`max_groups`); fail (§ 7) |
-| Sort buffer (rows + `take` indices + output batch) | `SortOperator` | Open → close | Spill (TASK-513) |
+| Sort buffer (rows + `take` indices + output batch) | `SortOperator` | Open → close | Spill (TASK-513; layout per `engine/spill.md` § 6.1) |
 | Distinct hash set | `DistinctOperator` | Open → close | Hard cap; fail (§ 7) |
-| IN-subquery / cohort hash set | Cohort materialization (`MergeSources` / `SubqueryFilter`) | Outer query lifetime | TASK-502 / TASK-514 freeze the policy |
+| IN-subquery / cohort hash set | Cohort materialization (`MergeSources` / `SubqueryFilter`) | Outer query lifetime | Fail (`engine/spill.md` § 4.3); TASK-514 wires the budget check |
 | K-way merge read buffers | Scan layer (per active worker × k inputs) | Per-morsel | None — fail-fast on construction (these are fixed-size) |
 | Decoded column payloads materialized past the scan/filter boundary | Stateless kernels (`materialize_filtered_batch`) | Per-batch | Fail (§ 7) |
 | `FilteredBatch` payload buffers | Stateless segment driver | Per-batch | Fail |
@@ -489,14 +489,14 @@ participate.
 | `FilterOperator` (Wave 2 / fused) | Per-batch only | Fail | No | `execution-model.md` § 3.8 |
 | `ProjectOperator` | Per-batch only | Fail | No | `execution-model.md` § 3.8 |
 | `LimitOperator` | No (selection-vector slicing) | n/a | n/a | — |
-| `SortOperator` | Yes | **Spill** (TASK-513) | `max_rows` (10M) as last-resort backstop | `operators/sort-distinct.md`, TASK-502/513 |
+| `SortOperator` | Yes | **Spill** (TASK-513; on-disk layout per `engine/spill.md` § 6.1) | `max_rows` (10M) as last-resort backstop | `operators/sort-distinct.md`, `engine/spill.md`, TASK-513 |
 | `DistinctOperator` | Yes | **Fail** | `max_groups` (1M) | `operators/sort-distinct.md` |
 | `HashAccumulator` (aggregate) | Yes | **Fail** with `MaxGroupsExceeded` | `max_groups` (1M) | `operators/aggregate-operator.md` |
 | `MatchOperator` (sequence matching) | Per-entity output buffer + step-property retention | **Fail** (per-entity active-state cap is the v1 line of defence; budget overflow is fatal) | Active-state cap (10K candidates), entity-event limit (10M) | `operators/match-operator.md` § 8, `sequence-matching.md` § 16 |
 | `SessionizeOperator` | Yes (per-entity event buffer when downstream demands `match_events` etc.) | **Fail** | Per-entity event cap (1M) | `operators/sessionize.md` § 14 |
 | `EventSelectOperator` | Yes (per-entity candidate state, negligible) | **Fail** | Bounded by k for NTH | `operators/event-select-sample.md` |
 | `AttributeOperator` | Yes (sliding-window deque) | **Fail** | Per-entity deque cap | `operators/attribute.md` |
-| `MergeSources` / `SubqueryFilter` (cohort) | Yes (hash set) | **Per TASK-502 / TASK-514** — either spill (with on-disk hash set) or fail. The user-facing semantics are documented as "the entire query fails with an out-of-budget error" until TASK-502 chooses. | None (cohort size is unbounded) | `language/cohorts-aliases-joins.md` § 2.7, TASK-502 |
+| `MergeSources` / `SubqueryFilter` (cohort) | Yes (hash set) | **Fail** with `MemoryBudgetExceeded` per `engine/spill.md` § 4.3 (no on-disk hash-set in v1; spill deferred past Wave 5) | None (cohort size is unbounded) | `language/cohorts-aliases-joins.md` § 2.7, `engine/spill.md` § 4.3, TASK-514 |
 
 **Spill is the preferred response only for operators in the table above
 that explicitly say "Spill".** Every other operator's response to a

@@ -339,14 +339,13 @@ every exit path. The guard is the single source of truth for spill-file
 lifetime — operators may not call `remove_file` directly.
 
 **Crash safety.** A process crash mid-query leaves spill files on disk
-because `Drop` does not run. The engine recovers by sweeping the
-configured spill directory at startup: any file matching the spill
-filename pattern (`bqlite-spill-<pid>-<query>-<seq>.tmp`) whose `<pid>`
-is not a live bqlite process is deleted. This mirrors the manifest-based
-orphan cleanup in `compaction-concurrency.md` §6 and is enumerated in the
-Wave 5 ingest-spill task (TASK-512). The pattern-based sweep is
-sufficient because spill files are always in the configured spill
-directory; user data lives elsewhere.
+because `Drop` does not run. The engine recovers by reclaiming the
+entire spill root at engine open under the existing database flock —
+see [`engine/spill.md`](spill.md) § 5.4 / § 9 for the crash-recovery
+model and the rationale (the database lock guarantees no other live
+process can be using the spill tree, and spill files have no
+cross-startup meaning). The pid-pattern filename sweep originally
+sketched here is superseded by that simpler model.
 
 **No filesystem fsync on the spill path.** Spill files are temporary by
 construction — durability is unnecessary, and the sync cost would
@@ -355,14 +354,17 @@ dominate small spills.
 ### 5.3 Spill-directory layout
 
 All spill files for a given query land under
-`<spill_root>/<query_id>/`, where `<spill_root>` defaults to the
-database's `spill/` subdirectory and is configurable via
+`<spill_root>/<query_id>/<purpose>-<seq>.spill`, where `<spill_root>`
+defaults to `<db_root>/spill/` and is configurable via
 `Engine::with_spill_root`. The per-query subdirectory makes cleanup
 trivial: on any exit path, the engine `rm -rf`s the per-query
 subdirectory after the operator-tree drop has run, as a belt-and-braces
 sweep against any guard that failed to delete its file. The subdirectory
 is created lazily on the first spill so cancel-before-spill paths leave
-no trace.
+no trace. The full path scheme, the `<purpose>` tags
+(`sort-run`, `ingest-part-w<window>-s<shard>`), and the per-purpose
+file payload (Arrow IPC stream) are owned by
+[`engine/spill.md`](spill.md) § 6 / § 7.
 
 ### 5.4 Warnings on the failure path
 

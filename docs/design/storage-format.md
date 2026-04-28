@@ -1089,7 +1089,7 @@ bqlite ships three independent memory budgets, one per subsystem. They do **not*
 |---|---:|---|---|
 | Query execution | **3 GiB** | `MemoryBudget` per query (`engine/memory-budget.md`) | Shared across the fixed query worker pool |
 | Compaction | **800 MiB** | Compaction worker pool ceiling | One compaction at a time per `(window, shard)` |
-| Ingest buffering | **256 MiB** | `Partitioner::new(.., budget_bytes)` | Sort buffer for batch ingest; matches the engine's `DEFAULT_INGEST_BUDGET_BYTES` |
+| Ingest buffering | **256 MiB** | `Partitioner::new(.., budget_bytes)` | Sort buffer for batch ingest; matches the engine's `DEFAULT_INGEST_BUDGET_BYTES`. External spill on overflow (TASK-512) follows the file layout, naming, and cleanup contract in [`engine/spill.md`](engine/spill.md) § 6.2 / § 7. |
 
 The aggregate ceiling — the user-facing summary "bqlite uses up to ~4 GiB by default" — is the sum of these three sub-budgets (~4.06 GiB at simultaneous peak). It is a capacity-planning number, not a runtime invariant; see `engine/memory-budget.md` § 2 for why three independent budgets rather than one parent allocator.
 

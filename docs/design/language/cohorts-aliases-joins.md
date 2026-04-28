@@ -95,7 +95,7 @@ Cohort materialization (both alias caches per § 2.5 and inline `IN QUERY` subqu
 
 A cohort that exceeds the memory budget causes the whole query to fail with the standard out-of-budget error. There is no "silently truncated cohort" failure mode -- the only possible outcomes are "cohort fits, query succeeds" and "cohort doesn't fit, query errors."
 
-The spill-vs-fail decision for cohort materialization specifically is owned by TASK-502 (`engine/spill.md`); TASK-514 implements whichever policy that doc settles on. Until TASK-502 lands, the user-visible behaviour is "fail with `MemoryBudgetExceeded`".
+The spill-vs-fail decision for cohort materialization is **fail** in v1 per [`engine/spill.md`](../engine/spill.md) § 4.3: cohort hash sets do not spill, and a query whose cohort exceeds the budget aborts with `BqliteError::MemoryBudgetExceeded`. TASK-514 wires the budget integration with no spill code path. Spill may be revisited in a future wave once entity-id pushdown (TASK-522) is in production and we have evidence about the cohort sizes real users hit; the trait surface in `engine/memory-budget.md` § 4 already accommodates a future cohort spill handler without engine code change.
 
 **User-facing documentation requirement:** the exceeds-budget error path must be documented in `query-language.md` § 17 / § 18.
 
@@ -500,7 +500,7 @@ spec; semantics are unchanged.
 
 **TASK-430 (SAMPLE pushdown):** honor § 3.4's value-based hash when the source is a `MergeSources`.
 
-**TASK-501 (memory budget):** the cohort `HashSet` is a tracked allocation class in `engine/memory-budget.md` § 5.1; spill-vs-fail policy for cohort materialization is owned by TASK-502 (`engine/spill.md`) and implemented by TASK-514 per § 2.7.
+**TASK-501 (memory budget):** the cohort `HashSet` is a tracked allocation class in `engine/memory-budget.md` § 5.1. **TASK-502 (spill protocol):** `engine/spill.md` § 4.3 fixes the cohort policy as fail-fast (no on-disk hash set in v1). **TASK-514 (cohort enforcement):** wires the budget integration so cohort materialisation aborts with `BqliteError::MemoryBudgetExceeded` per § 2.7.
 
 ---
 

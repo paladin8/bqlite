@@ -36,7 +36,7 @@ What this doc does **not** cover:
 | Null-ordering rules | `query-language.md §15` | NULLs last in ASC, NULLs first in DESC — this doc enforces that convention. |
 | Error variant usage | `operators/operator-traits.md §4.3` | Both operators raise `BqliteError::Execution` on cap overflow. |
 | Plan tree placement | `planner/wave3-lowering.md` (TASK-309) | Defines where Sort / Distinct appear in the logical plan; this doc only specifies operator-level behavior. |
-| Sort spill (future) | Wave 5 TASK-502 | Sort spill is explicitly deferred; this doc specifies the no-spill hard-cap policy for Wave 3. |
+| Sort spill (future) | Wave 5 TASK-513 (protocol: `engine/spill.md`) | Sort spill is explicitly deferred from Wave 3; this doc specifies the no-spill hard-cap policy for Wave 3. The Wave 5 protocol is owned by `engine/spill.md` § 6.1. |
 
 ### 2.1 Deviation from execution-model.md §10.3
 
@@ -46,7 +46,7 @@ What this doc does **not** cover:
 - Spill adds implementation complexity (temp files, merge-sort pass, cleanup on cancel/error) that is disproportionate to Wave 3's scope.
 - The hard-cap error gives query authors a clear signal to add a pre-sort aggregate or `LIMIT`.
 
-Sort spill is tracked as Wave 5 TASK-502. When that task ships, `SortPhysical` will gain a `spill_dir: Option<PathBuf>` field; operators that carry `None` take the Wave 3 in-memory path.
+Sort spill is tracked as Wave 5 TASK-513; the on-disk file layout, naming, spill-root configuration, and cleanup contract are owned by [`engine/spill.md`](../engine/spill.md) (TASK-502). When TASK-513 ships, `SortOperator` participates by construction — every sort op receives the engine's `Arc<dyn MemoryBudget>` and registers a spill handler — so no per-physical-descriptor opt-in field is needed; the engine's `EngineConfig::spill_root` is the single configuration point. The Wave 3 in-memory hard-cap path is preserved as the zero-spill case (no run is written, the merge degenerates to "emit the in-memory run").
 
 ---
 
@@ -311,7 +311,7 @@ On error (either cap overflow or upstream error), the engine calls `close()` whi
 
 | Wave | Task | Change |
 |---|---|---|
-| Wave 5 | TASK-502 | Sort spill: sorted runs to temp files, merge-sort pass. `SortPhysical` gains `spill_dir: Option<PathBuf>`. `None` → current in-memory path. |
+| Wave 5 | TASK-513 (protocol: TASK-502 / `engine/spill.md`) | Sort spill: sorted runs to temp files (Arrow IPC stream per `engine/spill.md` § 6.1), merge-sort pass at end-of-input. No `SortPhysical` opt-in field — every Sort participates by construction once TASK-513 lands; spill root configured engine-wide via `EngineConfig::spill_root`. |
 | Wave 5 | — | `NULLS FIRST` / `NULLS LAST` modifiers in `ORDER BY` syntax. `SortDirection` gains a `null_position` field. |
 | Wave 5+ | — | Unstable sort variant for performance when key uniqueness is known. Controlled by a flag on `SortPhysical`. |
 | Wave 5 | TASK-510 (per `engine/memory-budget.md`) | `MemoryBudget` integration: both operators reserve through the query's `MemoryBudget` (TASK-111 trait, `MemoryTracker` impl) instead of relying solely on the hard cap. Sort registers a spill handler (TASK-513); Distinct fails fast on overflow. |
