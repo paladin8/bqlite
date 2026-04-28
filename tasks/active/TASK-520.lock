@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-520",
+  "claimed_at": "2026-04-28T08:41:06Z",
+  "branch": "task/TASK-520",
+  "description": "Stateful-to-aggregate fusion for Sessionize / EventSelect / Attribute"
+}
