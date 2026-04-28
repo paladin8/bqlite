@@ -43,7 +43,7 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bqlite_ast::Span;
 use bqlite_benches::common::*;
-use bqlite_core::{BqlType, ColumnDef, OperatorSchema};
+use bqlite_core::{BqlType, ColumnDef, OperatorSchema, UnboundedMemory};
 use bqlite_operators::cohort::{CohortHashSet, SubqueryFilterOperator};
 use bqlite_operators::operator::{CancellationToken, PhysicalOperator};
 use bqlite_operators::scan::MergeSourcesOperator;
@@ -195,7 +195,10 @@ fn build_cohort(n: usize) -> Arc<CohortHashSet> {
     let ids: Vec<String> = (0..n).map(|i| format!("user_{i:06}")).collect();
     let col: ArrayRef = Arc::new(StringViewArray::from(ids));
     let batch = RecordBatch::try_new(arrow, vec![col]).unwrap();
-    Arc::new(CohortHashSet::from_batches(&cohort_schema, vec![batch]).expect("build cohort"))
+    Arc::new(
+        CohortHashSet::from_batches(&cohort_schema, vec![batch], &UnboundedMemory::new())
+            .expect("build cohort"),
+    )
 }
 
 /// Drain an operator to exhaustion, returning total rows produced.

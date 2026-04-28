@@ -1125,7 +1125,9 @@ Type rules: see type-system.md Section 6.9.
 
 ### 17.5 Memory Budget for IN QUERY
 
-Subquery results used in `IN QUERY` and alias-based `IN` expressions are materialized as hash sets in memory. Materialization draws from the query's memory budget (configured at engine initialization; default 3 GiB — see [`engine/memory-budget.md`](engine/memory-budget.md)). If the hash set exceeds the budget, the entire query fails with an out-of-budget error — there is no partial-result mode and the set is never silently truncated.
+Subquery results used in `IN QUERY` and alias-based `IN` expressions are materialized as hash sets in memory. Materialization draws from the query's memory budget (configured at engine initialization; default 3 GiB — see [`engine/memory-budget.md`](engine/memory-budget.md)). If the hash set would exceed the budget, the engine **fails the entire query immediately** with the typed `BqliteError::MemoryBudgetExceeded { used, budget }` error. There is no partial-result mode, the set is never silently truncated, and the engine **does not spill the cohort hash set to disk** — the v1 cohort policy is fail-fast per [`engine/spill.md`](engine/spill.md) §4.3 (cohort hash sets do not spill in v1; an on-disk hash-set probe is dramatically slower than failing the query and is deferred until production data motivates the work).
+
+To make a cohort fit, narrow the inner subquery — tighter time ranges, more selective filters, or projecting fewer columns. The error reports the post-overflow `used` total against the configured `budget`, so you can size up the engine if your workload genuinely needs a larger cohort (`docs/design/engine/memory-budget.md` §8 covers per-query overrides).
 
 ---
 
@@ -1150,7 +1152,7 @@ events | WHERE entity_id IN churned | MATCH FIRST SEQUENCE(support_ticket THEN c
 - **No cycles.** Circular references are a planner error.
 - **Lexically scoped naming.** An alias name must be a valid identifier and must not shadow a keyword or table name. Shadowing other aliases is permitted — the most recent definition wins.
 - **Top-down order.** An alias must be defined before it is referenced within the submission.
-- **Memory-bounded materialization.** When an alias is materialized as a hash set for `IN` matching, it draws from the query's memory budget. Exceeding the budget fails the entire query with an out-of-budget error — there is no partial-result or silent-truncation mode. See also §17.5.
+- **Memory-bounded materialization.** When an alias is materialized as a hash set for `IN` matching, it draws from the query's memory budget. Exceeding the budget fails the entire query with the typed `BqliteError::MemoryBudgetExceeded` error — there is no partial-result, silent-truncation, or spill-to-disk fallback for cohort hash sets in v1. See also §17.5.
 
 ### 18.2 Alias Resolution in IN
 

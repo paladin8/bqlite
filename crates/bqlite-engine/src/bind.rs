@@ -1037,6 +1037,7 @@ fn bind_subquery_filter(
             let cohort = Arc::new(CohortHashSet::from_batches(
                 sqf.subquery.output_schema(),
                 batches,
+                ctx.memory().as_ref(),
             )?);
             cohorts.insert((*sqf.subquery).clone(), Arc::clone(&cohort));
             cohort
@@ -2138,6 +2139,69 @@ mod tests {
             }
             other => panic!("expected Plan error for undefined alias, got {other:?}"),
         }
+    }
+
+    /// TASK-514: a cohort whose materialised hash set would exceed the
+    /// per-query memory budget surfaces the typed
+    /// `BqliteError::MemoryBudgetExceeded` instead of growing
+    /// unbounded. Uses a `QueryContext::new(64)` directly — going
+    /// through `Engine::query_with_options` would clamp at the 512 MiB
+    /// floor (`docs/design/engine/memory-budget.md` §8.2) which is
+    /// far more than a unit-test cohort can possibly exceed.
+    #[test]
+    fn cohort_materialisation_fails_fast_on_budget_overflow() {
+        let scratch = Scratch::new("cohort-budget-overflow");
+        let (mut db, engine) = create_db_with_events_table(scratch.path());
+
+        engine
+            .query(
+                "INSERT INTO events VALUES \
+                 ('alice',   1700000000000000000, 'click', 1), \
+                 ('bob',     1700000000050000000, 'click', 2), \
+                 ('carol',   1700000000100000000, 'click', 3), \
+                 ('dave',    1700000000150000000, 'click', 4)",
+                &mut db,
+            )
+            .expect("insert");
+
+        // Plan a query that needs to materialise a cohort.
+        let mut stmts = bqlite_parser::parse(
+            "events | where user_id in query (\
+                 events | where event_type = 'click' | select user_id\
+             )",
+        )
+        .expect("parse cohort query");
+        let stmt = stmts.remove(0);
+        let physical = {
+            let cat = db.catalog();
+            plan(stmt, &cat, 0).expect("plan cohort query")
+        };
+
+        // Budget chosen below `cohort_key_bytes(one row)` (≥ 16-byte
+        // hashbrown overhead + 24-byte Vec header + one 32-byte
+        // ScalarValue + the string capacity), so the very first
+        // batch's reservation overshoots.
+        let ctx = QueryContext::new(8);
+        match bind_physical(&physical, &mut db, &ctx) {
+            Err(BqliteError::MemoryBudgetExceeded { used, budget }) => {
+                assert_eq!(budget, 8, "budget must echo the configured ceiling");
+                assert!(
+                    used > budget,
+                    "MemoryBudgetExceeded must report a `used` past the budget: \
+                     used={used} budget={budget}"
+                );
+            }
+            Err(other) => panic!("expected MemoryBudgetExceeded, got {other:?}"),
+            Ok(_) => panic!("expected MemoryBudgetExceeded, got Ok(_)"),
+        }
+        // The failed materialisation must release every byte it
+        // briefly reserved — cohorts-aliases-joins.md §2.7 / spill.md
+        // §4.3 require a clean fail with no leaked accounting.
+        assert_eq!(
+            ctx.memory().used_bytes(),
+            0,
+            "failed cohort materialisation must release every reserved byte"
+        );
     }
 
     /// Direct unit test of the cache hit path: install one cohort,

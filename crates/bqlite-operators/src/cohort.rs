@@ -43,6 +43,21 @@
 //! immediately. Callers that wrap this operator (e.g. `LimitOperator`
 //! over a cohort filter) tolerate mid-stream empty batches per
 //! `execution-model.md` §3.2.
+//!
+//! ## Memory budget
+//!
+//! The materialised hash set is a tracked allocation per
+//! `docs/design/engine/memory-budget.md` §5.1, with the cohort policy
+//! pinned to **fail-fast** by `docs/design/engine/spill.md` §4.3 —
+//! cohort hash sets do not spill in v1. [`CohortHashSet::from_batches`]
+//! reserves bytes from the per-query [`bqlite_core::MemoryBudget`] at
+//! every batch boundary; on overflow, the partially-built set is
+//! dropped and the call returns the typed
+//! [`bqlite_core::BqliteError::MemoryBudgetExceeded`] error. The
+//! returned cohort holds its [`bqlite_core::memory::MemoryReservation`]
+//! handles for the lifetime of the `Arc<CohortHashSet>`, so the bytes
+//! are released back to the budget when the last reference drops at
+//! query teardown.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -56,7 +71,8 @@ use arrow::compute;
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::{BqliteError, OperatorSchema, Result, ScalarValue};
+use bqlite_core::memory::MemoryReservation;
+use bqlite_core::{BqliteError, MemoryBudget, OperatorSchema, Result, ScalarValue};
 use bqlite_planner::compiled::CompiledExpr;
 
 use crate::eval;
@@ -132,7 +148,15 @@ impl CohortKey {
 /// `ahash::RandomState` is used for a small but consistent throughput
 /// win over `std::collections::hash_map::RandomState` on the small
 /// scalar tuples this set holds.
-#[derive(Debug, Clone)]
+///
+/// ## Memory accounting
+///
+/// `CohortHashSet` owns the [`MemoryReservation`]s charged for the
+/// bytes its hash set occupies (see [`Self::from_batches`]). The
+/// reservations are released when the cohort is dropped — typically at
+/// query teardown when the last `Arc<CohortHashSet>` reference goes
+/// out of scope.
+#[derive(Debug)]
 pub struct CohortHashSet {
     /// Underlying hash set. `pub(crate)` so the bind step can construct
     /// a set without going through the row-extraction helpers when it
@@ -142,14 +166,27 @@ pub struct CohortHashSet {
     /// subquery's output schema. Matches the LHS arity at probe time;
     /// the bind step asserts this when wiring the operator.
     arity: usize,
+    /// Memory reservations charged to the per-query budget for the
+    /// bytes this hash set occupies. One entry per materialisation
+    /// batch that contributed at least one new key. Held for the
+    /// cohort's lifetime; the bytes are released back to the budget
+    /// when the cohort is dropped.
+    reservations: Vec<MemoryReservation>,
 }
 
 impl CohortHashSet {
     /// Construct an empty set with the given declared column arity.
+    ///
+    /// Holds no [`MemoryReservation`] — the empty set's footprint is
+    /// fixed-size and falls under the "untracked" class per
+    /// `docs/design/engine/memory-budget.md` §5.2. Tests use this
+    /// constructor in place of `from_batches` when they only care
+    /// about the probe path.
     pub fn empty(arity: usize) -> Self {
         Self {
             set: HashSet::with_hasher(RandomState::new()),
             arity,
+            reservations: Vec::new(),
         }
     }
 
@@ -172,6 +209,18 @@ impl CohortHashSet {
         self.arity
     }
 
+    /// Total bytes currently reserved against the per-query
+    /// [`MemoryBudget`] for this cohort's hash-set occupancy.
+    ///
+    /// Sum of every [`MemoryReservation`] held by the cohort. Useful
+    /// for tests / EXPLAIN-style diagnostics; the live reservation
+    /// total mirrors what the per-query [`MemoryBudget`] sees, so
+    /// dropping the cohort returns exactly this many bytes to the
+    /// budget.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reservations.iter().map(|r| r.bytes()).sum()
+    }
+
     /// `true` iff `key` was inserted at materialization time.
     #[inline]
     pub fn contains(&self, key: &CohortKey) -> bool {
@@ -189,7 +238,23 @@ impl CohortHashSet {
     /// using declared columns. The corresponding column indices are
     /// captured once and reused per batch to avoid name lookups in
     /// the inner row loop.
-    pub fn from_batches<I>(subquery_schema: &OperatorSchema, batches: I) -> Result<Self>
+    ///
+    /// Bytes added to the hash set are reserved against `budget` at
+    /// each batch boundary per the design contract pinned by
+    /// `docs/design/engine/spill.md` §4.3 / TASK-514: the cohort hash
+    /// set is fail-fast against the per-query memory budget — there
+    /// is no on-disk hash-set in v1. On overflow the partially-built
+    /// set is dropped and the call returns
+    /// [`BqliteError::MemoryBudgetExceeded`]. The successful return
+    /// value owns one [`MemoryReservation`] per batch that contributed
+    /// at least one new key; the bytes are released back to `budget`
+    /// when the returned [`CohortHashSet`] (or the `Arc` wrapping it)
+    /// is dropped.
+    pub fn from_batches<I>(
+        subquery_schema: &OperatorSchema,
+        batches: I,
+        budget: &dyn MemoryBudget,
+    ) -> Result<Self>
     where
         I: IntoIterator<Item = RecordBatch>,
     {
@@ -208,6 +273,7 @@ impl CohortHashSet {
         }
 
         let mut set: HashSet<CohortKey, RandomState> = HashSet::with_hasher(RandomState::new());
+        let mut reservations: Vec<MemoryReservation> = Vec::new();
         for batch in batches {
             let n = batch.num_rows();
             if n == 0 {
@@ -215,17 +281,85 @@ impl CohortHashSet {
             }
             let key_arrays: Vec<&ArrayRef> =
                 declared_indices.iter().map(|&i| batch.column(i)).collect();
+            let mut batch_bytes: u64 = 0;
             for row in 0..n {
                 let mut values: Vec<ScalarValue> = Vec::with_capacity(arity);
                 for arr in &key_arrays {
                     values.push(extract_scalar(arr, row));
                 }
-                set.insert(CohortKey(values));
+                let key = CohortKey(values);
+                let bytes = cohort_key_bytes(&key);
+                if set.insert(key) {
+                    batch_bytes = batch_bytes.saturating_add(bytes);
+                }
+            }
+            // Reserve once per batch; on overflow we drop `set` and
+            // `reservations` together, returning the bytes reserved so
+            // far. The OS reclaims the partially-built hash set; the
+            // budget tracker observes a clean state via
+            // `MemoryReservation::Drop`.
+            if batch_bytes > 0 {
+                reservations.push(budget.try_reserve(batch_bytes)?);
             }
         }
 
-        Ok(Self { set, arity })
+        Ok(Self {
+            set,
+            arity,
+            reservations,
+        })
     }
+}
+
+/// Estimate the bytes a [`CohortKey`] occupies inside a
+/// `HashSet<CohortKey, ahash::RandomState>` allocation.
+///
+/// The cohort hash set is the v1 tracked allocation per
+/// `docs/design/engine/memory-budget.md` §5.1; this function is the
+/// per-key term of that accounting. The estimate covers:
+///
+/// - `Vec<ScalarValue>` header (24 bytes on 64-bit) plus
+///   `arity * size_of::<ScalarValue>()` for the inline tuple buffer.
+/// - `String::capacity()` for every `ScalarValue::String` payload.
+///   `String::capacity()` is the live heap allocation; it is at least
+///   the live byte length and may be slightly larger from
+///   power-of-two growth.
+/// - A flat `PER_ENTRY_OVERHEAD` byte allowance that covers the
+///   per-bucket cost the `hashbrown` `HashSet` carries for each
+///   logical entry: control byte plus the `~14%` load-factor
+///   slack that `hashbrown`'s default growth policy maintains.
+///
+/// The number is intentionally a coarse upper-ish estimate — coarse
+/// enough that a small string cohort never blows past the budget
+/// without a reservation having seen it, fine enough that a 100M
+/// entity-id cohort's accounting is dominated by the real string
+/// payload rather than the constant overhead. The estimate is mildly
+/// **conservative** for string cohorts (where `String::capacity()`
+/// dominates) and mildly **under-protective** for tiny scalar cohorts
+/// — the flat `PER_ENTRY_OVERHEAD` does not account for `hashbrown`'s
+/// 7/8 load-factor inflation, so a pure-`Int` cohort's tracked bytes
+/// can land ~30–40 % below the real RSS footprint. This is a deliberate
+/// v1 trade-off: a per-key amortised `capacity()` lookup against the
+/// hashbrown table would add per-row overhead for a class of cohort
+/// that already fits the budget by orders of magnitude. A future
+/// follow-up may switch to charging the table's allocated bytes
+/// directly if benchmarks flag a regression.
+#[inline]
+fn cohort_key_bytes(key: &CohortKey) -> u64 {
+    /// Per-bucket overhead in `hashbrown` (the backing implementation
+    /// for `std::collections::HashSet`): one control byte plus a
+    /// rough load-factor allowance. Picking a single conservative
+    /// constant avoids per-row branching on capacity/length math.
+    const PER_ENTRY_OVERHEAD: usize = 16;
+    let vec_header = std::mem::size_of::<Vec<ScalarValue>>();
+    let scalar_size = std::mem::size_of::<ScalarValue>();
+    let mut bytes = PER_ENTRY_OVERHEAD + vec_header + key.0.len() * scalar_size;
+    for scalar in &key.0 {
+        if let ScalarValue::String(s) = scalar {
+            bytes = bytes.saturating_add(s.capacity());
+        }
+    }
+    bytes as u64
 }
 
 /// Extract a `ScalarValue` from an Arrow column at the given row.
@@ -443,7 +577,7 @@ mod tests {
 
     use bqlite_ast::expr::{Expr, Spanned};
     use bqlite_ast::span::{Name, Span};
-    use bqlite_core::{BqlType, ColumnDef, OperatorSchema};
+    use bqlite_core::{memory::MemoryTracker, BqlType, ColumnDef, OperatorSchema, UnboundedMemory};
     use bqlite_planner::expr::{FunctionRegistry, TypedExpr};
 
     use super::*;
@@ -556,7 +690,11 @@ mod tests {
         for &i in ids {
             set.insert(CohortKey(vec![ScalarValue::Int(i)]));
         }
-        Arc::new(CohortHashSet { set, arity: 1 })
+        Arc::new(CohortHashSet {
+            set,
+            arity: 1,
+            reservations: Vec::new(),
+        })
     }
 
     fn cohort_from_string_ids(ids: &[&str]) -> Arc<CohortHashSet> {
@@ -564,7 +702,11 @@ mod tests {
         for &s in ids {
             set.insert(CohortKey(vec![ScalarValue::String(s.to_owned())]));
         }
-        Arc::new(CohortHashSet { set, arity: 1 })
+        Arc::new(CohortHashSet {
+            set,
+            arity: 1,
+            reservations: Vec::new(),
+        })
     }
 
     fn cohort_tuples_string_int(pairs: &[(&str, i64)]) -> Arc<CohortHashSet> {
@@ -575,7 +717,11 @@ mod tests {
                 ScalarValue::Int(*n),
             ]));
         }
-        Arc::new(CohortHashSet { set, arity: 2 })
+        Arc::new(CohortHashSet {
+            set,
+            arity: 2,
+            reservations: Vec::new(),
+        })
     }
 
     fn collect_int_id_column(batch: &RecordBatch) -> Vec<i64> {
@@ -773,7 +919,11 @@ mod tests {
             set.insert(CohortKey(vec![ScalarValue::Int(v)]));
         }
         set.insert(CohortKey(vec![ScalarValue::Null]));
-        let cohort = Arc::new(CohortHashSet { set, arity: 1 });
+        let cohort = Arc::new(CohortHashSet {
+            set,
+            arity: 1,
+            reservations: Vec::new(),
+        });
 
         let mut op =
             SubqueryFilterOperator::new(child, vec![col_expr("user_id", &schema)], cohort).unwrap();
@@ -897,7 +1047,8 @@ mod tests {
         let id_array: ArrayRef = Arc::new(StringViewArray::from(vec!["alice", "bob", "alice"]));
         let seq_array: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
         let batch = RecordBatch::try_new(arrow_schema, vec![id_array, seq_array]).unwrap();
-        let cohort = CohortHashSet::from_batches(&schema, vec![batch]).unwrap();
+        let cohort =
+            CohortHashSet::from_batches(&schema, vec![batch], &UnboundedMemory::new()).unwrap();
 
         // Two unique declared values; __seq_id is ignored, so the
         // duplicate "alice" rows collapse to a single cohort key.
@@ -920,11 +1071,151 @@ mod tests {
         )]));
         let seq_array: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
         let batch = RecordBatch::try_new(arrow_schema, vec![seq_array]).unwrap();
-        match CohortHashSet::from_batches(&schema, vec![batch]) {
+        match CohortHashSet::from_batches(&schema, vec![batch], &UnboundedMemory::new()) {
             Err(BqliteError::Execution(_)) => {}
             Err(e) => panic!("expected Execution error, got {e}"),
             Ok(_) => panic!("expected Execution error, got Ok"),
         }
+    }
+
+    // ── Memory-budget enforcement (TASK-514) ──────────────────────────────
+
+    /// Build a single-column string cohort batch of `n` distinct ids
+    /// without any column-name nor system-column noise. Used by the
+    /// budget tests below.
+    fn cohort_batch_strings(n: usize) -> (OperatorSchema, RecordBatch) {
+        let schema =
+            OperatorSchema::new(vec![ColumnDef::required("entity_id", BqlType::String)]).unwrap();
+        let arrow = Arc::new(ArrowSchema::new(vec![Field::new(
+            "entity_id",
+            DataType::Utf8View,
+            false,
+        )]));
+        let ids: Vec<String> = (0..n).map(|i| format!("user_{i:08}")).collect();
+        let col: ArrayRef = Arc::new(StringViewArray::from(ids));
+        let batch = RecordBatch::try_new(arrow, vec![col]).unwrap();
+        (schema, batch)
+    }
+
+    #[test]
+    fn from_batches_charges_budget_proportional_to_size() {
+        // A cohort that fits inside the budget reports exactly the
+        // `cohort_key_bytes`-summed reservation back through the
+        // tracker. Two cohorts of different sizes therefore charge
+        // different amounts, and the larger cohort must charge more.
+        let tracker_small = MemoryTracker::new(1 << 30);
+        let (schema, small_batch) = cohort_batch_strings(8);
+        let small = CohortHashSet::from_batches(&schema, vec![small_batch], tracker_small.as_ref())
+            .expect("small cohort fits");
+        let small_used = tracker_small.used_bytes();
+        assert!(small_used > 0, "non-empty cohort must charge the budget");
+        assert_eq!(small_used, small.reserved_bytes());
+
+        let tracker_big = MemoryTracker::new(1 << 30);
+        let (schema, big_batch) = cohort_batch_strings(64);
+        let big = CohortHashSet::from_batches(&schema, vec![big_batch], tracker_big.as_ref())
+            .expect("big cohort fits");
+        assert!(
+            tracker_big.used_bytes() > tracker_small.used_bytes(),
+            "{}-row cohort must charge more than {}-row cohort \
+             (big={} small={})",
+            big.len(),
+            small.len(),
+            tracker_big.used_bytes(),
+            tracker_small.used_bytes(),
+        );
+    }
+
+    #[test]
+    fn cohort_drop_releases_budget_bytes() {
+        // Per `engine/memory-budget.md` §5.1 / §7, the cohort hash set
+        // is held for the outer-query lifetime and its bytes are
+        // released when the cohort is dropped at query teardown.
+        let tracker = MemoryTracker::new(1 << 30);
+        let (schema, batch) = cohort_batch_strings(32);
+        let cohort = CohortHashSet::from_batches(&schema, vec![batch], tracker.as_ref())
+            .expect("cohort fits");
+        assert!(tracker.used_bytes() > 0);
+        let charged = tracker.used_bytes();
+        assert_eq!(cohort.reserved_bytes(), charged);
+        drop(cohort);
+        assert_eq!(
+            tracker.used_bytes(),
+            0,
+            "dropping the cohort must release every charged byte"
+        );
+    }
+
+    #[test]
+    fn from_batches_returns_typed_memory_budget_exceeded() {
+        // `engine/spill.md` §4.3: cohort materialisation does not spill
+        // in v1; an over-budget cohort fails the whole query with
+        // `BqliteError::MemoryBudgetExceeded`. The budget is set
+        // intentionally below `cohort_key_bytes(one row)` so the very
+        // first batch overflows.
+        let tracker = MemoryTracker::new(8);
+        let (schema, batch) = cohort_batch_strings(4);
+        let err = CohortHashSet::from_batches(&schema, vec![batch], tracker.as_ref())
+            .expect_err("must overflow");
+        match err {
+            BqliteError::MemoryBudgetExceeded { used, budget } => {
+                assert_eq!(budget, 8);
+                // `used` is the requested-bytes folded onto the live
+                // total (which is 0 at this point — the rollback inside
+                // `MemoryTracker::try_reserve` undoes the optimistic
+                // charge before the helper formats the error).
+                assert!(used > budget);
+            }
+            other => panic!("expected MemoryBudgetExceeded, got {other:?}"),
+        }
+        assert_eq!(
+            tracker.used_bytes(),
+            0,
+            "failed materialisation must leave the tracker untouched"
+        );
+    }
+
+    #[test]
+    fn from_batches_fails_fast_on_second_batch_overflow() {
+        // First batch fits (cohort_key_bytes ≈ 64–80 per entry; 4 rows
+        // ≈ 320 bytes max with the 8-char ids). Second batch's
+        // reservation must fail and surface `MemoryBudgetExceeded`.
+        // Charge for the first batch must already be released by the
+        // time the error returns, since the partially-built cohort and
+        // its reservation are dropped.
+        let tracker = MemoryTracker::new(1024);
+        let (schema, batch_a) = cohort_batch_strings(4);
+        let batch_b = cohort_batch_strings(64).1;
+        let err = CohortHashSet::from_batches(&schema, vec![batch_a, batch_b], tracker.as_ref())
+            .expect_err("second batch must overflow");
+        assert!(matches!(err, BqliteError::MemoryBudgetExceeded { .. }));
+        assert_eq!(
+            tracker.used_bytes(),
+            0,
+            "rollback must release the first batch's reservation"
+        );
+    }
+
+    #[test]
+    fn empty_cohort_charges_no_budget_bytes() {
+        // Per `from_batches`'s zero-row short-circuit, no reservation
+        // is taken when every batch has zero rows.
+        let tracker = MemoryTracker::new(1024);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "entity_id",
+            DataType::Utf8View,
+            false,
+        )]));
+        let schema =
+            OperatorSchema::new(vec![ColumnDef::required("entity_id", BqlType::String)]).unwrap();
+        let empty_ids: Vec<&str> = Vec::new();
+        let col: ArrayRef = Arc::new(StringViewArray::from(empty_ids));
+        let batch = RecordBatch::try_new(arrow_schema, vec![col]).unwrap();
+        let cohort = CohortHashSet::from_batches(&schema, vec![batch], tracker.as_ref())
+            .expect("empty cohort must succeed");
+        assert!(cohort.is_empty());
+        assert_eq!(cohort.reserved_bytes(), 0);
+        assert_eq!(tracker.used_bytes(), 0);
     }
 
     // ── CancellationToken sanity (unused arg avoids warnings) ──────────────
