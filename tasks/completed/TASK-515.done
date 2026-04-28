@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-515",
   "claimed_at": "2026-04-28T06:23:43Z",
+  "completed_at": "2026-04-28T07:11:16Z",
   "branch": "task/TASK-515",
   "description": "Copy-budget instrumentation + null-mask preservation"
 }
