@@ -1221,83 +1221,167 @@ Error cases: unknown step names, binding references crossing an aggregate group-
 
 ## Wave 5: Production Quality & Performance
 
-**Goal.** Bounded memory under load, spill-to-disk, complete optimizer, fused operators, cancellation, microbench-tuned.
-**Size.** ~22-28 tasks.
-**Parallelism.** 6-10 agents.
-**Acceptance.** Queries over billion-event datasets complete under a 4 GB memory budget. Benchmark regressions gate CI.
+**Goal.** The steady-state engine lands: enforced memory budgets, spill where the design blesses it, fused scan/filter execution, multi-core morsel scheduling, real cancellation/warnings, and regression-gated performance.
+**Size.** ~29 tasks.
+**Parallelism.** 8-12 agents.
+**Acceptance.** Under the documented default query budget, large multi-shard analytical queries run to completion with bounded memory, spill/timeout behavior matches the shipped design notes, and the Wave 5 regression gate is green on the reference machine.
 
-### TASK-501: [DESIGN] Memory budget enforcement model
+**Drafting note.** This initial Wave 5 list is being written while TASK-455 is still open. A few tasks below intentionally absorb known Wave 4 carryovers that clearly belong to the steady-state engine if TASK-455 leaves them unresolved. If TASK-455 lands one of those items before Wave 5 begins, retire the corresponding Wave 5 task rather than renumbering the wave.
+
+### TASK-501: [HARD][DESIGN] Memory budget enforcement model
 **Output**: docs/design/engine/memory-budget.md
 **Depends on**: none
-**Description**: Every operator's reservation contract, overcommit policy, spill triggers, error handling on OOM. Cross-cutting — touches every operator.
+**Description**: Freeze the real reservation/release contract for query-time memory: tracked allocation classes, per-worker vs per-query budget splits, fixed-size untracked state, operator-level spill-vs-fail policy, and how TASK-111's `MemoryBudget` trait maps onto engine `QueryContext`. This task must explicitly reconcile the remaining doc drift on the default query budget (some docs still say 3 GB, older Wave 5 text said 4 GB) and update all conflicting design notes in the same checkpoint.
 
-### TASK-502: [DESIGN] Spill-to-disk protocol
+### TASK-502: [HARD][DESIGN] Spill-to-disk protocol
 **Output**: docs/design/engine/spill.md
 **Depends on**: TASK-501
-**Description**: Which operators spill, spill file format, spill directory management, resume semantics. Risky.
+**Description**: Decide exactly which structures spill in v1, how spill files are laid out and named, which temp directory is used, how cleanup works on timeout/cancellation/panic/crash, and what still fails fast instead of spilling. This is the design gate that reconciles the current cross-doc conflict between execution-model.md (sort + IN-subquery spill, aggregate no spill) and older task text that pointed at broader spill work.
 
-### TASK-503: [DESIGN] Operator fusion
+### TASK-503: [HARD][DESIGN] Fused stateless segment and operator-fusion contract
 **Output**: docs/design/engine/operator-fusion.md
 **Depends on**: none
-**Description**: Which operators fuse, the fusion rewriter's place in the planner, code generation vs template strategies, DemandCapabilities integration. Risky.
+**Description**: Turn execution-model.md §3.8 from "documented target" into an implementation contract: `FilteredBatch`, `SelectionVector`, `StatelessKernel`, the fused push-segment driver, materialization triggers, and the exact boundary between stateless fusion and stateful-to-aggregate fusion. The note must also decide which Wave 4 stateful operators get `finish_entity_into()` overrides in v1 and which remain intentionally unfused.
 
 **Load-bearing forward reference:** execution-model.md §3.8 already specifies the steady-state stateless-segment design — `FilteredBatch`, `SelectionVector`, `StatelessKernel`, `materialize_filtered_batch`, and the three explicit materialization triggers (sparsity, push-segment boundary, aggregation hand-off — note the deliberate "materialization" terminology in §3.8.3, distinct from storage-format.md §7 "compaction"). The Wave 2 filter/project/limit operators (TASK-231) deliberately ship without that infrastructure because a fused push segment is required to make the selection-vector chain pay off. This design task is the point at which §3.8 moves from "documented target" to "implemented contract." It should produce the `[IMPL]` tasks that refactor TASK-231's operators into kernels that implement `StatelessKernel` and plug into a new fused-segment driver, **not** leave §3.8 to a later wave. See also the TASK-242 retirement stub for the history of how this design got deferred from Wave 2.
 
-### TASK-504: [DESIGN] Cost model and statistics source
-**Output**: docs/design/planner/cost-model.md
+### TASK-504: [HARD][DESIGN] Optimizer direction reconciliation + statistics source
+**Output**: docs/design/planner/optimizer-direction.md
 **Depends on**: none
-**Description**: Resolves the open questions from TASK-006 — rule-based vs cost-based, where statistics come from (zone maps, manifest metadata), how cardinality is estimated, which optimizer rules become cost-gated. Risky.
+**Description**: Reconcile planner-pipeline.md's Wave 0 "rule-based only" v1 promise with the newer desire to make fusion/pushdown decisions data-aware. Decide whether Wave 5 stays purely rule-based, adopts narrow heuristic gating, or introduces a true cost layer; define the statistics sources (manifest metadata, zone maps, runtime counters) and which rules are allowed to consult them.
 
-### TASK-505: [DESIGN] Cancellation and timeout protocol
+### TASK-505: [HARD][DESIGN] Cancellation, timeout, and warning protocol
 **Output**: docs/design/engine/cancellation.md
 **Depends on**: none
-**Description**: How cancellation propagates through the operator tree, cleanup responsibilities, how timeouts are enforced, how cancellation interacts with spilled state.
+**Description**: Freeze how caller cancellation, timeout expiry, panic cleanup, spill cleanup, and operator warnings interact in the real engine. Includes typed error mapping, warning-cap behavior, cleanup ordering for temporary files, and the latency bounds at batch, sub-batch, and morsel boundaries.
 
-### TASK-506: [IMPL] Optimizer rule set
-**Output**: crates/bqlite-planner/src/optimizer/
-**Depends on**: TASK-504
-**Description**: The full optimizer rule set — predicate pushdown, projection pruning, constant folding, filter-before-match reordering, match-pushdown to scan, cost-gated fusion decisions. Each rule is its own sub-task filled in as Wave 5 progresses.
+### TASK-506: [HARD][DESIGN] Morsel scheduler and query/compaction sharing
+**Output**: docs/design/engine/morsel-scheduler.md
+**Depends on**: none
+**Description**: Implementation-level note for execution-model.md §9/§14: morsel generation, work stealing, query queuing, partial-aggregate ownership, query-vs-compaction capacity sharing, and the exact metrics the runtime must expose. Risky because it locks the engine's steady-state multi-core shape.
 
-### TASK-507: [IMPL] Per-operator microbenchmark coverage audit
+### TASK-507: [EASY][IMPL] Per-operator microbenchmark coverage audit
 **Output**: benches/coverage-report.md
 **Depends on**: none
-**Description**: Audit every operator introduced in Waves 2-4 for microbenchmark coverage. File follow-up tasks for any missing benches. Ensures the core belief "microbenchmark frequently" has actually happened.
+**Description**: Audit every hot path introduced in Waves 2-4 for bench coverage, including EventSelect, joined-source scan, tombstone filtering, Sessionize end-event lists, and compaction/tombstone reclamation. Any missing or non-load-bearing bench becomes a concrete Wave 5 task rather than lingering as an audit note.
 
-### TASK-508: [HARD][IMPL] Scan system-column materialization (`__seq_id`, `__batch_id`)
-**Output**: crates/bqlite-operators/src/scan.rs, crates/bqlite-storage/src/segment_reader.rs (and related storage layer files)
-**Depends on**: TASK-429, TASK-434, TASK-436
-**Description**: Materializes `__seq_id` and `__batch_id` as concrete columns in every `ScanOperator` output `RecordBatch`. This is the single cross-cutting blocker for three Wave 4 feature areas: (1) `EventSelectOperator` requires `__seq_id` for same-`(ts, __seq_id)` tie-breaking (all seven FIRST/LAST/NTH integration tests are `#[ignore]` with this attribution — see TASK-445 audit finding E1); (2) `MergeSourcesOperator` declares `__seq_id: NOT NULL` in its combined join schema but receives null arrays from child scans, crashing every joined-source query (see TASK-447 audit finding J1); (3) `TombstoneFilter.apply_batch_deletes` / `apply_row_deletes` require `__batch_id`/`__seq_id` columns to filter row- and batch-level tombstones at query time — currently both surface a hard `BqliteError::Execution` when those columns are absent (see TASK-448 audit finding F1). All three blockers share the same root: the Wave 2 segment reader does not yet expose system columns in its `RecordBatch` output. The fix must (a) compute the per-row `__seq_id` value from `seg.seq_id_range.start + segment_row_offset` and append it as an `Int64 NOT NULL` column, (b) expose `__batch_id` from `SegmentMeta.batch_id` as a scalar-broadcast `Int64 NOT NULL` column, (c) update `ScanOperator`'s schema advertisement so the bind step sees the columns, and (d) remove the `#[ignore]` markers on the FIRST/LAST/NTH, JOIN, and row/batch-tombstone integration tests once those tests pass end-to-end. Also fixes the SESSIONIZE scan-binding gap documented in TASK-444 finding E (explicit `SELECT entity_id, ts, event_type` projection workaround required before SESSIONIZE).
+### TASK-508: [HARD][IMPL] System-column materialization in scan and joined-source output
+**Depends on**: none
+**Description**: Materialize `__seq_id` and `__batch_id` end-to-end in ScanOperator and MergeSources, reconcile nullability/type rules, and make the system-column contract explicit in the docs. This is the correctness unblocker for EventSelect runtime, joined-source scans, and row/batch tombstone filtering.
 
-### TASK-509: [HARD][IMPL] BRACKETS runtime emission in SequenceMatch operator
+### TASK-509: [EASY][IMPL] System-column follow-up correctness suite
+**Output**: tests/tests/wave5_system_columns.rs
+**Depends on**: TASK-508
+**Description**: Un-ignore and strengthen the joined-source, EventSelect, SESSIONIZE, and row/batch DELETE cases that were blocked by missing system columns. Includes joined-source + DELETE, DELETE + cohort, and query-snapshot isolation coverage promoted out of the Wave 4 audit notes.
+
+### TASK-510: [HARD][IMPL] Memory tracker enforcement scaffold
+**Depends on**: TASK-501
+**Description**: Land the real query-scoped memory tracker with reservations/releases, RAII guards, per-worker budget derivation, and QueryContext plumbing through the engine. No spill yet — just correct accounting and typed `MemoryBudgetExceeded` surfacing.
+
+### TASK-511: [HARD][IMPL] Structured execution errors and warning channel
+**Depends on**: TASK-505
+**Description**: Replace the remaining stringly planner/execution errors with structured variants where the docs already promise them, and plumb `QueryWarning` collection/result surfacing so Sessionize, Attribute, and future memory-pressure diagnostics can ship without another API pass.
+
+### TASK-512: [HARD][IMPL] Ingest partitioner external spill
+**Depends on**: TASK-502, TASK-510
+**Description**: Replace the Wave 2 "error loudly when the buffer exceeds budget" path with external spill + merge for the `(shard, window)` partitioner. Must preserve `(entity_id, ts)` ordering, batch-id assignment, and crash cleanup semantics.
+
+### TASK-513: [HARD][IMPL] Sort spill runs + on-disk merge
+**Depends on**: TASK-502, TASK-510
+**Description**: Implement sorted-run spill and final k-way merge for ORDER BY. Cancellation and temp-file cleanup must match TASK-505's protocol; ORDER BY correctness must remain identical to the in-memory path.
+
+### TASK-514: [HARD][IMPL] Cohort materialization memory enforcement
+**Depends on**: TASK-502, TASK-510
+**Description**: Make cohort / `IN QUERY` materialization respect the real budget. The implementation follows TASK-502's decision: either spill to the on-disk structure that task specifies or fail the whole query with a typed out-of-budget error, and update the user-facing docs to state the chosen behavior explicitly.
+
+### TASK-515: [HARD][IMPL] Copy-budget instrumentation + null-mask preservation
+**Depends on**: none
+**Description**: First zero-copy checkpoint from storage/zero-copy-scan-filter.md §12: add `bytes_materialized_before_filter`-style metrics, preserve null masks instead of row-group-wide null splicing, and make the current copy budget measurable before behavior changes.
+
+### TASK-516: [HARD][IMPL] Dictionary/RLE selection-first scan path
+**Depends on**: TASK-515
+**Description**: Implement encoded-view filtering for dictionary and RLE columns, producing row selections rather than dense arrays before filter. This is the first real payoff checkpoint for the zero-copy design and should measurably lower pre-filter materialization on common predicates.
+
+### TASK-517: [HARD][IMPL] Merge without `interleave` + late materialization boundary
+**Depends on**: TASK-515
+**Description**: Replace row-group-wide interleave copies with stitched row references over encoded sources and materialize only at the scan/filter boundary. Must preserve tombstone filtering, joined-source semantics, and projection pruning behavior.
+
+### TASK-518: [HARD][IMPL] Fused stateless segment scaffold
+**Depends on**: TASK-503
+**Description**: Land `FilteredBatch`, `SelectionVector`, `StatelessKernel`, `materialize_filtered_batch`, and the push-segment driver from execution-model.md §3.8 without changing the external `PhysicalOperator` boundary.
+
+### TASK-519: [HARD][IMPL] Refactor Filter / Project / Limit onto fused stateless kernels
+**Depends on**: TASK-518
+**Description**: Move the Wave 2 stateless operators onto the fused-segment infrastructure, add selection-vector metrics, and extend the Wave 2 bench suite so the new path is load-bearing rather than optional.
+
+### TASK-520: [HARD][IMPL] Stateful-to-aggregate fusion for Sessionize / EventSelect / Attribute
+**Depends on**: TASK-503
+**Description**: Implement the remaining v1 fusion shapes already described in planner-pipeline.md and the Wave 4 operator notes: planner detection, physical descriptors, `finish_entity_into()` overrides, and equivalence tests against the unfused path.
+
+### TASK-521: [HARD][IMPL] Optimizer framework + rule-trace surface
+**Depends on**: TASK-504
+**Description**: Replace the current placeholder optimizer skeleton with a real pass pipeline, rule registry, and EXPLAIN-visible rule trace / stats surface. This is the merge-first scaffold for later Wave 5 rule work so new rules can land without re-litigating the optimizer shape.
+
+### TASK-522: [HARD][IMPL] Cohort/entity pushdown into scan
+**Depends on**: TASK-504
+**Description**: Implement the deferred entity-id pushdown from the cohort/join design note: extend `ScanPredicate` with entity-set membership, exploit shard/segment skipping, and wire the pushed filter from materialized cohorts into the outer scan. Performance-only if the pushdown cannot apply; correctness must remain identical to the post-scan probe path.
+
+### TASK-523: [HARD][IMPL] Morsel scheduler + partial-aggregate handoff
+**Depends on**: TASK-506
+**Description**: Implement the engine-side morsel generator, work queue, worker handoff, and per-shard partial-aggregate ownership model from execution-model.md §9. This is the main multi-core execution checkpoint for Wave 5.
+
+### TASK-524: [HARD][IMPL] CPU/skew metrics + `--explain-perf` surface
+**Depends on**: TASK-506
+**Description**: Implement the Wave 5-only metrics rows from execution-model.md §14 — selection-vector materializations, morsel skew, worker idle/busy spread, spill bytes, and sampled CPU-cost metrics when available — and surface them through CLI/EXPLAIN tooling without making perf collection mandatory in normal queries.
+
+### TASK-525: [HARD][IMPL] Memory-pressure, spill, and cancellation stress suite
+**Output**: tests/tests/wave5_runtime_stress.rs
+**Depends on**: TASK-510, TASK-511, TASK-512, TASK-513, TASK-514, TASK-523
+**Description**: Stress tests for hard budget exhaustion, spill fallback, concurrent DELETE/query snapshot isolation under real runtime scheduling, timeout cleanup of temp files, and warning-channel overflow behavior.
+
+### TASK-526: [HARD][IMPL] Wave 5 benchmark suite + regression-gate refresh
+**Output**: benches/wave5/
+**Depends on**: TASK-507, TASK-516, TASK-517, TASK-519, TASK-520, TASK-522, TASK-523, TASK-524, TASK-527
+**Description**: Add benchmark groups and CI baselines for the new execution path: zero-copy scan/filter copy budget, fused stateless segment, stateful-to-aggregate fusion, morsel-scheduler skew behavior, spill overhead, and cohort pushdown savings. Extends the existing bench gate rather than creating a one-off suite.
+
+### TASK-527: [HARD][IMPL] Scan-adjacent optimizer rule pack
+**Depends on**: TASK-521
+**Description**: Implement the first concrete Wave 5 rule pack beyond framework plumbing: safe filter-before-match reordering, MATCH/EventSelect predicate extraction that can become scan pushdown, and the heuristic or cost-gated materialization/fusion decisions blessed by TASK-504. This is the task that turns the optimizer lane from "framework exists" into "the planner is actually smarter on production workloads."
+
+### TASK-529: [HARD][IMPL] BRACKETS runtime emission in SequenceMatch operator
 **Output**: crates/bqlite-operators/src/matcher/ (compile.rs, nfa.rs, step_counter.rs, output.rs), crates/bqlite-planner/src/physical.rs
 **Depends on**: TASK-425, TASK-426, TASK-427
-**Description**: Implements per-bracket row emission in the SequenceMatch operator, unblocking RETENTION end-to-end (TASK-443 audit finding R1). Currently the physical planner discards `BracketSpec` at `physical.rs:1237` (`brackets: _`), the compiled NFA carries no bracket state, and `output.rs` emits a null array for the non-nullable `bracket` column — causing a panic on every RETENTION query. Required work: (a) add `brackets: Option<BracketSpec>` to `SequenceMatchPhysical` and forward it from the logical plan; (b) extend `CompiledNfa` to carry bracket durations and the `cumulative` flag; (c) implement per-bracket row emission in `output.rs` — for EMIT ALL with brackets, emit one row per `(entity, binding track, bracket)` with `step_reached` set to the highest step completed within that bracket's `[prev_duration, duration)` window; (d) implement cumulative bracket partial-sum: for `cumulative=true`, bracket N's `step_reached` is `max(step_reached[0..=N])`; (e) clarify and implement `bracket_end` semantics in `query-language.md §4.12` — specify whether the column is an absolute epoch timestamp (`anchor_ts + duration_ns`) or a relative duration (R3); (f) add `brackets` and `cumulative` fields to `ExplainNode::SequenceMatch` and bring the explain output into alignment with the full spec at `planner-pipeline.md §10.2` (R4 — currently four of the nine spec-defined fields are missing); (g) un-`#[ignore]` both RETENTION integration tests and strengthen them to assert specific bracket-indexed `retention_rate` values; (h) add a proptest for cumulative bracket monotonicity (R6); (i) add a test for BRACKETS × variable-binding composition §30.6 (R7). Note: TASK-455 fixed R2 (bracket ascending-order validation) in-place by adding a planner guard in `lower_match` — that guard should already exist when this task begins.
+**Status note**: The original-blocker panic ("Column 'bracket' is declared as non-nullable but contains null values") is already mitigated. Commit `670b2d5` (TASK-439 followup CP4) relaxed the planner's `MATCH` lowering to declare `bracket` / `bracket_end` as nullable, and commit `e505bfc` (TASK-499 followup, audit P1 #4) made the matcher output layer's null emission for those columns explicit and self-documenting. The four originally-blocked RETENTION integration tests are already un-ignored and asserting `row_count() > 0` (not per-bracket rates). The work below is the remaining feature: actually emitting per-bracket rows so RETENTION reports real bracket-indexed retention.
+**Description**: Implements per-bracket row emission in SequenceMatch, completing RETENTION end-to-end (TASK-443 audit finding R1). The Wave 4 physical planner discards `BracketSpec` at `physical.rs:1237` (`brackets: _`), the compiled NFA carries no bracket state, and `output.rs` deliberately emits a single row per match with null `bracket` / `bracket_end` until this task lands. Required: (a) add `brackets: Option<BracketSpec>` to `SequenceMatchPhysical` and forward from logical; (b) extend `CompiledNfa` to carry bracket durations + `cumulative` flag; (c) implement per-bracket emission in `output.rs` — for EMIT ALL with brackets, one row per `(entity, binding track, bracket)` with `step_reached` set to the highest step completed within `[prev_duration, duration)`; (d) implement cumulative partial-sum: bracket N's `step_reached` is `max(step_reached[0..=N])`; (e) clarify and implement `bracket_end` semantics in `query-language.md §4.12` — absolute epoch (`anchor_ts + duration_ns`) vs relative duration (R3); (f) once emission produces non-null brackets, tighten the `bracket` / `bracket_end` nullability in `MATCH` lowering back to non-null where the spec allows it (reverse the 670b2d5 relaxation); (g) add `brackets`/`cumulative` to `ExplainNode::SequenceMatch`, align with `planner-pipeline.md §10.2` (R4); (h) strengthen the two un-ignored RETENTION integration tests to assert specific bracket-indexed `retention_rate` values rather than `row_count() > 0`; (i) proptest for cumulative bracket monotonicity (R6); (j) test BRACKETS × variable-binding composition §30.6 (R7). TASK-455 already fixed R2 (ascending-order validation in `lower_match`).
 
-### TASK-510: [HARD][IMPL] WITHIN SESSION expiry in NFA compiler
-**Output**: crates/bqlite-planner/src/compile.rs, crates/bqlite-operators/src/matcher/ (nfa.rs, execution paths)
-**Depends on**: TASK-428
-**Description**: Implements the `MatchWindow::WithinSession` arm in the NFA compiler, making `SESSIONIZE | MATCH … WITHIN SESSION` correctly expire NFA candidates at session boundaries (TASK-444 audit finding A). Currently `compile.rs:262` coalesces `MatchWindow::WithinSession` to `None` — a windowless matcher — so cross-session matches are never rejected. Two integration tests (`within_session_match_expires_across_boundary`, `within_session_match_composes_with_downstream_stats`) are `#[ignore]` with explicit attribution. Required work: (a) remove the `Some(MatchWindow::WithinSession) | None => None` arm; (b) teach the NFA execution loop to observe the `session_id` column (materialized by SESSIONIZE) and expire all active candidate tracks when `session_id` increments for the same entity; (c) update or replace the unit test `global_window_session_is_none` at `compile.rs:1554–1566` — it currently documents the broken behavior and must not assert `nfa.global_window == None` for a `WithinSession` pattern after the fix; (d) un-`#[ignore]` the two integration tests; (e) add a proptest verifying that no match output row pairs a step from session N with a step from session N+1.
+### TASK-530: [RETIRED]
+**Status**: Retired before scheduling. Originally scoped as "WITHIN SESSION expiry in NFA compiler" to address TASK-444 audit finding A — the planner coalescing `MatchWindow::WithinSession` to `None` so `SESSIONIZE | MATCH … WITHIN SESSION` accepted cross-session matches. The work landed early as TASK-499 audit P0 #1 (commit `031cdf5`, 2026-04-26): `compile.rs` now sets `CompiledNfa.session_window` on `WithinSession`, all three matcher paths (`nfa.rs`, `bindings.rs`, `step_counter.rs`) track per-entity `last_session_id` and call `expire_all_candidates` on session boundary, `matcher/mod.rs` adds `session_id` to `required_column_names`, and both integration tests (`within_session_match_expires_across_boundary`, `within_session_match_composes_with_downstream_stats`) are un-ignored. Number retired per the "numbers are never reused" rule.
 
-### TASK-511: [EASY][IMPL] EventSelect property tests and benchmarks
+### TASK-531: [EASY][IMPL] EventSelect property tests and benchmarks
 **Output**: crates/bqlite-operators/src/event_select.rs (proptest module), benches/wave4/event_select.rs
 **Depends on**: TASK-508
-**Description**: Adds property tests and benchmarks for the EventSelect operator after the `__seq_id` scan-materialization blocker (TASK-508) is resolved. TASK-445 audit finding E2 identifies seven operator invariants that are directly property-testable using `tests/src/strategies.rs` Arrow-shaped generators; finding E3 identifies seven benchmark scenarios with explicit numeric targets. Property tests: (1) output cardinality exactly 0 or 1 rows per entity; (2) FIRST correctness — emitted row has minimum `(ts, __seq_id)` among qualifying events; (3) LAST correctness — maximum `(ts, __seq_id)`; (4) NTH correctness — exactly `n-1` qualifying events have smaller `(ts, __seq_id)`; (5) omission invariant — no row iff fewer than `n` qualifying events; (6) entity isolation — no output row mixes data from two entities; (7) NTH(1) == FIRST equivalence over arbitrary inputs. Benchmarks: FIRST throughput (10M events, 100K entities, target ≥200M events/sec/core), LAST throughput (≥100M), NTH(5) throughput (≥150M), FIRST with WHERE predicate (≥150M), event-type list matching (no string alloc), memory per entity at 10 demanded columns (<2 KB), entity boundary overhead (<500 ns). The bench file should live at `benches/wave4/event_select.rs` using `bqlite_benches::common` generators.
+**Description**: Adds property tests and benchmarks for EventSelect once the `__seq_id` scan-materialization blocker (TASK-508) is resolved. Concrete spinoff of TASK-507 for this operator. Property tests (TASK-445 finding E2): (1) output cardinality exactly 0 or 1 row per entity; (2) FIRST emits row with min `(ts, __seq_id)` among qualifying events; (3) LAST emits max `(ts, __seq_id)`; (4) NTH(n) emits row with exactly n−1 qualifying events at smaller `(ts, __seq_id)`; (5) omission iff fewer than `n` qualifying events; (6) entity isolation; (7) NTH(1) ≡ FIRST. Benchmarks (E3, with explicit targets): FIRST ≥200M events/s/core (10M events, 100K entities), LAST ≥100M, NTH(5) ≥150M, FIRST+WHERE ≥150M, event-type list match (no string alloc), per-entity memory <2 KB at 10 demanded columns, entity boundary overhead <500 ns. Bench file at `benches/wave4/event_select.rs` using `bqlite_benches::common` generators.
 
-### TASK-512: [EASY][IMPL] Wave 4 integration test re-enable and coverage additions
-**Output**: tests/tests/ (multiple files), tests/tests/wave4_advanced_analytics_attribute_cohort_join.rs
-**Depends on**: TASK-508, TASK-510
-**Description**: After TASK-508 and TASK-510 resolve the `__seq_id` scan-materialization and `WITHIN SESSION` blockers, this task re-enables ignored tests and adds the remaining integration coverage identified by the Wave 4 semantic audits. (1) TASK-445 E4: un-`#[ignore]` all seven FIRST/LAST/NTH integration tests (`first_returns_first_event_per_entity`, `last_returns_last_event_per_entity`, `nth_returns_third_matching_event`, `first_with_candidate_predicate_filters_before_selection`, `first_with_event_type_list_matches_any`, `first_without_lookback_is_bounded_by_outer_range`, `first_with_lookback_widens_scan_range`). (2) TASK-447 J1: un-`#[ignore]` all three joined-source tests (`joined_source_stats_counts_entities_in_both_tables`, `joined_source_sequence_match_spans_tables`, `joined_source_funnel_invariance_under_compaction`). (3) TASK-446 A7: un-`#[ignore]` `joined_source_stats_counts_entities_in_both_tables` and `joined_source_sequence_match_spans_tables` in the ATTRIBUTE integration file. (4) TASK-448 F1: confirm that row/batch tombstone integration tests (`batch_id_delete_uses_segment_metadata_for_count`, `allow_scan_materializes_row_tombstones_to_disk`, `seq_id_in_list_returns_input_set_cardinality`) fully exercise the query-time filter path now that system columns are materialized; add assertions that confirm deleted rows are absent in a subsequent SELECT. (5) TASK-446 A4: add integration test for `events LAST <d> | ATTRIBUTE(window: <d>, …)` end-to-end scan extension path. (6) TASK-446 A5: add integration test for multi-type `ATTRIBUTE(conversion: (purchase, subscription), touchpoints: (ad_click, email_open), …)`. (7) TASK-446 A6: add integration test for `SESSIONIZE | ATTRIBUTE` composition. (8) TASK-448 F2: add integration test for DELETE + joined-source read verifying tombstone coherence. (9) TASK-448 F3: add integration test for DELETE + cohort-filtered query. (10) TASK-444 §12: add proptest for WITHIN SESSION semantics verifying no cross-session matches. Note: TASK-448 F4 (concurrent DELETE + query isolation multi-threaded test) is intentionally deferred to Wave 5 stress-testing work; the per-query snapshot correctness argument is well-supported by code inspection and the `each_query_loads_a_fresh_tombstone_snapshot` integration test covers the sequential case.
+### TASK-532: [EASY][IMPL] ATTRIBUTE composition and WITHIN SESSION integration coverage
+**Output**: tests/tests/wave4_advanced_analytics_attribute.rs, tests/tests/wave4_advanced_analytics_sessionize.rs
+**Depends on**: TASK-509
+**Description**: Adds the Wave 4 integration coverage that existing TASK-509 doesn't enumerate. TASK-509 already covers un-ignoring joined-source/EventSelect/SESSIONIZE/row+batch DELETE tests and the joined-source+DELETE / DELETE+cohort / snapshot-isolation cases; the WITHIN SESSION runtime fix landed early via the retired TASK-530 (commit `031cdf5`), and the integration tests there already pass. This task adds: (1) `events LAST <d> | ATTRIBUTE(window: <d>, …)` end-to-end scan-extension path (TASK-446 A4); (2) multi-type `ATTRIBUTE(conversion: (purchase, subscription), touchpoints: (ad_click, email_open), …)` (A5); (3) `SESSIONIZE | ATTRIBUTE` composition (A6); (4) proptest for WITHIN SESSION semantics verifying no cross-session matches (TASK-444 §12) — strengthens the now-passing example tests with a property-based assertion. Note: TASK-448 F4 (concurrent DELETE + query isolation under real scheduling) is owned by TASK-525's stress suite; the per-query snapshot correctness argument is supported by code inspection and TASK-509's sequential coverage.
 
-### TASK-513: [EASY][IMPL] Wave 4 minor planner and operator correctness fixes
+### TASK-533: [EASY][IMPL] Wave 4 minor planner and operator correctness fixes
 **Output**: crates/bqlite-planner/src/logical.rs, crates/bqlite-planner/src/explain.rs, crates/bqlite-operators/src/event_select.rs, crates/bqlite-operators/src/sessionize.rs, crates/bqlite-core/src/error.rs
 **Depends on**: none
-**Description**: Collects the minor correctness fixes and missing guards identified by the Wave 4 semantic audits that were too small for individual tasks but too numerous to bundle into TASK-455's in-place closure work. (1) TASK-447 J8: add alias-name table-name collision check — in `lower_statement_with_aliases` (or `push_definition`), consult `catalog.resolve_table(name)` before inserting; reject with `BqliteError::Plan("alias name '...' shadows table '...'")` and add test `alias_name_matching_table_name_is_rejected`. (2) TASK-446 A2: add explicit `MATCH | ATTRIBUTE` planner rejection in `lower_attribute` with error `"ATTRIBUTE cannot consume MATCH output; MATCH emits per-match rows rather than raw event rows"` and add planner unit test asserting the rejection. (3) TASK-447 J3 (partial): add `AliasCycle { path: Vec<String> }` and `IncompatibleCohortShape { lhs_arity: usize, rhs_arity: usize }` variants to `BqliteError` (or a new `TypeError` sub-enum) to replace the current `BqliteError::Plan(String)` formatting for those paths; update the alias cycle path at `logical.rs:1635–1645` and the cohort shape check at `logical.rs:1681–1731` to use the new variants; update tests accordingly. (4) TASK-445 E6: document `forwarded_columns` as unused-in-v1 on `EventSelectPhysical` with a comment explaining that the demand-driven forwarding path derives column availability from `output_schema` instead. (5) TASK-447 J2 resolution: decide whether to add `BqlType::SmallInt` / `Int8` to bqlite-core or to update `cohorts-aliases-joins.md §3.8` to accept `Int` (i64) for `__source_table_id`; implement whichever path is chosen and update `type-system.md` with the new `__source_table_id` section per design §7.2. (6) TASK-444 finding B: replace the hardcoded `"entity_id"` literal in `sessionize.rs:201` (`push_name("entity_id", ...)`) with the actual entity-key column name propagated through `SessionizePhysical` (or derived from the input schema's NOT NULL safety net already present at lines 209–224); without this fix, any table whose entity key column is not literally named `entity_id` panics at SESSIONIZE construction time. (7) TASK-446 A1 (if not resolved in-place by TASK-455): change the `lower_attribute` guard from `args.window <= 0` to `args.window < 0` to allow `window: 0s` per spec §16.1 ("semantically valid but useless — not rejected at plan time"); add a plan-level test asserting zero window does not error. Note: TASK-455 fixed several related minor bugs in-place — SESSIONIZE `flush_session` empty-buffer guard (finding D), `entity_event_count` under-count when skipping (finding C), `EventSelectOperator` `fused_aggregate` assertion (E5), `Nth(0)` guard (E7), bracket duration ascending-order validation (R2), and the `ATTRIBUTE window: 0s` planner guard (A1) — confirm those fixes are present before starting work on this task.
+**Description**: Collects the minor correctness fixes and missing guards identified by Wave 4 semantic audits (TASK-443–448) that are too small for individual tasks but more numerous than TASK-455's in-place closure absorbed. (1) TASK-447 J8: alias-name table-name collision check in `lower_statement_with_aliases` / `push_definition` — consult `catalog.resolve_table(name)` before inserting, reject with `BqliteError::Plan("alias name '...' shadows table '...'")`, add test `alias_name_matching_table_name_is_rejected`. (2) TASK-446 A2: explicit `MATCH | ATTRIBUTE` planner rejection in `lower_attribute` ("ATTRIBUTE cannot consume MATCH output; MATCH emits per-match rows rather than raw event rows"), with planner unit test. (3) TASK-447 J3 (planner-only subset of TASK-511): add `AliasCycle { path: Vec<String> }` and `IncompatibleCohortShape { lhs_arity: usize, rhs_arity: usize }` variants to `BqliteError` (or new `TypeError` sub-enum) replacing string-formatted `Plan` errors at `logical.rs:1635–1645` and `logical.rs:1681–1731`; coordinate scope with TASK-511. (4) TASK-445 E6: document `forwarded_columns` as unused-in-v1 on `EventSelectPhysical` — comment that the demand-driven forwarding path derives column availability from `output_schema` instead. (5) TASK-447 J2: decide whether to add `BqlType::SmallInt`/`Int8` to bqlite-core or update `cohorts-aliases-joins.md §3.8` to accept `Int` (i64) for `__source_table_id`; implement chosen path; update `type-system.md` §7.2 with the `__source_table_id` section. (6) TASK-444 finding B: replace the hardcoded `"entity_id"` literal in `sessionize.rs:201` (`push_name("entity_id", ...)`) with the actual entity-key column name propagated through `SessionizePhysical` — without this, any table whose entity key isn't literally named `entity_id` panics at SESSIONIZE construction. (7) TASK-446 A1: verify-only — commit `fda797e` (TASK-499 followup P2 #2) already aligned the `lower_attribute` rustdoc with `window: 0s` acceptance, and the actual guard accepts `window == 0` per spec §16.1. The remaining work is purely confirming a plan-level test asserts zero window does not error; if missing, add it.
+
+### TASK-528: [HARD][IMPL] Wave 5 acceptance gate
+**Output**: tests/tests/wave5_acceptance.rs
+**Depends on**: TASK-509, TASK-512, TASK-513, TASK-514, TASK-517, TASK-519, TASK-520, TASK-522, TASK-523, TASK-524, TASK-525, TASK-526, TASK-527, TASK-529, TASK-531, TASK-532, TASK-533
+**Description**: End-to-end gate for the wave. Runs a large multi-shard analytical query under the documented budget, proves cancellation/timeout cleanup on a long-running query, verifies that sort/ingest/cohort behavior follows the chosen spill policy, and asserts that the fused/zero-copy path produces exactly the same results as the fallback path on the reference fixtures.
 
 Additional Wave 5 tasks: individual optimizer rule implementations, spill implementations per spillable operator, fusion implementations for specific operator pairs, cancellation plumbing per operator, property tests, stress tests, memory-pressure integration tests.
 
-### TASK-599: [IMPL] Wave 5 quality audit
+### TASK-599: [HARD][IMPL] Wave 5 quality audit
 **Output**: docs/quality-score.md
-**Depends on**: TASK-501, TASK-502, TASK-503, TASK-504, TASK-505, TASK-506, TASK-507, TASK-508, TASK-509, TASK-510, TASK-511, TASK-512, TASK-513
+**Depends on**: TASK-528
 **Description**: Same audit pattern as TASK-199, rescored after Wave 5. Wave 5 is the production-quality wave — the audit is a hard gate, not a reflective pass. Every crate is expected to be at least B across all dimensions; anything below B ships only with a named owner, a concrete remediation plan, and human sign-off before Wave 6 begins. The Benchmarks dimension specifically verifies that regression gates are wired up in CI and have been green for at least one full merge cycle. Any below-B grade is a blocker, not a follow-up.
 
 ---
