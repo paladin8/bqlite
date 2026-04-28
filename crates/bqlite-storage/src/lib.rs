@@ -47,6 +47,7 @@
 pub mod catalog;
 pub mod compaction;
 pub mod database;
+pub mod encoded_tombstone;
 pub mod encoding;
 pub mod ingest;
 pub mod manifest;
@@ -65,6 +66,7 @@ pub use compaction::{
 pub use database::{
     empty_segment_reader, Database, LOCK_FILE_NAME, MANIFEST_FILE_NAME, MANIFEST_TMP_FILE_NAME,
 };
+pub use encoded_tombstone::EncodedTombstoneSource;
 pub use encoding::{
     select_encoding, select_encoding_type, Alp, BitPacking, CompressionType, Constant, Delta,
     Dictionary, DoubleDelta, EncodedChunk, Encoding, EncodingType, ForEncoding, Fsst, Pfor, Plain,

@@ -202,6 +202,18 @@ impl EntityDeleteIndex {
     pub fn is_empty(&self) -> bool {
         self.str_set.is_empty() && self.int_set.is_empty()
     }
+
+    /// Probe the string-key entity set. Used by encoded-path
+    /// tombstone filtering (`encoded_tombstone.rs`) which decodes the
+    /// entity-key column from a pinned chunk and probes per row.
+    pub fn contains_str(&self, key: &str) -> bool {
+        self.str_set.contains(key)
+    }
+
+    /// Probe the integer-key entity set. See [`Self::contains_str`].
+    pub fn contains_int(&self, key: i64) -> bool {
+        self.int_set.contains(&key)
+    }
 }
 
 impl TimeRangeDelete {
