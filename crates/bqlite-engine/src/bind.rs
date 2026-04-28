@@ -864,6 +864,7 @@ fn bind_physical_with_cache(
                 sort.keys.clone(),
                 sort.max_rows,
                 ctx.cancellation().clone(),
+                ctx.memory().clone(),
             )))
         }
 

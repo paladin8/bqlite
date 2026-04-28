@@ -5,9 +5,12 @@
 //! ## Algorithm
 //!
 //! **Phase 1 — accumulation**: `next_batch` drains the child operator,
-//! pushing each input batch into an in-memory buffer. If the running row
+//! pushing each input batch into an in-memory buffer. Each batch's
+//! Arrow array memory is charged to the per-query [`MemoryBudget`]
+//! through a [`MemoryReservation`] held alongside the batch, so the
+//! buffered footprint is visible to the tracker.  If the running row
 //! count exceeds `max_rows` the operator returns
-//! `BqliteError::Execution` immediately — no spill in Wave 3.
+//! `BqliteError::Execution` immediately.
 //!
 //! **Phase 2 — sort and drain**: when the child is exhausted the
 //! operator concatenates all buffered batches into one `RecordBatch` via
@@ -31,9 +34,12 @@
 //!
 //! ## Memory
 //!
-//! The hard `max_rows` cap (default `DEFAULT_SORT_MAX_ROWS` = 10 M) is
-//! the sole overflow defense in Wave 3. No `MemoryBudget` registration
-//! occurs here; that infrastructure arrives with TASK-111 (Wave 4+).
+//! The operator now reserves through the per-query budget on every
+//! buffered batch; `MemoryBudgetExceeded` propagates immediately when
+//! the budget is exhausted (TASK-513 CP2a). The pre-existing `max_rows`
+//! hard cap (default `DEFAULT_SORT_MAX_ROWS` = 10 M) is preserved as
+//! an absolute upper bound. The on-disk spill writer + k-way merge land
+//! in TASK-513 CP2b, layered on top of this scaffolding.
 //!
 //! See `docs/design/operators/sort-distinct.md §3` for the full spec.
 
@@ -43,6 +49,7 @@ use arrow::compute::{concat_batches, lexsort_to_indices, take, SortColumn, SortO
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 
+use bqlite_core::memory::{MemoryBudget, MemoryReservation};
 use bqlite_core::{BqliteError, OperatorSchema, Result};
 use bqlite_planner::compiled::CompiledExpr;
 use bqlite_planner::logical::SortDirection;
@@ -66,10 +73,28 @@ pub struct SortOperator {
     /// Hard cap on total input rows. `BqliteError::Execution` on breach.
     max_rows: usize,
     cancel: CancellationToken,
+    /// Per-query memory budget. Each buffered input batch is reserved
+    /// against this budget so the tracker observes the in-flight sort
+    /// footprint and can fire spill handlers on pressure (CP2b).
+    budget: Arc<dyn MemoryBudget>,
     schema: OperatorSchema,
     /// Cached Arrow schema derived from `schema`; used by `concat_batches`.
     arrow_schema: Arc<ArrowSchema>,
     state: SortState,
+}
+
+/// One in-memory input batch plus the budget reservation that pinned its
+/// Arrow array bytes.  Dropping the entry releases the bytes back to the
+/// tracker.  The reservation is held alongside the batch so the spill
+/// handler (CP2b) can compute the freed-bytes total exactly when it
+/// drains the buffer.
+struct BufferedBatch {
+    batch: RecordBatch,
+    /// Held-for-drop. CP2a never reads this; CP2b's spill handler will
+    /// inspect `reservation.bytes()` to compute the total bytes freed
+    /// when the buffer drains.
+    #[allow(dead_code)]
+    reservation: MemoryReservation,
 }
 
 /// Internal state machine for `SortOperator`.
@@ -80,7 +105,7 @@ pub struct SortOperator {
 enum SortState {
     /// Phase 1: consuming input from the child.
     Accumulating {
-        buffer: Vec<RecordBatch>,
+        buffer: Vec<BufferedBatch>,
         total_rows: usize,
     },
     /// Phase 2: sorted output ready; drain one batch per `next_batch` call.
@@ -106,11 +131,16 @@ impl SortOperator {
     ///   default.
     /// - `cancel` — shared cancellation flag; checked at every
     ///   `next_batch` entry.
+    /// - `budget` — per-query [`MemoryBudget`]. Each accumulated batch's
+    ///   Arrow array bytes are reserved against this budget; tests that
+    ///   don't care about enforcement can pass
+    ///   `Arc::new(bqlite_core::UnboundedMemory::new())`.
     pub fn new(
         child: Box<dyn PhysicalOperator>,
         keys: Vec<(CompiledExpr, SortDirection)>,
         max_rows: usize,
         cancel: CancellationToken,
+        budget: Arc<dyn MemoryBudget>,
     ) -> Self {
         let schema = child.output_schema().clone();
         let arrow_schema = Arc::new(schema.to_arrow_schema());
@@ -119,6 +149,7 @@ impl SortOperator {
             keys,
             max_rows,
             cancel,
+            budget,
             schema,
             arrow_schema,
             state: SortState::Accumulating {
@@ -176,8 +207,18 @@ impl PhysicalOperator for SortOperator {
                                     new_total, self.max_rows
                                 )));
                             }
+                            // Charge the batch's Arrow array bytes to the
+                            // budget. On `MemoryBudgetExceeded`, the
+                            // budget has already exhausted its single
+                            // retry through any registered spill handler
+                            // (memory-budget.md § 4.1) — propagate.
+                            // CP2b registers a real spill handler that
+                            // can free bytes here; CP2a propagates the
+                            // typed error.
+                            let bytes = batch.get_array_memory_size() as u64;
+                            let reservation = self.budget.try_reserve(bytes)?;
                             total_rows = new_total;
-                            buffer.push(batch);
+                            buffer.push(BufferedBatch { batch, reservation });
                             // Restore accumulating state and loop to pull next batch.
                             self.state = SortState::Accumulating { buffer, total_rows };
 
@@ -196,6 +237,11 @@ impl PhysicalOperator for SortOperator {
                                 return Ok(None);
                             }
                             let output = sort_and_split(&buffer, &self.arrow_schema, &self.keys)?;
+                            // Drop reservations once the rearranged
+                            // output owns the data — the buffer's
+                            // borrowed views into the input batches are
+                            // no longer live after `take`.
+                            drop(buffer);
                             self.state = SortState::Draining { output, idx: 0 };
                             // Loop immediately to drain the first output batch.
                         }
@@ -247,12 +293,13 @@ impl PhysicalOperator for SortOperator {
 /// Returns an empty `Vec` if the combined batch has zero rows (the caller
 /// already handles the pre-sort empty-input check, but this is a safety net).
 fn sort_and_split(
-    buffer: &[RecordBatch],
+    buffer: &[BufferedBatch],
     arrow_schema: &Arc<ArrowSchema>,
     keys: &[(CompiledExpr, SortDirection)],
 ) -> Result<Vec<RecordBatch>> {
     // ── Step 1: concat all buffered batches into one ──────────────────────
-    let combined = concat_batches(arrow_schema, buffer)?;
+    let batches: Vec<RecordBatch> = buffer.iter().map(|b| b.batch.clone()).collect();
+    let combined = concat_batches(arrow_schema, &batches)?;
     let num_rows = combined.num_rows();
     if num_rows == 0 {
         return Ok(vec![]);
@@ -336,9 +383,14 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
 
-    use bqlite_core::{BqlType, BqliteError, ColumnDef, OperatorSchema};
+    use bqlite_core::memory::{MemoryBudget, MemoryTracker};
+    use bqlite_core::{BqlType, BqliteError, ColumnDef, OperatorSchema, Result, UnboundedMemory};
     use bqlite_planner::compiled::{CompiledExpr, CompiledNode};
     use bqlite_planner::logical::SortDirection;
+
+    fn unbounded_budget() -> Arc<dyn MemoryBudget> {
+        Arc::new(UnboundedMemory::new())
+    }
 
     use crate::operator::{CancellationToken, DEFAULT_OUTPUT_BATCH_SIZE};
 
@@ -428,7 +480,13 @@ mod tests {
     #[test]
     fn sort_empty_input_returns_none() {
         let child = Box::new(VecOp::new(int_schema(), vec![]));
-        let mut op = SortOperator::new(child, vec![], 1000, CancellationToken::new());
+        let mut op = SortOperator::new(
+            child,
+            vec![],
+            1000,
+            CancellationToken::new(),
+            unbounded_budget(),
+        );
         assert!(op.next_batch().unwrap().is_none());
     }
 
@@ -439,7 +497,13 @@ mod tests {
         let batch = make_int_batch(&[5, 3, 1, 4, 2]);
         let child = Box::new(VecOp::new(int_schema(), vec![batch]));
         let keys = vec![(col0_expr(), SortDirection::Asc)];
-        let mut op = SortOperator::new(child, keys, 1_000_000, CancellationToken::new());
+        let mut op = SortOperator::new(
+            child,
+            keys,
+            1_000_000,
+            CancellationToken::new(),
+            unbounded_budget(),
+        );
 
         let out = op.next_batch().unwrap().unwrap();
         let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -454,7 +518,13 @@ mod tests {
         let batch = make_int_batch(&[3, 1, 2]);
         let child = Box::new(VecOp::new(int_schema(), vec![batch]));
         let keys = vec![(col0_expr(), SortDirection::Desc)];
-        let mut op = SortOperator::new(child, keys, 1_000_000, CancellationToken::new());
+        let mut op = SortOperator::new(
+            child,
+            keys,
+            1_000_000,
+            CancellationToken::new(),
+            unbounded_budget(),
+        );
 
         let out = op.next_batch().unwrap().unwrap();
         let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -471,7 +541,13 @@ mod tests {
         let b3 = make_int_batch(&[2, 3]);
         let child = Box::new(VecOp::new(int_schema(), vec![b1, b2, b3]));
         let keys = vec![(col0_expr(), SortDirection::Asc)];
-        let mut op = SortOperator::new(child, keys, 1_000_000, CancellationToken::new());
+        let mut op = SortOperator::new(
+            child,
+            keys,
+            1_000_000,
+            CancellationToken::new(),
+            unbounded_budget(),
+        );
 
         // Collect all output rows across potentially multiple batches.
         let mut all_values: Vec<i64> = Vec::new();
@@ -516,7 +592,13 @@ mod tests {
             nullable: false,
         };
         let keys = vec![(key_expr, SortDirection::Asc)];
-        let mut op = SortOperator::new(child, keys, 1_000_000, CancellationToken::new());
+        let mut op = SortOperator::new(
+            child,
+            keys,
+            1_000_000,
+            CancellationToken::new(),
+            unbounded_budget(),
+        );
 
         let out = op.next_batch().unwrap().unwrap();
         let order_values: Vec<i64> = {
@@ -532,7 +614,13 @@ mod tests {
     fn sort_output_schema_unchanged() {
         let schema = int_schema();
         let child = Box::new(VecOp::new(schema.clone(), vec![]));
-        let op = SortOperator::new(child, vec![], 1_000_000, CancellationToken::new());
+        let op = SortOperator::new(
+            child,
+            vec![],
+            1_000_000,
+            CancellationToken::new(),
+            unbounded_budget(),
+        );
         assert_eq!(*op.output_schema(), schema);
     }
 
@@ -547,6 +635,7 @@ mod tests {
             vec![],
             2, /* cap at 2 */
             CancellationToken::new(),
+            unbounded_budget(),
         );
 
         match op.next_batch() {
@@ -565,7 +654,8 @@ mod tests {
         let batch = make_int_batch(&[2, 1]); // 2 rows, cap is 2
         let child = Box::new(VecOp::new(int_schema(), vec![batch]));
         let keys = vec![(col0_expr(), SortDirection::Asc)];
-        let mut op = SortOperator::new(child, keys, 2, CancellationToken::new());
+        let mut op =
+            SortOperator::new(child, keys, 2, CancellationToken::new(), unbounded_budget());
 
         let out = op.next_batch().unwrap().unwrap();
         assert_eq!(out.num_rows(), 2);
@@ -581,7 +671,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
         let child = Box::new(VecOp::new(int_schema(), vec![make_int_batch(&[1, 2])]));
-        let mut op = SortOperator::new(child, vec![], 1_000_000, token);
+        let mut op = SortOperator::new(child, vec![], 1_000_000, token, unbounded_budget());
 
         match op.next_batch() {
             Err(BqliteError::Cancelled) => {}
@@ -598,7 +688,7 @@ mod tests {
         let batch = make_int_batch(&values);
         let child = Box::new(VecOp::new(int_schema(), vec![batch]));
         let keys = vec![(col0_expr(), SortDirection::Asc)];
-        let mut op = SortOperator::new(child, keys, n + 100, token.clone());
+        let mut op = SortOperator::new(child, keys, n + 100, token.clone(), unbounded_budget());
 
         // First call triggers full sort and returns the first output batch.
         let first = op.next_batch().unwrap();
@@ -622,7 +712,13 @@ mod tests {
         let batch = make_int_batch(&values);
         let child = Box::new(VecOp::new(int_schema(), vec![batch]));
         let keys = vec![(col0_expr(), SortDirection::Asc)];
-        let mut op = SortOperator::new(child, keys, n + 100, CancellationToken::new());
+        let mut op = SortOperator::new(
+            child,
+            keys,
+            n + 100,
+            CancellationToken::new(),
+            unbounded_budget(),
+        );
 
         let b1 = op.next_batch().unwrap().unwrap();
         assert_eq!(b1.num_rows(), DEFAULT_OUTPUT_BATCH_SIZE);
@@ -638,7 +734,13 @@ mod tests {
     #[test]
     fn sort_close_is_idempotent() {
         let child = Box::new(VecOp::new(int_schema(), vec![]));
-        let mut op = SortOperator::new(child, vec![], 1_000_000, CancellationToken::new());
+        let mut op = SortOperator::new(
+            child,
+            vec![],
+            1_000_000,
+            CancellationToken::new(),
+            unbounded_budget(),
+        );
         op.close().unwrap();
         op.close().unwrap();
         // After close, next_batch returns None (Done state).
@@ -656,6 +758,7 @@ mod tests {
             vec![], /* no keys */
             1_000_000,
             CancellationToken::new(),
+            unbounded_budget(),
         );
 
         let out = op.next_batch().unwrap().unwrap();
@@ -663,5 +766,94 @@ mod tests {
         // With no sort keys, lexsort is a no-op and rows keep their input order.
         let values: Vec<i64> = (0..col.len()).map(|i| col.value(i)).collect();
         assert_eq!(values, vec![3, 1, 2]);
+    }
+
+    // ── Memory budget plumbing (TASK-513 CP2a) ────────────────────────────────
+
+    #[test]
+    fn sort_charges_buffered_batches_to_budget() -> Result<()> {
+        // Sort accumulates two batches; the tracker must observe a peak
+        // ≥ Σ get_array_memory_size of the input batches.
+        let batch_a = make_int_batch(&[3, 1, 2]);
+        let batch_b = make_int_batch(&[6, 5, 4]);
+        let expected_min_peak =
+            (batch_a.get_array_memory_size() + batch_b.get_array_memory_size()) as u64;
+        let child = Box::new(VecOp::new(int_schema(), vec![batch_a, batch_b]));
+        let tracker = MemoryTracker::new(1_000_000);
+        let budget: Arc<dyn MemoryBudget> = tracker.clone();
+        let mut op = SortOperator::new(
+            child,
+            vec![(col0_expr(), SortDirection::Asc)],
+            1_000_000,
+            CancellationToken::new(),
+            budget,
+        );
+        // Drive the operator until it returns one full output batch.
+        let _ = op.next_batch()?.expect("must produce output");
+        // After phase-2 transition the buffer is dropped, so peak is what
+        // we want to assert against — used has already returned to ~0.
+        assert!(
+            tracker.peak_bytes() >= expected_min_peak,
+            "peak {} should be at least {}",
+            tracker.peak_bytes(),
+            expected_min_peak
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sort_overflow_returns_typed_budget_error() {
+        // Tracker with a tiny budget (smaller than even one Int64Array
+        // batch) — the first try_reserve must surface
+        // `BqliteError::MemoryBudgetExceeded` since no spill handler is
+        // registered in CP2a.
+        let batch = make_int_batch(&[1, 2, 3, 4, 5]);
+        let bytes = batch.get_array_memory_size() as u64;
+        let tiny_budget = bytes.saturating_sub(1);
+        let child = Box::new(VecOp::new(int_schema(), vec![batch]));
+        let tracker = MemoryTracker::new(tiny_budget);
+        let budget: Arc<dyn MemoryBudget> = tracker;
+        let mut op = SortOperator::new(
+            child,
+            vec![(col0_expr(), SortDirection::Asc)],
+            1_000_000,
+            CancellationToken::new(),
+            budget,
+        );
+        match op.next_batch() {
+            Err(BqliteError::MemoryBudgetExceeded { used, budget }) => {
+                assert_eq!(budget, tiny_budget);
+                assert!(
+                    used >= bytes,
+                    "used should reflect the rejected reservation: {used}"
+                );
+            }
+            other => panic!("expected MemoryBudgetExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_releases_reservation_after_drain() -> Result<()> {
+        // After the merge-and-drain phase completes and every output
+        // batch has been read, all reservations are released.
+        let batch = make_int_batch(&[3, 1, 2]);
+        let child = Box::new(VecOp::new(int_schema(), vec![batch]));
+        let tracker = MemoryTracker::new(1_000_000);
+        let budget: Arc<dyn MemoryBudget> = tracker.clone();
+        let mut op = SortOperator::new(
+            child,
+            vec![(col0_expr(), SortDirection::Asc)],
+            1_000_000,
+            CancellationToken::new(),
+            budget,
+        );
+        // Drive to completion.
+        while op.next_batch()?.is_some() {}
+        assert_eq!(
+            tracker.used_bytes(),
+            0,
+            "all reservations must be released after drain"
+        );
+        Ok(())
     }
 }

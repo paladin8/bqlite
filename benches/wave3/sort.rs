@@ -16,12 +16,16 @@ use arrow::record_batch::RecordBatch;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use bqlite_benches::common::*;
-use bqlite_core::{BqlType, ColumnDef, OperatorSchema};
+use bqlite_core::{BqlType, ColumnDef, MemoryBudget, OperatorSchema, UnboundedMemory};
 use bqlite_operators::operator::{CancellationToken, PhysicalOperator};
 use bqlite_operators::SortOperator;
 use bqlite_planner::compiled::{CompiledExpr, CompiledNode};
 use bqlite_planner::logical::SortDirection;
 use bqlite_planner::physical::DEFAULT_SORT_MAX_ROWS;
+
+fn unbounded_budget() -> Arc<dyn MemoryBudget> {
+    Arc::new(UnboundedMemory::new())
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data generators
@@ -136,6 +140,7 @@ fn bench_sort_int_by_rows(c: &mut Criterion) {
                     vec![(col0_expr(), SortDirection::Asc)],
                     DEFAULT_SORT_MAX_ROWS,
                     CancellationToken::new(),
+                    unbounded_budget(),
                 );
                 black_box(drain_sort(&mut sort))
             });
@@ -171,6 +176,7 @@ fn bench_sort_two_keys(c: &mut Criterion) {
                         ],
                         DEFAULT_SORT_MAX_ROWS,
                         CancellationToken::new(),
+                        unbounded_budget(),
                     );
                     black_box(drain_sort(&mut sort))
                 });
@@ -204,6 +210,7 @@ fn bench_sort_multi_batch(c: &mut Criterion) {
                 vec![(col0_expr(), SortDirection::Asc)],
                 DEFAULT_SORT_MAX_ROWS,
                 CancellationToken::new(),
+                unbounded_budget(),
             );
             black_box(drain_sort(&mut sort))
         });
