@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-516",
   "claimed_at": "2026-04-28T07:59:50Z",
+  "completed_at": "2026-04-28T08:38:56Z",
   "branch": "task/TASK-516",
   "description": "Dictionary/RLE selection-first scan path"
 }
