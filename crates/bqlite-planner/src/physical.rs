@@ -608,7 +608,8 @@ pub struct SortPhysical {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistinctPhysical {
     /// Hard cap on distinct row count. Default: 1,000,000.
-    /// Returns `BqliteError::Execution` if exceeded — no spill in Wave 3.
+    /// Returns [`bqlite_core::BqliteError::MaxGroupsExceeded`] if exceeded
+    /// — no spill in Wave 3.
     pub max_groups: usize,
     /// Child plan feeding this distinct operator.
     pub input: Box<PhysicalPlan>,

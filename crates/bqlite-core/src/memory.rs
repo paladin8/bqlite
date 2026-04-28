@@ -9,8 +9,9 @@
 //! Operators that grow with data size (aggregation hash tables, sort buffers,
 //! decoded column data) call [`MemoryBudget::try_reserve`] before each
 //! allocation. On budget exhaustion the method returns
-//! [`Err(BqliteError::Execution(...))`], at which point the operator should
-//! attempt to spill (see [`SpillNotification`]) before propagating the error.
+//! [`Err(BqliteError::MemoryBudgetExceeded { .. })`], at which point the operator
+//! should attempt to spill (see [`SpillNotification`]) before propagating the
+//! error.
 //!
 //! [`MemoryReservation`] is a RAII guard: when it is dropped the reserved
 //! bytes are automatically returned to the budget.
@@ -133,9 +134,9 @@ pub trait MemoryBudget: Send + Sync {
     /// Attempt to reserve `bytes` of memory.
     ///
     /// Returns a [`MemoryReservation`] on success. On failure returns
-    /// `Err(BqliteError::Execution(...))` indicating that the budget
-    /// would be exceeded. Callers should try to spill before propagating
-    /// the error.
+    /// `Err(BqliteError::MemoryBudgetExceeded { .. })` indicating that
+    /// the budget would be exceeded. Callers should try to spill before
+    /// propagating the error.
     fn try_reserve(&self, bytes: u64) -> Result<MemoryReservation>;
 
     /// Register a spill handler that the budget may call when under pressure.
@@ -445,13 +446,17 @@ impl MemoryBudget for MemoryTracker {
 // BudgetExceededError helper
 // ---------------------------------------------------------------------------
 
-/// Construct a [`BqliteError::Execution`] indicating a memory budget
-/// overflow. Centralised here so the error message is consistent.
+/// Construct a [`BqliteError::MemoryBudgetExceeded`] with the standard
+/// shape used by every memory-budget-aware operator. `requested` is
+/// folded into `used` (the variant only exposes `{ used, budget }` per
+/// `docs/design/engine/cancellation.md` §4.3); callers that need to
+/// surface the requested-bytes diagnostic should log it before
+/// propagating the error.
 pub fn budget_exceeded_error(requested: u64, budget: u64, used: u64) -> BqliteError {
-    BqliteError::Execution(format!(
-        "memory budget exceeded: requested {requested} bytes, \
-         {used} bytes already in use, budget is {budget} bytes"
-    ))
+    BqliteError::MemoryBudgetExceeded {
+        used: used.saturating_add(requested),
+        budget,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,13 +539,21 @@ mod tests {
     }
 
     #[test]
-    fn budget_exceeded_error_message() {
+    fn budget_exceeded_error_yields_structured_variant() {
         let err = budget_exceeded_error(100, 200, 150);
-        let msg = err.to_string();
+        match err {
+            BqliteError::MemoryBudgetExceeded { used, budget } => {
+                // requested(100) is folded into used(150) → 250.
+                assert_eq!(used, 250);
+                assert_eq!(budget, 200);
+            }
+            other => panic!("expected MemoryBudgetExceeded, got {other:?}"),
+        }
+        // Display still names the budget and the post-attempt usage.
+        let msg = budget_exceeded_error(100, 200, 150).to_string();
         assert!(msg.contains("memory budget exceeded"));
-        assert!(msg.contains("100"));
+        assert!(msg.contains("250"));
         assert!(msg.contains("200"));
-        assert!(msg.contains("150"));
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -586,12 +599,13 @@ mod tests {
         let _r = tracker.try_reserve(400).unwrap();
         let err = tracker.try_reserve(200).unwrap_err();
         match err {
-            BqliteError::Execution(msg) => {
-                assert!(msg.contains("memory budget exceeded"));
-                assert!(msg.contains("200"));
-                assert!(msg.contains("500"));
+            BqliteError::MemoryBudgetExceeded { used, budget } => {
+                // Tracker rolls back the failed optimistic charge;
+                // budget_exceeded_error folds requested+used (200+400=600).
+                assert_eq!(used, 600);
+                assert_eq!(budget, 500);
             }
-            other => panic!("expected Execution error, got {other:?}"),
+            other => panic!("expected MemoryBudgetExceeded, got {other:?}"),
         }
         // The failed reservation must roll back the optimistic charge.
         assert_eq!(tracker.used_bytes(), 400);

@@ -73,7 +73,7 @@ use crate::operator::{CancellationToken, PhysicalOperator};
 /// child operator and cancellation token.
 pub struct DistinctOperator {
     child: Box<dyn PhysicalOperator>,
-    /// Hard cap on distinct row count. `BqliteError::Execution` on breach.
+    /// Hard cap on distinct row count. `BqliteError::MaxGroupsExceeded` on breach.
     max_groups: usize,
     cancel: CancellationToken,
     schema: OperatorSchema,
@@ -181,7 +181,7 @@ impl DistinctOperator {
     /// Build a `BooleanArray` mask: `true` for first-occurrence rows,
     /// `false` for duplicates. Updates `self.seen` as a side effect.
     ///
-    /// Returns `BqliteError::Execution` if a new key would exceed `max_groups`.
+    /// Returns `BqliteError::MaxGroupsExceeded` if a new key would exceed `max_groups`.
     fn build_inclusion_mask(&mut self, batch: &RecordBatch) -> Result<BooleanArray> {
         let num_rows = batch.num_rows();
         let columns = batch.columns();
@@ -194,10 +194,9 @@ impl DistinctOperator {
             } else {
                 // New key — check the cap before inserting.
                 if self.seen.len() >= self.max_groups {
-                    return Err(BqliteError::Execution(format!(
-                        "DistinctOperator: distinct row count exceeds max_groups limit {}",
-                        self.max_groups
-                    )));
+                    return Err(BqliteError::MaxGroupsExceeded {
+                        limit: self.max_groups,
+                    });
                 }
                 self.seen.insert(key);
                 builder.append_value(true);
@@ -528,13 +527,10 @@ mod tests {
         let mut op = DistinctOperator::new(child, 2 /* cap at 2 */, CancellationToken::new());
 
         match op.next_batch() {
-            Err(BqliteError::Execution(msg)) => {
-                assert_eq!(
-                    msg,
-                    "DistinctOperator: distinct row count exceeds max_groups limit 2"
-                );
+            Err(BqliteError::MaxGroupsExceeded { limit }) => {
+                assert_eq!(limit, 2);
             }
-            other => panic!("expected Execution error, got {other:?}"),
+            other => panic!("expected MaxGroupsExceeded, got {other:?}"),
         }
     }
 

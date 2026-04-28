@@ -458,7 +458,7 @@ pub trait Accumulator: Send {
 ///
 /// Group cardinality is bounded by `max_groups` (default 1,000,000).
 /// When the cap is reached and a new group is encountered, `update`
-/// returns `BqliteError::Execution` with the overflow message.
+/// returns [`BqliteError::MaxGroupsExceeded`].
 /// There is no spill-to-disk for aggregation state in v1.
 pub struct HashAccumulator {
     /// Per-group state. Key is the group-by values tuple.
@@ -550,10 +550,9 @@ impl HashAccumulator {
     fn get_or_create_group(&mut self, key: GroupKey) -> Result<&mut Vec<AggState>> {
         if !self.groups.contains_key(&key) {
             if self.groups.len() >= self.max_groups {
-                return Err(BqliteError::Execution(format!(
-                    "aggregation group cardinality limit exceeded: {} groups",
-                    self.max_groups
-                )));
+                return Err(BqliteError::MaxGroupsExceeded {
+                    limit: self.max_groups,
+                });
             }
             let states = self.create_group_states();
             self.groups.insert(key.clone(), states);
@@ -704,10 +703,9 @@ impl Accumulator for HashAccumulator {
                 }
             } else {
                 if self.groups.len() >= self.max_groups {
-                    return Err(BqliteError::Execution(format!(
-                        "aggregation group cardinality limit exceeded: {} groups",
-                        self.max_groups
-                    )));
+                    return Err(BqliteError::MaxGroupsExceeded {
+                        limit: self.max_groups,
+                    });
                 }
                 self.groups.insert(key.clone(), other_states.clone());
             }
@@ -835,7 +833,7 @@ impl HashAggregateOperator {
     /// - `group_by`: compiled group-by key expressions paired with
     ///   their output column names.
     /// - `max_groups`: hard cap on group cardinality. When exceeded,
-    ///   returns `BqliteError::Execution`.
+    ///   returns [`BqliteError::MaxGroupsExceeded`].
     /// - `output_schema`: plan-time output schema (group columns +
     ///   aggregate columns).
     pub fn new(
@@ -2143,8 +2141,8 @@ mod tests {
             op.open().unwrap();
             let err = op.next_batch().unwrap_err();
             assert!(
-                matches!(err, BqliteError::Execution(ref msg) if msg.contains("cardinality")),
-                "expected group limit error, got: {err}"
+                matches!(err, BqliteError::MaxGroupsExceeded { .. }),
+                "expected MaxGroupsExceeded, got: {err}"
             );
         }
 
