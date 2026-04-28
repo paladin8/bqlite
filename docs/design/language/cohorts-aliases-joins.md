@@ -228,11 +228,24 @@ This is **not** a binary merge chained left-to-right (extra buffer layers), and 
 
 ### 3.8 Source-Table Discriminator Column (B7)
 
-Merged rows carry a discriminator column:
+Merged rows carry a discriminator column plus the implicit
+`__seq_id` / `__batch_id` system columns each picked sub-scan
+contributes:
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
 | `__source_table_id` | `Int8` | no | 0-indexed position in the JOIN clause |
+| `__seq_id` | `Int64` | no | Synthesised per-row sequence id from the picked sub-scan's segment footer (`storage/system-columns.md` §3) |
+| `__batch_id` | `Int64` | no | Synthesised per-row batch id from the picked sub-scan's segment footer |
+
+The system columns are bare-named (no `<table>.` qualifier) because
+they have identical semantics across every sub-table. The merge picks
+one row from one sub-scan at a time, and that sub-scan's emitted
+`__seq_id` / `__batch_id` populate the output — never null — because
+every sub-scan emits them as of TASK-508. See
+`docs/design/storage/system-columns.md` §4.2 for the full operator
+contract and the reconciliation that closed the pre-TASK-508
+carve-out where the joined schema omitted these columns.
 
 The mapping from `i8` values to table names lives in an out-of-band dictionary registry that the planner builds for the pipeline and attaches to the physical plan. Downstream operators look up table names by id when needed (e.g., for display in EXPLAIN).
 

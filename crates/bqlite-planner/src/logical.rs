@@ -1264,8 +1264,11 @@ fn lower_query_pipeline(
 ///   mandatory-qualification rule of §3.11.
 /// - A `__source_table_id: Int NOT NULL` discriminator is appended so
 ///   downstream operators can route rows back to their originating table.
-/// - System columns (`__seq_id`, `__batch_id`) keep their bare names — they
-///   are shared across all joined rows.
+/// - The implicit system columns `__seq_id` and `__batch_id` are
+///   appended bare-named (no `<table>.` qualifier) and NOT NULL. They
+///   are populated by `MergeSourcesOperator`'s bare-name resolution
+///   path against each sub-scan's emitted system columns
+///   (system-columns.md §4.2).
 ///
 /// Entity-key type compatibility is verified by the caller.
 fn build_joined_scan(
@@ -1316,17 +1319,25 @@ fn build_joined_scan(
         }
     }
 
-    // Discriminator column. `__seq_id` / `__batch_id` are intentionally
-    // omitted from the combined schema: the Wave 2 `ScanOperator` does
-    // not materialise them in per-sub-scan batches (see
-    // `bqlite-operators::scan` module docs), so declaring them here
-    // would force `MergeSourcesOperator` to populate non-nullable
-    // columns with values it has no way to source — exactly the
-    // failure mode that blocked `events JOIN purchases` end-to-end. If
-    // a future scan gains system-column materialisation, `__seq_id` /
-    // `__batch_id` can be re-added to the combined schema in lockstep;
-    // see `cohorts-aliases-joins.md` §3.8 for the spec shape.
+    // Discriminator + system columns. Per
+    // `docs/design/storage/system-columns.md` §4.2 (which extends
+    // `cohorts-aliases-joins.md` §3.8), the combined schema declares
+    // `__source_table_id`, `__seq_id`, and `__batch_id` as bare-named,
+    // NOT NULL, Int. The merge picks one row from one sub-scan at a
+    // time, and that sub-scan's emitted `__seq_id` / `__batch_id`
+    // populate the output (each sub-scan materialises them as of
+    // TASK-508 — see `bqlite-operators::scan` module docs). The
+    // `__source_table_id` spec type is `Int8`; `BqlType` lacks `Int8`
+    // so we use `Int` here (see the constant's doc-comment above).
     cols.push(ColumnDef::required(SOURCE_TABLE_ID_COLUMN, BqlType::Int));
+    cols.push(ColumnDef::required(
+        bqlite_core::schema::SEQ_ID_COLUMN,
+        BqlType::Int,
+    ));
+    cols.push(ColumnDef::required(
+        bqlite_core::schema::BATCH_ID_COLUMN,
+        BqlType::Int,
+    ));
 
     let output_schema = OperatorSchema::new(cols)?;
 
@@ -8065,15 +8076,17 @@ mod tests {
     }
 
     #[test]
-    fn joined_pipeline_omits_system_columns_from_combined_schema() {
-        // Regression guard for TASK-499 audit finding J1: the Wave 2
-        // ScanOperator does not materialise `__seq_id` / `__batch_id`
-        // (see `bqlite-operators::scan` module docs), so the joined
-        // schema must not declare them — otherwise MergeSourcesOperator
-        // would emit non-nullable columns it has no way to populate and
-        // `RecordBatch::try_new` would panic. If a future scan gains
-        // system-column materialisation, this test must be updated in
-        // lockstep with `build_joined_scan` per `cohorts-aliases-joins.md` §3.8.
+    fn joined_pipeline_includes_system_columns_in_combined_schema() {
+        // Per `docs/design/storage/system-columns.md` §4.2, the joined
+        // schema declares __seq_id and __batch_id as bare-named, NOT
+        // NULL, Int columns. They are populated by
+        // MergeSourcesOperator's bare-name resolution path against
+        // each sub-scan's emitted system columns (now that
+        // ScanOperator materialises them as of TASK-508).
+        //
+        // This test was previously a negative regression guard
+        // (`joined_pipeline_omits_system_columns_from_combined_schema`)
+        // and is flipped to assert the post-TASK-508 contract.
         let cat = InMemoryCatalog::default()
             .with(purchases_schema())
             .with(logins_schema());
@@ -8092,13 +8105,19 @@ mod tests {
             .map(|c| c.name.as_str())
             .collect();
         assert!(
-            !names.contains(&"__seq_id"),
-            "joined schema must not declare __seq_id while scan does not materialise it; got {names:?}",
+            names.contains(&"__seq_id"),
+            "expected __seq_id in joined combined schema, got {names:?}"
         );
         assert!(
-            !names.contains(&"__batch_id"),
-            "joined schema must not declare __batch_id while scan does not materialise it; got {names:?}",
+            names.contains(&"__batch_id"),
+            "expected __batch_id in joined combined schema, got {names:?}"
         );
+        let (_, seq) = output_schema.column("__seq_id").unwrap();
+        assert_eq!(seq.bql_type, BqlType::Int);
+        assert!(!seq.nullable, "__seq_id must be NOT NULL");
+        let (_, bid) = output_schema.column("__batch_id").unwrap();
+        assert_eq!(bid.bql_type, BqlType::Int);
+        assert!(!bid.nullable, "__batch_id must be NOT NULL");
     }
 
     #[test]
