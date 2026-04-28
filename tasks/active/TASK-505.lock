@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-505",
+  "claimed_at": "2026-04-28T05:37:54Z",
+  "branch": "task/TASK-505",
+  "description": "Cancellation, timeout, and warning protocol"
+}
