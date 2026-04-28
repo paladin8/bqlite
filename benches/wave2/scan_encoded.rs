@@ -131,7 +131,7 @@ fn run_encoded(
     let mut scan = reader.scan(&projection, None).unwrap();
     let shape = EncodedEqShape {
         col_index: col_idx,
-        literal: PropertyValue::String(literal.into()),
+        literals: vec![PropertyValue::String(literal.into())],
     };
     let col_type = types[col_idx].clone();
     let mut total = 0u64;

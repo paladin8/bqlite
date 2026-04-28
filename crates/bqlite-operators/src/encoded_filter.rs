@@ -657,41 +657,148 @@ pub fn apply_materialized_mask(
 // Shape recognition + dispatch (scan-operator entry point)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Recognized shape: `column == literal` (commutative). The column is
-/// identified by its table-schema ordinal — which coincides with the
-/// position inside [`EncodedBatch::columns`] when the scan's projection
-/// preserves table-schema order (the scan operator enforces this).
+/// Recognized shape: `column ∈ {literals…}` (a single-element vector for
+/// simple `column == literal`, multi-element for `column IN (lit, …)`).
+///
+/// The column is identified by its table-schema ordinal — which
+/// coincides with the position inside [`EncodedBatch::columns`] when the
+/// scan's projection preserves table-schema order (the scan operator
+/// enforces this).
+///
+/// # Invariants (maintained by the recognizer)
+///
+/// - `literals` is non-empty.
+/// - No element is [`PropertyValue::Null`] (the recognizer strips them).
+/// - Every element shares one logical type — i.e. they're all `Int`, all
+///   `Timestamp`, all `Float`, all `String`, or all `Bool`. Heterogeneous
+///   shapes are dispatcher bugs and the recognizer rejects them.
+///
+/// The dispatcher (`apply_encoded_eq`) and kernels rely on these
+/// invariants — `debug_assert!` calls validate them, but the recognizer
+/// is the only intended construction site.
 #[derive(Debug, Clone)]
 pub struct EncodedEqShape {
     pub col_index: usize,
-    pub literal: PropertyValue,
+    pub literals: Vec<PropertyValue>,
 }
 
-/// Try to match a compiled predicate against the shape the encoded path
-/// can dispatch on today: a non-null equality between a column and a
-/// literal. Returns `None` for every other shape — the caller keeps
-/// those predicates in its residual post-filter list and enforces them
-/// on the materialized batch via arrow-compute.
+/// Try to match a compiled predicate against the shapes the encoded
+/// path can dispatch on today:
+///
+/// - `column = literal` (commutative `Compare { Equal }`),
+/// - `column IN (lit_1, …, lit_k)` (`InLiteralSet { negated: false }`).
+///
+/// Returns `None` for every other shape — the caller keeps those
+/// predicates in its residual post-filter list and enforces them on the
+/// materialized batch via arrow-compute.
+///
+/// # Null and empty-set handling
+///
+/// `PropertyValue::Null` literals are stripped from the IN-list (a value
+/// can never be 2VL-equal to NULL — Arrow `is_in` returns NULL/unknown
+/// in that case and the post-filter drops it; the encoded path produces
+/// the same observable answer because rows whose comparison would have
+/// been "unknown" cannot survive any 2VL filter conjunction). After
+/// stripping, an empty literal list is **not pushable**: the recognizer
+/// returns `None` and the residual post-filter handles the case (TASK-227
+/// already elides constant-`false` `IN ()` shapes upstream of this).
+///
+/// `Compare { Equal }` against a `Literal(Null)` returns `None` for the
+/// same reason — `NULL = x` is SQL UNKNOWN under 3VL.
 pub fn recognize_encoded_eq(expr: &CompiledExpr) -> Option<EncodedEqShape> {
-    let CompiledNode::Compare {
-        op: CompareOp::Equal,
-        left,
-        right,
-        ..
-    } = &expr.node
-    else {
-        return None;
-    };
-    let (col_index, literal) = match (&left.node, &right.node) {
-        (CompiledNode::Column { index, .. }, CompiledNode::Literal(v)) => (*index, v.clone()),
-        (CompiledNode::Literal(v), CompiledNode::Column { index, .. }) => (*index, v.clone()),
-        _ => return None,
-    };
-    // `NULL = x` is SQL UNKNOWN — leave it to post-filter 3VL.
-    if matches!(literal, PropertyValue::Null) {
-        return None;
+    match &expr.node {
+        CompiledNode::Compare {
+            op: CompareOp::Equal,
+            left,
+            right,
+            ..
+        } => {
+            let (col_index, literal) = match (&left.node, &right.node) {
+                (CompiledNode::Column { index, .. }, CompiledNode::Literal(v)) => {
+                    (*index, v.clone())
+                }
+                (CompiledNode::Literal(v), CompiledNode::Column { index, .. }) => {
+                    (*index, v.clone())
+                }
+                _ => return None,
+            };
+            // `NULL = x` is SQL UNKNOWN — leave it to post-filter 3VL.
+            if matches!(literal, PropertyValue::Null) {
+                return None;
+            }
+            Some(EncodedEqShape {
+                col_index,
+                literals: vec![literal],
+            })
+        }
+        CompiledNode::InLiteralSet {
+            input,
+            values,
+            negated,
+            ..
+        } => {
+            // `NOT IN` decomposes into `≠` per literal across rows; the
+            // storage path does not yet support that as a cross-row
+            // conjunction — residual handles it.
+            if *negated {
+                return None;
+            }
+            let CompiledNode::Column { index, .. } = &input.node else {
+                return None;
+            };
+            // Strip null literals: under 2VL the comparison result is
+            // either a real boolean (drops to `false` for non-matches)
+            // or unknown (drops to `false` after Kleene fold), so a
+            // null literal contributes no live rows.
+            let literals: Vec<PropertyValue> = values
+                .iter()
+                .filter(|v| !matches!(v, PropertyValue::Null))
+                .cloned()
+                .collect();
+            if literals.is_empty() {
+                return None;
+            }
+            // Reject heterogeneous-type literal sets — those are
+            // dispatcher bugs (the planner should not produce one). The
+            // residual post-filter still handles them via Arrow `is_in`,
+            // so falling through here is correct.
+            if !literals_are_homogeneous(&literals) {
+                return None;
+            }
+            Some(EncodedEqShape {
+                col_index: *index,
+                literals,
+            })
+        }
+        _ => None,
     }
-    Some(EncodedEqShape { col_index, literal })
+}
+
+/// True when every literal in the set has the same logical kind. Treats
+/// `Int` and `Timestamp` as distinct kinds — they share an `i64`
+/// representation but the dispatch type-check uses logical types.
+fn literals_are_homogeneous(literals: &[PropertyValue]) -> bool {
+    fn kind_tag(v: &PropertyValue) -> u8 {
+        match v {
+            PropertyValue::Bool(_) => 1,
+            PropertyValue::Int(_) => 2,
+            PropertyValue::Float(_) => 3,
+            PropertyValue::String(_) => 4,
+            PropertyValue::Timestamp(_) => 5,
+            // Null was stripped before this is called; List/Map are
+            // dispatcher bugs in this position. Either way, "not
+            // homogeneous with anything else" produces a safe `false`.
+            PropertyValue::Null | PropertyValue::List(_) | PropertyValue::Map(_) => 0,
+        }
+    }
+    let Some(first) = literals.first() else {
+        return false;
+    };
+    let tag = kind_tag(first);
+    if tag == 0 {
+        return false;
+    }
+    literals.iter().all(|l| kind_tag(l) == tag)
 }
 
 /// Partition a list of post-filter predicates into (encoded-eligible,
@@ -711,82 +818,143 @@ pub fn partition_encoded_eq(
     (shapes, residual)
 }
 
-/// Apply one recognized `col == literal` predicate to an
-/// [`EncodedBatch`] and return a narrowed [`RowSelection`].
+/// Apply one recognized `col ∈ {literals}` predicate (single literal =
+/// `=`, multiple = `IN (…)`) to an [`EncodedBatch`] and return a narrowed
+/// [`RowSelection`].
 ///
 /// Dispatch:
 ///
-/// - `Constant` → [`ConstantEqKernel`] (cheapest path).
-/// - `Rle` with Int/Timestamp literal → [`RleIntEqKernel`] (run-
-///   preserving).
+/// - `Constant` → [`ConstantEqKernel`] (cheapest path; the kernel
+///   already accepts a `Vec<ScalarValue>`).
+/// - `Rle` with Int/Timestamp literal set → [`RleIntEqKernel`] (run-
+///   preserving). Literals not representable as `i64` are dropped; the
+///   conjunct only falls back to materialized when *every* literal
+///   would have been dropped, mirroring the Dictionary path's
+///   "unresolved literal contributes zero rows" rule.
+/// - `Dictionary` → [`DictionaryEqKernel`] (already accepts a
+///   `Vec<ScalarValue>`).
 /// - Anything else (other encodings, or `Materialized` fallback from
 ///   `pin_column_chunk`) → materialize just that column and run
-///   arrow-compute `eq` + [`apply_materialized_mask`]. This is the
-///   same fallback path the bench measures under `realistic_rg`.
+///   arrow-compute `eq` (single-literal) or `or_kleene` over per-literal
+///   masks (multi-literal) + [`apply_materialized_mask`].
 pub fn apply_encoded_eq(
     shape: &EncodedEqShape,
     batch: &EncodedBatch,
     input: &RowSelection,
     col_type: &BqlType,
 ) -> Result<RowSelection> {
+    debug_assert!(
+        !shape.literals.is_empty(),
+        "EncodedEqShape::literals must be non-empty (recognizer guarantees this)"
+    );
+    debug_assert!(
+        shape
+            .literals
+            .iter()
+            .all(|v| !matches!(v, PropertyValue::Null)),
+        "EncodedEqShape::literals must not contain Null (recognizer strips them)"
+    );
+
     let col = &batch.columns[shape.col_index];
-    let scalar = match property_value_to_scalar(&shape.literal) {
-        Some(s) => s,
-        // Unrepresentable literal (e.g. List/Map) — fall back to the
-        // arrow-compute path, which either succeeds via broadcast or
-        // returns an Execution error that the caller surfaces.
-        None => return apply_fallback_eq(col, &shape.literal, input, col_type),
-    };
+    // Convert literals to ScalarValue for the kernels that take them.
+    // Any unrepresentable literal (List/Map) is a dispatcher bug; fall
+    // through to the materialized path, where the per-literal type
+    // mismatch is surfaced as an Execution error.
+    let scalars: Vec<ScalarValue> = shape
+        .literals
+        .iter()
+        .filter_map(property_value_to_scalar)
+        .collect();
+    if scalars.len() != shape.literals.len() {
+        return apply_fallback_eq(col, &shape.literals, input, col_type);
+    }
     match col.view() {
         EncodedColumnView::Encoded { kind, .. } => match kind {
             EncodedKind::Constant { .. } => {
-                let kernel = ConstantEqKernel::new(vec![scalar]);
+                let kernel = ConstantEqKernel::new(scalars);
                 Ok(kernel.apply(&col.view(), input))
             }
-            EncodedKind::Rle => match &shape.literal {
-                PropertyValue::Int(v) | PropertyValue::Timestamp(v) => {
-                    let kernel = RleIntEqKernel::new(vec![*v]);
-                    Ok(kernel.apply(&col.view(), input))
+            EncodedKind::Rle => {
+                // RLE Int/Timestamp kernel takes `Vec<i64>`; drop
+                // literals whose `PropertyValue` doesn't carry an i64.
+                let i64_literals: Vec<i64> = shape
+                    .literals
+                    .iter()
+                    .filter_map(|v| match v {
+                        PropertyValue::Int(i) | PropertyValue::Timestamp(i) => Some(*i),
+                        _ => None,
+                    })
+                    .collect();
+                if i64_literals.is_empty() {
+                    // Every literal was unrepresentable for this kernel
+                    // (e.g. RLE String, or a Float literal against an
+                    // RLE Int column — the latter is a planner mismatch
+                    // that materialized fallback surfaces correctly).
+                    return apply_fallback_eq(col, &shape.literals, input, col_type);
                 }
-                _ => apply_fallback_eq(col, &shape.literal, input, col_type),
-            },
-            EncodedKind::Dictionary { .. } => {
-                let kernel = DictionaryEqKernel::new(vec![scalar], col_type.clone());
+                let kernel = RleIntEqKernel::new(i64_literals);
                 Ok(kernel.apply(&col.view(), input))
             }
-            _ => apply_fallback_eq(col, &shape.literal, input, col_type),
+            EncodedKind::Dictionary { .. } => {
+                let kernel = DictionaryEqKernel::new(scalars, col_type.clone());
+                Ok(kernel.apply(&col.view(), input))
+            }
+            _ => apply_fallback_eq(col, &shape.literals, input, col_type),
         },
         EncodedColumnView::Materialized { .. } => {
-            apply_fallback_eq(col, &shape.literal, input, col_type)
+            apply_fallback_eq(col, &shape.literals, input, col_type)
         }
     }
 }
 
 fn apply_fallback_eq(
     col: &EncodedColumn,
-    literal: &PropertyValue,
+    literals: &[PropertyValue],
     input: &RowSelection,
     col_type: &BqlType,
 ) -> Result<RowSelection> {
     use arrow::array::{Array, BooleanArray};
-    use arrow::compute::kernels::cmp;
+    use arrow::compute::kernels::{boolean, cmp};
+    debug_assert!(
+        !literals.is_empty(),
+        "apply_fallback_eq: literal slice must be non-empty"
+    );
     let dense = bqlite_storage::materialize_encoded_column(col, col_type)?;
-    let lit_arr = broadcast_literal_one(literal, col_type)?;
-    let lit = arrow::array::Scalar::new(lit_arr);
-    let mask = cmp::eq(&dense.as_ref(), &lit).map_err(|e| {
-        bqlite_core::BqliteError::Execution(format!(
-            "encoded fallback: arrow::compute::eq failed: {e}"
-        ))
-    })?;
-    let mask_bool = mask
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| {
-            bqlite_core::BqliteError::Execution(
-                "encoded fallback: eq did not return BooleanArray".into(),
-            )
+    // Build a per-literal `eq` mask, OR-fold into the running mask. The
+    // single-literal path is the simple `Compare { Equal }` case
+    // unchanged; the multi-literal path implements `IN` via per-literal
+    // OR rather than `arrow::compute::is_in` because the latter does not
+    // exist in the cmp::* surface and the OR fold matches the existing
+    // type-coercion path one-to-one.
+    let mut combined: Option<BooleanArray> = None;
+    for literal in literals {
+        let lit_arr = broadcast_literal_one(literal, col_type)?;
+        let lit = arrow::array::Scalar::new(lit_arr);
+        let mask = cmp::eq(&dense.as_ref(), &lit).map_err(|e| {
+            bqlite_core::BqliteError::Execution(format!(
+                "encoded fallback: arrow::compute::eq failed: {e}"
+            ))
         })?;
-    Ok(apply_materialized_mask(mask_bool, input))
+        let mask_bool = mask
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                bqlite_core::BqliteError::Execution(
+                    "encoded fallback: eq did not return BooleanArray".into(),
+                )
+            })?
+            .clone();
+        combined = Some(match combined {
+            None => mask_bool,
+            Some(acc) => boolean::or_kleene(&acc, &mask_bool).map_err(|e| {
+                bqlite_core::BqliteError::Execution(format!(
+                    "encoded fallback: boolean::or_kleene failed: {e}"
+                ))
+            })?,
+        });
+    }
+    let combined = combined.expect("literals non-empty (debug_assert above)");
+    Ok(apply_materialized_mask(&combined, input))
 }
 
 fn broadcast_literal_one(value: &PropertyValue, ty: &BqlType) -> Result<arrow::array::ArrayRef> {
@@ -1416,5 +1584,383 @@ mod tests {
         let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1]));
         let out = kernel.apply(&col.view(), &input);
         assert_eq!(out.len(), 2);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Recognizer + dispatcher tests for IN-list shapes
+    //
+    // Construct `CompiledExpr` directly rather than through
+    // AST → TypedExpr → CompiledExpr — recognizer behavior depends only
+    // on `CompiledNode` shape, not on which path produced it.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use bqlite_planner::compiled::{ArrowKernelId, CompareKernel, InSetKernel};
+
+    fn col_node(index: usize, name: &str, ty: BqlType) -> CompiledExpr {
+        CompiledExpr {
+            node: CompiledNode::Column {
+                index,
+                name: name.into(),
+            },
+            result_type: ty,
+            nullable: false,
+        }
+    }
+
+    fn lit_node(value: PropertyValue, ty: BqlType) -> CompiledExpr {
+        CompiledExpr {
+            node: CompiledNode::Literal(value),
+            result_type: ty,
+            nullable: false,
+        }
+    }
+
+    fn compare_eq(left: CompiledExpr, right: CompiledExpr) -> CompiledExpr {
+        CompiledExpr {
+            node: CompiledNode::Compare {
+                op: CompareOp::Equal,
+                left: Box::new(left),
+                right: Box::new(right),
+                kernel: CompareKernel::ArrowKernel(ArrowKernelId::EqInt),
+            },
+            result_type: BqlType::Bool,
+            nullable: false,
+        }
+    }
+
+    fn in_literal_set(
+        column: CompiledExpr,
+        values: Vec<PropertyValue>,
+        negated: bool,
+    ) -> CompiledExpr {
+        CompiledExpr {
+            node: CompiledNode::InLiteralSet {
+                input: Box::new(column),
+                values,
+                negated,
+                kernel: InSetKernel::ArrowIsIn,
+            },
+            result_type: BqlType::Bool,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn recognize_encoded_eq_lowers_compare_to_single_literal_shape() {
+        let expr = compare_eq(
+            col_node(2, "event_type", BqlType::String),
+            lit_node(PropertyValue::String("click".into()), BqlType::String),
+        );
+        let shape = recognize_encoded_eq(&expr).expect("Equal should recognize");
+        assert_eq!(shape.col_index, 2);
+        assert_eq!(shape.literals, vec![PropertyValue::String("click".into())]);
+    }
+
+    #[test]
+    fn recognize_encoded_eq_rejects_null_literal() {
+        let expr = compare_eq(
+            col_node(0, "x", BqlType::Int),
+            lit_node(PropertyValue::Null, BqlType::Int),
+        );
+        assert!(recognize_encoded_eq(&expr).is_none());
+    }
+
+    #[test]
+    fn recognize_encoded_in_dictionary_lowers_to_shape() {
+        // `event_type IN ('click', 'view')` — the realistic case for
+        // low-cardinality string columns.
+        let expr = in_literal_set(
+            col_node(3, "event_type", BqlType::String),
+            vec![
+                PropertyValue::String("click".into()),
+                PropertyValue::String("view".into()),
+            ],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).expect("IN should recognize");
+        assert_eq!(shape.col_index, 3);
+        assert_eq!(shape.literals.len(), 2);
+        assert_eq!(shape.literals[0], PropertyValue::String("click".into()));
+        assert_eq!(shape.literals[1], PropertyValue::String("view".into()));
+    }
+
+    #[test]
+    fn recognize_encoded_in_negated_falls_through() {
+        // `NOT IN` decomposes into `≠` per literal — not a Wave 2
+        // pushable shape.
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::Int),
+            vec![PropertyValue::Int(1), PropertyValue::Int(2)],
+            true,
+        );
+        assert!(recognize_encoded_eq(&expr).is_none());
+    }
+
+    #[test]
+    fn recognize_encoded_in_empty_returns_none() {
+        // Empty IN-set should never reach the recognizer (TASK-227
+        // elides it to a `false` residual). Defensive guard returns
+        // `None` so the residual stays authoritative.
+        let expr = in_literal_set(col_node(0, "x", BqlType::Int), vec![], false);
+        assert!(recognize_encoded_eq(&expr).is_none());
+    }
+
+    #[test]
+    fn recognize_encoded_in_strips_null_literal() {
+        // `IN (10, NULL, 20)` → `literals = [10, 20]`. NULL is never
+        // 2VL-equal to anything; the encoded path drops it and leaves
+        // 2VL-correct behavior to the surviving comparisons.
+        let expr = in_literal_set(
+            col_node(1, "x", BqlType::Int),
+            vec![
+                PropertyValue::Int(10),
+                PropertyValue::Null,
+                PropertyValue::Int(20),
+            ],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).expect("partial-null IN should recognize");
+        assert_eq!(
+            shape.literals,
+            vec![PropertyValue::Int(10), PropertyValue::Int(20)]
+        );
+    }
+
+    #[test]
+    fn recognize_encoded_in_only_null_literals_returns_none() {
+        // `IN (NULL, NULL)` strips to empty — recognizer rejects so the
+        // residual handles the 3VL "always unknown" semantics.
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::Int),
+            vec![PropertyValue::Null, PropertyValue::Null],
+            false,
+        );
+        assert!(recognize_encoded_eq(&expr).is_none());
+    }
+
+    #[test]
+    fn recognize_encoded_in_heterogeneous_types_returns_none() {
+        // `IN (10, "foo")` is a planner-stage bug — typed-expr-checker
+        // should reject it. Defensive guard makes the encoded path
+        // never dispatch a heterogeneous literal set.
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::Int),
+            vec![PropertyValue::Int(10), PropertyValue::String("foo".into())],
+            false,
+        );
+        assert!(recognize_encoded_eq(&expr).is_none());
+    }
+
+    #[test]
+    fn recognize_encoded_in_non_column_input_returns_none() {
+        // `IN (…)` over a non-column expression (e.g. an arithmetic
+        // result) is not pushable to the encoded path because the
+        // selection-first kernels operate on column views.
+        let arith_expr = CompiledExpr {
+            node: CompiledNode::Arith {
+                op: bqlite_ast::expr::BinaryOp::Add,
+                left: Box::new(col_node(0, "x", BqlType::Int)),
+                right: Box::new(lit_node(PropertyValue::Int(1), BqlType::Int)),
+                kernel: bqlite_planner::compiled::ArithKernel::ArrowKernel(ArrowKernelId::AddInt),
+            },
+            result_type: BqlType::Int,
+            nullable: false,
+        };
+        let expr = in_literal_set(
+            arith_expr,
+            vec![PropertyValue::Int(1), PropertyValue::Int(2)],
+            false,
+        );
+        assert!(recognize_encoded_eq(&expr).is_none());
+    }
+
+    #[test]
+    fn apply_encoded_eq_dispatches_dictionary_in_list() {
+        // Dict [10, 20, 30]; rows codes [0, 1, 2, 1, 0]; predicate
+        // `IN (10, 30)` → matches rows {0, 2, 4}. End-to-end: from a
+        // `CompiledExpr::InLiteralSet` through the recognizer, the
+        // dispatcher, and the kernel.
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::Int),
+            vec![PropertyValue::Int(10), PropertyValue::Int(30)],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).unwrap();
+        let col = dict_column(&[0, 1, 2, 1, 0], 2, int_dict_bytes(&[10, 20, 30]), 5, None);
+        let batch = bqlite_core::encoded::EncodedBatch::new(5, vec![col]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 5 }]);
+        let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::Int).unwrap();
+        assert_eq!(out.as_indices().as_slice(), &[0, 2, 4]);
+    }
+
+    #[test]
+    fn apply_encoded_eq_dispatches_rle_int_in_list() {
+        // RLE int column with runs (3, 1), (5, 2), (10, 1); predicate
+        // `IN (1, 2)` matches every row → run-preserving output spans
+        // the whole 0..10 range as one merged run.
+        let col = rle_int_column(&[(3, 1), (5, 2), (10, 1)], 10, None);
+        let batch = bqlite_core::encoded::EncodedBatch::new(10, vec![col]);
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::Int),
+            vec![PropertyValue::Int(1), PropertyValue::Int(2)],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).unwrap();
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::Int).unwrap();
+        assert_eq!(
+            out,
+            RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }])
+        );
+    }
+
+    #[test]
+    fn apply_encoded_eq_dispatches_constant_in_list() {
+        let col = constant_column(ScalarValue::Int(7), 4, None);
+        let batch = bqlite_core::encoded::EncodedBatch::new(4, vec![col]);
+        // Predicate: `IN (5, 7, 9)` — one literal hits the constant,
+        // others miss; result is "all rows" (modulo nulls — none here).
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::Int),
+            vec![
+                PropertyValue::Int(5),
+                PropertyValue::Int(7),
+                PropertyValue::Int(9),
+            ],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).unwrap();
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 4 }]);
+        let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::Int).unwrap();
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn apply_encoded_eq_constant_in_no_match_empty() {
+        let col = constant_column(ScalarValue::Int(7), 3, None);
+        let batch = bqlite_core::encoded::EncodedBatch::new(3, vec![col]);
+        // Predicate: every literal misses.
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::Int),
+            vec![PropertyValue::Int(1), PropertyValue::Int(2)],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).unwrap();
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 3 }]);
+        let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::Int).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_encoded_eq_in_partial_fallback_drops_unrepresentable() {
+        // RLE Int column. Predicate literals carry one Float that
+        // doesn't fit the kernel's `i64` slot. The dispatcher drops
+        // it, runs the kernel with the i64 survivors, and produces
+        // the same result as if the Float had never been listed.
+        //
+        // This relies on the recognizer's homogeneity guard rejecting
+        // mixed-type literals before they reach `apply_encoded_eq`,
+        // so we construct the shape directly here to exercise the
+        // dispatcher's drop-then-run rule independently.
+        let col = rle_int_column(&[(3, 1), (5, 2), (10, 1)], 10, None);
+        let batch = bqlite_core::encoded::EncodedBatch::new(10, vec![col]);
+        let shape = EncodedEqShape {
+            col_index: 0,
+            literals: vec![
+                PropertyValue::Int(2),
+                PropertyValue::Float(1.5),
+                PropertyValue::Int(2),
+            ],
+        };
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::Int).unwrap();
+        // Only literal `2` matches (one run from index 3 to 5).
+        assert_eq!(
+            out,
+            RowSelection::from_runs(vec![RowRun { start: 3, len: 2 }])
+        );
+    }
+
+    #[test]
+    fn apply_encoded_eq_in_all_unrepresentable_falls_back() {
+        // Every literal would be dropped from the RLE Int kernel. The
+        // dispatcher falls through to the materialized arrow-compute
+        // path, which surfaces the type mismatch as an Execution error.
+        let col = rle_int_column(&[(3, 1), (5, 2), (10, 1)], 10, None);
+        let batch = bqlite_core::encoded::EncodedBatch::new(10, vec![col]);
+        let shape = EncodedEqShape {
+            col_index: 0,
+            literals: vec![PropertyValue::Float(1.5), PropertyValue::Float(2.5)],
+        };
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        // Materialized fallback raises an error on Float-vs-Int; that's
+        // the expected planner-stage-mismatch surface.
+        let err = apply_encoded_eq(&shape, &batch, &input, &BqlType::Int);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn apply_encoded_eq_in_respects_narrow_input_selection() {
+        // Contract: the kernel result is a subset of `input`. The
+        // IN-list path easily computes "every dict-matching logical
+        // row" and must intersect it with the caller's narrow input
+        // before returning. Regression guard against any kernel that
+        // forgets the intersection.
+        let col = dict_column(&[0, 1, 2, 0, 1], 2, int_dict_bytes(&[10, 20, 30]), 5, None);
+        let batch = bqlite_core::encoded::EncodedBatch::new(5, vec![col]);
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::Int),
+            vec![PropertyValue::Int(10), PropertyValue::Int(20)],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).unwrap();
+        // Universe match would be {0, 1, 3, 4}; input restricts to
+        // logical rows {1, 3} so the output must be {1, 3} (not the
+        // wider universe set).
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![1, 3]));
+        let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::Int).unwrap();
+        assert_eq!(out.as_indices().as_slice(), &[1, 3]);
+    }
+
+    #[test]
+    fn recognize_encoded_in_single_literal_routes_through_in_arm() {
+        // `IN (10)` is structurally an `InLiteralSet` — the recognizer
+        // accepts it via the IN arm and returns a one-element shape
+        // identical to what `Compare { Equal }` would produce. Locks in
+        // the equivalence.
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::Int),
+            vec![PropertyValue::Int(10)],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).expect("single-element IN is pushable");
+        assert_eq!(shape.col_index, 0);
+        assert_eq!(shape.literals, vec![PropertyValue::Int(10)]);
+    }
+
+    #[test]
+    fn apply_encoded_eq_dispatches_dictionary_string_in_list() {
+        // Dict ["click", "view"], rows [1, 0, 1] → codes match
+        // `IN ("click", "view")` selects every row.
+        let col = dict_column(
+            &[1, 0, 1],
+            1,
+            string_dict_bytes(&["click", "view"]),
+            3,
+            None,
+        );
+        let batch = bqlite_core::encoded::EncodedBatch::new(3, vec![col]);
+        let expr = in_literal_set(
+            col_node(0, "x", BqlType::String),
+            vec![
+                PropertyValue::String("click".into()),
+                PropertyValue::String("view".into()),
+            ],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).unwrap();
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 3 }]);
+        let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::String).unwrap();
+        assert_eq!(out.len(), 3);
     }
 }
