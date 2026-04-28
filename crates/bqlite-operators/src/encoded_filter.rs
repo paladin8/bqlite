@@ -26,6 +26,8 @@
 //! `next_encoded_row_group` → run kernels → materialize at boundary)
 //! lands in CP7.
 
+use std::sync::Arc;
+
 use bqlite_core::encoded::{
     EncodedBatch, EncodedColumn, EncodedColumnView, EncodedKind, PinnedChunkRef, RowRun,
     RowSelection, SelectionVector,
@@ -296,6 +298,200 @@ fn translate_runs_through_bitmap(
 /// Adjacent matching runs are merged so the output keeps
 /// [`RowSelection::from_runs`]'s non-overlapping invariant tight.
 fn select_runs_matching_i64(runs: &[(u32, i64)], matches: &impl Fn(i64) -> bool) -> Vec<RowRun> {
+    let mut out: Vec<RowRun> = Vec::new();
+    let mut prev_end: u32 = 0;
+    for &(end, val) in runs {
+        if matches(val) {
+            if let Some(last) = out.last_mut() {
+                if last.start + last.len == prev_end {
+                    last.len = end - last.start;
+                    prev_end = end;
+                    continue;
+                }
+            }
+            out.push(RowRun {
+                start: prev_end,
+                len: end - prev_end,
+            });
+        }
+        prev_end = end;
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RleStringEqKernel — RLE-preserving equality for String columns
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Kernel for `rle_string_column = literal` and `… IN (lit, …)`.
+///
+/// Mirrors [`RleIntEqKernel`] for the String case: low-cardinality string
+/// columns commonly land as RLE (the encoding selector compares Plain,
+/// Dictionary, RLE — RLE wins when run length amortizes its 4-byte
+/// run-end overhead). For long-run columns like `event_type`, `country`,
+/// or `os` on entity-sorted data, the filter output stays in
+/// [`RowSelection::Runs`] shape: one comparison per run, not per row.
+///
+/// # On-disk layout consumed
+///
+/// Matches `bqlite-storage/src/encoding/rle.rs::collect_string_view_runs_encoded`:
+/// - `params` = `run_count: u32 LE` (4 bytes)
+/// - `payload` = `[run_ends: u32 LE × run_count] || [(u32 LE length, utf8 bytes) × run_count]`
+///
+/// String values are variable-length, so unlike the Int variant the
+/// payload's value region cannot be addressed by a fixed stride —
+/// `parse_rle_string_runs` walks the length prefixes once at apply time
+/// to materialize a borrowed `&str` slice per run. Per-conjunct cost,
+/// not per-row.
+///
+/// # Literal storage
+///
+/// `Arc<[Box<str>]>` keeps the literal slice cheap to clone across kernel
+/// dispatches and avoids per-row heap traffic in the hot loop. The
+/// kernel compares borrowed `&str` against the boxed slice; no
+/// allocations after construction.
+///
+/// # Null handling
+///
+/// Non-nullable columns: emit `RowSelection::Runs` directly (`run_end`
+/// is the logical row index). Nullable columns: walk the validity
+/// bitmap to translate non-null-space runs into logical row indices
+/// (interspersed nulls break run shape, so the output coerces to
+/// `RowSelection::Indices`).
+pub struct RleStringEqKernel {
+    pub literals: Arc<[Box<str>]>,
+}
+
+impl RleStringEqKernel {
+    /// Build a kernel from any iterable of strings. Each literal is
+    /// boxed exactly once at construction; subsequent kernel dispatches
+    /// share the same `Arc<[Box<str>]>` without further allocation.
+    pub fn new<I, S>(literals: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Box<str>>,
+    {
+        let boxed: Vec<Box<str>> = literals.into_iter().map(Into::into).collect();
+        Self {
+            literals: Arc::from(boxed),
+        }
+    }
+}
+
+impl EncodedPredicateKernel for RleStringEqKernel {
+    fn apply(&self, column: &EncodedColumnView<'_>, input: &RowSelection) -> RowSelection {
+        let (chunk, logical_rows) = match column {
+            EncodedColumnView::Encoded { chunk, kind, rows } => match kind {
+                EncodedKind::Rle => (chunk, *rows),
+                _ => return input.clone(),
+            },
+            EncodedColumnView::Materialized { .. } => return input.clone(),
+        };
+        if self.literals.is_empty() {
+            return RowSelection::empty();
+        }
+        // RLE runs index into the dense (non-null) value stream, not
+        // into logical rows. For non-nullable columns those spaces
+        // coincide; for nullable columns the kernel translates via the
+        // validity bitmap.
+        let runs = match parse_rle_string_runs(chunk) {
+            Some(r) => r,
+            None => return RowSelection::empty(),
+        };
+        let lits = self.literals.as_ref();
+        let matches = |v: &str| lits.iter().any(|lit| lit.as_ref() == v);
+        match chunk.nulls {
+            None => {
+                let matched = select_runs_matching_str(&runs, &matches);
+                let predicate_sel = RowSelection::from_runs(matched);
+                RowSelection::intersect(&predicate_sel, input)
+            }
+            Some(bitmap) => {
+                let matched_logical =
+                    translate_str_runs_through_bitmap(&runs, &matches, bitmap, logical_rows);
+                let predicate_sel =
+                    RowSelection::Indices(SelectionVector::from_sorted(matched_logical));
+                RowSelection::intersect(&predicate_sel, input)
+            }
+        }
+    }
+}
+
+/// Parse run_ends and borrowed string values for an RLE-encoded String
+/// column. `run_end[i]` indexes into the non-null value stream.
+///
+/// String values are variable-length, so the parser walks the value
+/// region once to bind each run to a `&str` view into `chunk.payload`.
+/// Returns `None` on malformed bytes (too-short params, truncated
+/// length prefix, truncated value bytes, invalid UTF-8) — the kernel
+/// prefers "no selection" over panic on adversarial input. In practice
+/// the segment reader has already validated these bytes; the defensive
+/// posture protects against dispatch bugs.
+fn parse_rle_string_runs<'a>(chunk: &'a PinnedChunkRef<'_>) -> Option<Vec<(u32, &'a str)>> {
+    if chunk.params.len() < 4 {
+        return None;
+    }
+    let run_count = u32::from_le_bytes(chunk.params[..4].try_into().ok()?) as usize;
+    // Run-ends region: 4 bytes per run.
+    let ends_byte_len = run_count.checked_mul(4)?;
+    if chunk.payload.len() < ends_byte_len {
+        return None;
+    }
+    let (ends_bytes, values_bytes) = chunk.payload.split_at(ends_byte_len);
+    let mut out = Vec::with_capacity(run_count);
+    let mut cursor = 0usize;
+    for i in 0..run_count {
+        let end = u32::from_le_bytes(ends_bytes[i * 4..i * 4 + 4].try_into().ok()?);
+        if cursor + 4 > values_bytes.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(values_bytes[cursor..cursor + 4].try_into().ok()?) as usize;
+        cursor += 4;
+        if cursor + len > values_bytes.len() {
+            return None;
+        }
+        let bytes = &values_bytes[cursor..cursor + len];
+        cursor += len;
+        let s = std::str::from_utf8(bytes).ok()?;
+        out.push((end, s));
+    }
+    Some(out)
+}
+
+/// Walk the validity bitmap in parallel with the RLE string runs,
+/// emitting logical row indices for every non-null value whose run
+/// satisfies `matches`. Mirrors [`translate_runs_through_bitmap`] for
+/// strings.
+fn translate_str_runs_through_bitmap(
+    runs: &[(u32, &str)],
+    matches: &impl Fn(&str) -> bool,
+    bitmap: &[u8],
+    logical_rows: u32,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut non_null_pos: u32 = 0;
+    let mut run_idx = 0usize;
+    for logical in 0..logical_rows {
+        if !bit_is_set(bitmap, logical as usize) {
+            continue;
+        }
+        while run_idx < runs.len() && runs[run_idx].0 <= non_null_pos {
+            run_idx += 1;
+        }
+        if run_idx < runs.len() && matches(runs[run_idx].1) {
+            out.push(logical);
+        }
+        non_null_pos += 1;
+    }
+    out
+}
+
+/// Given parsed `(run_end, value)` pairs, emit the runs whose string
+/// value satisfies `matches`. Adjacent matching runs are merged to keep
+/// the [`RowSelection::from_runs`] invariant tight. Mirrors
+/// [`select_runs_matching_i64`] for strings; merge logic is identical
+/// because run shape doesn't depend on value type.
+fn select_runs_matching_str(runs: &[(u32, &str)], matches: &impl Fn(&str) -> bool) -> Vec<RowRun> {
     let mut out: Vec<RowRun> = Vec::new();
     let mut prev_end: u32 = 0;
     for &(end, val) in runs {
@@ -874,27 +1070,50 @@ pub fn apply_encoded_eq(
                 let kernel = ConstantEqKernel::new(scalars);
                 Ok(kernel.apply(&col.view(), input))
             }
-            EncodedKind::Rle => {
-                // RLE Int/Timestamp kernel takes `Vec<i64>`; drop
-                // literals whose `PropertyValue` doesn't carry an i64.
-                let i64_literals: Vec<i64> = shape
-                    .literals
-                    .iter()
-                    .filter_map(|v| match v {
-                        PropertyValue::Int(i) | PropertyValue::Timestamp(i) => Some(*i),
-                        _ => None,
-                    })
-                    .collect();
-                if i64_literals.is_empty() {
-                    // Every literal was unrepresentable for this kernel
-                    // (e.g. RLE String, or a Float literal against an
-                    // RLE Int column — the latter is a planner mismatch
-                    // that materialized fallback surfaces correctly).
-                    return apply_fallback_eq(col, &shape.literals, input, col_type);
+            EncodedKind::Rle => match col_type {
+                BqlType::String => {
+                    // Collect the String literals; any non-String entry
+                    // is a planner-stage type mismatch — fall back to
+                    // materialized so the user sees a real error rather
+                    // than silently empty results.
+                    let mut string_literals: Vec<Box<str>> =
+                        Vec::with_capacity(shape.literals.len());
+                    for lit in &shape.literals {
+                        match lit {
+                            PropertyValue::String(s) => {
+                                string_literals.push(s.as_str().into());
+                            }
+                            _ => {
+                                return apply_fallback_eq(col, &shape.literals, input, col_type);
+                            }
+                        }
+                    }
+                    let kernel = RleStringEqKernel::new(string_literals);
+                    Ok(kernel.apply(&col.view(), input))
                 }
-                let kernel = RleIntEqKernel::new(i64_literals);
-                Ok(kernel.apply(&col.view(), input))
-            }
+                _ => {
+                    // RLE Int/Timestamp kernel takes `Vec<i64>`; drop
+                    // literals whose `PropertyValue` doesn't carry an i64.
+                    let i64_literals: Vec<i64> = shape
+                        .literals
+                        .iter()
+                        .filter_map(|v| match v {
+                            PropertyValue::Int(i) | PropertyValue::Timestamp(i) => Some(*i),
+                            _ => None,
+                        })
+                        .collect();
+                    if i64_literals.is_empty() {
+                        // Every literal was unrepresentable for this kernel
+                        // (e.g. a Float literal against an RLE Int column,
+                        // or an RLE Bool column — both surface as planner
+                        // mismatches that the materialized fallback
+                        // raises as Execution errors).
+                        return apply_fallback_eq(col, &shape.literals, input, col_type);
+                    }
+                    let kernel = RleIntEqKernel::new(i64_literals);
+                    Ok(kernel.apply(&col.view(), input))
+                }
+            },
             EncodedKind::Dictionary { .. } => {
                 let kernel = DictionaryEqKernel::new(scalars, col_type.clone());
                 Ok(kernel.apply(&col.view(), input))
@@ -1962,5 +2181,326 @@ mod tests {
         let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 3 }]);
         let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::String).unwrap();
         assert_eq!(out.len(), 3);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // RleStringEqKernel tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build an RLE-encoded String column with the on-disk chunk shape
+    /// the kernel consumes:
+    /// - `params` = `run_count: u32 LE`
+    /// - `payload` = `[run_ends u32 LE × run_count] || [(u32 LE length, utf8 bytes) × run_count]`
+    ///
+    /// `runs` is `[(run_end, value), …]`; `row_count` is the logical
+    /// row count (equal to the last `run_end` for non-nullable columns,
+    /// larger when a null bitmap is supplied).
+    fn rle_string_column(
+        runs: &[(u32, &str)],
+        row_count: u32,
+        nulls: Option<Vec<u8>>,
+    ) -> EncodedColumn {
+        let run_count = runs.len() as u32;
+        let params = run_count.to_le_bytes().to_vec();
+        let mut payload = Vec::new();
+        for &(end, _) in runs {
+            payload.extend_from_slice(&end.to_le_bytes());
+        }
+        for &(_, val) in runs {
+            payload.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            payload.extend_from_slice(val.as_bytes());
+        }
+        EncodedColumn::Encoded {
+            chunk: PinnedChunk {
+                payload: Arc::from(payload),
+                nulls: nulls.map(Arc::from),
+                params: Arc::from(params),
+            },
+            kind: EncodedKind::Rle,
+            rows: row_count,
+        }
+    }
+
+    #[test]
+    fn rle_string_eq_preserves_runs_through_filter() {
+        // 10 rows, runs: [click]x3, [view]x2, [click]x5
+        //   run_ends = [3, 5, 10], values = ["click", "view", "click"]
+        let col = rle_string_column(&[(3, "click"), (5, "view"), (10, "click")], 10, None);
+        let kernel = RleStringEqKernel::new(["click"]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = kernel.apply(&col.view(), &input);
+        match &out {
+            RowSelection::Runs(runs) => {
+                assert_eq!(
+                    runs,
+                    &vec![RowRun { start: 0, len: 3 }, RowRun { start: 5, len: 5 }],
+                );
+            }
+            _ => panic!("expected runs output; got indices"),
+        }
+        assert_eq!(out.len(), 8);
+    }
+
+    #[test]
+    fn rle_string_eq_merges_adjacent_matching_runs() {
+        // Three runs in a row that all match: ["a"]x2, ["a"]x3, ["a"]x4
+        // — hypothetical, since the writer would coalesce them at
+        // encode time. Construct the bytes directly to verify the
+        // kernel's merge logic in the rare event the encoder ever
+        // emits adjacent same-value runs (e.g. through a join /
+        // re-encode path that doesn't re-coalesce).
+        let col = rle_string_column(&[(2, "a"), (5, "a"), (9, "a")], 9, None);
+        let kernel = RleStringEqKernel::new(["a"]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 9 }]);
+        let out = kernel.apply(&col.view(), &input);
+        match &out {
+            RowSelection::Runs(runs) => {
+                // Three matching adjacent runs collapse to one.
+                assert_eq!(runs, &vec![RowRun { start: 0, len: 9 }]);
+            }
+            _ => panic!("expected runs output"),
+        }
+    }
+
+    #[test]
+    fn rle_string_eq_in_list_with_multiple_runs() {
+        // 12 rows: ["click"]x3, ["view"]x3, ["other"]x3, ["click"]x3
+        // Filter `IN ("click", "view")` matches the first two runs and
+        // the last run; merging applies for the first two.
+        let col = rle_string_column(
+            &[(3, "click"), (6, "view"), (9, "other"), (12, "click")],
+            12,
+            None,
+        );
+        let kernel = RleStringEqKernel::new(["click", "view"]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 12 }]);
+        let out = kernel.apply(&col.view(), &input);
+        match &out {
+            RowSelection::Runs(runs) => {
+                assert_eq!(
+                    runs,
+                    &vec![RowRun { start: 0, len: 6 }, RowRun { start: 9, len: 3 }],
+                );
+            }
+            _ => panic!("expected runs output"),
+        }
+    }
+
+    #[test]
+    fn rle_string_eq_no_match_empty() {
+        let col = rle_string_column(&[(3, "click"), (5, "view"), (10, "click")], 10, None);
+        let kernel = RleStringEqKernel::new(["nope"]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = kernel.apply(&col.view(), &input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rle_string_eq_empty_literals_returns_empty() {
+        let col = rle_string_column(&[(3, "click")], 3, None);
+        let kernel = RleStringEqKernel::new(Vec::<String>::new());
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 3 }]);
+        let out = kernel.apply(&col.view(), &input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rle_string_eq_narrows_with_input_runs() {
+        // Restrict input to rows [2..7); RLE matches for "click" cover
+        // [0..3) and [5..10), so the intersection is [2..3) ∪ [5..7).
+        let col = rle_string_column(&[(3, "click"), (5, "view"), (10, "click")], 10, None);
+        let kernel = RleStringEqKernel::new(["click"]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 2, len: 5 }]);
+        let out = kernel.apply(&col.view(), &input);
+        match &out {
+            RowSelection::Runs(runs) => {
+                assert_eq!(
+                    runs,
+                    &vec![RowRun { start: 2, len: 1 }, RowRun { start: 5, len: 2 }],
+                );
+            }
+            _ => panic!("expected runs output"),
+        }
+    }
+
+    #[test]
+    fn rle_string_eq_with_nulls_translates_to_logical_indices() {
+        // 10 logical rows, nulls at rows 1 and 6 → 8 non-null values.
+        // Null bitmap LSB-first: bits 0,2,3,4,5,7,8,9 set.
+        //   byte0 = 0b10111101 = 0xBD (rows 0..=7)
+        //   byte1 = 0b00000011 = 0x03 (rows 8..=9)
+        //
+        // Dense (non-null) value stream:
+        //   rows 0,2,3 → "click", rows 4,5 → "view", rows 7,8,9 → "click"
+        //   so non-null positions are [click,click,click, view,view, click,click,click]
+        //   run_ends (non-null space) = [3, 5, 8], values = ["click","view","click"]
+        //
+        // Filter "click" → non-null positions {0,1,2, 5,6,7}.
+        // Logical mapping: 0→0, 2→1, 3→2, 4→3, 5→4, 7→5, 8→6, 9→7.
+        // Through the mapping, "click" matches at logical {0, 2, 3, 7, 8, 9}.
+        let col = rle_string_column(
+            &[(3, "click"), (5, "view"), (8, "click")],
+            10,
+            Some(vec![0xBDu8, 0x03u8]),
+        );
+        let kernel = RleStringEqKernel::new(["click"]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = kernel.apply(&col.view(), &input);
+        let sv = out.as_indices();
+        assert_eq!(sv.as_slice(), &[0, 2, 3, 7, 8, 9]);
+    }
+
+    #[test]
+    fn rle_string_eq_nulls_intersect_with_input() {
+        // Same column as the previous test; narrow input to [2..8).
+        let col = rle_string_column(
+            &[(3, "click"), (5, "view"), (8, "click")],
+            10,
+            Some(vec![0xBDu8, 0x03u8]),
+        );
+        let kernel = RleStringEqKernel::new(["click"]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 2, len: 6 }]);
+        let out = kernel.apply(&col.view(), &input);
+        assert_eq!(out.as_indices().as_slice(), &[2, 3, 7]);
+    }
+
+    /// Differential test — drives the kernel through real RLE bytes
+    /// produced by `bqlite_storage::Rle.encode` over a `StringViewArray`,
+    /// then through the kernel with a synthesized null bitmap. Exercises
+    /// the pin-time contract that `rows` is the *logical* row count
+    /// when the column has nulls (not the encoder's non-null count).
+    #[test]
+    fn rle_string_eq_real_rle_bytes_with_nulls() {
+        use arrow::array::StringViewArray;
+        use bqlite_storage::{Encoding, Rle};
+
+        // Dense non-null values as the writer's RLE encoder sees them.
+        // Dense = ["click","click","click", "view","view", "click","click","click"]
+        let dense = StringViewArray::from(vec![
+            "click", "click", "click", "view", "view", "click", "click", "click",
+        ]);
+        let chunk = Rle.encode(&dense).expect("rle encode");
+
+        // Rebuild a PinnedChunk from the real on-disk bytes. `rows` on
+        // EncodedColumn::Encoded is the *logical* row count — 10, not
+        // the encoded 8.
+        let pinned = PinnedChunk {
+            payload: Arc::from(chunk.payload),
+            nulls: Some(Arc::from(vec![0xBDu8, 0x03u8])),
+            params: Arc::from(chunk.params),
+        };
+        let col = EncodedColumn::Encoded {
+            chunk: pinned,
+            kind: EncodedKind::Rle,
+            rows: 10,
+        };
+
+        let kernel = RleStringEqKernel::new(["click"]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = kernel.apply(&col.view(), &input);
+        assert_eq!(out.as_indices().as_slice(), &[0, 2, 3, 7, 8, 9]);
+    }
+
+    #[test]
+    fn rle_string_eq_wrong_encoding_passes_through() {
+        let col = EncodedColumn::Encoded {
+            chunk: PinnedChunk {
+                payload: Arc::from(Vec::<u8>::new()),
+                nulls: None,
+                params: Arc::from(Vec::<u8>::new()),
+            },
+            kind: EncodedKind::PlainFixed { width: 8 },
+            rows: 2,
+        };
+        let kernel = RleStringEqKernel::new(["x"]);
+        let input = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1]));
+        let out = kernel.apply(&col.view(), &input);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn rle_string_eq_malformed_payload_returns_empty() {
+        // params claims one run, but payload is too short. Defensive
+        // path returns empty rather than panicking.
+        let chunk = PinnedChunk {
+            payload: Arc::from(vec![0u8, 0, 0, 1]), // one run-end byte, no value bytes
+            nulls: None,
+            params: Arc::from(1u32.to_le_bytes().to_vec()),
+        };
+        let col = EncodedColumn::Encoded {
+            chunk,
+            kind: EncodedKind::Rle,
+            rows: 1,
+        };
+        let kernel = RleStringEqKernel::new(["x"]);
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 1 }]);
+        let out = kernel.apply(&col.view(), &input);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_encoded_eq_dispatches_rle_string_to_run_kernel() {
+        // End-to-end: an `IN` predicate on an RLE-encoded String column
+        // routes through `apply_encoded_eq` → `RleStringEqKernel` and
+        // produces `RowSelection::Runs` (proving we're on the run-
+        // preserving path, not the materialized fallback).
+        let col = rle_string_column(
+            &[(3, "click"), (6, "view"), (9, "other"), (12, "click")],
+            12,
+            None,
+        );
+        let batch = EncodedBatch::new(12, vec![col]);
+        let expr = in_literal_set(
+            col_node(0, "event_type", BqlType::String),
+            vec![
+                PropertyValue::String("click".into()),
+                PropertyValue::String("view".into()),
+            ],
+            false,
+        );
+        let shape = recognize_encoded_eq(&expr).unwrap();
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 12 }]);
+        let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::String).unwrap();
+        assert!(
+            matches!(out, RowSelection::Runs(_)),
+            "RLE String IN must stay run-preserving (not materialized)"
+        );
+        assert_eq!(out.len(), 9);
+    }
+
+    #[test]
+    fn apply_encoded_eq_dispatches_rle_string_eq_to_run_kernel() {
+        // Single literal via `Compare { Equal }` exercises the same
+        // path as IN (one-element literal vector). Output must still
+        // be `Runs` and match `RleStringEqKernel`'s output.
+        let col = rle_string_column(&[(3, "click"), (5, "view"), (10, "click")], 10, None);
+        let batch = EncodedBatch::new(10, vec![col]);
+        let expr = compare_eq(
+            col_node(0, "event_type", BqlType::String),
+            lit_node(PropertyValue::String("click".into()), BqlType::String),
+        );
+        let shape = recognize_encoded_eq(&expr).unwrap();
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 10 }]);
+        let out = apply_encoded_eq(&shape, &batch, &input, &BqlType::String).unwrap();
+        assert!(matches!(out, RowSelection::Runs(_)));
+        assert_eq!(out.len(), 8);
+    }
+
+    #[test]
+    fn apply_encoded_eq_rle_string_type_mismatch_falls_back() {
+        // Int literal against an RLE String column is a planner-stage
+        // mismatch. The dispatcher's "non-String literal in a String
+        // RLE conjunct" guard falls through to the materialized
+        // fallback, which surfaces the type mismatch as an Execution
+        // error (mirrors the all-unrepresentable behavior for RLE Int).
+        let col = rle_string_column(&[(2, "click")], 2, None);
+        let batch = EncodedBatch::new(2, vec![col]);
+        let shape = EncodedEqShape {
+            col_index: 0,
+            literals: vec![PropertyValue::Int(99)],
+        };
+        let input = RowSelection::from_runs(vec![RowRun { start: 0, len: 2 }]);
+        let err = apply_encoded_eq(&shape, &batch, &input, &BqlType::String);
+        assert!(err.is_err());
     }
 }

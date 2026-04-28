@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Scalar, StringViewArray};
+use arrow::array::{Array, Scalar, StringViewArray};
 use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::cmp;
 use bqlite_benches::common::*;
@@ -132,6 +132,83 @@ fn run_encoded(
     let shape = EncodedEqShape {
         col_index: col_idx,
         literals: vec![PropertyValue::String(literal.into())],
+    };
+    let col_type = types[col_idx].clone();
+    let mut total = 0u64;
+    while let Some(encoded) = scan.next_encoded_row_group().unwrap() {
+        let rows = encoded.row_count;
+        let input_sel = RowSelection::from_runs(vec![bqlite_core::encoded::RowRun {
+            start: 0,
+            len: rows,
+        }]);
+        let sel = apply_encoded_eq(&shape, &encoded, &input_sel, &col_type).unwrap();
+        let fb = materialize_selected(&encoded, Some(&sel), types, arrow_schema.clone()).unwrap();
+        total += fb.batch.num_rows() as u64;
+        black_box(&fb);
+    }
+    total
+}
+
+/// Materialized baseline for a multi-literal `IN` predicate. Per-literal
+/// `cmp::eq` masks Kleene-OR'd into a single mask, then
+/// `filter_record_batch`. Mirrors the structure of `apply_fallback_eq`
+/// for the OR-fold path so bench numbers are comparable between the
+/// encoded and materialized sides.
+fn run_materialized_in(
+    bytes: &[u8],
+    schema: &bqlite_core::schema::TableSchema,
+    col_idx: usize,
+    literals: &[&str],
+) -> u64 {
+    use arrow::array::BooleanArray;
+    use arrow::compute::kernels::boolean;
+    let reader = SegmentFileReader::from_bytes(bytes.to_vec(), schema.clone()).unwrap();
+    let projection = ColumnProjection::all();
+    let mut scan = reader.scan(&projection, None).unwrap();
+    let mut total = 0u64;
+    while let Some(batch) = scan.next_row_group().unwrap() {
+        let col = batch.column(col_idx);
+        let mut combined: Option<BooleanArray> = None;
+        for &literal in literals {
+            let lit = Scalar::new(StringViewArray::from(vec![literal]));
+            let mask = cmp::eq(&col.as_ref(), &lit).unwrap();
+            let mask_bool = mask
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .clone();
+            combined = Some(match combined {
+                None => mask_bool,
+                Some(acc) => boolean::or_kleene(&acc, &mask_bool).unwrap(),
+            });
+        }
+        let mask = combined.expect("literals non-empty");
+        let filtered = filter_record_batch(&batch, &mask).unwrap();
+        total += filtered.num_rows() as u64;
+        black_box(&filtered);
+    }
+    total
+}
+
+/// Encoded kernel path for a multi-literal IN predicate. Uses the new
+/// `EncodedEqShape::literals` vector to drive the dictionary IN kernel.
+fn run_encoded_in(
+    bytes: &[u8],
+    schema: &bqlite_core::schema::TableSchema,
+    col_idx: usize,
+    literals: &[&str],
+    types: &[BqlType],
+    arrow_schema: Arc<arrow::datatypes::Schema>,
+) -> u64 {
+    let reader = SegmentFileReader::from_bytes(bytes.to_vec(), schema.clone()).unwrap();
+    let projection = ColumnProjection::all();
+    let mut scan = reader.scan(&projection, None).unwrap();
+    let shape = EncodedEqShape {
+        col_index: col_idx,
+        literals: literals
+            .iter()
+            .map(|s| PropertyValue::String((*s).into()))
+            .collect(),
     };
     let col_type = types[col_idx].clone();
     let mut total = 0u64;
@@ -287,11 +364,85 @@ fn bench_realistic_column_filter(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Bench 3: Dictionary IN-list (TASK-516 CP1) ──────────────────────────────
+//
+// Dictionary-encoded `event_type` filtered by a 2-literal `IN` predicate.
+// The encoded path goes through `recognize_encoded_eq`'s IN arm, the
+// `apply_encoded_eq` dispatcher, and `DictionaryEqKernel` with both
+// literals — no row-group-wide materialization before filter. The
+// materialized baseline OR-folds two `cmp::eq` masks before
+// `filter_record_batch`, mirroring `apply_fallback_eq`'s shape so the
+// comparison isolates kernel cost vs. arrow-compute cost on the same
+// workload.
+
+fn bench_dictionary_in_list_filter(c: &mut Criterion) {
+    let mode = BenchMode::from_env();
+    let sizing = BenchSizing::for_mode(mode);
+    let n = sizing.scan_events;
+    let entities = sizing.scan_entities;
+    let rg = bqlite_storage::writer::DEFAULT_ROW_GROUP_SIZE;
+    let (bytes, schema) = write_segment_with_rg(n, entities, rg);
+    let types = types_for(&schema);
+    let file_bytes = bytes.len() as u64;
+    let arrow_schema = first_batch_schema(&bytes, &schema);
+
+    let event_col = schema
+        .columns()
+        .iter()
+        .position(|c| c.name == "event_type")
+        .unwrap();
+    let literals: &[&str] = &["event_0", "event_1"];
+
+    let m_rows = run_materialized_in(&bytes, &schema, event_col, literals);
+    let e_rows = run_encoded_in(
+        &bytes,
+        &schema,
+        event_col,
+        literals,
+        &types,
+        arrow_schema.clone(),
+    );
+    assert_eq!(m_rows, e_rows, "encoded and materialized IN paths disagree");
+
+    let mut group = c.benchmark_group("scan/filter_compare/dictionary_in");
+    group.throughput(Throughput::Bytes(file_bytes));
+
+    group.bench_function("materialized_arrow", |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(run_materialized_in(&bytes, &schema, event_col, literals));
+            }
+            start.elapsed()
+        })
+    });
+
+    group.bench_function("encoded_kernel", |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(run_encoded_in(
+                    &bytes,
+                    &schema,
+                    event_col,
+                    literals,
+                    &types,
+                    arrow_schema.clone(),
+                ));
+            }
+            start.elapsed()
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = scan_encoded_benches;
     config = criterion_for_mode(BenchMode::from_env());
     targets =
         bench_constant_column_filter,
         bench_realistic_column_filter,
+        bench_dictionary_in_list_filter,
 }
 criterion_main!(scan_encoded_benches);
