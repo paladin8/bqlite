@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-507",
   "claimed_at": "2026-04-28T06:00:12Z",
+  "completed_at": "2026-04-28T07:15:00Z",
   "branch": "task/TASK-507",
   "description": "Per-operator microbenchmark coverage audit"
 }
