@@ -1091,15 +1091,19 @@ The morsel scheduler is only valuable if we can see when it works and when it do
 
 The full table is implemented incrementally — Wave 2 ships rows/throughput; CPU-cost and skew rows land alongside the morsel scheduler in Wave 5. Metrics that depend on a feature not yet shipped (`marks_pruned`, `morsels_*`) report zero until the feature lands.
 
+**Surface (TASK-524).** The Wave 5 aggregate lives at `bqlite_engine::QueryMetrics` (`crates/bqlite-engine/src/perf.rs`), is attached to `ExecutionResult.metrics`, and renders through `bqlite_engine::format_perf_explain`. The CLI exposes it via `bqlite query <bql> --db <path> --explain-perf`, which discards the row table and prints the metrics footer instead. `--explain-perf` and `--limit` are mutually exclusive — the metrics describe whatever the engine actually ran, so injecting an auto-limit would silently bias the counters.
+
 ### 14.3 Sampling Protocol for CPU-Cost Metrics
 
 `branch_misses` and `llc_misses` come from `perf_event_open` on Linux and `kpc` on macOS. Both APIs have non-trivial setup cost, so they are not enabled per-batch. Instead:
 
-- The engine opens one perf-event group per worker at query start (if the query is configured to collect CPU-cost metrics — opt-in via `QueryContext::collect_cpu_metrics`).
+- The engine opens one perf-event group per worker at query start (if the query is configured to collect CPU-cost metrics — opt-in via `QueryOptions::collect_cpu_metrics` on the `Engine::query_with_options` boundary, propagated to `QueryContext::collect_cpu_metrics`).
 - The group is read once per morsel boundary, summing into the worker's `WorkerContext`.
 - On platforms without perf counters, the metrics report zero and the per-query derived numbers reflect that absence.
 
 CPU-cost metric collection adds <1% overhead per batch when enabled. It is off by default; the benchmark suite (TASK-236, TASK-507) turns it on for the bench job, and the CLI exposes it via `bqlite query --explain-perf`.
+
+**Wave 5 implementation status (TASK-524).** The per-query opt-in flag (`QueryOptions::collect_cpu_metrics`), the per-worker perf-counter seam (`bqlite_engine::PerfCounters::open_or_disabled`), and the `QueryMetrics::cpu_metrics_enabled` round-trip all ship in Wave 5. The platform integration itself (`perf_event_open` on Linux, `kpc` on macOS) is a stub today — `PerfCounters::open_or_disabled` always returns the disabled variant, so `branch_misses` / `llc_misses` / `total_cpu_cycles` / `cycles_per_event` report zero (or em-dash for derived ratios) even when the flag is set. Plugging in real counters is a follow-up to TASK-524 that does not require a surface change.
 
 ### 14.2 Collection
 
