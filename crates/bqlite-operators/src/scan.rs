@@ -75,15 +75,21 @@
 //! tombstoned rows. The snapshot is passed in by the engine at bind
 //! time and never re-read from disk during execution (deletes.md §6.3).
 //!
-//! Tombstone filtering is **materialized only** today: the encoded
-//! fast paths (single-segment encoded scan and `EncodedKWayMergeScan`)
-//! need real encoded columns to hit their kernels, but
-//! [`TombstoneScanWrapper`] applies the filter on the materialized
-//! `RecordBatch` produced by `next_row_group`. When any segment in the
-//! scan has a non-empty tombstone entry, the operator stays on the
-//! materialized merge path for the whole query to avoid mixing encoded
-//! and fallback outputs in the merge. An empty snapshot is a no-op:
-//! the operator keeps whatever scan path was requested.
+//! Tombstone filtering composes with **both** read paths (TASK-517).
+//! On the materialized path the operator wraps every affected
+//! `Box<dyn SegmentScan>` in [`TombstoneScanWrapper`] so the merge sees
+//! a tombstone-filtered `RecordBatch` stream. On the encoded path the
+//! operator instead wraps each affected per-segment
+//! `KernelAppliedSource` in
+//! [`bqlite_storage::EncodedTombstoneSource`] — the §8.4 selection-first
+//! analogue from `docs/design/storage/zero-copy-scan-filter.md`. The two
+//! wrappers never compose: a segment is wrapped by exactly one of them,
+//! decided by the active [`ScanPath`]. A single tombstoned segment
+//! drops into the encoded merge (rather than the single-segment fast
+//! path) so the `EncodedTombstoneSource` boundary always exists upstream
+//! of [`bqlite_storage::segment::merge::EncodedKWayMergeScan`]. An
+//! empty snapshot is a no-op: the operator keeps whatever scan path was
+//! requested and leaves the single-segment fast path enabled.
 //!
 //! The operator delegates row / batch / entity / time-range checks and
 //! the scan-time tombstone ordering (batch → entity → row → time-range)
@@ -122,7 +128,10 @@ use bqlite_core::{
 };
 use bqlite_planner::compiled::{CompareOp, CompiledExpr, CompiledNode};
 use bqlite_storage::segment::merge::{EncodedBatchSource, EncodedKWayMergeScan, KWayMergeScan};
-use bqlite_storage::{AndPredicate, SampleFilter, TombstoneScanWrapper, TombstoneSnapshot};
+use bqlite_storage::{
+    AndPredicate, EncodedTombstoneSource, SampleFilter, TombstoneFile, TombstoneScanWrapper,
+    TombstoneSnapshot,
+};
 
 use crate::encoded_filter::{apply_encoded_eq, partition_encoded_eq, EncodedEqShape};
 use crate::eval;
@@ -155,17 +164,20 @@ use crate::operator::{CancellationToken, PhysicalOperator};
 /// fall back to the compile-time default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanPath {
-    /// Classic path: every row-group is decoded to a `RecordBatch`
-    /// and post-filters run via `compute::filter_record_batch`.
+    /// Debug fallback: every row-group is decoded to a `RecordBatch`
+    /// and post-filters run via `compute::filter_record_batch`. Kept
+    /// behind `BQLITE_SCAN_PATH=materialized` so we can still bisect
+    /// regressions against the pre-zero-copy behavior; not the
+    /// production default any more.
     Materialized,
-    /// Selection-first encoded path: scan produces `EncodedBatch`es
-    /// and kernels emit row selections. Not yet implemented — treated
-    /// as `Materialized` until Checkpoint 3 lands dictionary kernels.
+    /// Selection-first encoded path: scan produces `EncodedBatch`es,
+    /// kernels emit `RowSelection`s, and tombstoned segments compose
+    /// through [`EncodedTombstoneSource`]. Materialization happens at
+    /// the merge boundary via `materialize_stitched`.
     Encoded,
     /// Pick `Encoded` when every predicate has an encoded kernel and
     /// the input scan supports `next_encoded_row_group`; otherwise
-    /// `Materialized`. Currently resolves to `Materialized` until
-    /// Checkpoint 3.
+    /// `Materialized`. The compile-time default.
     Auto,
 }
 
@@ -245,10 +257,12 @@ pub struct ScanOperator {
     entity_col: usize,
     /// Ordinal of the timestamp column in `arrow_schema`.
     ts_col: usize,
-    /// Running k-way merge. `None` until `open()` has been called;
-    /// reset to `None` by `close()` so the operator may be closed
-    /// before any data flows. Mutually exclusive with `encoded_scan`:
-    /// the encoded single-segment fast path bypasses the merge.
+    /// Running k-way merge for the materialized debug path. `Some`
+    /// only when `scan_path == ScanPath::Materialized`; the encoded
+    /// path uses `encoded_scan` (single-segment, no tombstones) or
+    /// `encoded_merge` (everything else, including any tombstoned
+    /// segment). Reset to `None` by `close()` so the operator may be
+    /// closed before any data flows.
     merge: Option<KWayMergeScan>,
     /// Direct single-segment scan for the encoded path. `Some` only
     /// when `scan_path != Materialized` and exactly one segment handle
@@ -436,13 +450,15 @@ impl ScanOperator {
     ///
     /// Tombstones affect `open()` only: every segment handle whose
     /// `(window_id, shard_id)` has a non-empty entry in the snapshot is
-    /// wrapped in a [`TombstoneScanWrapper`] before being handed to the
-    /// merge. If **any** input segment needs wrapping, the operator
-    /// forces itself onto the materialized merge path for the whole
-    /// query because the tombstone wrapper applies its filter on
-    /// materialized row groups (deletes.md §7) — mixing a wrapped
-    /// segment into the encoded k-way merge would decode some inputs
-    /// and not others, breaking the merge's encoded-batch contract.
+    /// wrapped before being handed to the merge. The wrapper depends
+    /// on the active [`ScanPath`]: [`TombstoneScanWrapper`] on the
+    /// materialized path, [`EncodedTombstoneSource`] (zero-copy
+    /// scan/filter §8.4) on the encoded path. The two never compose —
+    /// each segment gets exactly one wrap. A single tombstoned segment
+    /// on the encoded path drops into [`EncodedKWayMergeScan`] rather
+    /// than the single-segment fast path so the
+    /// [`EncodedTombstoneSource`] boundary always exists upstream of
+    /// the merge.
     pub fn with_tombstones_and_scan_path(
         reader: Arc<dyn SegmentReader>,
         projected_columns: &[String],
@@ -757,8 +773,23 @@ impl PhysicalOperator for ScanOperator {
                 }
             };
 
+        let encoded_requested = self.scan_path != ScanPath::Materialized;
+
         let mut scans: Vec<Box<dyn SegmentScan>> = Vec::with_capacity(handles.len());
-        let mut any_wrapped = false;
+        // Parallel to `scans`/`handles`: `Some(tf)` for segments whose
+        // `(window_id, shard_id)` carries a non-empty `TombstoneFile` in
+        // the snapshot. On the materialized path the wrapping happens
+        // inline below and these slots stay `None` (no second wrap on the
+        // encoded side); on the encoded path the wrapping is deferred to
+        // the `EncodedBatchSource` build below where we have the
+        // post-`KernelAppliedSource` boundary that §8.4 requires.
+        //
+        // Invariant: a segment is wrapped by exactly one tombstone
+        // adapter — `TombstoneScanWrapper` on `ScanPath::Materialized`,
+        // `EncodedTombstoneSource` on the encoded path; the two never
+        // compose.
+        let mut encoded_tombstones: Vec<Option<TombstoneFile>> = Vec::with_capacity(handles.len());
+        let mut any_encoded_tombstone = false;
         for handle in &handles {
             let scan =
                 self.reader
@@ -772,49 +803,108 @@ impl PhysicalOperator for ScanOperator {
             // `TombstoneSnapshot::from_map` / `load_tombstone_snapshot`),
             // so a `Some` hit is proof that wrapping is worth the per-row
             // cost.
-            let scan = match snapshot_key(handle) {
-                Some(key) => match self.tombstones.get(key.0, key.1) {
-                    Some(tf) if !tf.is_empty() => {
-                        any_wrapped = true;
-                        Box::new(TombstoneScanWrapper::new(
-                            scan,
-                            tf.clone(),
-                            self.entity_key_name.clone(),
-                            self.ts_col_name.clone(),
-                            handle.seq_id_first,
-                            handle.batch_id,
-                        )) as Box<dyn SegmentScan>
-                    }
-                    _ => scan,
-                },
+            let tombstone_for_segment: Option<TombstoneFile> = snapshot_key(handle)
+                .and_then(|key| self.tombstones.get(key.0, key.1))
+                .filter(|tf| !tf.is_empty())
+                .cloned();
+            let scan: Box<dyn SegmentScan> = match &tombstone_for_segment {
+                Some(tf) if !encoded_requested => {
+                    // Materialized path: wrap inline so the merge sees a
+                    // tombstone-filtered `RecordBatch` stream.
+                    Box::new(TombstoneScanWrapper::new(
+                        scan,
+                        tf.clone(),
+                        self.entity_key_name.clone(),
+                        self.ts_col_name.clone(),
+                        handle.seq_id_first,
+                        handle.batch_id,
+                    ))
+                }
+                Some(_) => {
+                    // Encoded path with tombstones: defer wrapping to
+                    // the `EncodedTombstoneSource` build below
+                    // (zero-copy scan/filter §8.4). The raw `Box<dyn
+                    // SegmentScan>` flows through here; the wrap
+                    // happens beneath `KernelAppliedSource` so the
+                    // tombstone wrapper sees every row group and its
+                    // `next_row_offset` accumulator stays in lockstep
+                    // with the on-disk layout.
+                    any_encoded_tombstone = true;
+                    scan
+                }
                 None => scan,
             };
             scans.push(scan);
+            // Materialized path: tombstone is already applied via
+            // `TombstoneScanWrapper`; the encoded path's slot would
+            // never be consumed, so clear it to keep the
+            // exactly-one-wrap invariant honest.
+            encoded_tombstones.push(if encoded_requested {
+                tombstone_for_segment
+            } else {
+                None
+            });
         }
 
-        // If any segment is tombstone-wrapped, stay on the materialized
-        // merge path: the encoded k-way merge expects real encoded
-        // columns from every input, and `TombstoneScanWrapper` produces
-        // its filter on top of `next_row_group` (materialized). Mixing
-        // wrapped and unwrapped inputs would decode some segments and
-        // not others, violating the encoded-batch contract. Deletes are
-        // expected to be rare, so this is a conservative fallback.
-        let encoded_requested = self.scan_path != ScanPath::Materialized && !any_wrapped;
-        if encoded_requested && scans.len() == 1 {
-            // Single-segment encoded fast path: drive the segment
-            // directly via `next_encoded_row_group`, no merge.
+        // Single-segment encoded fast path: only valid when no
+        // tombstone needs to be applied. Tombstoned single-segment scans
+        // drop into the encoded merge below so they can compose with
+        // `EncodedTombstoneSource` per §8.4.
+        if encoded_requested && scans.len() == 1 && !any_encoded_tombstone {
             self.encoded_scan = Some(scans.pop().unwrap());
         } else if encoded_requested {
-            // Multi-segment encoded path (CP5): wrap each segment in a
-            // `KernelAppliedSource` that shares the compiled shapes +
-            // types by `Arc`, and hand the vec to `EncodedKWayMergeScan`.
+            // Encoded merge path. Per-segment wrap order, bottom-up:
+            //
+            //   raw `Box<dyn SegmentScan>`
+            //     └─ `RawEncodedSource`           — exposes the scan as an
+            //                                        `EncodedBatchSource`,
+            //                                        forwards every row
+            //                                        group unchanged
+            //     └─ `EncodedTombstoneSource`?    — only for tombstoned
+            //                                        segments; sees every
+            //                                        row group so its
+            //                                        cumulative
+            //                                        `next_row_offset`
+            //                                        (used to synthesise
+            //                                        `__seq_id` for
+            //                                        `row_deletes`) stays
+            //                                        in lockstep with the
+            //                                        on-disk layout
+            //     └─ `KernelAppliedSource`        — applies any pushed
+            //                                        encoded-EQ shapes to
+            //                                        the surviving
+            //                                        selection
+            //     └─ `EncodedKWayMergeScan`
+            //
+            // The order is load-bearing: putting `KernelAppliedSource`
+            // *below* the tombstone wrapper would let it skip empty /
+            // fully-filtered row groups before the tombstone wrapper
+            // saw them, and the tombstone wrapper's row-offset
+            // accumulator would drift, miscomputing `__seq_id` for
+            // `row_deletes` in later row groups of the same segment.
             let shapes: Arc<[EncodedEqShape]> = Arc::from(self.encoded_shapes.as_slice());
             let types: Arc<[BqlType]> = Arc::from(self.types.as_slice());
+            let entity_bql = self.types[self.entity_col].clone();
             let sources: Vec<Box<dyn EncodedBatchSource>> = scans
                 .into_iter()
-                .map(|scan| -> Box<dyn EncodedBatchSource> {
+                .zip(encoded_tombstones)
+                .zip(handles.iter())
+                .map(|((scan, tf_opt), handle)| -> Box<dyn EncodedBatchSource> {
+                    let raw: Box<dyn EncodedBatchSource> = Box::new(RawEncodedSource::new(scan));
+                    let with_tombstones: Box<dyn EncodedBatchSource> = match tf_opt {
+                        Some(tf) => Box::new(EncodedTombstoneSource::new(
+                            raw,
+                            tf,
+                            self.entity_col,
+                            self.ts_col,
+                            entity_bql.clone(),
+                            handle.seq_id_first,
+                            handle.batch_id,
+                        )),
+                        None => raw,
+                    };
                     Box::new(KernelAppliedSource::new(
-                        scan,
+                        with_tombstones,
                         shapes.clone(),
                         types.clone(),
                         self.cancel.clone(),
@@ -930,11 +1020,49 @@ fn apply_compiled_filters(predicates: &[CompiledExpr], batch: RecordBatch) -> Re
 // Multi-segment encoded adapter (CP5)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Wraps a per-segment `Box<dyn SegmentScan>` into an
-/// [`EncodedBatchSource`] by applying the recognised
-/// [`EncodedEqShape`]s from the scan operator to every row group
-/// before handing the `(EncodedBatch, RowSelection)` pair to
-/// [`EncodedKWayMergeScan`].
+/// Tiny adapter that turns a raw `Box<dyn SegmentScan>` into an
+/// [`EncodedBatchSource`] by yielding `(EncodedBatch, full
+/// RowSelection)` for every row group the scan returns. No filtering,
+/// no batch skipping — its sole job is to expose the scan's row groups
+/// in the `EncodedBatchSource` shape so other wrappers (most notably
+/// [`EncodedTombstoneSource`]) can compose underneath
+/// [`KernelAppliedSource`].
+///
+/// **Why we keep skipping out of this layer.** [`EncodedTombstoneSource`]
+/// derives `__seq_id` for `row_deletes` from a cumulative row offset
+/// (`seq_id_first + Σ batch.row_count`). If an upstream wrapper skipped
+/// empty / fully-filtered row groups, the offset would drift and the
+/// row-level tombstone match would target the wrong rows in later
+/// row groups of the same segment. Forwarding every batch unchanged
+/// keeps the offset accumulator in lockstep with the on-disk layout.
+struct RawEncodedSource {
+    inner: Box<dyn SegmentScan>,
+}
+
+impl RawEncodedSource {
+    fn new(inner: Box<dyn SegmentScan>) -> Self {
+        Self { inner }
+    }
+}
+
+impl EncodedBatchSource for RawEncodedSource {
+    fn next(&mut self) -> Result<Option<(EncodedBatch, RowSelection)>> {
+        let Some(encoded) = self.inner.next_encoded_row_group()? else {
+            return Ok(None);
+        };
+        let sel = RowSelection::from_runs(vec![RowRun {
+            start: 0,
+            len: encoded.row_count,
+        }]);
+        Ok(Some((encoded, sel)))
+    }
+}
+
+/// Wraps an [`EncodedBatchSource`] (typically a [`RawEncodedSource`] or
+/// a [`bqlite_storage::EncodedTombstoneSource`] over one) by applying
+/// the recognised [`EncodedEqShape`]s from the scan operator to every
+/// row group before handing the `(EncodedBatch, RowSelection)` pair
+/// downstream — usually to [`EncodedKWayMergeScan`].
 ///
 /// Mirrors the single-segment pull loop in
 /// [`ScanOperator::encoded_next_batch`], minus the materialization
@@ -944,7 +1072,7 @@ fn apply_compiled_filters(predicates: &[CompiledExpr], batch: RecordBatch) -> Re
 /// through `Arc` so every source wrapper references the same data
 /// without per-batch clones.
 struct KernelAppliedSource {
-    inner: Box<dyn SegmentScan>,
+    inner: Box<dyn EncodedBatchSource>,
     shapes: Arc<[EncodedEqShape]>,
     types: Arc<[BqlType]>,
     cancel: CancellationToken,
@@ -952,7 +1080,7 @@ struct KernelAppliedSource {
 
 impl KernelAppliedSource {
     fn new(
-        inner: Box<dyn SegmentScan>,
+        inner: Box<dyn EncodedBatchSource>,
         shapes: Arc<[EncodedEqShape]>,
         types: Arc<[BqlType]>,
         cancel: CancellationToken,
@@ -975,19 +1103,26 @@ impl EncodedBatchSource for KernelAppliedSource {
             if self.cancel.is_cancelled() {
                 return Err(BqliteError::Cancelled);
             }
-            let Some(encoded) = self.inner.next_encoded_row_group()? else {
+            let Some((encoded, mut sel)) = self.inner.next()? else {
                 return Ok(None);
             };
             let rows = encoded.row_count;
             if rows == 0 {
                 // Skip empty row groups; the merge would otherwise
-                // pay a reload round-trip for no picks.
+                // pay a reload round-trip for no picks. Empty inputs
+                // carry no rows, so there is no offset state for any
+                // upstream wrapper to keep in sync.
                 continue;
             }
-            let mut sel = RowSelection::from_runs(vec![RowRun {
-                start: 0,
-                len: rows,
-            }]);
+            if sel.is_empty() {
+                // Upstream already eliminated every row (e.g. a
+                // tombstone wrapper covering the whole batch); the
+                // merge tolerates empty selections, but skipping here
+                // saves a reload round-trip. The upstream's offset
+                // accounting already advanced when it consumed this
+                // batch, so dropping the empty selection is safe.
+                continue;
+            }
             for shape in self.shapes.iter() {
                 if sel.is_empty() {
                     break;
@@ -3564,8 +3699,18 @@ mod tests {
         // synthesised `__seq_id` matches. This test was previously a
         // negative carve-out (`row_tombstones_error_when_seq_id_column_missing`)
         // and is flipped to assert the correctness contract.
+        //
+        // The handle and the batch carry the *same* (`seq_id_first`,
+        // `batch_id`) pair so both the materialized
+        // (`TombstoneScanWrapper` reads `__seq_id` from the batch) and
+        // encoded (`EncodedTombstoneSource` derives `__seq_id` from
+        // `handle.seq_id_first + offset`) paths see the same row IDs —
+        // the manifest invariant in production.
+        let mut handle = handle_for(1, 0, 0, 1);
+        handle.seq_id_first = 42;
+        handle.batch_id = 1;
         let segments = vec![(
-            handle_for(1, 0, 0, 1),
+            handle,
             // Seq_id_first = 42, batch_id = 1 → the single row's
             // synthesised __seq_id is 42; the tombstone targets that.
             vec![make_batch_at(&["alice"], &[100], &["e1"], 42, 1)],
@@ -3626,6 +3771,246 @@ mod tests {
         op.open().unwrap();
         let ids = drain_entity_ids(&mut op);
         assert_eq!(ids, vec!["bob", "carol"]);
+    }
+
+    /// Helper: build the ScanOperator on the requested path and drain
+    /// every emitted row's `entity_id` and `__seq_id` so two paths can be
+    /// compared row-for-row.
+    fn drain_with_path(
+        reader: Arc<dyn SegmentReader>,
+        snap: Arc<TombstoneSnapshot>,
+        path: ScanPath,
+    ) -> Vec<(String, i64)> {
+        use arrow::array::Int64Array;
+        let mut op = ScanOperator::with_tombstones_and_scan_path(
+            reader,
+            &[],
+            Vec::new(),
+            CancellationToken::new(),
+            path,
+            snap,
+        )
+        .unwrap();
+        op.open().unwrap();
+        // Confirm the operator actually picked the requested path.
+        match path {
+            ScanPath::Materialized => assert!(
+                op.merge.is_some(),
+                "Materialized path must drive the materialized k-way merge"
+            ),
+            _ => assert!(
+                op.encoded_scan.is_some() || op.encoded_merge.is_some(),
+                "encoded path must drive encoded_scan or encoded_merge"
+            ),
+        }
+        let mut rows = Vec::new();
+        while let Some(b) = op.next_batch().unwrap() {
+            let ids = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            let seq = b
+                .column(b.schema().fields().len() - 2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i).to_string(), seq.value(i)));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn encoded_and_materialized_paths_agree_under_tombstones() {
+        // TASK-517 §8.4 invariant: the encoded path must produce the
+        // same surviving rows the materialized path would, given the
+        // same tombstone snapshot. Exercises all four tombstone
+        // granularities composed in one snapshot across two
+        // `(window, shard)` pairs and three segments. Each granularity
+        // drops a *distinct* row so a single granularity going wrong
+        // is observable in the row diff — entity tombstones drop
+        // alice/h1 + alice/h3-survive (different shard), row tombstone
+        // drops dave (seq 200), time-range drops eve (ts 60), batch
+        // tombstone targets a non-existent batch_id and must be a no-op.
+        let mut h1 = handle_for(1, 0, 0, 4);
+        h1.seq_id_first = 100;
+        h1.batch_id = 1;
+        let mut h2 = handle_for(2, 0, 0, 3);
+        h2.seq_id_first = 200;
+        h2.batch_id = 2;
+        // Different shard so its tombstone is independent.
+        let mut h3 = handle_for(3, 0, 1, 2);
+        h3.seq_id_first = 300;
+        h3.batch_id = 3;
+        let segments = vec![
+            (
+                h1,
+                vec![make_batch_at(
+                    &["alice", "alice", "bob", "carol"],
+                    &[10, 20, 30, 40],
+                    &["e1", "e2", "e3", "e4"],
+                    100,
+                    1,
+                )],
+                vec![zones_for("alice", "carol", 10, 40)],
+            ),
+            (
+                h2,
+                vec![make_batch_at(
+                    &["dave", "eve", "frank"],
+                    &[50, 60, 70],
+                    &["e5", "e6", "e7"],
+                    200,
+                    2,
+                )],
+                vec![zones_for("dave", "frank", 50, 70)],
+            ),
+            (
+                h3,
+                vec![make_batch_at(
+                    &["alice", "grace"],
+                    &[80, 90],
+                    &["e8", "e9"],
+                    300,
+                    3,
+                )],
+                vec![zones_for("alice", "grace", 80, 90)],
+            ),
+        ];
+        // Tombstone shard (0,0) with all four granularities; shard
+        // (0,1) gets nothing — its `alice` rows must survive.
+        let mut tf = TombstoneFile::for_entities([ScalarValue::String("alice".into())]);
+        tf.merge(&TombstoneFile::for_rows([200])); // drops dave (seq 200, h2 row 0)
+        tf.merge(&TombstoneFile::for_time_range(
+            bqlite_storage::TimeRangeDelete {
+                min_ts: Some(60),
+                min_inclusive: true,
+                max_ts: Some(60),
+                max_inclusive: true,
+            },
+        )); // drops eve (ts 60, h2 row 1) — distinct from the row tombstone
+        tf.merge(&TombstoneFile::for_batches([99])); // batch 99 absent → no effect
+        let snap = Arc::new(TombstoneSnapshot::from_map([((0, 0), tf)]));
+        let reader: Arc<dyn SegmentReader> =
+            Arc::new(VecReader::with_segments(minimal_schema(), segments.clone()));
+        let materialized = drain_with_path(reader, snap.clone(), ScanPath::Materialized);
+        let reader: Arc<dyn SegmentReader> =
+            Arc::new(VecReader::with_segments(minimal_schema(), segments));
+        let encoded = drain_with_path(reader, snap, ScanPath::Encoded);
+        // Survivors after tombstone application, in (entity, ts) order
+        // across both shards: bob+carol (h1 not-alice), frank (h2 ts 70),
+        // alice/grace (h3, untombstoned shard).
+        let expected: Vec<(String, i64)> = vec![
+            ("alice".into(), 300),
+            ("bob".into(), 102),
+            ("carol".into(), 103),
+            ("frank".into(), 202),
+            ("grace".into(), 301),
+        ];
+        assert_eq!(materialized, expected);
+        assert_eq!(
+            materialized, encoded,
+            "encoded path must produce the same rows as the materialized path"
+        );
+    }
+
+    #[test]
+    fn encoded_row_tombstone_offset_survives_kernel_skipped_row_group() {
+        // Regression for the kernel-skip / row-tombstone offset
+        // interaction: an encoded-EQ predicate filters row group 0
+        // entirely; row group 1 contains the row whose synthesised
+        // `__seq_id` matches the row tombstone. The wrap order
+        // (RawEncodedSource → EncodedTombstoneSource → KernelAppliedSource)
+        // is the reason this works — putting the kernel below would
+        // skip the first batch from the tombstone wrapper, leaving its
+        // cumulative `next_row_offset` at 0 when row group 1 arrived,
+        // miscomputing `__seq_id` and either missing the targeted row
+        // or hitting the wrong row.
+        let mut h = handle_for(1, 0, 0, 4);
+        h.seq_id_first = 100;
+        h.batch_id = 1;
+        // RG0: two rows, both `skip` — kernel will eliminate them.
+        // RG1: two rows, both `keep` — survive kernel; tombstone
+        //      targets the second (`__seq_id = 100 + 2 + 1 = 103`).
+        let rg0 = make_batch_at(&["u0", "u1"], &[10, 20], &["skip", "skip"], 100, 1);
+        let rg1 = make_batch_at(&["u2", "u3"], &[30, 40], &["keep", "keep"], 102, 1);
+        let segments = vec![(
+            h,
+            vec![rg0, rg1],
+            vec![zones_for("u0", "u1", 10, 20), zones_for("u2", "u3", 30, 40)],
+        )];
+        let reader: Arc<dyn SegmentReader> =
+            Arc::new(VecReader::with_segments(minimal_schema(), segments));
+
+        // Pushable equality on `event_type == "keep"`: kernel-eligible.
+        let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
+        let pred = compile_predicate(
+            compare(CompareOp::Equal, col("event_type"), string_lit("keep")),
+            &output_schema,
+        );
+        let snap = TombstoneSnapshot::from_map([((0, 0), TombstoneFile::for_rows([103]))]);
+        let mut op = ScanOperator::with_tombstones_and_scan_path(
+            reader,
+            &[],
+            vec![pred],
+            CancellationToken::new(),
+            ScanPath::Encoded,
+            Arc::new(snap),
+        )
+        .unwrap();
+        op.open().unwrap();
+        let pairs = drain_pairs(&mut op);
+        // RG0 dropped by the kernel; RG1 has u2 and u3, tombstone
+        // drops u3 (seq 103). Survivor: u2.
+        assert_eq!(pairs, vec![("u2".to_string(), "keep".to_string())]);
+    }
+
+    #[test]
+    fn encoded_path_single_tombstoned_segment_drops_into_encoded_merge() {
+        // CP2 invariant: a single tombstoned segment on the encoded
+        // path must NOT take the single-segment fast path
+        // (`encoded_scan`) — it has to go through `encoded_merge` so
+        // the `EncodedTombstoneSource` boundary always exists upstream
+        // of `EncodedKWayMergeScan`.
+        let mut h = handle_for(1, 0, 0, 2);
+        h.seq_id_first = 0;
+        h.batch_id = 0;
+        let segments = vec![(
+            h,
+            vec![make_batch_at(
+                &["alice", "bob"],
+                &[10, 20],
+                &["e1", "e2"],
+                0,
+                0,
+            )],
+            vec![zones_for("alice", "bob", 10, 20)],
+        )];
+        let reader: Arc<dyn SegmentReader> =
+            Arc::new(VecReader::with_segments(minimal_schema(), segments));
+        let snap = TombstoneSnapshot::from_map([(
+            (0, 0),
+            TombstoneFile::for_entities([ScalarValue::String("alice".into())]),
+        )]);
+        let mut op = ScanOperator::with_tombstones_and_scan_path(
+            reader,
+            &[],
+            Vec::new(),
+            CancellationToken::new(),
+            ScanPath::Encoded,
+            Arc::new(snap),
+        )
+        .unwrap();
+        op.open().unwrap();
+        assert!(
+            op.encoded_merge.is_some(),
+            "tombstoned single-segment scan must run through encoded_merge"
+        );
+        assert!(op.encoded_scan.is_none());
+        let ids = drain_entity_ids(&mut op);
+        assert_eq!(ids, vec!["bob"]);
     }
 
     // ── SAMPLE pushdown tests (TASK-430) ────────────────────────────────────

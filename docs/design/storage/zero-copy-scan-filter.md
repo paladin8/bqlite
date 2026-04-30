@@ -431,6 +431,18 @@ the physical handoff.
 
 ### 8.4 Tombstone application on the encoded path
 
+> **Status:** implemented in TASK-517 as
+> [`bqlite_storage::EncodedTombstoneSource`]
+> (`crates/bqlite-storage/src/encoded_tombstone.rs`), wired into
+> [`bqlite_operators::scan::ScanOperator::open`]
+> (`crates/bqlite-operators/src/scan.rs`). On `ScanPath::Materialized`
+> the scan keeps using `TombstoneScanWrapper`; on the encoded path each
+> tombstoned segment is wrapped with `EncodedTombstoneSource`
+> downstream of `KernelAppliedSource`, and a tombstoned single-segment
+> scan now drops into `EncodedKWayMergeScan` instead of the
+> single-segment fast path. Dictionary-code lowering for entity
+> tombstones (final bullet below) is deferred as a follow-up.
+
 `docs/design/storage/deletes.md` and
 `docs/superpowers/plans/2026-04-13-tombstone-aware-scan.md` define the
 per-query `TombstoneSnapshot`: the query opens each segment with an

@@ -73,16 +73,29 @@
 //! row group and the compaction-specific hint pair are deferred
 //! to Wave 4 per `docs/design/storage-format.md` §8.2.
 //!
-//! # Tombstone transparency (TASK-434)
+//! # Tombstone transparency (TASK-434, TASK-517)
 //!
-//! The k-way merge is intentionally oblivious to tombstones. Per
-//! `docs/design/storage/deletes.md` §7, tombstone filtering is applied
-//! **per-segment** after zone-map pushdown and before the merge: the
-//! scan operator wraps each affected segment's `Box<dyn SegmentScan>`
-//! in a [`crate::tombstone_scan::TombstoneScanWrapper`] before handing
-//! the vec to [`KWayMergeScan`]. As a result:
+//! Both the materialized [`KWayMergeScan`] and the encoded
+//! [`EncodedKWayMergeScan`] are intentionally oblivious to tombstones.
+//! Per `docs/design/storage/deletes.md` §7, tombstone filtering is
+//! applied **per-segment** after zone-map pushdown and before the
+//! merge:
 //!
-//! - Every row this merge sees is already tombstone-filtered; the
+//! - **Materialized path:** the scan operator wraps each affected
+//!   segment's `Box<dyn SegmentScan>` in a
+//!   [`crate::tombstone_scan::TombstoneScanWrapper`].
+//! - **Encoded path** (zero-copy scan/filter §8.4, TASK-517): the scan
+//!   operator wraps each tombstoned per-segment scan in a
+//!   [`crate::EncodedTombstoneSource`] — a selection-first filter that
+//!   produces a [`bqlite_core::encoded::RowSelection`] of rows not
+//!   covered by any tombstone, intersected with the upstream selection,
+//!   without materializing payload columns before filter. Pushed
+//!   predicate kernels then refine the surviving selection on top of
+//!   the tombstone-narrowed batch.
+//!
+//! As a result:
+//!
+//! - Every row either merge sees is already tombstone-filtered; the
 //!   merge never re-checks tombstones.
 //! - Cross-segment and cross-window correctness is automatic: an
 //!   entity whose rows are tombstoned only in one segment still
@@ -90,9 +103,9 @@
 //!   that carry surviving rows (the per-query snapshot resolves
 //!   per-`(window, shard)` — see deletes.md §6).
 //! - Merge inputs with zero surviving rows produce zero-length
-//!   `RecordBatch`es from the wrapper; the merge already handles empty
-//!   batches as scan-exhausted candidates, so no new merge path is
-//!   needed.
+//!   `RecordBatch`es / empty selections from the wrapper; both merges
+//!   already handle empty inputs as scan-exhausted candidates, so no
+//!   new merge path is needed.
 //!
 //! This file therefore does not take a `TombstoneSnapshot` argument.
 //! If a future refactor needs to hoist wrapping into the merge

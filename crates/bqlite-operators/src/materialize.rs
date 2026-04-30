@@ -187,7 +187,8 @@ fn record_batch_bytes(batch: &RecordBatch) -> u64 {
 }
 
 /// Materialize a [`StitchedBatch`] into a dense [`FilteredBatch`]
-/// (CP5 of the zero-copy scan/filter plan).
+/// (zero-copy scan/filter §9, CP6/CP7 of the zero-copy scan/filter
+/// plan).
 ///
 /// The k-way merge's output form: zero or more encoded source batches
 /// plus a [`StitchedRows`] reference describing merged row order. Three
@@ -205,15 +206,16 @@ fn record_batch_bytes(batch: &RecordBatch) -> u64 {
 ///   dense column, then `take` the referenced indices per source and
 ///   concatenate.
 ///
-/// # Non-goal for CP5 in this commit
-///
-/// This helper is the **consumption** side of the stitched merge. The
-/// producer (a modified [`bqlite_storage::segment::merge::KWayMergeScan`]
-/// that emits `StitchedBatch` instead of materializing via
-/// `arrow::compute::interleave`) lands in a subsequent change because
-/// it touches production merge code used by every scan path. Landing
-/// the consumer first gives that change a stable target to write
-/// against and an acceptance test already in place.
+/// This helper is the boundary that turns selection-first encoded
+/// output into the dense [`FilteredBatch`] downstream operators
+/// expect. Together with
+/// [`bqlite_storage::segment::merge::EncodedKWayMergeScan`] (the
+/// stitched-merge producer) and
+/// [`bqlite_storage::EncodedTombstoneSource`] (the §8.4 selection-first
+/// tombstone filter wired in by [`crate::scan::ScanOperator`]), it
+/// ensures `arrow::compute::interleave` is no longer the default
+/// scan/merge path — it survives only as the
+/// `BQLITE_SCAN_PATH=materialized` debug fallback.
 pub fn materialize_stitched(
     stitched: &StitchedBatch,
     types: &[BqlType],
