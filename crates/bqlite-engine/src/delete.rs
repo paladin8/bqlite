@@ -93,6 +93,10 @@ pub fn execute_delete_statement(
         // DELETE does not run stateful operators that produce warnings
         // (`cancellation.md` §7.4); the sink stays empty.
         warnings: Vec::new(),
+        // DELETE bypasses the drive loop and the QueryContext metrics
+        // handle; nothing to aggregate. TASK-525 may surface real
+        // metrics once DELETE is rewired through the context.
+        metrics: crate::QueryMetrics::zero(),
     })
 }
 

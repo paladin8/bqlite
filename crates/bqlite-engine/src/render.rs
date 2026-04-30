@@ -119,6 +119,7 @@ pub fn format_result_as_text_limited(
         rows_affected: result.rows_affected,
         peak_memory_bytes: result.peak_memory_bytes,
         warnings: result.warnings.clone(),
+        metrics: result.metrics,
     };
 
     // Render the truncated result normally, then append the truncation
@@ -261,6 +262,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
 
         let rendered = format_result_as_text(&result);
@@ -301,6 +303,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
 
         let rendered = format_result_as_text(&result);
@@ -340,6 +343,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
 
         let rendered = format_result_as_text(&result);
@@ -379,6 +383,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
 
         let rendered = format_result_as_text(&result);
@@ -425,6 +430,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
         let plain = format_result_as_text(&result);
         let limited = format_result_as_text_limited(&result, None);
@@ -441,6 +447,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
         let out = format_result_as_text_limited(&result, Some(10));
         assert!(
@@ -460,6 +467,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
         let out = format_result_as_text_limited(&result, Some(2));
         assert!(
@@ -479,6 +487,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
         let out = format_result_as_text_limited(&result, Some(1));
         // The footer must mention "1 row" (singular) and the hint.
@@ -514,6 +523,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
         let out = format_result_as_text_limited(&result, Some(2000));
         assert!(
@@ -544,6 +554,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
         let out = format_result_as_text_limited(&result, Some(5));
         // Values 1-5 present, 6-9 absent.
@@ -589,6 +600,7 @@ mod tests {
             rows_affected: None,
             peak_memory_bytes: None,
             warnings: Vec::new(),
+            metrics: Default::default(),
         };
 
         let rendered = format_result_as_text(&result);

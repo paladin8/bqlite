@@ -223,6 +223,8 @@ pub fn execute_explain_statement(
         rows_affected: None,
         peak_memory_bytes: None,
         warnings: Vec::new(),
+        // EXPLAIN bypasses the drive loop; nothing to measure.
+        metrics: crate::QueryMetrics::zero(),
     })
 }
 

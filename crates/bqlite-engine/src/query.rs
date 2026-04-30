@@ -68,6 +68,7 @@ use bqlite_storage::Database;
 
 use crate::bind::bind_physical;
 use crate::context::{resolve_query_budget, EngineConfig, QueryContext, QueryOptions};
+use crate::perf::{QueryMetrics, WorkerMetricsSnapshot};
 use crate::scheduler::MorselScheduler;
 
 /// The result of a successfully executed query.
@@ -118,6 +119,14 @@ pub struct ExecutionResult {
     /// with a final `WarningsOverflow` appended when any warnings
     /// were suppressed).
     pub warnings: Vec<QueryWarning>,
+    /// Per-query metrics aggregate (TASK-524). Operators contribute
+    /// through the shared metrics handle on [`QueryContext`]; the
+    /// engine snapshots once at query teardown. Inspectable
+    /// programmatically; rendered by `bqlite query --explain-perf`
+    /// via [`crate::perf::format_perf_explain`]. Defaults to
+    /// `QueryMetrics::zero()` for DDL / DELETE / EXPLAIN paths that
+    /// bypass the drive loop.
+    pub metrics: QueryMetrics,
 }
 
 /// Wrapper attached when the engine surfaces a fatal error alongside
@@ -307,7 +316,9 @@ impl Engine {
             Ok(b) => b,
             Err(e) => return Err(ExecutionFailure::from(e)),
         };
-        let ctx = QueryContext::new(budget_bytes).with_spill_fs(db.spill_fs().clone());
+        let ctx = QueryContext::new(budget_bytes)
+            .with_spill_fs(db.spill_fs().clone())
+            .collect_cpu_metrics(options.collect_cpu_metrics);
 
         // `AssertUnwindSafe` is required because `&mut Database` is
         // not `UnwindSafe` by default. This is sound here per
@@ -373,6 +384,11 @@ fn run_query_inner(
     ctx: &QueryContext,
     scheduler: &MorselScheduler,
 ) -> bqlite_core::Result<ExecutionResult> {
+    // Wall-clock stamp for `QueryMetrics::wall_clock_ns`. Started here
+    // so it covers parse + plan + bind + drive — the user-visible
+    // duration of the `Engine::query` call.
+    let started_at = std::time::Instant::now();
+
     // 1. Parse. `parse()` returns a Vec: zero or more
     //    `Statement::DefineAlias` items followed by the terminal
     //    statement (query, DDL, …). Its typed `ParseError` is
@@ -445,19 +461,32 @@ fn run_query_inner(
     //    The "primary error wins" cleanup convention from the prior
     //    single-threaded driver carries through: `close` runs on
     //    both happy and sad paths so mmap handles and spill files
-    //    are released promptly.
+    //    are released promptly. The closure drops the operator tree
+    //    before returning so any adapter clones of the warning sink
+    //    AND of the shared `Arc<dyn Metrics>` are released first —
+    //    matches `cancellation.md` §5.1 leaf-first teardown and
+    //    `execution-model.md` §14.2's "after all morsels complete"
+    //    rule for the metrics aggregate.
     let rows = scheduler.submit(move || -> bqlite_core::Result<Vec<RecordBatch>> {
         let mut operator = operator;
         let drive_result = drive_to_completion(operator.as_mut());
         let close_result = operator.close();
         let rows = drive_result?;
         close_result?;
-        // Drop the operator tree before returning so any adapter
-        // clones of the warning sink are released first (matches
-        // `cancellation.md` §5.1's leaf-first teardown ordering).
         drop(operator);
         Ok(rows)
     })?;
+
+    // v1 dispatches one degenerate "whole-database" task per query, so
+    // record exactly one `WorkerMetricsSnapshot::default()` to seed
+    // `num_workers == 1` and give the worker min/max aggregates
+    // concrete (zero) values. The per-shard morsel-parallelism
+    // follow-up will switch to one snapshot per worker. CPU-counter
+    // fields stay zero — `PerfCounters::open_or_disabled` returns
+    // disabled today.
+    ctx.record_worker_snapshot(WorkerMetricsSnapshot::default());
+    let wall_clock_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let metrics = ctx.take_query_metrics(wall_clock_ns);
 
     Ok(ExecutionResult {
         schema,
@@ -465,6 +494,7 @@ fn run_query_inner(
         rows_affected: None,
         peak_memory_bytes: ctx.peak_memory_bytes(),
         warnings: ctx.warnings().clone().into_warnings(),
+        metrics,
     })
 }
 
@@ -701,6 +731,68 @@ mod tests {
         assert_eq!(engine.config().query_memory_budget_bytes, 3 << 30);
     }
 
+    // ── Per-query metrics surface (TASK-524) ────────────────────────
+
+    #[test]
+    fn query_records_wall_clock_and_num_workers() {
+        let scratch = Scratch::new("metrics-wall-clock");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let result = engine.query("events", &mut db).expect("query must succeed");
+
+        // Single-threaded driver records exactly one worker snapshot
+        // at teardown.
+        assert_eq!(result.metrics.num_workers, 1);
+        // Wall clock spans parse + plan + bind + drive — non-zero on
+        // any sane platform clock resolution.
+        assert!(
+            result.metrics.wall_clock_ns > 0,
+            "wall_clock_ns must be non-zero, got {}",
+            result.metrics.wall_clock_ns
+        );
+    }
+
+    #[test]
+    fn query_metrics_default_to_zero_on_empty_table() {
+        let scratch = Scratch::new("metrics-zero");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let result = engine.query("events", &mut db).expect("must succeed");
+
+        // Operator-tree counters are all zero on an empty table.
+        assert_eq!(result.metrics.operator.rows_in, 0);
+        assert_eq!(result.metrics.operator.rows_out, 0);
+        assert_eq!(result.metrics.operator.spill_bytes_written, 0);
+        assert_eq!(result.metrics.operator.selection_vector_materializations, 0);
+        // Skew rows zero (no morsel scheduler running).
+        assert_eq!(result.metrics.morsels_dispatched, 0);
+        // CPU metrics off by default.
+        assert!(!result.metrics.cpu_metrics_enabled);
+    }
+
+    #[test]
+    fn query_with_cpu_metrics_enabled_propagates_flag() {
+        let scratch = Scratch::new("metrics-cpu-flag");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let opts = QueryOptions {
+            collect_cpu_metrics: true,
+            ..Default::default()
+        };
+        let result = engine
+            .query_with_options("events", &mut db, &opts)
+            .expect("query must succeed");
+
+        assert!(
+            result.metrics.cpu_metrics_enabled,
+            "collect_cpu_metrics flag must propagate to QueryMetrics"
+        );
+        // The flag is informational today — the actual perf counters
+        // remain zero because the platform integration is a stub.
+        assert_eq!(result.metrics.total_cpu_cycles, 0);
+        assert_eq!(result.metrics.branch_misses, 0);
+    }
+
     #[test]
     fn query_reports_zero_peak_memory_when_no_operator_reserves() {
         // No operator yet calls try_reserve against the QueryContext
@@ -722,6 +814,7 @@ mod tests {
         let engine = Engine::new();
         let opts = QueryOptions {
             memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES - 1),
+            ..Default::default()
         };
         match engine.query_with_options("events", &mut db, &opts) {
             Err(ExecutionFailure {
@@ -744,6 +837,7 @@ mod tests {
         let engine = Engine::new();
         let opts = QueryOptions {
             memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES),
+            ..Default::default()
         };
         let result = engine
             .query_with_options("events", &mut db, &opts)

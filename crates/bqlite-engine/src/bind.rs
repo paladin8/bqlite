@@ -1237,14 +1237,14 @@ fn bind_fused_segment(
             }
         }
     }
-    // Metrics: until the engine threads a per-query `Metrics` handle
-    // through `QueryContext` (TASK-524 / `--explain-perf`), the
-    // segment uses `NoopMetrics` at bind time. The `Metrics` trait
-    // surface and the segment's metric call sites are already in
-    // place — wiring them through is a follow-up that does not block
-    // the optimizer flip in TASK-519.
-    let metrics: Arc<dyn bqlite_core::metrics::Metrics> =
-        Arc::new(bqlite_core::metrics::NoopMetrics::new());
+    // Metrics: thread the per-query handle from `QueryContext`
+    // (TASK-524) so the fused stateless segment's
+    // `selection_vector_materializations` / `_dropped_rows` counters
+    // contribute to the per-query aggregate surfaced by
+    // `bqlite query --explain-perf`. Every operator in the tree shares
+    // this single `Arc<dyn Metrics>` clone, so a single `snapshot()`
+    // at query teardown captures the union of their writes.
+    let metrics: Arc<dyn bqlite_core::metrics::Metrics> = ctx.metrics().clone();
     let segment = FusedStatelessSegment::new(
         child,
         runtime_steps,

@@ -26,11 +26,14 @@
 //! TASK-510 stops at making the context available so those tasks have a
 //! single seam to wire against.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use bqlite_core::metrics::{AtomicMetrics, Metrics};
 use bqlite_core::spill::{SpillFs, SpillQueryId, TempSpillFile};
 use bqlite_core::{memory::MemoryTracker, BqliteError, MemoryBudget, Result, UnboundedMemory};
 use bqlite_operators::CancellationToken;
+
+use crate::perf::{QueryMetrics, WorkerMetricsSnapshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Defaults & constants (design doc § 2.2 / § 8)
@@ -128,6 +131,16 @@ pub struct QueryOptions {
     /// Override the per-query memory budget. Validated against
     /// [`MIN_QUERY_BUDGET_BYTES`] at submission time.
     pub memory_budget_bytes: Option<u64>,
+    /// Opt this query into CPU-cost sampling per
+    /// `docs/design/execution-model.md` §14.3. The CLI's
+    /// `--explain-perf` flag sets this; normal queries leave it
+    /// `false` so the perf-counter overhead never lands on the
+    /// hot path. Today the platform integration is a stub
+    /// ([`crate::perf::PerfCounters`]); the flag still propagates
+    /// through to `QueryMetrics::cpu_metrics_enabled` so callers can
+    /// distinguish "CPU counters were sampled but were zero" from
+    /// "CPU counters were never enabled".
+    pub collect_cpu_metrics: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +195,22 @@ pub struct QueryContext {
     /// once the last clone of this context goes out of scope. `None`
     /// when no `spill_fs` is attached.
     _cleanup: Option<Arc<SpillCleanup>>,
+    /// Per-query operator-counter handle. Shared across every operator
+    /// in the tree so a single `snapshot()` at teardown captures the
+    /// query-level totals. Default is a fresh [`AtomicMetrics`] so the
+    /// shape is non-zero even for unbounded / test contexts.
+    metrics: Arc<dyn Metrics>,
+    /// Cross-worker aggregate accumulating `WorkerMetricsSnapshot`s
+    /// recorded through [`QueryContext::record_worker_snapshot`]. The
+    /// single-threaded driver records exactly one snapshot today; the
+    /// morsel-scheduler follow-up will record one per worker.
+    worker_aggregate: Arc<Mutex<QueryMetrics>>,
+    /// Whether CPU-cost sampling is opted in for this query
+    /// (`PerfCounters::open_or_disabled` returns enabled only when
+    /// this flag is set and the platform supports it). Default
+    /// `false` per `execution-model.md` §14.3 — perf collection is
+    /// off in normal queries.
+    collect_cpu_metrics: bool,
 }
 
 /// Belt-and-braces sweep: when the last `Arc<SpillCleanup>` drops, the
@@ -225,6 +254,9 @@ impl QueryContext {
             spill_fs: None,
             spill_query_id: None,
             _cleanup: None,
+            metrics: Arc::new(AtomicMetrics::new()),
+            worker_aggregate: Arc::new(Mutex::new(QueryMetrics::zero())),
+            collect_cpu_metrics: false,
         }
     }
 
@@ -240,6 +272,9 @@ impl QueryContext {
             spill_fs: None,
             spill_query_id: None,
             _cleanup: None,
+            metrics: Arc::new(AtomicMetrics::new()),
+            worker_aggregate: Arc::new(Mutex::new(QueryMetrics::zero())),
+            collect_cpu_metrics: false,
         }
     }
 
@@ -311,6 +346,61 @@ impl QueryContext {
     /// `docs/design/engine/cancellation.md` §7.
     pub fn warnings(&self) -> &crate::warning_sink::WarningSink {
         &self.warnings
+    }
+
+    /// Per-query operator-counter handle. Operators clone the `Arc` at
+    /// construction time so a single `snapshot()` at query teardown
+    /// captures the query-level totals.
+    pub fn metrics(&self) -> &Arc<dyn Metrics> {
+        &self.metrics
+    }
+
+    /// Set the CPU-cost collection opt-in flag. `false` (the default)
+    /// keeps perf-event sampling off entirely; `true` arms the
+    /// platform integration (today still a stub — see
+    /// [`crate::perf::PerfCounters`]). Returns the modified context
+    /// for builder-style chaining.
+    pub fn collect_cpu_metrics(mut self, enabled: bool) -> Self {
+        self.collect_cpu_metrics = enabled;
+        self
+    }
+
+    /// Whether CPU-cost sampling was opted into for this query.
+    pub fn cpu_metrics_enabled(&self) -> bool {
+        self.collect_cpu_metrics
+    }
+
+    /// Record one worker's contribution to the per-query metrics
+    /// aggregate. The single-threaded driver calls this exactly once
+    /// at query teardown; the morsel scheduler will call it per
+    /// worker. Calls beyond the first fold the snapshot in via
+    /// [`QueryMetrics::record_worker`].
+    pub fn record_worker_snapshot(&self, snap: WorkerMetricsSnapshot) {
+        let mut guard = self
+            .worker_aggregate
+            .lock()
+            .expect("query worker_aggregate mutex poisoned");
+        guard.record_worker(&snap);
+    }
+
+    /// Snapshot the per-query metrics: read the shared operator
+    /// counters, fold them into the worker aggregate, stamp the
+    /// wall-clock duration and the CPU-metrics flag, and return.
+    ///
+    /// Non-draining: subsequent calls return identical values modulo
+    /// any later `record_*` activity. The engine drops the operator
+    /// tree before calling this so no operator clones still publish
+    /// into the shared metrics handle.
+    pub fn take_query_metrics(&self, wall_clock_ns: u64) -> QueryMetrics {
+        let operator_snapshot = self.metrics.snapshot();
+        let mut guard = self
+            .worker_aggregate
+            .lock()
+            .expect("query worker_aggregate mutex poisoned");
+        guard.operator = operator_snapshot;
+        guard.wall_clock_ns = wall_clock_ns;
+        guard.cpu_metrics_enabled = self.collect_cpu_metrics;
+        *guard
     }
 }
 
@@ -416,6 +506,7 @@ mod tests {
         let cfg = EngineConfig::default();
         let opts = QueryOptions {
             memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES),
+            ..Default::default()
         };
         let budget = resolve_query_budget(&cfg, &opts).expect("at-floor must validate");
         assert_eq!(budget, MIN_QUERY_BUDGET_BYTES);
@@ -426,6 +517,7 @@ mod tests {
         let cfg = EngineConfig::default();
         let opts = QueryOptions {
             memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES - 1),
+            ..Default::default()
         };
         let err = resolve_query_budget(&cfg, &opts).expect_err("must reject");
         match err {
@@ -434,6 +526,101 @@ mod tests {
             }
             other => panic!("expected Execution error, got {other:?}"),
         }
+    }
+
+    // ── Per-query metrics surface (TASK-524) ────────────────────────
+
+    #[test]
+    fn unbounded_context_has_metrics_handle() {
+        let ctx = QueryContext::unbounded();
+        // Default `AtomicMetrics` is wired even on the unbounded path.
+        let m = ctx.metrics();
+        m.record_rows_in(7);
+        assert_eq!(m.snapshot().rows_in, 7);
+    }
+
+    #[test]
+    fn collect_cpu_metrics_flag_round_trips_through_clone() {
+        let ctx = QueryContext::new(MIN_QUERY_BUDGET_BYTES).collect_cpu_metrics(true);
+        assert!(ctx.cpu_metrics_enabled());
+        let clone = ctx.clone();
+        assert!(clone.cpu_metrics_enabled());
+    }
+
+    #[test]
+    fn collect_cpu_metrics_default_is_off() {
+        let ctx = QueryContext::unbounded();
+        assert!(!ctx.cpu_metrics_enabled());
+    }
+
+    #[test]
+    fn record_worker_snapshot_folds_into_take_query_metrics() {
+        let ctx = QueryContext::unbounded();
+        ctx.record_worker_snapshot(WorkerMetricsSnapshot {
+            worker_busy_ns: 1_000,
+            worker_idle_ns: 100,
+            morsels_dispatched: 4,
+            ..Default::default()
+        });
+        ctx.record_worker_snapshot(WorkerMetricsSnapshot {
+            worker_busy_ns: 2_000,
+            worker_idle_ns: 50,
+            morsels_dispatched: 6,
+            ..Default::default()
+        });
+        let snap = ctx.take_query_metrics(123_456);
+        assert_eq!(snap.num_workers, 2);
+        assert_eq!(snap.worker_busy_ns_min, 1_000);
+        assert_eq!(snap.worker_busy_ns_max, 2_000);
+        assert_eq!(snap.morsels_dispatched, 10);
+        assert_eq!(snap.wall_clock_ns, 123_456);
+    }
+
+    #[test]
+    fn take_query_metrics_is_non_draining() {
+        // Calling twice must produce identical values (modulo any
+        // intervening `record_*` activity, of which there is none).
+        let ctx = QueryContext::unbounded();
+        ctx.record_worker_snapshot(WorkerMetricsSnapshot {
+            worker_busy_ns: 500,
+            ..Default::default()
+        });
+        let first = ctx.take_query_metrics(1_000);
+        let second = ctx.take_query_metrics(1_000);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn take_query_metrics_includes_operator_snapshot() {
+        let ctx = QueryContext::unbounded();
+        ctx.metrics().record_rows_in(42);
+        ctx.metrics().record_spill_bytes_written(1024);
+        let snap = ctx.take_query_metrics(0);
+        assert_eq!(snap.operator.rows_in, 42);
+        assert_eq!(snap.operator.spill_bytes_written, 1024);
+    }
+
+    #[test]
+    fn take_query_metrics_with_no_workers_yields_zero_aggregate() {
+        // DDL / DELETE paths construct a QueryContext but never invoke
+        // `record_worker_snapshot`. Calling `take_query_metrics` on
+        // that context must produce a sensible all-zero aggregate
+        // rather than panicking or leaking uninitialised state.
+        let ctx = QueryContext::unbounded();
+        let snap = ctx.take_query_metrics(500);
+        assert_eq!(snap.num_workers, 0);
+        assert_eq!(snap.worker_busy_ns_min, 0);
+        assert_eq!(snap.worker_busy_ns_max, 0);
+        assert_eq!(snap.wall_clock_ns, 500);
+        // Derived metrics return None when num_workers is zero.
+        assert!(snap.gb_per_sec_scanned().is_none());
+    }
+
+    #[test]
+    fn take_query_metrics_stamps_cpu_flag() {
+        let ctx = QueryContext::unbounded().collect_cpu_metrics(true);
+        let snap = ctx.take_query_metrics(0);
+        assert!(snap.cpu_metrics_enabled);
     }
 
     #[test]
