@@ -331,6 +331,24 @@ Full multi-column pushdown via tuple-bloom or multi-key predicate is a Wave 5 op
 
 **Rationale.** Entity-id pushdown is the high-value case (storage-layer shard/segment pruning). Multi-component pushdown adds complexity disproportionate to its gain for typical cohort shapes.
 
+**Implementation notes (TASK-522).** The pushdown is implemented as
+`bqlite_core::storage::ScanConjunct::EntityIn { column, values, set_min, set_max }`.
+The engine extracts the entity-id set from a materialised cohort
+after the inner subquery completes, computes the set's min/max once
+for O(1) row-group zone-map acceptance, and threads the conjunct
+through pass-through plan nodes (`Filter` / `Project` / `Limit` /
+`FusedSegment` / nested `SubqueryFilter`) until it reaches the inner
+`Scan`. Per [`docs/design/planner/optimizer-direction.md`](../planner/optimizer-direction.md) §7 row 9
+the pushdown is **size-gated**: cohorts with `size >=
+COHORT_PUSHDOWN_MAX_SIZE` (65,536 in v1) and cohorts whose LHS is not
+a direct entity-key column reference are not pushed down and rely on
+the post-scan probe alone. Multi-column cohorts (the `(entity_id,
+day) IN ...` shape this section originally targeted) are likewise
+not pushed in v1 — the deferred multi-key generalization above
+remains future work. Correctness is preserved either way:
+[`SubqueryFilterOperator`](../../../crates/bqlite-operators/src/cohort.rs)
+probes the full cohort row by row regardless of which branch fires.
+
 ---
 
 ## 5. Planner Integration
@@ -479,9 +497,24 @@ For `MergeSources`, the output entity-key column is always named `entity_id` reg
   storage-layer scan-predicate vocabulary to grow a
   `column IN literal_set` shape.
 
-#### 6.3.1 Entity-id pushdown deferral (post-TASK-437)
+#### 6.3.1 Entity-id pushdown deferral (post-TASK-437) — RESOLVED by TASK-522
 
-The entity-id-component pushdown described in § 4.3 has not been
+> **Status:** Resolved by TASK-522 (2026-04-30). The
+> `ScanPredicate` taxonomy now includes
+> `ScanConjunct::EntityIn { column, values, set_min, set_max }`,
+> the engine bind step extracts the entity-id set from materialised
+> cohorts after the inner subquery completes (see
+> [`crates/bqlite-engine/src/cohort_pushdown.rs`](../../../crates/bqlite-engine/src/cohort_pushdown.rs)),
+> and threads the conjunct through pass-through plan nodes into the
+> outer `Scan` via [`ScanOperator::with_extra_conjuncts`](../../../crates/bqlite-operators/src/scan.rs).
+> The pushdown is size-gated per
+> [`optimizer-direction.md §7 row 9`](../planner/optimizer-direction.md)
+> (`COHORT_PUSHDOWN_MAX_SIZE = 65_536`); larger cohorts and
+> multi-column cohorts fall back to the post-scan probe path, which
+> is the v1 correctness baseline. The historical text below is
+> preserved for context.
+
+The entity-id-component pushdown described in § 4.3 was not
 wired into the scan layer in TASK-437. The cohort runtime is
 correct without it — every outer row is probed against the
 materialized hash set after the scan emits it — and the missing

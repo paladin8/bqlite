@@ -152,6 +152,7 @@ literals of a type compatible with `col`:
 | `col IS NULL`, `col IS NOT NULL` | `referrer IS NULL` | Nullability. Zone-map prunable via `null_count == 0` / `null_count == row_count`. |
 | `pushable AND pushable` | `event = 'x' AND amount > 10` | Conjunction of pushable shapes is pushable; evaluated as the intersection of per-conjunct acceptance. |
 | `NOT pushable` | `NOT (event = 'x')` | **Not directly pushable** in v1; the planner rewrites `NOT (col = lit)` to `col != lit` (which is pushable) and `NOT (col IS NULL)` to `col IS NOT NULL`, but generic negation stays in the filter. |
+| `entity_id IN <materialised cohort>` (engine-injected, TASK-522) | `entity_id IN buyers` after `buyers = events \| WHERE … \| SELECT entity_id` | **Not lowered from `CompiledExpr`** — the engine bind step constructs `ScanConjunct::EntityIn { column, values: Arc<Vec<PropertyValue>>, set_min, set_max }` directly after a `SubqueryFilter` materialises its cohort. Acceptance compares the cohort's `[set_min, set_max]` interval against the column zone-map: O(1) per row group, regardless of cohort size. Size-gated to `len() < 65_536` per [`optimizer-direction.md §7 row 9`](../planner/optimizer-direction.md). See [`cohorts-aliases-joins.md §4.3 / §6.3.1`](../language/cohorts-aliases-joins.md). |
 
 Any conjunct that does not match one of these shapes is
 non-pushable and remains in the parent `FilterPhysical`. Explicitly
@@ -838,7 +839,13 @@ Called out explicitly so we do not accidentally close them:
    add a `resolve_bloom` default method returning a bit that says
    "definitely absent" or "maybe present", and an `accepts_zone`-
    style hook for checking. No `ScanConjunct` shape change
-   required.
+   required. **Partially realised by TASK-522:** the
+   `EntityIn { column, values, set_min, set_max }` variant is the
+   engine-injected set-membership shape for cohort entity-id
+   pushdown; it skips dictionary rewrite and relies purely on the
+   precomputed `[set_min, set_max]` interval for O(1) zone-map
+   acceptance. Future bloom-filter work may either reuse this shape
+   or add a sibling variant alongside it.
 4. **Residual reuse across row-groups.** A conservative reader
    might return the same post-filter mask for every row-group in
    a segment. Nothing in the protocol forbids this, but also
