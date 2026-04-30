@@ -65,3 +65,10 @@ bitpacking = { version = "=0.9.3", default-features = false, features = ["bitpac
 # Pinned exactly because FSST's serialized symbol tables and compressed
 # payloads depend on the crate's wire format staying compatible.
 fsst = "=4.0.0"
+# Lock-free MPMC queue for the engine's per-query morsel queue
+# (engine/morsel-scheduler.md §4.1). `crossbeam-queue` is the slim
+# subcrate without the channel infrastructure.
+crossbeam-queue = "0.3"
+# Worker thread pool for the engine-side query scheduler
+# (engine/morsel-scheduler.md §5.1).
+rayon = "1.10"

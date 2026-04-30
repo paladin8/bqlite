@@ -58,6 +58,7 @@ pub mod delete;
 pub mod ingest;
 pub mod query;
 pub mod render;
+pub mod scheduler;
 pub mod warning_sink;
 
 pub use bind::bind_physical;
