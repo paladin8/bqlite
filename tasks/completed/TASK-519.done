@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-519",
   "claimed_at": "2026-04-30T06:21:31Z",
+  "completed_at": "2026-04-30T08:30:00Z",
   "branch": "task/TASK-519",
   "description": "Refactor Filter / Project / Limit onto fused stateless kernels"
 }
