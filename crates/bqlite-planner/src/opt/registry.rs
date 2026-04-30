@@ -43,8 +43,9 @@
 //! lives in `lib.rs` tests.
 
 use crate::opt::{
-    filter_order::order_stateless_filters, fuse_match_aggregate::fuse_match_aggregate,
-    prune::prune_columns, pushdown::pushdown_predicates, sample_pushdown::pushdown_sample,
+    coalesce_scan_predicates::coalesce_scan_predicates, filter_order::order_stateless_filters,
+    fuse_match_aggregate::fuse_match_aggregate, prune::prune_columns,
+    pushdown::pushdown_predicates, sample_pushdown::pushdown_sample,
 };
 use crate::physical::PhysicalPlan;
 use crate::stats::{PlannerStats, PlannerStatsView, StatsBudget};
@@ -209,6 +210,7 @@ impl OptimizerPipeline {
     /// 5. Pass 6.5 — `tier3_predicate_shape` (TASK-527 stub)
     /// 6. Pass 7 — `match_anchor_presence` (TASK-527 stub)
     /// 7. Pass 9 — `stateless_filter_order` (TASK-527)
+    /// 8. Pass 10 — `coalesce_scan_predicates` (TASK-527)
     ///
     /// Phase-5.2 rules: none registered here. TASK-522 will register
     /// Pass 8 (cohort/entity pushdown) on top of this baseline.
@@ -221,6 +223,7 @@ impl OptimizerPipeline {
             .with(Box::new(crate::opt::rules::Tier3PredicateShapeRule))
             .with(Box::new(crate::opt::rules::MatchAnchorPresenceRule))
             .with(Box::new(StatelessFilterOrderingRule))
+            .with(Box::new(ScanPredicateCoalesceRule))
     }
 
     /// Run every plan-time (`RulePhase::PlanTime`) rule in registration
@@ -397,6 +400,27 @@ impl OptimizerRule for StatelessFilterOrderingRule {
     }
     fn apply(&self, plan: PhysicalPlan, _ctx: &mut RuleContext<'_>) -> PhysicalPlan {
         order_stateless_filters(plan)
+    }
+}
+
+/// Wraps [`coalesce_scan_predicates`] (Pass 10, TASK-527). See
+/// `optimizer-direction.md` §7 row 11 — structural dedup +
+/// `InLiteralSet` union on each `ScanPhysical`'s `scan_predicates`
+/// list; no stats access.
+pub struct ScanPredicateCoalesceRule;
+
+impl OptimizerRule for ScanPredicateCoalesceRule {
+    fn id(&self) -> &'static str {
+        "coalesce_scan_predicates"
+    }
+    fn phase(&self) -> RulePhase {
+        RulePhase::PlanTime
+    }
+    fn budget(&self) -> StatsBudget {
+        StatsBudget::none()
+    }
+    fn apply(&self, plan: PhysicalPlan, _ctx: &mut RuleContext<'_>) -> PhysicalPlan {
+        coalesce_scan_predicates(plan)
     }
 }
 
@@ -590,9 +614,9 @@ mod tests {
     }
 
     #[test]
-    fn v1_registers_seven_rules_in_documented_order() {
+    fn v1_registers_eight_rules_in_documented_order() {
         let pipeline = OptimizerPipeline::v1();
-        assert_eq!(pipeline.rule_count(), 7);
+        assert_eq!(pipeline.rule_count(), 8);
         let stats = PlannerStats::empty();
         let mut trace = RuleTrace::default();
         let _ = pipeline.run_plan_time(dummy_scan(), &stats, &mut trace);
@@ -607,6 +631,7 @@ mod tests {
                 "tier3_predicate_shape",
                 "match_anchor_presence",
                 "stateless_filter_order",
+                "coalesce_scan_predicates",
             ]
         );
     }
@@ -617,9 +642,9 @@ mod tests {
         let stats = PlannerStats::empty();
         let mut trace = RuleTrace::default();
         let _ = pipeline.run_plan_time(dummy_scan(), &stats, &mut trace);
-        // The four pass wrappers + Pass 9 reorder report Applied; the
-        // two TASK-527 stubs (6.5 / 7) report Skipped because the
-        // registry is empty.
+        // The five concrete passes (Wave 0/2 wrappers + Pass 9 + Pass 10)
+        // report Applied; the two TASK-527 stubs (6.5 / 7) report Skipped
+        // because the registry is empty.
         let by_id: Vec<_> = trace
             .entries
             .iter()
@@ -641,6 +666,7 @@ mod tests {
                     RuleTraceOutcome::Skipped("no entity-presence bitmaps registered")
                 ),
                 ("stateless_filter_order", RuleTraceOutcome::Applied),
+                ("coalesce_scan_predicates", RuleTraceOutcome::Applied),
             ]
         );
     }

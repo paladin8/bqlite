@@ -90,7 +90,9 @@ walk plan; for every ScanPhysical:
 
 **Subtlety.** The dedup is structural — two `CompiledExpr` are duplicates iff their `CompiledNode` trees are equal. The Wave 0 `CompiledExpr` derives `PartialEq` already (verified via the predicate-pushdown tests at `crates/bqlite-planner/src/opt/pushdown.rs:419` and elsewhere). No deep canonicalization (no commutativity-aware sort) — that would be a bigger task and the spec says "equivalent", not "semantically equivalent".
 
-**InLiteralSet merging.** Only union sets that share `(column_index: usize, negated: bool, kernel: InSetKernel)` — the grouping key contains no `PropertyValue` (`PropertyValue` is `Eq + Ord` but **not `Hash`** per `crates/bqlite-core/src/storage.rs:364`). `PropertyValue` ordering is total for the literal types we care about (String/Int/Bool/Timestamp). For `Float` we conservatively skip the merge entirely if any value in the candidate group is `Float(_)` (NaN-vs-NaN inequality breaks both `BTreeSet` insertion and structural dedup). The merged `values` Vec is built from a `BTreeSet<PropertyValue>` for deterministic ordering. The dedup pass at the front of `coalesce` *also* leaves `Float(NaN)` duplicates alone naturally because two `Float(NaN)` literals do not compare equal under `==` — that is correct (preserves the worst-case semantics) and is locked in by a dedicated test (`float_nan_equality_predicates_are_not_deduplicated`).
+**InLiteralSet merging.** Only union sets that share `(column_index: usize, negated: bool, kernel: InSetKernel)` — the grouping key contains no `PropertyValue` (`PropertyValue` is `Eq + Ord` but **not `Hash`**). `PropertyValue` ordering is total for every literal type. The merged `values` Vec is built from a `BTreeSet<PropertyValue>` for deterministic ordering.
+
+**Float / NaN behavior** *(amended during CP2 implementation, 2026-04-30)*: an earlier draft of this plan special-cased `Float` to skip both dedup and union under the assumption that `NaN ≠ NaN` would corrupt the BTreeSet. Verification of `crates/bqlite-core/src/property.rs:237` and `:287` shows that bqlite intentionally uses `f64::total_cmp` for both `PartialEq` and `Ord` on `PropertyValue::Float` — `Float(NaN) == Float(NaN)` is true under bqlite's total ordering, and `BTreeSet<PropertyValue>` is well-defined for any Float value. The implementation therefore performs Float merge / dedup like every other type. Tests `float_nan_equality_predicates_are_deduplicated` and `float_in_set_with_nan_is_unioned_under_total_ordering` lock in the behavior.
 
 **Determinism.** Output ordering: dedup-survivors in first-seen order, with merged `InLiteralSet` conjuncts placed at the position of their first occurrence. No `PlannerStats` access — `StatsBudget::none()`.
 
@@ -201,8 +203,8 @@ Wait — re-reading §9, the order is: 6.5, 7, 9, 10. Pass 9 is filter ordering 
 - `negated_in_literal_sets_are_left_alone` — only `negated: false` qualifies.
 - `unrelated_conjuncts_pass_through_unchanged`
 - `mixed_dedup_and_union` — full case.
-- `float_values_in_set_are_not_merged` — `[col IN (1.0), col IN (2.0)]` stays as two conjuncts.
-- `float_nan_equality_predicates_are_not_deduplicated` — `[col = NaN, col = NaN]` stays as two conjuncts (NaN ≠ NaN by `PartialEq`).
+- `float_nan_equality_predicates_are_deduplicated` — `[col = NaN, col = NaN]` collapses (bqlite uses `total_cmp` for `PartialEq` on Float, so `NaN == NaN` is true). See the §2.2 Float / NaN amendment.
+- `float_in_set_with_nan_is_unioned_under_total_ordering` — `[col IN (NaN), col IN (NaN)]` merges into one set with a single NaN entry under `BTreeSet<PropertyValue>` total ordering.
 - `bare_scan_with_no_predicates_is_unchanged`
 - `walks_into_fused_segment_input`, `walks_into_sequence_match_input`, `walks_into_explain`
 - `idempotent`
