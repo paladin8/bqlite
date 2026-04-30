@@ -2,6 +2,7 @@
   "agent_id": "agent-4",
   "task_id": "TASK-523",
   "claimed_at": "2026-04-30T06:29:14Z",
+  "completed_at": "2026-04-30T07:21:02Z",
   "branch": "task/TASK-523",
   "description": "Morsel scheduler + partial-aggregate handoff"
 }
