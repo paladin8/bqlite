@@ -644,6 +644,7 @@ mod spill_fallback {
             .expect("default-budget order by");
         let opts = QueryOptions {
             memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES),
+            ..QueryOptions::default()
         };
         let r_floor = engine
             .query_with_options("purchases | ORDER BY ts ASC", &mut db, &opts)
