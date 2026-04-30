@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-524",
   "claimed_at": "2026-04-30T06:44:47Z",
+  "completed_at": "2026-04-30T07:25:00Z",
   "branch": "task/TASK-524",
   "description": "CPU/skew metrics + `--explain-perf` surface"
 }
