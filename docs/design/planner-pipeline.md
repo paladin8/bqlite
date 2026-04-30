@@ -26,7 +26,7 @@ This document is the source of truth for how BQL queries become physical plans. 
 
 ### 1.2 Non-Goals
 
-- **Cost-based optimization.** Rule-based only for v1. Structural rewrites are sufficient for linear BQL pipelines.
+- **Cost-based optimization.** Rule-based only for v1. Wave 5 admits **narrow heuristic gating** (`docs/design/planner/optimizer-direction.md` §3): rules remain pure structural functions, but a small allowlisted set may consult `PlannerStats` (optimizer-direction.md §6) for go/no-go decisions on a single rule. No plan-space search, no cost minimization, no continuous selectivity estimation.
 - **Multi-query optimization.** Each query is planned independently. Aliases provide manual sharing of intermediate results (query-language.md §18).
 - **Plan caching across sessions.** Compilation is cheap relative to execution; caching adds complexity with little benefit.
 - **Iterative optimizer passes.** Passes run in a fixed order with no fixpoint iteration.
@@ -509,18 +509,18 @@ Exact column names, types, and nullability are defined in type-system.md §6.
 
 | Question                          | Decision                                | Rationale                                                                 |
 | --------------------------------- | --------------------------------------- | ------------------------------------------------------------------------- |
-| Cost model?                       | Rule-based only                         | Transformations are always beneficial for linear pipelines                |
+| Cost model?                       | Rule-based only with narrow heuristic gating (Wave 5) | Wave 5 reconciliation in `optimizer-direction.md` §3: rules remain pure structural functions, no plan-space search, but a small allowlisted set may consult `PlannerStats` for go/no-go decisions |
 | Pass ordering?                    | Fixed, single pass                      | No circular interactions between rules                                    |
 | Fixpoint iteration?               | Not needed                              | One pass per rule is provably sufficient                                  |
 | Multi-query optimization?         | Not in v1                               | Aliases provide manual sharing                                            |
 | Plan caching across queries?      | Not in v1                               | Compilation is cheap relative to execution                                |
-| Statistics from storage?          | Not in v1                               | No cardinality estimates; zone maps used only at scan runtime             |
+| Statistics from storage?          | Allowlisted catalog metadata + index registry booleans + post-materialization cohort sizes (Wave 5) | `optimizer-direction.md` §4 catalog of admitted sources; no NDV, no histograms, no continuous selectivity |
 
-The optimizer is a sequence of small rewriters. Each rewriter is a function from `LogicalPlan` to `LogicalPlan` that visits the tree and performs a specific transformation. They are composed in a fixed order; running them twice is always a no-op on a stable plan.
+The optimizer is a sequence of small rewriters. Each rewriter is a function from `LogicalPlan` to `LogicalPlan` (or `PhysicalPlan` for the late passes) that visits the tree and performs a specific transformation. They are composed in a fixed order; running them twice is always a no-op on a stable plan. Wave 5 introduces a rule registry + driver in `bqlite-planner::opt::registry` (TASK-521) that owns the physical-side passes and produces a `RuleTrace` for EXPLAIN; the driver is still a single sequential walk over registered rules, with no plan-space search.
 
 ### 6.2 Pass Order
 
-The six passes run in this exact order. Each pass depends on the output form of its predecessors:
+Wave 0 / Wave 2–4 passes (1–6) run during AST → logical lowering, in this exact order. Each pass depends on the output form of its predecessors:
 
 1. **Expression inlining** — resolve `Let` / computed columns to their defining expressions
 2. **Predicate pushdown** — move `Filter` nodes closer to scans
@@ -528,6 +528,16 @@ The six passes run in this exact order. Each pass depends on the output form of 
 4. **Projection pruning / demand collection** — determine which columns the scan must produce
 5. **Constant folding** — evaluate constant subexpressions
 6. **General fusion detection** — set `fused_downstream` on stateful operators
+
+Wave 5 extends the sequence with the following physical-side passes (per `optimizer-direction.md` §9). The numbering is decimal-extended rather than renumbering 1–6, so existing references to "Pass 4" in other docs stay valid:
+
+7. **Pass 6.5 — Tier-3 value-set predicate-shape gating** *(plan-time; reads `PlannerStats.value_set_indexed`; owned by TASK-527; framework slot lands in TASK-521)*
+8. **Pass 7 — MATCH anchor presence-bitmap pushdown** *(plan-time; reads `PlannerStats.entity_presence_indexed`; owned by TASK-527; framework slot lands in TASK-521)*
+9. **Pass 8 — Cohort/entity pushdown into scan** *(post-cohort phase, runs in `bqlite-engine` after `PlannerStats::bind_cohorts`; reads `cohort_size`; owned by TASK-522)*
+10. **Pass 9 — Stateless filter ordering inside fused segment** *(plan-time; pure structural; owned by TASK-527)*
+11. **Pass 10 — Scan-pushdown filter coalescing** *(plan-time; pure structural; owned by TASK-527)*
+
+Passes 6.5, 7, 9, 10 run in plan-time (phase 5.1). Pass 8 runs in the engine after cohort materialization (phase 5.2). Plan-time output is a `PhysicalPlan` that phase 5.2 may further mutate before execution starts. The framework that drives these passes (rule registry, `PlannerStatsView` budget enforcement, `RuleTrace` for EXPLAIN) lands with TASK-521; rule bodies for passes 6.5 / 7 / 9 / 10 are TASK-527's deliverable; Pass 8 plus the engine-side phase-5.2 driver is TASK-522's.
 
 ### 6.3 Pass 1: Expression Inlining
 
@@ -1182,6 +1192,10 @@ pub enum ExplainNode {
 
 `ExplainNode` is a simple string-based mirror of the physical plan — it exists so that EXPLAIN output is stable across executor changes.
 
+### 10.2.1 Rule trace (Wave 5 addition)
+
+The TASK-521 framework appends a `rule_trace:` section after the existing tree dump, listing every optimizer rule that ran (or was eligible to run) along with its outcome. `optimizer-direction.md` §8.2 fixes the visibility contract: every stat read by a rule appears in the trace, including reads that did not change the plan. The format is freed by TASK-521 implementation; the existing tree dump is unchanged so consumers that match on Scan / Filter / Project / etc. continue to work. The exact rendering is described in TASK-521's plan and is exercised by the planner's `plan_with_trace` entry point.
+
 ### 10.3 What EXPLAIN Does Not Show
 
 - Runtime statistics (row counts, timings). `EXPLAIN ANALYZE` is a potential v2 addition.
@@ -1414,7 +1428,7 @@ The following open questions from TASK-006 and the design notes are resolved:
 | Fusion scope?                                          | Stateful operator → (filter →)? aggregate, adjacent only                                           | Simple, predictable; handles the high-value cases                                                     |
 | Chains of stateful operators?                          | v1 does not fuse across stateful-operator boundaries; `WITHIN SESSION` is a MATCH-internal special | Keeps fusion detection tractable                                                                      |
 | Demand propagation direction?                          | Backward (root → scan)                                                                             | Standard approach; matches execution-model.md §8.2                                                    |
-| Statistics from storage?                               | Not used for planning in v1                                                                        | Zone maps are consulted at scan runtime, not at plan time                                             |
+| Statistics from storage?                               | Allowlisted catalog metadata + index registry booleans + post-materialization cohort sizes (Wave 5) | `optimizer-direction.md` §4 catalog of admitted sources; zone maps and Tier-1/2/3 bitmaps are runtime-only inputs to the scan, not plan-time stats |
 | Scan time range extension when MATCH has WINDOW?       | Planner extends upper bound by `max(window, max_bracket)`; entry-step predicates still filter the user's stated range | Ensures matches can complete without changing reported anchor ranges                                  |
 | Error surfacing model?                                 | Planner halts on the first `TypeError`; no partial planning                                        | Matches parser-halt-on-first-error in query-language.md §27                                           |
 | ATTRIBUTE output shape?                                | Auto-unnest: emit one flat row per `(entity, conversion, matched-touchpoint)` with a single String `touchpoint_key` column | Avoids BQL's type-system gap around `List(Struct)`/`List(Map)` and removes the need for a separate UNNEST operator |
@@ -1431,7 +1445,9 @@ The following open questions from TASK-006 and the design notes are resolved:
 | `LogicalPlan`, `TypedExpr`          | `bqlite-planner` | Typed logical plan                                        |
 | `type_check(expr, schema)`          | `bqlite-planner` | Expression typing (sole entry point)                      |
 | Desugaring (FUNNEL, RETENTION, LET) | `bqlite-planner` | Runs during lowering                                      |
-| Optimizer passes 1–7                | `bqlite-planner` | Rule-based structural rewrites                            |
+| Optimizer passes 1–6 + 6.5 + 7 + 9 + 10 | `bqlite-planner` | Rule-based structural rewrites; physical-side passes driven by `bqlite-planner::opt::registry` (TASK-521) |
+| Optimizer Pass 8 (cohort/entity pushdown) | `bqlite-engine` | Phase-5.2 rule that runs after cohort materialization; lives in the engine's query coordinator because cohort sizes only exist there. The rule consumes planner types directly — no reverse dependency on the engine from the planner. |
+| `PlannerStats`, `StatsBudget`, `PlannerStatsView`, `RuleTrace` | `bqlite-planner::stats` / `bqlite-planner::opt::registry` | Wave 5 statistics surface and optimizer rule registry (TASK-521 / TASK-504) |
 | `DemandSet`                          | `bqlite-planner` | Downstream-needs value carried through backward pass      |
 | `DemandCapabilities`                 | `bqlite-planner` | Operator-side capability advertisement (demand-protocol.md §2–§3) |
 | `DemandPropagation`                  | `bqlite-planner` | Object-safe trait for capability queries (demand-protocol.md §5) |

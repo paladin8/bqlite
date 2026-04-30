@@ -120,20 +120,12 @@ pub use stats::{CohortId, PlannerStats, PlannerStatsView, StatsBudget};
 ///    that swaps `TypedExpr` for `CompiledExpr` and resolves AST time
 ///    ranges into absolute [`bqlite_core::TimeRange`] bounds using
 ///    `now_ns` as the current Unix epoch nanoseconds.
-/// 3. [`opt::fuse_match_aggregate::fuse_match_aggregate`] (TASK-320) —
-///    detects `Aggregate(SequenceMatch(...))` pairs where the aggregate
-///    can be fulfilled from the match output, fuses the aggregate into
-///    `SequenceMatchPhysical.fused_aggregate`, and elides the
-///    `Aggregate` node. Must run before pushdown and prune so the plan
-///    shape is correct for those passes.
-/// 4. [`opt::pushdown::pushdown_predicates`] (TASK-227) — moves
-///    `Filter(Scan)` conjuncts into `ScanPhysical::scan_predicates`
-///    and elides the `Filter` node when all conjuncts are pushable.
-///    DDL / DML leaf nodes are returned unchanged.
-/// 5. [`opt::prune::prune_columns`] (TASK-228) — propagates a
-///    backward demand set from the root to the scan and writes
-///    `ScanPhysical::projected_columns` with the minimal sorted column
-///    list. DDL / DML leaf nodes are returned unchanged.
+/// 3. [`opt::OptimizerPipeline::v1`] (TASK-521) — drives the Wave 5
+///    rule registry, applying `fuse_match_aggregate`, `sample_pushdown`,
+///    `predicate_pushdown`, `projection_pruning`, plus the Pass 6.5 /
+///    Pass 7 stub rules in registration order. The rule trace produced
+///    here is discarded by [`plan`]; callers that want the trace (for
+///    EXPLAIN) should use [`plan_with_trace`].
 ///
 /// # Errors
 ///
@@ -145,7 +137,8 @@ pub use stats::{CohortId, PlannerStats, PlannerStatsView, StatsBudget};
 ///   columns, missing role columns, invalid `ALTER` action).
 pub fn plan(statement: Statement, catalog: &dyn Catalog, now_ns: i64) -> Result<PhysicalPlan> {
     let logical = lower_statement(statement, catalog)?;
-    finalize_physical(logical, now_ns)
+    let (physical, _trace) = finalize_physical(logical, now_ns);
+    Ok(physical)
 }
 
 /// Lower a full BQL script (zero or more `DefineAlias` statements followed
@@ -161,27 +154,45 @@ pub fn plan_script(
     now_ns: i64,
 ) -> Result<PhysicalPlan> {
     let logical = lower_statements(statements, catalog)?;
-    finalize_physical(logical, now_ns)
+    let (physical, _trace) = finalize_physical(logical, now_ns);
+    Ok(physical)
 }
 
-fn finalize_physical(logical: LogicalPlan, now_ns: i64) -> Result<PhysicalPlan> {
+/// Compile a [`Statement`] into a [`PhysicalPlan`] **and** the
+/// [`opt::RuleTrace`] produced by the optimizer pipeline.
+///
+/// This is the trace-returning sibling of [`plan`]. Used by the
+/// engine's `EXPLAIN` batch builder to render the per-rule outcomes
+/// alongside the formatted plan tree (`optimizer-direction.md` §8.2).
+///
+/// The `now_ns` argument has the same semantics as in [`plan`].
+pub fn plan_with_trace(
+    statement: Statement,
+    catalog: &dyn Catalog,
+    now_ns: i64,
+) -> Result<(PhysicalPlan, opt::RuleTrace)> {
+    let logical = lower_statement(statement, catalog)?;
+    Ok(finalize_physical(logical, now_ns))
+}
+
+/// Like [`plan_with_trace`] but accepts a full BQL script (mirrors
+/// [`plan_script`]).
+pub fn plan_script_with_trace(
+    statements: Vec<Statement>,
+    catalog: &dyn Catalog,
+    now_ns: i64,
+) -> Result<(PhysicalPlan, opt::RuleTrace)> {
+    let logical = lower_statements(statements, catalog)?;
+    Ok(finalize_physical(logical, now_ns))
+}
+
+fn finalize_physical(logical: LogicalPlan, now_ns: i64) -> (PhysicalPlan, opt::RuleTrace) {
     let physical = lower_physical(logical, now_ns);
-    // Wave 3 fusion pass (TASK-320): fuse Aggregate(SequenceMatch) pairs.
-    // Runs first so the plan shape downstream sees the fused schema.
-    let physical = opt::fuse_match_aggregate::fuse_match_aggregate(physical);
-    // Wave 4 sample pushdown (TASK-430). Runs before predicate pushdown
-    // so `Sample(Filter(Scan))` first becomes `Filter(Scan_with_sample)`;
-    // the subsequent predicate-pushdown pass then collapses the filter
-    // into `Scan::scan_predicates`. Running in the other order would
-    // leave the filter above the scan because predicate pushdown does
-    // not recurse through `Sample`.
-    let physical = opt::sample_pushdown::pushdown_sample(physical);
-    // Apply Wave 2 optimizer passes in order (TASK-227, TASK-228).
-    // Both passes treat DDL / DML leaves as identity, so it is safe to
-    // apply them unconditionally regardless of statement kind.
-    let physical = opt::pushdown::pushdown_predicates(physical);
-    let physical = opt::prune::prune_columns(physical);
-    Ok(physical)
+    let pipeline = opt::OptimizerPipeline::v1();
+    let stats = stats::PlannerStats::empty();
+    let mut trace = opt::RuleTrace::with_capacity(pipeline.rule_count());
+    let physical = pipeline.run_plan_time(physical, &stats, &mut trace);
+    (physical, trace)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -558,5 +569,99 @@ mod tests {
             }
             other => panic!("expected Plan error for alias, got {other:?}"),
         }
+    }
+
+    // ── TASK-521: optimizer pipeline + rule trace ───────────────────
+
+    #[test]
+    fn plan_with_trace_returns_six_v1_rule_entries() {
+        // The Wave 5 pipeline registers exactly six rules per
+        // `optimizer-direction.md` §9; the trace surfaces every one
+        // regardless of whether the rule modified the plan.
+        let catalog = InMemoryCatalog::default().with(events_schema());
+        let stmt = Statement::Query(bare_pipeline("events"));
+        let (_plan, trace) = plan_with_trace(stmt, &catalog, 0).unwrap();
+        let ids: Vec<&str> = trace.entries.iter().map(|e| e.rule).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "fuse_match_aggregate",
+                "sample_pushdown",
+                "predicate_pushdown",
+                "projection_pruning",
+                "tier3_predicate_shape",
+                "match_anchor_presence",
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_with_trace_is_deterministic() {
+        // `optimizer-direction.md` §8.1: identical inputs produce
+        // identical (plan, trace) pairs. The trace is part of the
+        // deterministic surface.
+        //
+        // Use a pipeline that exercises predicate pushdown, sample
+        // pushdown, and projection pruning so the wrapped passes have
+        // real structural work to do. A bare scan would only catch
+        // HashMap-iteration ordering bugs in the trace.
+        let catalog = InMemoryCatalog::default().with(events_schema());
+        let where_stage = PipelineStage::Where {
+            predicate: Spanned {
+                node: Expr::Compare {
+                    op: bqlite_ast::expr::CompareOp::Equal,
+                    left: Box::new(Spanned {
+                        node: Expr::Column(Name::synthetic("event_type")),
+                        span: Span::EMPTY,
+                    }),
+                    right: Box::new(Spanned {
+                        node: Expr::Literal(Literal::String("purchase".into())),
+                        span: Span::EMPTY,
+                    }),
+                },
+                span: Span::EMPTY,
+            },
+            span: Span::EMPTY,
+        };
+        let sample_stage = PipelineStage::Sample(bqlite_ast::Sample {
+            fraction: 0.5,
+            seed: Some(17),
+            span: Span::EMPTY,
+        });
+        let pipeline = Pipeline {
+            source: Source {
+                primary: table_ref("events"),
+                joins: vec![],
+                time_range: None,
+                span: Span::EMPTY,
+            },
+            stages: vec![where_stage, sample_stage],
+            span: Span::EMPTY,
+        };
+        let stmt = Statement::Query(pipeline);
+        let (plan1, trace1) = plan_with_trace(stmt.clone(), &catalog, 1234).unwrap();
+        let (plan2, trace2) = plan_with_trace(stmt, &catalog, 1234).unwrap();
+        // Plans don't impl PartialEq directly; compare via EXPLAIN
+        // tree which is a deterministic string mirror.
+        let plan_text1 = format_explain(&build_explain_node(&plan1));
+        let plan_text2 = format_explain(&build_explain_node(&plan2));
+        assert_eq!(plan_text1, plan_text2);
+        assert_eq!(trace1, trace2);
+        // Sanity: the plan must show the pushed predicate, proving the
+        // optimizer actually ran (not a no-op tautology).
+        assert!(
+            plan_text1.contains("event_type = 'purchase'"),
+            "expected pushed predicate in plan, got:\n{plan_text1}"
+        );
+    }
+
+    #[test]
+    fn plan_discards_trace_so_existing_callers_unaffected() {
+        // `plan` is the legacy entry point; it must continue to return
+        // a bare PhysicalPlan. The trace machinery is opt-in via
+        // `plan_with_trace`. This guards the API contract.
+        let catalog = InMemoryCatalog::default().with(events_schema());
+        let stmt = Statement::Query(bare_pipeline("events"));
+        let _: PhysicalPlan = plan(stmt, &catalog, 0).unwrap();
     }
 }
