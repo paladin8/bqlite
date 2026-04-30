@@ -2,6 +2,7 @@
   "agent_id": "agent-4",
   "task_id": "TASK-525",
   "claimed_at": "2026-04-30T07:21:34Z",
+  "completed_at": "2026-04-30T07:59:11Z",
   "branch": "task/TASK-525",
   "description": "Memory-pressure, spill, and cancellation stress suite"
 }
