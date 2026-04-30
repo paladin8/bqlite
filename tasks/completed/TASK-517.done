@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-517",
   "claimed_at": "2026-04-30T05:31:16Z",
+  "completed_at": "2026-04-30T06:06:38Z",
   "branch": "task/TASK-517",
   "description": "Merge without `interleave` + late materialization boundary"
 }
