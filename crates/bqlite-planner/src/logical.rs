@@ -1998,27 +1998,22 @@ fn lower_match(
     }
 
     // 3a. bracket / bracket_end columns when BRACKETS is specified.
-    // query-language.md §4.12 eventually requires one row per (entity,
-    // binding track, bracket), but the matcher runtime does not yet
-    // track brackets (the matcher's `step_counter` module has a single
-    // scan-widening reference but no per-bracket emission). Until the
-    // matcher learns to enumerate brackets, these columns are
-    // advertised as nullable so `MATCH … BRACKETS [..]` (and therefore
-    // the RETENTION sugar that desugars to it) can at least complete
-    // end-to-end and feed downstream stages without violating Arrow's
-    // non-nullable contract. Per-bracket semantics need a matcher
-    // change before the nullability can be tightened.
+    // query-language.md §4.12: one row per (entity, binding track,
+    // bracket). Both columns are non-null — the matcher's output layer
+    // emits a real value for every row (TASK-529). `bracket` is the
+    // 0-indexed bracket position; `bracket_end` is the bracket's
+    // anchor-relative upper-bound duration in nanoseconds.
     if pattern.brackets.is_some() {
         output_columns.push(ColumnDef {
             name: "bracket".to_string(),
             bql_type: BqlType::Int,
-            nullable: true,
+            nullable: false,
             default_value: None,
         });
         output_columns.push(ColumnDef {
             name: "bracket_end".to_string(),
             bql_type: BqlType::Int,
-            nullable: true,
+            nullable: false,
             default_value: None,
         });
     }

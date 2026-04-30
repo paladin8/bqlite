@@ -34,7 +34,7 @@ use bqlite_core::{BqlType, ColumnDef, EntityId, OperatorSchema, TimeRange};
 use bqlite_planner::compile::{CompiledNfa, MatchStrategy};
 use bqlite_planner::demand::{CompiledFusableAggregate, DemandCapabilities};
 use bqlite_planner::physical::SequenceMatchPhysical;
-use bqlite_planner::PhysicalPlan;
+use bqlite_planner::{BracketSpec, PhysicalPlan};
 
 use crate::aggregate::Accumulator;
 use crate::operator::EntityOperator;
@@ -147,10 +147,28 @@ impl SequenceMatchOperator {
         // aggregate schema. Build the original match output schema so
         // `finish_entity_into` can construct intermediate batches.
         let match_output_schema = if desc.fused_aggregate.is_some() {
-            Some(Self::build_match_output_schema(emit_all, num_steps))
+            Some(Self::build_match_output_schema(
+                emit_all,
+                num_steps,
+                desc.compiled_nfa.brackets.as_ref(),
+            ))
         } else {
             None
         };
+
+        // Demand-pruning sanity (TASK-529): if `BRACKETS` is set but the
+        // unfused output schema does not carry the `bracket` column,
+        // demand analysis stripped a column the matcher must populate.
+        // Catch that mismatch here rather than producing silently empty
+        // bracket rows downstream. The fused path replaces
+        // `output_schema` with the aggregate schema, so we only check
+        // when fusion is off.
+        debug_assert!(
+            desc.fused_aggregate.is_some()
+                || desc.compiled_nfa.brackets.is_none()
+                || desc.output_schema.column("bracket").is_some(),
+            "BRACKETS set but `bracket` column pruned from match output schema",
+        );
 
         Self {
             strategy,
@@ -255,6 +273,16 @@ impl SequenceMatchOperator {
         }
     }
 
+    /// Borrow the brackets spec from the underlying compiled NFA, if any.
+    /// Returned as `Option<&BracketSpec>` so the matcher's output layer
+    /// can decide whether to expand into per-bracket rows.
+    fn brackets(&self) -> Option<&BracketSpec> {
+        match &self.strategy {
+            StrategyDriver::StepCounter(sim) => sim.nfa().brackets.as_ref(),
+            StrategyDriver::Nfa(sim) => sim.nfa().brackets.as_ref(),
+        }
+    }
+
     /// Build the minimal match output schema needed by the fused
     /// `finish_entity_into` path to construct intermediate batches.
     ///
@@ -262,8 +290,13 @@ impl SequenceMatchOperator {
     /// aggregate schema, we can no longer call `build_output_batch`
     /// using `self.output_schema`. This method builds the match-level
     /// schema with the columns that `build_output_batch` knows how to
-    /// populate: `entity_id`, `match_duration`, and `step_reached`.
-    fn build_match_output_schema(emit_all: bool, _num_steps: u8) -> OperatorSchema {
+    /// populate: `entity_id`, `match_duration`, `step_reached`, and the
+    /// `bracket` / `bracket_end` pair when BRACKETS is active.
+    fn build_match_output_schema(
+        emit_all: bool,
+        _num_steps: u8,
+        brackets: Option<&BracketSpec>,
+    ) -> OperatorSchema {
         let mut cols = vec![
             ColumnDef {
                 name: "entity_id".into(),
@@ -281,6 +314,20 @@ impl SequenceMatchOperator {
         if emit_all {
             cols.push(ColumnDef {
                 name: "step_reached".into(),
+                bql_type: BqlType::Int,
+                nullable: false,
+                default_value: None,
+            });
+        }
+        if brackets.is_some() {
+            cols.push(ColumnDef {
+                name: "bracket".into(),
+                bql_type: BqlType::Int,
+                nullable: false,
+                default_value: None,
+            });
+            cols.push(ColumnDef {
+                name: "bracket_end".into(),
                 bql_type: BqlType::Int,
                 nullable: false,
                 default_value: None,
@@ -369,6 +416,7 @@ impl EntityOperator for SequenceMatchOperator {
             &partials,
             self.emit_all,
             self.num_steps,
+            self.brackets(),
         ))
     }
 
@@ -391,6 +439,7 @@ impl EntityOperator for SequenceMatchOperator {
                         &partials,
                         self.emit_all,
                         self.num_steps,
+                        self.brackets(),
                     );
                     accumulator.update_batch(&batch)?;
                 }

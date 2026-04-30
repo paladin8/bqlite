@@ -76,6 +76,11 @@ pub use compile::{
     classify_pattern, compile_pattern, select_strategy, CompiledNfa, MatchExecutionConfig,
     MatchStrategy, NfaState, PatternClass, PoisonTransition, Transition, VariableBindingDef,
 };
+// Re-export the AST-defined `BracketSpec` so downstream crates (e.g. the
+// matcher in `bqlite-operators`) can name the type without taking a
+// direct production dependency on `bqlite-ast` (CLAUDE.md dependency
+// direction allows `ast` only as a test-only dep for those crates).
+pub use bqlite_ast::pattern::BracketSpec;
 pub use compiled::{
     ArithKernel, ArrowKernelId, CastKernel, CompareKernel, CompiledExpr, CompiledNode, FunctionId,
     FunctionKernel, InSetKernel, LogicalKernel, UnaryKernel,
