@@ -68,6 +68,7 @@ pub mod expr;
 pub mod logical;
 pub mod opt;
 pub mod physical;
+pub mod stats;
 
 pub use compile::{
     classify_pattern, compile_pattern, select_strategy, CompiledNfa, MatchExecutionConfig,
@@ -99,6 +100,7 @@ pub use physical::{
     SubqueryFilterPhysical, DEFAULT_FILTER_TILE_SIZE, DEFAULT_MAX_GROUPS, DEFAULT_SAMPLE_SEED,
     DEFAULT_SORT_MAX_ROWS, MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
 };
+pub use stats::{CohortId, PlannerStats, PlannerStatsView, StatsBudget};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Plan entry point
