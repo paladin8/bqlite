@@ -1856,3 +1856,297 @@ mod tests {
         assert_eq!(amt.value(0), 77); // LAST qualifying, not overall last.
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property tests (TASK-531, event-select-sample.md §22.1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod proptests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, StringViewBuilder, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use proptest::prelude::*;
+
+    use bqlite_core::{BqlType, ColumnDef, EntityId, OperatorSchema, SEQ_ID_COLUMN};
+    use bqlite_planner::logical::EventSelectKind;
+    use bqlite_planner::physical::{EventSelectPhysical, PhysicalPlan, ScanPhysical};
+
+    use super::EventSelectOperator;
+    use crate::operator::EntityOperator;
+
+    // ── Schemas ──────────────────────────────────────────────────────────────
+
+    fn input_schema() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required(SEQ_ID_COLUMN, BqlType::Int),
+            ColumnDef::required("event_type", BqlType::String),
+        ])
+        .unwrap()
+    }
+
+    fn output_schema() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+        ])
+        .unwrap()
+    }
+
+    fn make_op(kind: EventSelectKind) -> EventSelectOperator {
+        let scan = ScanPhysical {
+            table: "events".to_string(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: input_schema(),
+            entity_key_col: "entity_id".to_string(),
+            timestamp_col: "ts".to_string(),
+            sample: None,
+        };
+        let desc = EventSelectPhysical {
+            kind,
+            event_types: vec!["purchase".to_string()],
+            predicate: None,
+            lookback: None,
+            forwarded_columns: vec![],
+            fused_aggregate: None,
+            input: Box::new(PhysicalPlan::Scan(scan)),
+            output_schema: output_schema(),
+            pre_fusion_output_schema: None,
+        };
+        EventSelectOperator::new(&desc, &input_schema())
+    }
+
+    // ── Strategies ───────────────────────────────────────────────────────────
+
+    /// Generate a sequence of (is_qualifying, ts_delta) pairs.
+    ///
+    /// ts_delta ∈ 1..=100 so timestamps are strictly increasing (no ties).
+    /// is_qualifying = true → event_type "purchase" (the target type).
+    fn arb_events() -> impl Strategy<Value = Vec<(bool, i64)>> {
+        prop::collection::vec((any::<bool>(), 1i64..=100), 1..=32)
+    }
+
+    // ── Batch / output helpers ────────────────────────────────────────────────
+
+    fn build_batch(events: &[(bool, i64)]) -> RecordBatch {
+        let n = events.len();
+        let mut ts_vals: Vec<i64> = Vec::with_capacity(n);
+        let mut seq_vals: Vec<i64> = Vec::with_capacity(n);
+        let mut eid_b = StringViewBuilder::with_capacity(n);
+        let mut et_b = StringViewBuilder::with_capacity(n);
+
+        let mut ts: i64 = 0;
+        for (i, (is_q, delta)) in events.iter().enumerate() {
+            ts += delta;
+            ts_vals.push(ts);
+            seq_vals.push(i as i64);
+            eid_b.append_value("e1");
+            et_b.append_value(if *is_q { "purchase" } else { "login" });
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("entity_id", DataType::Utf8View, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(SEQ_ID_COLUMN, DataType::Int64, false),
+            Field::new("event_type", DataType::Utf8View, false),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(eid_b.finish()) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(ts_vals).with_timezone("UTC")) as ArrayRef,
+                Arc::new(Int64Array::from(seq_vals)) as ArrayRef,
+                Arc::new(et_b.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn build_batch_for_entity(entity_id: &str, events: &[(bool, i64)]) -> RecordBatch {
+        let n = events.len();
+        let mut ts_vals: Vec<i64> = Vec::with_capacity(n);
+        let mut seq_vals: Vec<i64> = Vec::with_capacity(n);
+        let mut eid_b = StringViewBuilder::with_capacity(n);
+        let mut et_b = StringViewBuilder::with_capacity(n);
+
+        let mut ts: i64 = 0;
+        for (i, (is_q, delta)) in events.iter().enumerate() {
+            ts += delta;
+            ts_vals.push(ts);
+            seq_vals.push(i as i64);
+            eid_b.append_value(entity_id);
+            et_b.append_value(if *is_q { "purchase" } else { "login" });
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("entity_id", DataType::Utf8View, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(SEQ_ID_COLUMN, DataType::Int64, false),
+            Field::new("event_type", DataType::Utf8View, false),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(eid_b.finish()) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(ts_vals).with_timezone("UTC")) as ArrayRef,
+                Arc::new(Int64Array::from(seq_vals)) as ArrayRef,
+                Arc::new(et_b.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn run_op(op: &EventSelectOperator, batch: &RecordBatch) -> Option<RecordBatch> {
+        run_op_as(op, batch, "e1")
+    }
+
+    fn run_op_as(
+        op: &EventSelectOperator,
+        batch: &RecordBatch,
+        entity_id: &str,
+    ) -> Option<RecordBatch> {
+        let mut state = op.create_state(&EntityId::from(entity_id));
+        op.process_sub_batch(&mut state, batch);
+        op.finish_entity(state)
+    }
+
+    fn output_ts(out: &RecordBatch) -> i64 {
+        out.column_by_name("ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap()
+            .value(0)
+    }
+
+    /// Collect timestamps of qualifying events in arrival order.
+    fn qualifying_ts(events: &[(bool, i64)]) -> Vec<i64> {
+        let mut ts: i64 = 0;
+        events
+            .iter()
+            .filter_map(|(is_q, delta)| {
+                ts += delta;
+                if *is_q {
+                    Some(ts)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    // ── Properties ───────────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// §22.1 (1) — output cardinality is exactly 0 or 1 rows per entity,
+        /// for all three selection modes.
+        #[test]
+        fn output_cardinality_zero_or_one(events in arb_events()) {
+            let batch = build_batch(&events);
+            for kind in [EventSelectKind::First, EventSelectKind::Last, EventSelectKind::Nth(3)] {
+                let op = make_op(kind);
+                match run_op(&op, &batch) {
+                    None => {}
+                    Some(out) => prop_assert_eq!(out.num_rows(), 1),
+                }
+            }
+        }
+
+        /// §22.1 (2) — FIRST emits the row with minimum ts among qualifying events.
+        ///
+        /// Since ts is strictly increasing in the generated fixture, minimum ts
+        /// equals the first qualifying event in arrival order.
+        #[test]
+        fn first_emits_min_ts(events in arb_events()) {
+            let q = qualifying_ts(&events);
+            let op = make_op(EventSelectKind::First);
+            let out = run_op(&op, &build_batch(&events));
+            if q.is_empty() {
+                prop_assert!(out.is_none());
+            } else {
+                prop_assert_eq!(output_ts(&out.unwrap()), q[0]);
+            }
+        }
+
+        /// §22.1 (3) — LAST emits the row with maximum ts among qualifying events.
+        #[test]
+        fn last_emits_max_ts(events in arb_events()) {
+            let q = qualifying_ts(&events);
+            let op = make_op(EventSelectKind::Last);
+            let out = run_op(&op, &build_batch(&events));
+            if q.is_empty() {
+                prop_assert!(out.is_none());
+            } else {
+                prop_assert_eq!(output_ts(&out.unwrap()), *q.last().unwrap());
+            }
+        }
+
+        /// §22.1 (4) and (5) — NTH(n): emits row at position n; omits when
+        /// fewer than n qualifying events exist.
+        #[test]
+        fn nth_correct_position_and_omission(events in arb_events(), n in 1u32..=5) {
+            let q = qualifying_ts(&events);
+            let op = make_op(EventSelectKind::Nth(n));
+            let out = run_op(&op, &build_batch(&events));
+            if (q.len() as u32) < n {
+                // (5) omission
+                prop_assert!(out.is_none());
+            } else {
+                // (4) exactly n−1 qualifying events have smaller ts
+                let emitted = output_ts(&out.unwrap());
+                prop_assert_eq!(emitted, q[(n - 1) as usize]);
+                let smaller = q.iter().filter(|&&t| t < emitted).count() as u32;
+                prop_assert_eq!(smaller, n - 1);
+            }
+        }
+
+        /// §22.1 (6) — entity isolation: running entity A does not affect
+        /// the result for entity B (operator state is share-nothing).
+        #[test]
+        fn entity_isolation(events_a in arb_events(), events_b in arb_events()) {
+            let op = make_op(EventSelectKind::First);
+            let batch_a = build_batch_for_entity("ea", &events_a);
+            let batch_b = build_batch_for_entity("eb", &events_b);
+
+            // Baseline: entity B alone.
+            let ts_b_alone = run_op_as(&op, &batch_b, "eb").map(|o| output_ts(&o));
+
+            // Run entity A through its own state, then run entity B again.
+            let mut state_a = op.create_state(&EntityId::from("ea"));
+            op.process_sub_batch(&mut state_a, &batch_a);
+            let _ = op.finish_entity(state_a);
+
+            let ts_b_after = run_op_as(&op, &batch_b, "eb").map(|o| output_ts(&o));
+            prop_assert_eq!(ts_b_alone, ts_b_after);
+        }
+
+        /// §22.1 (7) — NTH(1) ≡ FIRST for any event stream.
+        #[test]
+        fn nth_1_equiv_first(events in arb_events()) {
+            let batch = build_batch(&events);
+            let ts_first = run_op(&make_op(EventSelectKind::First), &batch).map(|o| output_ts(&o));
+            let ts_nth1 = run_op(&make_op(EventSelectKind::Nth(1)), &batch).map(|o| output_ts(&o));
+            prop_assert_eq!(ts_first, ts_nth1);
+        }
+    }
+}

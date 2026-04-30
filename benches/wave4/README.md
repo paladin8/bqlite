@@ -20,6 +20,7 @@ benches/wave4/
 ├── compaction.rs        # Database::compact_now throughput + L0 reduction
 ├── cohort_join.rs       # SubqueryFilter probe + MergeSources k-way merge
 ├── encoding_matrix.rs   # ALP + head-to-head integer/string encodings
+├── event_select.rs      # EventSelectOperator FIRST/LAST/NTH throughput (TASK-531)
 ├── ingest.rs            # JSONL + Parquet end-to-end ingest
 ├── pfor.rs              # PFOR codec (TASK-450)
 ├── sample.rs            # SampleFilter per-row throughput + selectivity
@@ -36,6 +37,7 @@ benches/wave4/
 | SAMPLE pushdown savings | `sample.rs` | `SampleFilter::apply_to_array`, `ScanOperator::with_sample_filter` |
 | ATTRIBUTE latency on realistic ratios | `attribute.rs` | `AttributeOperator` (existing §17.1 workloads + 10:1 / 100:1 / 1000:1 ratio sweep) |
 | Cohort / joined-source query overhead | `cohort_join.rs` | `SubqueryFilterOperator`, `MergeSourcesOperator` |
+| EventSelect FIRST/LAST/NTH throughput + entity boundary overhead | `event_select.rs` | `EventSelectOperator` (TASK-531 §21.1 workloads) |
 
 ## Reference-machine targets
 
@@ -67,6 +69,11 @@ Provenance labels:
 | `sample/selectivity/fraction_0.10/abs_deviation` | ≤ 3σ bound | **[floor]** same |
 | `cohort/semijoin/cohort_10000/rows_per_sec` | ≥ 10 M rows/sec | **[floor]** hash-set probe regression tripwire |
 | `merge_sources/k2/rows_per_sec` | ≥ 10 M rows/sec | **[floor]** k-way merge regression tripwire |
+| `event_select/kind/first/events_per_sec` | ≥ 200 M events/sec | **[spec]** `event-select-sample.md` §21.1 row 1 |
+| `event_select/kind/last/events_per_sec` | ≥ 100 M events/sec | **[spec]** `event-select-sample.md` §21.1 row 2 |
+| `event_select/kind/nth_5/events_per_sec` | ≥ 150 M events/sec | **[spec]** `event-select-sample.md` §21.1 row 3 |
+| `event_select/predicate/first/amount_gt_50/events_per_sec` | ≥ 150 M events/sec | **[spec]** `event-select-sample.md` §21.1 row 4 |
+| `event_select/density/entity_boundary_ns` | ≤ 500 ns/entity | **[spec]** `event-select-sample.md` §21.1 row 7 |
 
 ### Not covered (intentional)
 
@@ -92,6 +99,7 @@ cargo bench -p bqlite-benches --bench cohort_join
 cargo bench -p bqlite-benches --bench attribute
 cargo bench -p bqlite-benches --bench sessionize
 cargo bench -p bqlite-benches --bench pfor
+cargo bench -p bqlite-benches --bench event_select
 
 # Reference mode — full-scale fixtures with hard targets. Only
 # meaningful on the pinned reference hardware.

@@ -130,9 +130,11 @@ name = "attribute"
 path = "wave4/attribute.rs"
 harness = false
 
-# Wave 4 EventSelectOperator benchmark (TASK-429).
+# Wave 4 EventSelectOperator throughput benchmarks (TASK-429, TASK-531).
+# Property tests and CI/reference-mode hard targets added in TASK-531.
 [[bench]]
 name = "event_select"
+path = "wave4/event_select.rs"
 harness = false
 
 # PFOR codec (TASK-450) — encode/decode throughput and payload-size

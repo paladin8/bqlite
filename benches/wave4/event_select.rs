@@ -1,20 +1,27 @@
-//! EventSelectOperator throughput benchmarks (TASK-429, Wave 4).
+//! `EventSelectOperator` throughput benchmarks (TASK-531, §21.1).
 //!
-//! Measures `EventSelectOperator` entity-processing throughput for FIRST,
-//! LAST, and NTH(5). Additional variants cover WHERE predicates,
-//! event-type list matching (plain + dictionary-encoded), and varying
-//! entity/event density.
+//! Measures `EventSelectOperator` entity-processing throughput across the
+//! workload shapes enumerated in `event-select-sample.md` §21.1:
+//!
+//! - **kind**: FIRST / LAST / NTH(5) — isolation of early-termination vs
+//!   full-scan cost at the canonical 100 events/entity density.
+//! - **predicate**: FIRST with vs without a WHERE predicate (50% selectivity).
+//! - **event_type_list**: 1 / 2 / 4 event types in the list — membership
+//!   check cost growth with set size (both StringView and Dict encoding).
+//! - **encoding**: StringView vs Dictionary<Int32, Utf8View> event_type — code
+//!   set fast path vs string comparison.
+//! - **density**: 100e×1000ev / 1000e×100ev / 10000e×10ev — entity boundary
+//!   overhead at fixed total event count.
 //!
 //! ## CI vs reference scale
 //!
-//! The CI fixture is intentionally small (1 000 entities × 100 events =
-//! 100 000 total events) to keep wall time under 5 s on shared runners.
-//! The relative ordering (FIRST ≈ early-termination fast path, LAST =
-//! full scan, NTH(5) = intermediate) is observable at this scale and is
-//! what matters for regression detection.
+//! CI mode (default): 1 000 entities × 100 events = 100 000 total events.
+//! Relative orderings (FIRST < NTH(5) < LAST in cost) are visible at this
+//! scale and drive regression detection via Criterion's statistical gate.
 //!
-//! For the full §21.1 reference targets (10M events / 100K entities),
-//! run with `BQLITE_BENCH_MODE=reference` on pinned reference hardware.
+//! Reference mode (`BQLITE_BENCH_MODE=reference`): 100 000 entities × 100
+//! events = 10 000 000 total events. Hard throughput targets from §21.1 are
+//! enforced via `BenchResultCollector`.
 //!
 //! Run with:
 //! ```bash
@@ -22,6 +29,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::{
     DictionaryArray, Int32Array, Int64Array, StringViewBuilder, TimestampNanosecondArray,
@@ -30,6 +38,7 @@ use arrow::datatypes::{DataType, Field, Int32Type, Schema as ArrowSchema, TimeUn
 use arrow::record_batch::RecordBatch;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
+use bqlite_benches::common::{BenchMode, BenchResultCollector, BenchTarget};
 use bqlite_core::{BqlType, ColumnDef, EntityId, OperatorSchema, PropertyValue, SEQ_ID_COLUMN};
 use bqlite_operators::{EntityOperator, EventSelectOperator};
 use bqlite_planner::compiled::{
@@ -39,11 +48,35 @@ use bqlite_planner::logical::EventSelectKind;
 use bqlite_planner::physical::{EventSelectPhysical, PhysicalPlan, ScanPhysical};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fixture parameters
+// Scale knobs (§21.1 workload shapes)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NUM_ENTITIES: usize = 1_000;
-const EVENTS_PER_ENTITY: usize = 100;
+struct Scale {
+    /// Number of entities for the main throughput benches.
+    entities: usize,
+    /// Events per entity for the main throughput benches.
+    events_per_entity: usize,
+}
+
+impl Scale {
+    fn for_mode(mode: BenchMode) -> Self {
+        match mode {
+            BenchMode::Ci => Self {
+                entities: 1_000,
+                events_per_entity: 100,
+            },
+            BenchMode::Reference => Self {
+                // §21.1: 10 M events, 100 K entities, 100 events/entity.
+                entities: 100_000,
+                events_per_entity: 100,
+            },
+        }
+    }
+
+    fn total_events(&self) -> u64 {
+        (self.entities * self.events_per_entity) as u64
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Schema helpers
@@ -132,7 +165,6 @@ fn predicate_amount_gt_50() -> CompiledExpr {
 // Fixture generation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Arrow schema for the input batch.
 fn arrow_schema() -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![
         Field::new("entity_id", DataType::Utf8View, false),
@@ -184,10 +216,8 @@ fn make_entity_batch(entity_id: &str, n_events: usize) -> RecordBatch {
 }
 
 /// Build a single-entity RecordBatch with dictionary-encoded event_type
-/// (`Dictionary<Int32, Utf8View>`). Same data distribution as
-/// [`make_entity_batch`] but exercises the `EventTypeCodeSet` fast path.
+/// (`Dictionary<Int32, Utf8View>`). Exercises the `EventTypeCodeSet` fast path.
 fn make_entity_batch_dict(entity_id: &str, n_events: usize) -> RecordBatch {
-    // Two-value dictionary: code 0 = "purchase", code 1 = "login".
     let dict_values = {
         let mut b = StringViewBuilder::with_capacity(2);
         b.append_value("purchase");
@@ -268,8 +298,6 @@ fn build_fixture_dict(
 // Core driver
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Drive an EventSelectOperator over `fixture` and return the count of
-/// entities that produced output rows (prevents dead-code elimination).
 fn run_event_select(op: &EventSelectOperator, fixture: &[(EntityId, RecordBatch)]) -> usize {
     let mut hits = 0usize;
     for (eid, batch) in fixture {
@@ -283,23 +311,26 @@ fn run_event_select(op: &EventSelectOperator, fixture: &[(EntityId, RecordBatch)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Benchmark: FIRST / LAST / NTH(5) baseline
+// Benchmark: FIRST / LAST / NTH(5) baseline (§21.1)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn bench_first_last_nth(c: &mut Criterion) {
-    let fixture = build_fixture(NUM_ENTITIES, EVENTS_PER_ENTITY);
-    let total_events = (NUM_ENTITIES * EVENTS_PER_ENTITY) as u64;
+    let mode = BenchMode::from_env();
+    let scale = Scale::for_mode(mode);
+    let fixture = build_fixture(scale.entities, scale.events_per_entity);
+    let total_events = scale.total_events();
 
+    let mut collector = BenchResultCollector::new(mode);
     let mut group = c.benchmark_group("event_select/kind");
     group.throughput(Throughput::Elements(total_events));
 
-    let cases: Vec<(&str, EventSelectKind)> = vec![
+    let cases: &[(&str, EventSelectKind)] = &[
         ("first", EventSelectKind::First),
         ("last", EventSelectKind::Last),
         ("nth_5", EventSelectKind::Nth(5)),
     ];
 
-    for (label, kind) in &cases {
+    for (label, kind) in cases {
         let desc = make_desc(*kind, vec!["purchase"], None);
         let op = EventSelectOperator::new(&desc, &input_schema());
 
@@ -308,16 +339,46 @@ fn bench_first_last_nth(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    // Reference-mode hard targets (§21.1 table row 1–3).
+    if mode.is_reference() {
+        let targets: &[(&str, EventSelectKind, f64)] = &[
+            ("first", EventSelectKind::First, 200_000_000.0),
+            ("last", EventSelectKind::Last, 100_000_000.0),
+            ("nth_5", EventSelectKind::Nth(5), 150_000_000.0),
+        ];
+        for (label, kind, floor) in targets {
+            let desc = make_desc(*kind, vec!["purchase"], None);
+            let op = EventSelectOperator::new(&desc, &input_schema());
+            let runs: u64 = 10;
+            let start = Instant::now();
+            for _ in 0..runs {
+                black_box(run_event_select(&op, &fixture));
+            }
+            let elapsed_s = start.elapsed().as_secs_f64();
+            let events_per_sec = (total_events as f64 * runs as f64) / elapsed_s;
+            collector.record(
+                &format!("event_select/kind/{label}/events_per_sec"),
+                events_per_sec,
+                "events/sec",
+                Some(BenchTarget::at_least(*floor)),
+            );
+        }
+    }
+    collector.finish();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Benchmark: FIRST with WHERE predicate
+// Benchmark: FIRST with WHERE predicate (§21.1 row 4)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn bench_first_with_predicate(c: &mut Criterion) {
-    let fixture = build_fixture(NUM_ENTITIES, EVENTS_PER_ENTITY);
-    let total_events = (NUM_ENTITIES * EVENTS_PER_ENTITY) as u64;
+    let mode = BenchMode::from_env();
+    let scale = Scale::for_mode(mode);
+    let fixture = build_fixture(scale.entities, scale.events_per_entity);
+    let total_events = scale.total_events();
 
+    let mut collector = BenchResultCollector::new(mode);
     let mut group = c.benchmark_group("event_select/predicate");
     group.throughput(Throughput::Elements(total_events));
 
@@ -326,8 +387,8 @@ fn bench_first_with_predicate(c: &mut Criterion) {
         ("amount_gt_50", Some(predicate_amount_gt_50())),
     ];
 
-    for (label, predicate) in cases {
-        let desc = make_desc(EventSelectKind::First, vec!["purchase"], predicate);
+    for (label, predicate) in &cases {
+        let desc = make_desc(EventSelectKind::First, vec!["purchase"], predicate.clone());
         let op = EventSelectOperator::new(&desc, &input_schema());
 
         group.bench_with_input(BenchmarkId::new("first", label), &0usize, |b, _| {
@@ -335,15 +396,42 @@ fn bench_first_with_predicate(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    // Reference-mode hard target for FIRST+WHERE (§21.1 row 4: ≥150M events/s).
+    if mode.is_reference() {
+        let desc = make_desc(
+            EventSelectKind::First,
+            vec!["purchase"],
+            Some(predicate_amount_gt_50()),
+        );
+        let op = EventSelectOperator::new(&desc, &input_schema());
+        let runs: u64 = 10;
+        let start = Instant::now();
+        for _ in 0..runs {
+            black_box(run_event_select(&op, &fixture));
+        }
+        let elapsed_s = start.elapsed().as_secs_f64();
+        let events_per_sec = (total_events as f64 * runs as f64) / elapsed_s;
+        collector.record(
+            "event_select/predicate/first/amount_gt_50/events_per_sec",
+            events_per_sec,
+            "events/sec",
+            Some(BenchTarget::at_least(150_000_000.0)),
+        );
+    }
+    collector.finish();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Benchmark: multi-type event list
+// Benchmark: multi-type event list (§21.1 row 5: no string alloc)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn bench_event_type_list(c: &mut Criterion) {
-    let fixture = build_fixture(NUM_ENTITIES, EVENTS_PER_ENTITY);
-    let total_events = (NUM_ENTITIES * EVENTS_PER_ENTITY) as u64;
+    let mode = BenchMode::from_env();
+    let scale = Scale::for_mode(mode);
+    let fixture = build_fixture(scale.entities, scale.events_per_entity);
+    let fixture_dict = build_fixture_dict(scale.entities, scale.events_per_entity);
+    let total_events = scale.total_events();
 
     let mut group = c.benchmark_group("event_select/event_type_list");
     group.throughput(Throughput::Elements(total_events));
@@ -360,26 +448,72 @@ fn bench_event_type_list(c: &mut Criterion) {
     for (label, types) in &cases {
         let desc = make_desc(EventSelectKind::First, types.clone(), None);
         let op = EventSelectOperator::new(&desc, &input_schema());
-
-        group.bench_with_input(BenchmarkId::new("first", label), &types.len(), |b, _| {
-            b.iter(|| black_box(run_event_select(&op, &fixture)))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("first_plain", label),
+            &types.len(),
+            |b, _| b.iter(|| black_box(run_event_select(&op, &fixture))),
+        );
     }
+
+    // Dictionary-encoded: demonstrates integer code lookup (no string alloc).
+    let desc_dict = make_desc(EventSelectKind::First, vec!["purchase"], None);
+    let op_dict = EventSelectOperator::new(&desc_dict, &input_schema());
+    group.bench_with_input(
+        BenchmarkId::new("first_dict", "single_type"),
+        &1usize,
+        |b, _| b.iter(|| black_box(run_event_select(&op_dict, &fixture_dict))),
+    );
+
     group.finish();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Benchmark: varying entity/event density
+// Benchmark: encoding comparison (StringView vs Dict fast path)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn bench_encoding(c: &mut Criterion) {
+    let mode = BenchMode::from_env();
+    let scale = Scale::for_mode(mode);
+    let fixture_plain = build_fixture(scale.entities, scale.events_per_entity);
+    let fixture_dict = build_fixture_dict(scale.entities, scale.events_per_entity);
+    let total_events = scale.total_events();
+
+    let mut group = c.benchmark_group("event_select/encoding");
+    group.throughput(Throughput::Elements(total_events));
+
+    let desc_plain = make_desc(EventSelectKind::First, vec!["purchase"], None);
+    let op_plain = EventSelectOperator::new(&desc_plain, &input_schema());
+    group.bench_with_input(
+        BenchmarkId::new("first_stringview", "1e×events"),
+        &0usize,
+        |b, _| b.iter(|| black_box(run_event_select(&op_plain, &fixture_plain))),
+    );
+
+    let desc_dict = make_desc(EventSelectKind::First, vec!["purchase"], None);
+    let op_dict = EventSelectOperator::new(&desc_dict, &input_schema());
+    group.bench_with_input(
+        BenchmarkId::new("first_dict_int32", "1e×events"),
+        &0usize,
+        |b, _| b.iter(|| black_box(run_event_select(&op_dict, &fixture_dict))),
+    );
+
+    group.finish();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Benchmark: entity boundary overhead (§21.1 row 7: <500 ns per entity)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn bench_entity_density(c: &mut Criterion) {
+    let mode = BenchMode::from_env();
+    let mut collector = BenchResultCollector::new(mode);
     let mut group = c.benchmark_group("event_select/density");
 
-    // (entities, events_per_entity) — total ≈ 100k each.
+    // (entities, events_per_entity) — total ≈ 100k in CI mode.
     let cases: Vec<(&str, usize, usize)> = vec![
-        ("100e_1000ev", 100, 1_000), // few entities, many events each
-        ("1000e_100ev", 1_000, 100), // balanced
-        ("10000e_10ev", 10_000, 10), // many entities, few events each
+        ("100e_1000ev", 100, 1_000),
+        ("1000e_100ev", 1_000, 100),
+        ("10000e_10ev", 10_000, 10),
     ];
 
     for (label, n_entities, n_events) in &cases {
@@ -394,39 +528,31 @@ fn bench_entity_density(c: &mut Criterion) {
         });
     }
     group.finish();
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Benchmark: dictionary-encoded event_type (§21.1 dict fast path)
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn bench_dict_event_type(c: &mut Criterion) {
-    let fixture_plain = build_fixture(NUM_ENTITIES, EVENTS_PER_ENTITY);
-    let fixture_dict = build_fixture_dict(NUM_ENTITIES, EVENTS_PER_ENTITY);
-    let total_events = (NUM_ENTITIES * EVENTS_PER_ENTITY) as u64;
-
-    let mut group = c.benchmark_group("event_select/encoding");
-    group.throughput(Throughput::Elements(total_events));
-
-    let desc_plain = make_desc(EventSelectKind::First, vec!["purchase"], None);
-    let op_plain = EventSelectOperator::new(&desc_plain, &input_schema());
-    group.bench_with_input(
-        BenchmarkId::new("first_plain_stringview", "1000e_100ev"),
-        &0usize,
-        |b, _| b.iter(|| black_box(run_event_select(&op_plain, &fixture_plain))),
-    );
-
-    // Same operator descriptor works for dictionary input — the operator
-    // handles both via `build_event_type_check` dispatch.
-    let desc_dict = make_desc(EventSelectKind::First, vec!["purchase"], None);
-    let op_dict = EventSelectOperator::new(&desc_dict, &input_schema());
-    group.bench_with_input(
-        BenchmarkId::new("first_dict_int32", "1000e_100ev"),
-        &0usize,
-        |b, _| b.iter(|| black_box(run_event_select(&op_dict, &fixture_dict))),
-    );
-
-    group.finish();
+    // Reference-mode: entity boundary overhead floor (§21.1 row 7: ≤500 ns per entity).
+    // Uses 100K entities × 10 events — 10× more entities than the CI 10K fixture —
+    // so boundary overhead dominates compute and the per-entity number is stable.
+    if mode.is_reference() {
+        let n_entities: usize = 100_000;
+        let n_events: usize = 10;
+        let fixture = build_fixture(n_entities, n_events);
+        let desc = make_desc(EventSelectKind::First, vec!["purchase"], None);
+        let op = EventSelectOperator::new(&desc, &input_schema());
+        let runs: u64 = 10;
+        let start = Instant::now();
+        for _ in 0..runs {
+            black_box(run_event_select(&op, &fixture));
+        }
+        let elapsed_ns = start.elapsed().as_nanos() as f64;
+        let ns_per_entity = elapsed_ns / (n_entities as f64 * runs as f64);
+        collector.record(
+            "event_select/density/entity_boundary_ns",
+            ns_per_entity,
+            "ns/entity",
+            Some(BenchTarget::at_most(500.0)),
+        );
+    }
+    collector.finish();
 }
 
 criterion_group!(
@@ -434,7 +560,7 @@ criterion_group!(
     bench_first_last_nth,
     bench_first_with_predicate,
     bench_event_type_list,
+    bench_encoding,
     bench_entity_density,
-    bench_dict_event_type,
 );
 criterion_main!(event_select);
