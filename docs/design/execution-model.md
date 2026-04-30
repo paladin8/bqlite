@@ -212,6 +212,8 @@ The `bqlite-storage` decoders already produce `StringViewArray` (see `crates/bql
 
 Filters are the most common operator in any pipeline, and naively materializing a filtered batch by copying surviving rows into fresh Arrow buffers wastes memory bandwidth on every selective predicate. bqlite makes **selection vectors a first-class output of the filter operator**. Materialization (copy-and-shrink into a contiguous `RecordBatch`) is an explicit, demand-driven decision, not the default — see §3.8.3 for the terminology distinction between this and segment-level compaction.
 
+> **Implementation contract.** The runtime shapes that realize this design — `StatelessKernel`, `FilterKernel` / `ProjectKernel`, the `materialize_filtered_batch` boundary helper, the `FusedStatelessSegment` driver, and the `FusedSegmentPhysical` planner descriptor — live in [`docs/design/engine/operator-fusion.md`](engine/operator-fusion.md). That document is the load-bearing spec for §3.8.1–§3.8.5; the present subsection establishes the vocabulary and §3.8.6 covers the encoded-path boundary that feeds the push segment.
+
 #### 3.8.1 The `FilteredBatch` Type
 
 Stateless operators consume and produce `FilteredBatch`, not bare `RecordBatch`. The type is declared in `bqlite-operators` and is the surface every push-based stateless operator works against:
