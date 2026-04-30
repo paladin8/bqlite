@@ -68,6 +68,7 @@ use arrow::compute;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
+use bqlite_core::storage::ScanConjunct;
 use bqlite_core::{
     BqlType, BqliteError, EntityId, OperatorSchema, PropertyValue, Result, SegmentReader, TimeRange,
 };
@@ -931,7 +932,8 @@ pub fn bind_physical(
     ctx: &QueryContext,
 ) -> Result<Box<dyn PhysicalOperator>> {
     let mut cohorts = CohortCache::default();
-    bind_physical_with_cache(plan, db, ctx, &mut cohorts)
+    let mut pushdowns: Vec<ScanConjunct> = Vec::new();
+    bind_physical_with_cache(plan, db, ctx, &mut cohorts, &mut pushdowns)
 }
 
 /// Bind a `PhysicalPlan` while threading a [`CohortCache`] through every
@@ -947,13 +949,21 @@ fn bind_physical_with_cache(
     db: &mut Database,
     ctx: &QueryContext,
     cohorts: &mut CohortCache,
+    pending_pushdowns: &mut Vec<ScanConjunct>,
 ) -> Result<Box<dyn PhysicalOperator>> {
     match plan {
         // ── Data-plane operators ─────────────────────────────────
-        PhysicalPlan::Scan(scan) => bind_scan(scan, db, ctx),
+        // Scan: drain `pending_pushdowns` into the operator. This is
+        // the only consumer — no pushdown ever travels past a Scan.
+        PhysicalPlan::Scan(scan) => bind_scan(scan, db, ctx, std::mem::take(pending_pushdowns)),
 
+        // Pass-through operators: the operator preserves entity-id
+        // semantics (every output row carries the same entity-id as
+        // its input row), so any pending cohort entity-id pushdown
+        // is still valid for the underlying scan.
         PhysicalPlan::Filter(filter) => {
-            let child = bind_physical_with_cache(&filter.input, db, ctx, cohorts)?;
+            let child =
+                bind_physical_with_cache(&filter.input, db, ctx, cohorts, pending_pushdowns)?;
             Ok(Box::new(FilterOperator::new(
                 child,
                 filter.predicate.clone(),
@@ -962,7 +972,8 @@ fn bind_physical_with_cache(
         }
 
         PhysicalPlan::Project(project) => {
-            let child = bind_physical_with_cache(&project.input, db, ctx, cohorts)?;
+            let child =
+                bind_physical_with_cache(&project.input, db, ctx, cohorts, pending_pushdowns)?;
             Ok(Box::new(ProjectOperator::from_physical_items(
                 child,
                 project.expressions.clone(),
@@ -971,16 +982,27 @@ fn bind_physical_with_cache(
         }
 
         PhysicalPlan::Limit(limit) => {
-            let child = bind_physical_with_cache(&limit.input, db, ctx, cohorts)?;
+            let child =
+                bind_physical_with_cache(&limit.input, db, ctx, cohorts, pending_pushdowns)?;
             Ok(Box::new(LimitOperator::new(child, limit.count)))
         }
 
         // ── Wave 5 fused stateless segment (TASK-518 CP4) ─────────
-        PhysicalPlan::FusedSegment(seg) => bind_fused_segment(seg, db, ctx, cohorts),
+        // FusedSegment chains stateless kernels that preserve
+        // entity-id; safe to propagate.
+        PhysicalPlan::FusedSegment(seg) => {
+            bind_fused_segment(seg, db, ctx, cohorts, pending_pushdowns)
+        }
 
         // ── Wave 3 operators (TASK-323) ───────────────────────────
+        // Sort / Distinct / Aggregate / SequenceMatch can change the
+        // entity-id semantics of their output, so any pending
+        // cohort pushdown is irrelevant beneath them. Drop the
+        // pushdowns by passing a fresh empty vec into the recursive
+        // call — the underlying scan must not be filtered by a
+        // cohort that doesn't apply to its rows.
         PhysicalPlan::Sort(sort) => {
-            let child = bind_physical_with_cache(&sort.input, db, ctx, cohorts)?;
+            let child = bind_physical_with_cache(&sort.input, db, ctx, cohorts, &mut Vec::new())?;
             Ok(Box::new(SortOperator::with_spill(
                 child,
                 sort.keys.clone(),
@@ -993,7 +1015,8 @@ fn bind_physical_with_cache(
         }
 
         PhysicalPlan::Distinct(distinct) => {
-            let child = bind_physical_with_cache(&distinct.input, db, ctx, cohorts)?;
+            let child =
+                bind_physical_with_cache(&distinct.input, db, ctx, cohorts, &mut Vec::new())?;
             Ok(Box::new(DistinctOperator::new(
                 child,
                 distinct.max_groups,
@@ -1002,7 +1025,7 @@ fn bind_physical_with_cache(
         }
 
         PhysicalPlan::Aggregate(agg) => {
-            let child = bind_physical_with_cache(&agg.input, db, ctx, cohorts)?;
+            let child = bind_physical_with_cache(&agg.input, db, ctx, cohorts, &mut Vec::new())?;
             Ok(Box::new(HashAggregateOperator::new(
                 child,
                 agg.aggregates.clone(),
@@ -1013,7 +1036,7 @@ fn bind_physical_with_cache(
         }
 
         PhysicalPlan::SequenceMatch(seq) => {
-            let child = bind_physical_with_cache(&seq.input, db, ctx, cohorts)?;
+            let child = bind_physical_with_cache(&seq.input, db, ctx, cohorts, &mut Vec::new())?;
             Ok(Box::new(SequenceMatchAdapter::new_with_sink(
                 seq,
                 child,
@@ -1021,8 +1044,13 @@ fn bind_physical_with_cache(
             )?))
         }
 
-        // ── Wave 4 cohort runtime (TASK-437) ──────────────────────
-        PhysicalPlan::SubqueryFilter(sqf) => bind_subquery_filter(sqf, db, ctx, cohorts),
+        // ── Wave 4 cohort runtime (TASK-437 / TASK-522) ───────────
+        // SubqueryFilter contributes its own cohort pushdown when
+        // the gate accepts, then propagates the (extended) pending
+        // list into its own input.
+        PhysicalPlan::SubqueryFilter(sqf) => {
+            bind_subquery_filter(sqf, db, ctx, cohorts, pending_pushdowns)
+        }
 
         // ── DDL ──────────────────────────────────────────────────
         PhysicalPlan::CreateTable(ct) => {
@@ -1074,6 +1102,12 @@ fn bind_physical_with_cache(
         }
 
         // ── Wave 4 EntityOperator-based operators (TASK-438) ─────
+        // Sessionize / EventSelect / Attribute / Sample preserve
+        // entity-id but emit a different row shape than the input.
+        // For v1 simplicity, drop the pending cohort pushdowns when
+        // descending through them — the post-scan probe still
+        // enforces correctness, and the optimizer can revisit
+        // entity-id propagation through these operators later.
         PhysicalPlan::Sessionize(sess) => bind_sessionize(sess, db, ctx, cohorts),
 
         PhysicalPlan::EventSelect(es) => bind_event_select(es, db, ctx, cohorts),
@@ -1083,6 +1117,10 @@ fn bind_physical_with_cache(
         // ── Wave 4 Sample + MergeSources (TASK-438 CP2) ──────────
         PhysicalPlan::Sample(s) => bind_sample(s, db, ctx, cohorts),
 
+        // MergeSources contains multiple inner Scans; v1 does not
+        // propagate cohort entity-id pushdowns into joined-source
+        // scans. Drop the pending list — see TASK-522 risk register
+        // for the deliberate v1 limitation.
         PhysicalPlan::MergeSources(merge) => bind_merge_sources(merge, db, ctx),
 
         // DELETE is intentionally not bound through this path —
@@ -1158,8 +1196,9 @@ fn bind_fused_segment(
     db: &mut Database,
     ctx: &QueryContext,
     cohorts: &mut CohortCache,
+    pending_pushdowns: &mut Vec<ScanConjunct>,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let child = bind_physical_with_cache(&seg.input, db, ctx, cohorts)?;
+    let child = bind_physical_with_cache(&seg.input, db, ctx, cohorts, pending_pushdowns)?;
     let mut limit_remaining: Option<u64> = None;
     let mut runtime_steps: Vec<KernelStep> = Vec::with_capacity(seg.steps.len());
     let mut step_input_schema = seg.input.output_schema().clone();
@@ -1251,6 +1290,7 @@ fn bind_subquery_filter(
     db: &mut Database,
     ctx: &QueryContext,
     cohorts: &mut CohortCache,
+    pending_pushdowns: &mut Vec<ScanConjunct>,
 ) -> Result<Box<dyn PhysicalOperator>> {
     let cohort = match cohorts.get(&sqf.subquery) {
         Some(existing) => existing,
@@ -1258,8 +1298,11 @@ fn bind_subquery_filter(
             // Materialize: bind the inner subquery (which may itself
             // contain SubqueryFilter — those recursive cohort lookups
             // share the same cache, so nested cohorts also materialize
-            // once per top-level execution).
-            let mut op = bind_physical_with_cache(&sqf.subquery, db, ctx, cohorts)?;
+            // once per top-level execution). The inner subquery owns
+            // its own cohort/pushdown state — the outer pipeline's
+            // pending pushdowns do not apply to its scans.
+            let mut op =
+                bind_physical_with_cache(&sqf.subquery, db, ctx, cohorts, &mut Vec::new())?;
             let drive_result = drive_cohort_subquery(op.as_mut());
             // Match `Engine::query`'s "primary error wins" cleanup
             // convention: close the inner operator on both happy and
@@ -1277,7 +1320,22 @@ fn bind_subquery_filter(
         }
     };
 
-    let child = bind_physical_with_cache(&sqf.input, db, ctx, cohorts)?;
+    // TASK-522: try to push the cohort's entity-id set into the outer
+    // scan. The shape/size gate runs once per cohort/scan pair; if it
+    // fires, the resulting conjunct travels with `pending_pushdowns`
+    // until it reaches a Scan node beneath this SubqueryFilter.
+    // Correctness is preserved either way — the SubqueryFilterOperator
+    // probes the full cohort row by row regardless.
+    let entity_key_col = entity_key_col_name(&sqf.input);
+    if let Some(conj) = crate::cohort_pushdown::try_extract_entity_pushdown(
+        &sqf.lhs_columns,
+        cohort.as_ref(),
+        entity_key_col,
+    ) {
+        pending_pushdowns.push(conj);
+    }
+
+    let child = bind_physical_with_cache(&sqf.input, db, ctx, cohorts, pending_pushdowns)?;
     Ok(Box::new(SubqueryFilterOperator::new(
         child,
         sqf.lhs_columns.clone(),
@@ -1301,6 +1359,7 @@ fn bind_scan(
     scan: &ScanPhysical,
     db: &Database,
     ctx: &QueryContext,
+    extra_conjuncts: Vec<ScanConjunct>,
 ) -> Result<Box<dyn PhysicalOperator>> {
     let reader_range = scan.reader_range.unwrap_or_else(TimeRange::unbounded);
 
@@ -1347,6 +1406,16 @@ fn bind_scan(
         ctx.cancellation().clone(),
         tombstones,
     )?;
+
+    // TASK-522: engine-injected cohort entity-id pushdowns from the
+    // bind tree's pending list. Empty in the common case (no
+    // SubqueryFilter above this scan, or the gate rejected); when
+    // populated, the conjuncts are folded into the runtime
+    // `ScanPredicate` at `open()` time and drive zone-map row-group
+    // skipping.
+    if !extra_conjuncts.is_empty() {
+        op.with_extra_conjuncts(extra_conjuncts);
+    }
 
     // Entity-level SAMPLE pushdown (TASK-430). When the planner's
     // sample-pushdown pass attaches a `SamplePushdown` to the scan,
@@ -1513,7 +1582,11 @@ fn bind_sessionize(
     ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let child = bind_physical_with_cache(&sess.input, db, ctx, cohorts)?;
+    // Sessionize transforms the row shape (one output row per session
+    // boundary, not per input event). v1 conservatively drops any
+    // pending cohort entity-id pushdown when descending through it —
+    // post-scan probe still enforces correctness.
+    let child = bind_physical_with_cache(&sess.input, db, ctx, cohorts, &mut Vec::new())?;
     let ek_col_name = entity_key_col_name(&sess.input);
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "SessionizeAdapter")?;
@@ -1544,7 +1617,10 @@ fn bind_event_select(
     ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let child = bind_physical_with_cache(&es.input, db, ctx, cohorts)?;
+    // EventSelect transforms the row shape (one row per entity per
+    // selected event). Drop pending cohort pushdowns — see
+    // `bind_sessionize` for rationale.
+    let child = bind_physical_with_cache(&es.input, db, ctx, cohorts, &mut Vec::new())?;
     let ek_col_name = entity_key_col_name(&es.input);
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "EventSelectAdapter")?;
@@ -1572,7 +1648,9 @@ fn bind_attribute(
     ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let child = bind_physical_with_cache(&attr.input, db, ctx, cohorts)?;
+    // Attribute transforms the row shape (touchpoint/conversion rows).
+    // Drop pending cohort pushdowns — see `bind_sessionize`.
+    let child = bind_physical_with_cache(&attr.input, db, ctx, cohorts, &mut Vec::new())?;
     let ek_col_name = entity_key_col_name(&attr.input);
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "AttributeAdapter")?;
@@ -1636,7 +1714,10 @@ fn bind_sample(
     ctx: &QueryContext,
     cohorts: &mut CohortCache,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let child = bind_physical_with_cache(&sample.input, db, ctx, cohorts)?;
+    // Sample is row-preserving but its position above stateful
+    // operators means a pending cohort pushdown may not apply
+    // cleanly to its child. Drop the pushdowns conservatively.
+    let child = bind_physical_with_cache(&sample.input, db, ctx, cohorts, &mut Vec::new())?;
     let ek_col_name = entity_key_col_name(&sample.input);
 
     // Resolve the entity-key column index and type in a single schema walk.
@@ -1673,10 +1754,14 @@ fn bind_merge_sources(
     db: &mut Database,
     ctx: &QueryContext,
 ) -> Result<Box<dyn PhysicalOperator>> {
+    // MergeSources contains multiple Scans; v1 cohort pushdown does
+    // not propagate into joined-source scans (see TASK-522 risk
+    // register). Each sub-scan is bound with an empty extra conjunct
+    // list — correctness is preserved by the post-scan probe.
     let sub_ops: Vec<Box<dyn PhysicalOperator>> = merge
         .tables
         .iter()
-        .map(|scan| bind_scan(scan, db, ctx))
+        .map(|scan| bind_scan(scan, db, ctx, Vec::new()))
         .collect::<Result<Vec<_>>>()?;
 
     let sub_entity_key_cols: Vec<String> = merge

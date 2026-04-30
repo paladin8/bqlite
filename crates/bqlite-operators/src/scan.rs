@@ -321,6 +321,13 @@ pub struct ScanOperator {
     /// can share the same filter across parallel tasks without
     /// duplicating the precomputed threshold + seed.
     sample_filter: Option<Arc<SampleFilter>>,
+    /// Engine-injected scan conjuncts that don't lower from
+    /// [`CompiledExpr`] — primarily cohort entity-id pushdown
+    /// (TASK-522, `docs/design/language/cohorts-aliases-joins.md` §4.3).
+    /// Folded into the runtime [`ScanPredicate`] when `open()` runs so
+    /// the engine bind step can call [`Self::with_extra_conjuncts`]
+    /// after construction but before `open`.
+    extra_conjuncts: Vec<ScanConjunct>,
 }
 
 impl std::fmt::Debug for ScanOperator {
@@ -531,6 +538,7 @@ impl ScanOperator {
             entity_key_name,
             ts_col_name,
             sample_filter: None,
+            extra_conjuncts: Vec::new(),
         })
     }
 
@@ -548,6 +556,24 @@ impl ScanOperator {
     /// bind step uses this form.
     pub fn with_sample_filter(&mut self, filter: Arc<SampleFilter>) -> &mut Self {
         self.sample_filter = Some(filter);
+        self
+    }
+
+    /// Append engine-injected scan conjuncts that cannot be derived
+    /// from [`CompiledExpr`] — primarily cohort entity-id pushdown
+    /// (TASK-522, see
+    /// `docs/design/language/cohorts-aliases-joins.md` §4.3).
+    /// Folded into the runtime [`ScanPredicate`] at `open()` so the
+    /// engine can stack `with_extra_conjuncts(...)` after the
+    /// constructor and before `open()`.
+    ///
+    /// Multiple calls accumulate. Conjuncts produced by this path
+    /// participate in zone-map row-group acceptance exactly like the
+    /// `CompiledExpr`-derived ones, but they have no row-level
+    /// post-filter step — the [`SubqueryFilterOperator`] above this
+    /// scan is the row-level source of truth for cohort membership.
+    pub fn with_extra_conjuncts(&mut self, extra: Vec<ScanConjunct>) -> &mut Self {
+        self.extra_conjuncts.extend(extra);
         self
     }
 
@@ -735,6 +761,21 @@ impl PhysicalOperator for ScanOperator {
         if matches!(&self.sample_filter, Some(f) if f.is_empty_set()) {
             self.exhausted = true;
             return Ok(());
+        }
+
+        // TASK-522: fold engine-injected `extra_conjuncts` into the
+        // runtime `ScanPredicate`. Done here (rather than at construction)
+        // so the engine bind step can call `with_extra_conjuncts` *after*
+        // the constructor returns. When `extra_conjuncts` is empty this
+        // path is a no-op and behaviour matches the pre-TASK-522 contract.
+        if !self.extra_conjuncts.is_empty() {
+            let mut conjuncts = lower_compiled_predicates(&self.post_filters);
+            conjuncts.extend(std::mem::take(&mut self.extra_conjuncts));
+            self.scan_predicate = if conjuncts.is_empty() {
+                None
+            } else {
+                Some(Arc::new(ScanPredicate::new(conjuncts)) as Arc<dyn Predicate>)
+            };
         }
 
         // Materialise the handle list up-front so any enumeration
@@ -1254,17 +1295,30 @@ fn build_output_schema(
 /// then hands `None` for `predicate`, and the reader streams every
 /// row-group unchanged.
 fn build_scan_predicate(predicates: &[CompiledExpr]) -> Option<Arc<dyn Predicate>> {
-    let mut conjuncts: Vec<ScanConjunct> = Vec::new();
-    for pred in predicates {
-        if let Some(conj) = lower_to_conjunct(pred) {
-            conjuncts.push(conj);
-        }
-    }
+    let conjuncts = lower_compiled_predicates(predicates);
     if conjuncts.is_empty() {
         None
     } else {
         Some(Arc::new(ScanPredicate::new(conjuncts)) as Arc<dyn Predicate>)
     }
+}
+
+/// Lower a slice of [`CompiledExpr`] into the [`ScanConjunct`] list
+/// the storage layer can evaluate. Conjuncts that don't match a
+/// Wave 2 pushable shape are silently dropped — they remain as
+/// `post_filters` for the scan operator's row-level filter pass.
+///
+/// Split out from [`build_scan_predicate`] so the engine bind step's
+/// extra conjuncts (cohort entity-id pushdown, TASK-522) can append
+/// to the same conjunct list before the predicate is wrapped.
+fn lower_compiled_predicates(predicates: &[CompiledExpr]) -> Vec<ScanConjunct> {
+    let mut conjuncts: Vec<ScanConjunct> = Vec::with_capacity(predicates.len());
+    for pred in predicates {
+        if let Some(conj) = lower_to_conjunct(pred) {
+            conjuncts.push(conj);
+        }
+    }
+    conjuncts
 }
 
 /// Try to convert a single [`CompiledExpr`] to a [`ScanConjunct`].

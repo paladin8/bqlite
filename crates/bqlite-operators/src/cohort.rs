@@ -227,6 +227,24 @@ impl CohortHashSet {
         self.set.contains(key)
     }
 
+    /// Iterate the cohort's keys. Order is unspecified — the cohort
+    /// is a hash set. Used by the engine's cohort entity-id pushdown
+    /// extraction (TASK-522,
+    /// `docs/design/language/cohorts-aliases-joins.md` §4.3) to copy
+    /// entity-id values into a `PropertyValue` set.
+    pub fn iter_keys(&self) -> impl Iterator<Item = &CohortKey> {
+        self.set.iter()
+    }
+
+    /// Insert a key directly without going through `from_batches`.
+    ///
+    /// Test-only — bypasses memory-budget reservation accounting, so
+    /// it must not be used in production code paths.
+    #[doc(hidden)]
+    pub fn insert_for_test(&mut self, key: CohortKey) {
+        self.set.insert(key);
+    }
+
     /// Materialize the cohort by reading every row of every batch and
     /// inserting one [`CohortKey`] per row.
     ///

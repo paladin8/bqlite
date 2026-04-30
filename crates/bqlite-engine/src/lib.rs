@@ -51,6 +51,7 @@
 //! without importing `bqlite-planner` directly.
 
 pub mod bind;
+pub mod cohort_pushdown;
 pub mod context;
 pub mod ddl;
 pub mod delete;
