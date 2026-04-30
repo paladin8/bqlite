@@ -572,6 +572,129 @@ fn alter_nonexistent_table_errors() {
     assert!(msg.contains("ghost"), "error should name the table: {msg}");
 }
 
+/// TASK-519 — selection-vector materialization counter increments through
+/// the fused stateless path. Builds the `FusedStatelessSegment` directly
+/// over hand-built batches so we can read the metric snapshot without
+/// piping a `Metrics` handle through `Engine::query`.
+#[test]
+fn fused_stateless_segment_records_selection_vector_metrics() {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use bqlite_ast::expr::{CompareOp, Expr, Literal, Spanned};
+    use bqlite_ast::span::{Name, Span};
+    use bqlite_core::metrics::{AtomicMetrics, Metrics};
+    use bqlite_core::{BqlType, ColumnDef, OperatorSchema};
+    use bqlite_operators::{
+        CancellationToken, FilterKernel, FusedStatelessSegment, KernelStep, PhysicalOperator,
+        StatelessKernel,
+    };
+    use bqlite_planner::compiled::CompiledExpr;
+    use bqlite_planner::expr::{FunctionRegistry, TypedExpr};
+
+    let op_schema = OperatorSchema::new(vec![
+        ColumnDef::required("id", BqlType::Int),
+        ColumnDef::required("value", BqlType::Int),
+    ])
+    .unwrap();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    // 100-row batch. First filter keeps 5 rows (5%, below the 10%
+    // sparsity threshold), forcing an intra-chain materialization at
+    // the second filter's entry point.
+    let ids: ArrayRef = Arc::new(Int64Array::from((0..100i64).collect::<Vec<_>>()));
+    let values: ArrayRef = Arc::new(Int64Array::from((0..100i64).collect::<Vec<_>>()));
+    let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![ids, values]).unwrap();
+
+    fn sp<T>(node: T) -> Spanned<T> {
+        Spanned::new(node, Span::EMPTY)
+    }
+    fn col(name: &str) -> Spanned<Expr> {
+        sp(Expr::Column(Name::synthetic(name)))
+    }
+    fn int_lit(i: i64) -> Spanned<Expr> {
+        sp(Expr::Literal(Literal::Int(i)))
+    }
+    fn compile_expr(ast: Spanned<Expr>, schema: &OperatorSchema) -> CompiledExpr {
+        let reg = FunctionRegistry::with_builtins();
+        let typed = TypedExpr::from_ast(&ast, schema, &reg).expect("type check");
+        CompiledExpr::from_typed(&typed)
+    }
+
+    // Filter 1: value < 5 → keeps 5 rows of 100 (sparse).
+    let f1 = compile_expr(
+        sp(Expr::Compare {
+            op: CompareOp::Less,
+            left: Box::new(col("value")),
+            right: Box::new(int_lit(5)),
+        }),
+        &op_schema,
+    );
+    // Filter 2: id >= 0 (always true) — runs over the materialized
+    // dense input produced by the sparsity boundary.
+    let f2 = compile_expr(
+        sp(Expr::Compare {
+            op: CompareOp::GreaterOrEqual,
+            left: Box::new(col("id")),
+            right: Box::new(int_lit(0)),
+        }),
+        &op_schema,
+    );
+
+    // A child operator that emits the single hand-built batch then None.
+    struct OneShot {
+        schema: OperatorSchema,
+        batch: Option<RecordBatch>,
+    }
+    impl PhysicalOperator for OneShot {
+        fn output_schema(&self) -> &OperatorSchema {
+            &self.schema
+        }
+        fn next_batch(&mut self) -> bqlite_core::Result<Option<RecordBatch>> {
+            Ok(self.batch.take())
+        }
+    }
+
+    let kernels: Vec<KernelStep> = vec![
+        KernelStep::Filter(
+            Arc::new(FilterKernel::with_default_tile_size(f1, op_schema.clone()))
+                as Arc<dyn StatelessKernel>,
+        ),
+        KernelStep::Filter(
+            Arc::new(FilterKernel::with_default_tile_size(f2, op_schema.clone()))
+                as Arc<dyn StatelessKernel>,
+        ),
+    ];
+    let metrics = Arc::new(AtomicMetrics::new());
+    let mut seg = FusedStatelessSegment::new(
+        Box::new(OneShot {
+            schema: op_schema.clone(),
+            batch: Some(batch),
+        }),
+        kernels,
+        op_schema,
+        None,
+        Arc::clone(&metrics) as Arc<dyn Metrics>,
+        CancellationToken::new(),
+    );
+
+    let out = seg.next_batch().expect("next_batch ok").expect("non-empty");
+    assert_eq!(out.num_rows(), 5);
+
+    let snap = metrics.snapshot();
+    // One mid-chain materialization at the sparsity boundary; the outer
+    // boundary is a full-cover Some(sv) (5 of 5) which short-circuits
+    // without incrementing the counter (per `materialize_filtered_batch`).
+    assert_eq!(snap.selection_vector_materializations, 1);
+    // Filter 1 dropped 95 rows from a dense input; its accounting is
+    // recorded at filter 2's entry. Total: 95.
+    assert_eq!(snap.selection_vector_dropped_rows, 95);
+}
+
 /// CSV fixture generator produces deterministic output.
 #[test]
 fn csv_fixture_deterministic() {

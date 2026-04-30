@@ -249,6 +249,7 @@ impl SequenceMatchOperator {
             PhysicalPlan::Filter(node) => Self::source_entry_range(&node.input),
             PhysicalPlan::Project(node) => Self::source_entry_range(&node.input),
             PhysicalPlan::Limit(node) => Self::source_entry_range(&node.input),
+            PhysicalPlan::FusedSegment(node) => Self::source_entry_range(&node.input),
             PhysicalPlan::SequenceMatch(node) => Self::source_entry_range(&node.input),
             PhysicalPlan::Aggregate(node) => Self::source_entry_range(&node.input),
             PhysicalPlan::Sort(node) => Self::source_entry_range(&node.input),

@@ -1,4 +1,4 @@
-//! Projection pruning optimizer pass (TASK-228).
+//! Projection pruning optimizer pass (TASK-228, retargeted by TASK-519).
 //!
 //! Implements a backward demand-set collection pass per
 //! `docs/design/planner-pipeline.md` §6.6 (Pass 4). Walks the physical plan
@@ -12,17 +12,19 @@
 //! 1. Begin at the root with its output schema column names as the initial
 //!    demand.
 //! 2. Walk toward the `Scan` (depth-first, top-down demand propagation):
-//!    - **`FilterPhysical`**: output schema = input schema, so pass the
-//!      downstream demand unchanged. Additionally, the filter's predicate
-//!      references columns — collect those and add them to the demand so the
-//!      scan decodes them even if nothing else needs them.
-//!    - **`ProjectPhysical`**: the project evaluates all its output expressions
-//!      (there is no partial-expression evaluation in Wave 2). The demand
-//!      to its child is therefore the union of every column name referenced
-//!      by every expression in `proj.expressions`, regardless of which output
-//!      columns the downstream demanded.
-//!    - **`LimitPhysical`**: passes demand through unchanged (limit is a row
-//!      cap, not a column restriction).
+//!    - **`FusedSegmentPhysical`**: walk `steps` in *reverse* order — the
+//!      last step appended is the outermost in the chain (`engine/operator-fusion.md`
+//!      §4.6). Each step transforms demand:
+//!        - `Limit`: identity.
+//!        - `Project`: replace demand wholesale with the union of column
+//!          names referenced by every output expression (Wave 2 evaluates
+//!          every output expression, no partial-expression dropping).
+//!        - `Filter`: union demand with the column names referenced by
+//!          the predicate (the segment's input must decode them even when
+//!          no other operator references them).
+//!
+//!      The final demand becomes the demand for the segment's `input`,
+//!      which is then recursed into.
 //!    - **`ExplainPhysical`**: recurses into the inner plan with all of the
 //!      inner plan's output columns as demand (the `Explain` wrapper does not
 //!      restrict columns).
@@ -49,8 +51,8 @@ use bqlite_core::OperatorSchema;
 
 use crate::compiled::{CompiledExpr, CompiledNode};
 use crate::physical::{
-    AggregatePhysical, DistinctPhysical, ExplainPhysical, FilterPhysical, LimitPhysical,
-    PhysicalPlan, ProjectPhysical, ScanPhysical, SequenceMatchPhysical, SortPhysical,
+    AggregatePhysical, DistinctPhysical, ExplainPhysical, FusedSegmentPhysical, FusedSegmentStep,
+    PhysicalPlan, ScanPhysical, SequenceMatchPhysical, SortPhysical,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,60 +189,45 @@ fn prune_with_demand(plan: PhysicalPlan, demand: HashSet<String>) -> PhysicalPla
             })
         }
 
-        // ── Filter: pass demand through + add predicate column refs ──────────
-        PhysicalPlan::Filter(filter) => {
-            let FilterPhysical {
-                predicate,
+        // ── FusedSegment: walk steps in reverse, transforming demand ────────
+        PhysicalPlan::FusedSegment(seg) => {
+            let FusedSegmentPhysical {
                 input,
-                tile_size,
+                steps,
+                sparsity_factor,
                 output_schema,
-            } = filter;
+            } = seg;
 
+            // Walk steps in reverse so the last appended step (outermost
+            // in the legacy `Limit(Project(Filter(Scan)))` shape) is
+            // processed first. Each step transforms the demand it passes
+            // *back to its predecessor*. See D3 of TASK-519's plan.
             let mut child_demand = demand;
-            collect_column_names(&predicate, &mut child_demand);
-
-            PhysicalPlan::Filter(FilterPhysical {
-                predicate,
-                input: Box::new(prune_with_demand(*input, child_demand)),
-                tile_size,
-                output_schema,
-            })
-        }
-
-        // ── Project: child demand = columns referenced by all expressions ────
-        PhysicalPlan::Project(proj) => {
-            let ProjectPhysical {
-                expressions,
-                input,
-                output_schema,
-            } = proj;
-
-            // Wave 2 ProjectPhysical evaluates every output expression, so
-            // the child always needs all columns referenced across all
-            // expressions — independent of which output columns downstream
-            // actually requested.
-            let mut child_demand = HashSet::new();
-            for item in &expressions {
-                collect_column_names(&item.expr, &mut child_demand);
+            for step in steps.iter().rev() {
+                match step {
+                    FusedSegmentStep::Limit(_) => {
+                        // identity — limit does not affect column demand.
+                    }
+                    FusedSegmentStep::Project(items) => {
+                        // Wave 2 Project evaluates every output expression,
+                        // so the child needs every column referenced
+                        // across them — independent of downstream demand.
+                        let mut new_demand = HashSet::new();
+                        for item in items {
+                            collect_column_names(&item.expr, &mut new_demand);
+                        }
+                        child_demand = new_demand;
+                    }
+                    FusedSegmentStep::Filter { predicate, .. } => {
+                        collect_column_names(predicate, &mut child_demand);
+                    }
+                }
             }
 
-            PhysicalPlan::Project(ProjectPhysical {
-                expressions,
+            PhysicalPlan::FusedSegment(FusedSegmentPhysical {
                 input: Box::new(prune_with_demand(*input, child_demand)),
-                output_schema,
-            })
-        }
-
-        // ── Limit: transparent column-wise, pass demand through ───────────────
-        PhysicalPlan::Limit(limit) => {
-            let LimitPhysical {
-                count,
-                input,
-                output_schema,
-            } = limit;
-            PhysicalPlan::Limit(LimitPhysical {
-                count,
-                input: Box::new(prune_with_demand(*input, demand)),
+                steps,
+                sparsity_factor,
                 output_schema,
             })
         }
@@ -471,11 +458,61 @@ mod tests {
         ArrowKernelId, CompareKernel, CompiledExpr, CompiledNode, LogicalKernel,
     };
     use crate::physical::{
-        FilterPhysical, LimitPhysical, PhysicalPlan, ProjectPhysical, ProjectPhysicalItem,
-        ScanPhysical, DEFAULT_FILTER_TILE_SIZE,
+        FusedSegmentPhysical, FusedSegmentStep, PhysicalPlan, ProjectPhysicalItem, ScanPhysical,
+        DEFAULT_FILTER_TILE_SIZE, DEFAULT_SPARSITY_FACTOR,
     };
 
     use super::*;
+
+    // ── FusedSegment fixture builders ─────────────────────────────────────
+
+    /// Wrap a scan in a single-step `FusedSegment([Project(items)])`.
+    fn project_segment(
+        items: Vec<ProjectPhysicalItem>,
+        scan: ScanPhysical,
+        out: OperatorSchema,
+    ) -> PhysicalPlan {
+        PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(PhysicalPlan::Scan(scan)),
+            steps: vec![FusedSegmentStep::Project(items)],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: out,
+        })
+    }
+
+    /// Wrap a scan in a single-step `FusedSegment([Filter(predicate)])`.
+    fn filter_segment(
+        predicate: CompiledExpr,
+        scan: ScanPhysical,
+        out: OperatorSchema,
+    ) -> PhysicalPlan {
+        PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(PhysicalPlan::Scan(scan)),
+            steps: vec![FusedSegmentStep::Filter {
+                predicate,
+                tile_size: DEFAULT_FILTER_TILE_SIZE,
+            }],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: out,
+        })
+    }
+
+    /// Build a multi-step `FusedSegment(steps over scan)` in source/append
+    /// order. Steps appended in source order match `lower_physical`'s
+    /// behaviour: index 0 = innermost (closest to scan), index N-1 =
+    /// outermost.
+    fn segment_over_scan(
+        steps: Vec<FusedSegmentStep>,
+        scan: ScanPhysical,
+        out: OperatorSchema,
+    ) -> PhysicalPlan {
+        PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(PhysicalPlan::Scan(scan)),
+            steps,
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: out,
+        })
+    }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
 
@@ -558,8 +595,8 @@ mod tests {
         let scan = make_scan_with_schema(ten_col_schema());
         let two_out = two_col_schema();
 
-        let plan = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![
+        let plan = project_segment(
+            vec![
                 ProjectPhysicalItem {
                     expr: col_expr("entity_id", 0, BqlType::String, false),
                     output_name: "entity_id".into(),
@@ -569,17 +606,17 @@ mod tests {
                     output_name: "ts".into(),
                 },
             ],
-            input: Box::new(PhysicalPlan::Scan(scan)),
-            output_schema: two_out,
-        });
+            scan,
+            two_out,
+        );
 
         let result = prune_columns(plan);
 
-        let PhysicalPlan::Project(proj) = result else {
-            panic!("expected Project, got {result:?}");
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment, got {result:?}");
         };
-        let PhysicalPlan::Scan(scan) = *proj.input else {
-            panic!("expected Scan under Project");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
         assert_eq!(
             scan.projected_columns,
@@ -622,20 +659,15 @@ mod tests {
         let all_col_names: Vec<String> = schema.columns().iter().map(|c| c.name.clone()).collect();
 
         let scan = make_scan_with_schema(schema.clone());
-        let plan = PhysicalPlan::Filter(FilterPhysical {
-            predicate: pushable_pred("col1", 3),
-            input: Box::new(PhysicalPlan::Scan(scan)),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
-            output_schema: schema,
-        });
+        let plan = filter_segment(pushable_pred("col1", 3), scan, schema);
 
         let result = prune_columns(plan);
 
-        let PhysicalPlan::Filter(filter) = result else {
-            panic!("expected Filter, got {result:?}");
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment, got {result:?}");
         };
-        let PhysicalPlan::Scan(scan) = *filter.input else {
-            panic!("expected Scan under Filter");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
         let mut expected = all_col_names;
         expected.sort_unstable();
@@ -649,44 +681,89 @@ mod tests {
 
     #[test]
     fn limit_over_project_passes_column_demand_to_scan() {
+        // FusedSegment([Project, Limit]) over Scan. Steps in source order:
+        // index 0 = Project (innermost), index 1 = Limit (outermost). The
+        // pruning pass walks steps in reverse so Limit is processed first
+        // (identity), then Project (replace demand). The scan must read
+        // exactly the 2 columns the Project needs.
         let scan = make_scan_with_schema(ten_col_schema());
         let two_out = two_col_schema();
 
-        let project = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![
-                ProjectPhysicalItem {
-                    expr: col_expr("entity_id", 0, BqlType::String, false),
-                    output_name: "entity_id".into(),
-                },
-                ProjectPhysicalItem {
-                    expr: col_expr("ts", 1, BqlType::Timestamp, false),
-                    output_name: "ts".into(),
-                },
+        let plan = segment_over_scan(
+            vec![
+                FusedSegmentStep::Project(vec![
+                    ProjectPhysicalItem {
+                        expr: col_expr("entity_id", 0, BqlType::String, false),
+                        output_name: "entity_id".into(),
+                    },
+                    ProjectPhysicalItem {
+                        expr: col_expr("ts", 1, BqlType::Timestamp, false),
+                        output_name: "ts".into(),
+                    },
+                ]),
+                FusedSegmentStep::Limit(10),
             ],
-            input: Box::new(PhysicalPlan::Scan(scan)),
-            output_schema: two_out.clone(),
-        });
-        let plan = PhysicalPlan::Limit(LimitPhysical {
-            count: 10,
-            input: Box::new(project),
-            output_schema: two_out,
-        });
+            scan,
+            two_out,
+        );
 
         let result = prune_columns(plan);
 
-        let PhysicalPlan::Limit(limit) = result else {
-            panic!("expected Limit, got {result:?}");
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment, got {result:?}");
         };
-        let PhysicalPlan::Project(proj) = *limit.input else {
-            panic!("expected Project under Limit");
-        };
-        let PhysicalPlan::Scan(scan) = *proj.input else {
-            panic!("expected Scan under Project");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
         assert_eq!(
             scan.projected_columns,
             vec!["entity_id", "ts"],
             "limit must not widen scan beyond what project needs"
+        );
+    }
+
+    // ── Multi-step demand reset (D3): downstream demand of a Limit step
+    // ── must NOT leak past a Project step that doesn't reference it.
+    #[test]
+    fn project_resets_demand_inside_segment() {
+        // FusedSegment([Filter(col1), Project(col2), Limit(5)]) over Scan.
+        // Source order: Filter at 0, Project at 1, Limit at 2. The
+        // pruning pass walks in reverse: Limit (identity) → Project
+        // (replace demand with `col2`) → Filter (union with `col1`).
+        // Final demand passed to scan: { col1, col2 }. The downstream
+        // demand seeded from output_schema (col2 only) is dropped at
+        // the Project step.
+        let scan = make_scan_with_schema(ten_col_schema());
+        let one_out = OperatorSchema::new(vec![ColumnDef::nullable("col2", BqlType::Int)])
+            .expect("one-col schema");
+
+        let plan = segment_over_scan(
+            vec![
+                FusedSegmentStep::Filter {
+                    predicate: pushable_pred("col1", 3),
+                    tile_size: DEFAULT_FILTER_TILE_SIZE,
+                },
+                FusedSegmentStep::Project(vec![ProjectPhysicalItem {
+                    expr: col_expr("col2", 4, BqlType::Int, true),
+                    output_name: "col2".into(),
+                }]),
+                FusedSegmentStep::Limit(5),
+            ],
+            scan,
+            one_out,
+        );
+
+        let result = prune_columns(plan);
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment, got {result:?}");
+        };
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
+        };
+        assert_eq!(
+            scan.projected_columns,
+            vec!["col1", "col2", "entity_id", "ts"],
+            "Project must reset demand mid-segment; Filter unions its predicate columns"
         );
     }
 
@@ -710,8 +787,8 @@ mod tests {
         };
         let two_out = two_col_schema();
 
-        let plan = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![
+        let plan = project_segment(
+            vec![
                 ProjectPhysicalItem {
                     expr: col_expr("entity_id", 0, BqlType::String, false),
                     output_name: "entity_id".into(),
@@ -721,17 +798,17 @@ mod tests {
                     output_name: "ts".into(),
                 },
             ],
-            input: Box::new(PhysicalPlan::Scan(scan_with_pred)),
-            output_schema: two_out,
-        });
+            scan_with_pred,
+            two_out,
+        );
 
         let result = prune_columns(plan);
 
-        let PhysicalPlan::Project(proj) = result else {
-            panic!("expected Project, got {result:?}");
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment, got {result:?}");
         };
-        let PhysicalPlan::Scan(scan) = *proj.input else {
-            panic!("expected Scan under Project");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
         assert_eq!(
             scan.projected_columns,
@@ -759,22 +836,22 @@ mod tests {
             .expect("output schema");
 
         let scan = make_scan_with_schema(ten_col_schema());
-        let plan = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![ProjectPhysicalItem {
+        let plan = project_segment(
+            vec![ProjectPhysicalItem {
                 expr: sum_expr,
                 output_name: "sum".into(),
             }],
-            input: Box::new(PhysicalPlan::Scan(scan)),
-            output_schema: out_schema,
-        });
+            scan,
+            out_schema,
+        );
 
         let result = prune_columns(plan);
 
-        let PhysicalPlan::Project(proj) = result else {
-            panic!("expected Project");
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment");
         };
-        let PhysicalPlan::Scan(scan) = *proj.input else {
-            panic!("expected Scan under Project");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
         // entity_id and ts are always included by the pruning pass
         // (required for k-way merge in the scan operator).
@@ -789,7 +866,11 @@ mod tests {
 
     #[test]
     fn filter_with_and_predicate_demands_all_referenced_columns() {
-        // Filter: `col1 > 0 AND col2 > 0` but only entity_id/ts are in project.
+        // FusedSegment([Filter(col1 AND col2), Project(entity_id, ts)])
+        // over Scan. Source order: Filter at 0, Project at 1. Reverse
+        // walk: Project (replace demand with entity_id, ts), then Filter
+        // (union with col1, col2). Final demand: { col1, col2, entity_id,
+        // ts }.
         let and_pred = CompiledExpr {
             node: CompiledNode::And {
                 operands: vec![pushable_pred("col1", 3), pushable_pred("col2", 4)],
@@ -798,52 +879,37 @@ mod tests {
             result_type: BqlType::Bool,
             nullable: false,
         };
-        let schema = ten_col_schema();
         let two_out = two_col_schema();
+        let scan = make_scan_with_schema(ten_col_schema());
 
-        let scan = make_scan_with_schema(schema.clone());
-        let plan = PhysicalPlan::Filter(FilterPhysical {
-            predicate: and_pred,
-            input: Box::new(PhysicalPlan::Scan(scan)),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
-            output_schema: schema,
-        });
-
-        // Wrap in a Project that only selects entity_id, ts.
-        // Filter sits between Project and Scan.
-        // But wait — that would require the filter to refer to columns in its
-        // input schema (the scan). After type-checking, Filter output = Filter
-        // input. So Filter(Scan) with a predicate referencing col1 and col2.
-        // Project above it selects entity_id and ts.
-        // Plan: Project(Filter(Scan))
-        let project_plan = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![
-                ProjectPhysicalItem {
-                    expr: col_expr("entity_id", 0, BqlType::String, false),
-                    output_name: "entity_id".into(),
+        let plan = segment_over_scan(
+            vec![
+                FusedSegmentStep::Filter {
+                    predicate: and_pred,
+                    tile_size: DEFAULT_FILTER_TILE_SIZE,
                 },
-                ProjectPhysicalItem {
-                    expr: col_expr("ts", 1, BqlType::Timestamp, false),
-                    output_name: "ts".into(),
-                },
+                FusedSegmentStep::Project(vec![
+                    ProjectPhysicalItem {
+                        expr: col_expr("entity_id", 0, BqlType::String, false),
+                        output_name: "entity_id".into(),
+                    },
+                    ProjectPhysicalItem {
+                        expr: col_expr("ts", 1, BqlType::Timestamp, false),
+                        output_name: "ts".into(),
+                    },
+                ]),
             ],
-            input: Box::new(plan),
-            output_schema: two_out,
-        });
+            scan,
+            two_out,
+        );
 
-        let result = prune_columns(project_plan);
-
-        let PhysicalPlan::Project(proj) = result else {
-            panic!("expected Project");
+        let result = prune_columns(plan);
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment");
         };
-        let PhysicalPlan::Filter(filter) = *proj.input else {
-            panic!("expected Filter under Project");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
-        let PhysicalPlan::Scan(scan) = *filter.input else {
-            panic!("expected Scan under Filter");
-        };
-        // Filter needs col1, col2 for predicate; Project needs entity_id, ts.
-        // scan.projected_columns must include all four.
         assert!(
             scan.projected_columns.contains(&"col1".to_string()),
             "col1 referenced by filter predicate must be in projected_columns"
@@ -877,8 +943,8 @@ mod tests {
         ])
         .expect("three col schema");
 
-        let plan = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![
+        let plan = project_segment(
+            vec![
                 ProjectPhysicalItem {
                     expr: col_expr("col3", 5, BqlType::Int, true),
                     output_name: "col3".into(),
@@ -892,17 +958,17 @@ mod tests {
                     output_name: "col1".into(),
                 },
             ],
-            input: Box::new(PhysicalPlan::Scan(scan)),
-            output_schema: three_out,
-        });
+            scan,
+            three_out,
+        );
 
         let result = prune_columns(plan);
 
-        let PhysicalPlan::Project(proj) = result else {
-            panic!("expected Project");
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment");
         };
-        let PhysicalPlan::Scan(scan) = *proj.input else {
-            panic!("expected Scan under Project");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
         // entity_id and ts are always included by the pruning pass
         // (required for k-way merge in the scan operator).
@@ -921,8 +987,8 @@ mod tests {
         // If the pruning pass mistakenly seeded the inner plan's demand from
         // the wrapper schema, the scan would get projected_columns = ["plan"]
         // (or even empty). The correct behavior is to seed from the inner
-        // plan's own output schema so the inner Project(Scan) is pruned
-        // to exactly the 2 columns the project needs.
+        // plan's own output schema so the inner FusedSegment(Scan) is pruned
+        // to exactly the 2 columns the project step needs.
         use crate::physical::ExplainPhysical;
 
         let scan = make_scan_with_schema(ten_col_schema());
@@ -930,8 +996,8 @@ mod tests {
         let explain_out = OperatorSchema::new(vec![ColumnDef::required("plan", BqlType::String)])
             .expect("explain schema");
 
-        let project = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![
+        let inner = project_segment(
+            vec![
                 ProjectPhysicalItem {
                     expr: col_expr("entity_id", 0, BqlType::String, false),
                     output_name: "entity_id".into(),
@@ -941,11 +1007,11 @@ mod tests {
                     output_name: "ts".into(),
                 },
             ],
-            input: Box::new(PhysicalPlan::Scan(scan)),
-            output_schema: two_out,
-        });
+            scan,
+            two_out,
+        );
         let plan = PhysicalPlan::Explain(ExplainPhysical {
-            plan: Box::new(project),
+            plan: Box::new(inner),
             output_schema: explain_out,
         });
 
@@ -954,11 +1020,11 @@ mod tests {
         let PhysicalPlan::Explain(explain) = result else {
             panic!("expected Explain, got {result:?}");
         };
-        let PhysicalPlan::Project(proj) = *explain.plan else {
-            panic!("expected Project inside Explain");
+        let PhysicalPlan::FusedSegment(seg) = *explain.plan else {
+            panic!("expected FusedSegment inside Explain");
         };
-        let PhysicalPlan::Scan(scan) = *proj.input else {
-            panic!("expected Scan under Project");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
         // Must be the Project's 2 columns — NOT the wrapper's "plan" column.
         assert_eq!(

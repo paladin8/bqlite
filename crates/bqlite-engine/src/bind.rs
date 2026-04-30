@@ -779,6 +779,12 @@ fn entity_key_col_name(plan: &PhysicalPlan) -> &str {
         PhysicalPlan::Filter(filter) => entity_key_col_name(&filter.input),
         PhysicalPlan::Project(proj) => entity_key_col_name(&proj.input),
         PhysicalPlan::Limit(limit) => entity_key_col_name(&limit.input),
+        // FusedSegment is column-transparent on the entity-key axis:
+        // even a Project step would emit an `entity_id`-named output if
+        // it forwarded the column, but in practice the segment carries
+        // its child's entity-key column unchanged. Recurse into the
+        // input the same way the legacy stateless arms did.
+        PhysicalPlan::FusedSegment(seg) => entity_key_col_name(&seg.input),
         // Wave 4 passthrough operators — entity key column name propagates
         // unchanged through these nodes.
         PhysicalPlan::Sessionize(sess) => entity_key_col_name(&sess.input),

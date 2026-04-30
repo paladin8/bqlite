@@ -210,6 +210,35 @@ pub fn build_explain_node(plan: &PhysicalPlan) -> ExplainNode {
             count: limit.count,
             input: Box::new(build_explain_node(&limit.input)),
         },
+        // FusedSegment renders one ExplainNode per step. Steps are
+        // appended in source order during lowering — index 0 is the
+        // innermost (closest to the scan) and the last index is the
+        // outermost. We iterate forward and wrap `node` at each step so
+        // the *last* step iterated (index N-1) ends up at the top of
+        // the rendered tree — preserving the legacy
+        // `Limit(Project(Filter(Scan)))` shape exactly. (D5 of TASK-519.)
+        PhysicalPlan::FusedSegment(seg) => {
+            let mut node = build_explain_node(&seg.input);
+            for step in seg.steps.iter() {
+                node = match step {
+                    crate::physical::FusedSegmentStep::Filter { predicate, .. } => {
+                        ExplainNode::Filter {
+                            predicate: format_expr(predicate),
+                            input: Box::new(node),
+                        }
+                    }
+                    crate::physical::FusedSegmentStep::Project(items) => ExplainNode::Project {
+                        columns: items.iter().map(|i| i.output_name.clone()).collect(),
+                        input: Box::new(node),
+                    },
+                    crate::physical::FusedSegmentStep::Limit(count) => ExplainNode::Limit {
+                        count: *count,
+                        input: Box::new(node),
+                    },
+                };
+            }
+            node
+        }
         // Transparently unwrap EXPLAIN so callers can pass either form.
         PhysicalPlan::Explain(explain) => build_explain_node(&explain.plan),
         // ── Wave 3 variants ────────────────────────────────────────────────
@@ -1133,6 +1162,140 @@ mod tests {
         let text = format_explain(&node);
         assert!(text.contains("Limit"), "missing Limit header: {text}");
         assert!(text.contains("50"), "missing count: {text}");
+    }
+
+    #[test]
+    fn fused_segment_renders_steps_in_outer_first_order() {
+        // FusedSegment([Filter, Project, Limit]) over Scan (steps in
+        // source/append order). The legacy `Limit(Project(Filter(Scan)))`
+        // shape demands Limit at the top, Project below, Filter below
+        // that, Scan at the bottom. D5 of TASK-519 pins this.
+        use crate::compiled::{ArrowKernelId, CompareKernel, CompiledNode as CN};
+        use crate::physical::{
+            FusedSegmentPhysical, FusedSegmentStep, ProjectPhysicalItem, ScanPhysical,
+            DEFAULT_FILTER_TILE_SIZE, DEFAULT_SPARSITY_FACTOR,
+        };
+        use bqlite_core::{BqlType, ColumnDef, OperatorSchema, PropertyValue};
+
+        let scan_schema = OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::nullable("amount", BqlType::Int),
+        ])
+        .unwrap();
+        let project_schema = OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+        ])
+        .unwrap();
+        let scan = ScanPhysical {
+            table: "events".into(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec!["entity_id".into(), "ts".into()],
+            output_schema: scan_schema.clone(),
+            entity_key_col: "entity_id".into(),
+            timestamp_col: "ts".into(),
+            sample: None,
+        };
+        let predicate = CompiledExpr {
+            node: CN::Compare {
+                op: CompareOp::Greater,
+                left: Box::new(CompiledExpr {
+                    node: CN::Column {
+                        index: 2,
+                        name: "amount".into(),
+                    },
+                    result_type: BqlType::Int,
+                    nullable: true,
+                }),
+                right: Box::new(CompiledExpr {
+                    node: CN::Literal(PropertyValue::Int(0)),
+                    result_type: BqlType::Int,
+                    nullable: false,
+                }),
+                kernel: CompareKernel::ArrowKernel(ArrowKernelId::GtInt),
+            },
+            result_type: BqlType::Bool,
+            nullable: false,
+        };
+        let plan = PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(PhysicalPlan::Scan(scan)),
+            steps: vec![
+                FusedSegmentStep::Filter {
+                    predicate,
+                    tile_size: DEFAULT_FILTER_TILE_SIZE,
+                },
+                FusedSegmentStep::Project(vec![
+                    ProjectPhysicalItem {
+                        expr: CompiledExpr {
+                            node: CN::Column {
+                                index: 0,
+                                name: "entity_id".into(),
+                            },
+                            result_type: BqlType::String,
+                            nullable: false,
+                        },
+                        output_name: "entity_id".into(),
+                    },
+                    ProjectPhysicalItem {
+                        expr: CompiledExpr {
+                            node: CN::Column {
+                                index: 1,
+                                name: "ts".into(),
+                            },
+                            result_type: BqlType::Timestamp,
+                            nullable: false,
+                        },
+                        output_name: "ts".into(),
+                    },
+                ]),
+                FusedSegmentStep::Limit(7),
+            ],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: project_schema,
+        });
+
+        let node = build_explain_node(&plan);
+        let text = format_explain(&node);
+
+        // Outermost is Limit.
+        let ExplainNode::Limit { count: 7, input } = node else {
+            panic!("expected Limit at root; got rendered as:\n{text}");
+        };
+        // Then Project.
+        let ExplainNode::Project {
+            columns,
+            input: pinput,
+        } = *input
+        else {
+            panic!("expected Project under Limit; got:\n{text}");
+        };
+        assert_eq!(columns, vec!["entity_id", "ts"]);
+        // Then Filter.
+        let ExplainNode::Filter {
+            predicate: _,
+            input: finput,
+        } = *pinput
+        else {
+            panic!("expected Filter under Project; got:\n{text}");
+        };
+        // Then Scan at the bottom.
+        let ExplainNode::Scan { table, .. } = *finput else {
+            panic!("expected Scan at the bottom; got:\n{text}");
+        };
+        assert_eq!(table, "events");
+
+        // Render order check: Limit line precedes Project line precedes
+        // Filter line precedes Scan line in the formatted text.
+        let limit_pos = text.find("Limit 7").expect("Limit 7 in text");
+        let project_pos = text.find("Project").expect("Project in text");
+        let filter_pos = text.find("Filter").expect("Filter in text");
+        let scan_pos = text.find("Scan(events)").expect("Scan in text");
+        assert!(limit_pos < project_pos);
+        assert!(project_pos < filter_pos);
+        assert!(filter_pos < scan_pos);
     }
 
     #[test]

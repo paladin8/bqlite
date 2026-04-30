@@ -64,8 +64,8 @@ use std::collections::HashSet;
 use crate::compiled::{CompiledExpr, CompiledNode};
 use crate::demand::{CompiledAggExpr, CompiledFusableAggregate};
 use crate::physical::{
-    AggregatePhysical, DistinctPhysical, ExplainPhysical, FilterPhysical, LimitPhysical,
-    PhysicalPlan, ProjectPhysical, SequenceMatchPhysical, SortPhysical,
+    AggregatePhysical, DistinctPhysical, ExplainPhysical, FusedSegmentPhysical, PhysicalPlan,
+    SequenceMatchPhysical, SortPhysical,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,43 +96,17 @@ pub fn fuse_match_aggregate(plan: PhysicalPlan) -> PhysicalPlan {
         PhysicalPlan::Aggregate(agg) => fuse_aggregate_node(agg),
 
         // ── Recursive cases: recurse into child plans ─────────────────────────
-        PhysicalPlan::Filter(filter) => {
-            let FilterPhysical {
-                predicate,
+        PhysicalPlan::FusedSegment(seg) => {
+            let FusedSegmentPhysical {
                 input,
-                tile_size,
+                steps,
+                sparsity_factor,
                 output_schema,
-            } = filter;
-            PhysicalPlan::Filter(FilterPhysical {
-                predicate,
+            } = seg;
+            PhysicalPlan::FusedSegment(FusedSegmentPhysical {
                 input: Box::new(fuse_match_aggregate(*input)),
-                tile_size,
-                output_schema,
-            })
-        }
-
-        PhysicalPlan::Project(proj) => {
-            let ProjectPhysical {
-                expressions,
-                input,
-                output_schema,
-            } = proj;
-            PhysicalPlan::Project(ProjectPhysical {
-                expressions,
-                input: Box::new(fuse_match_aggregate(*input)),
-                output_schema,
-            })
-        }
-
-        PhysicalPlan::Limit(limit) => {
-            let LimitPhysical {
-                count,
-                input,
-                output_schema,
-            } = limit;
-            PhysicalPlan::Limit(LimitPhysical {
-                count,
-                input: Box::new(fuse_match_aggregate(*input)),
+                steps,
+                sparsity_factor,
                 output_schema,
             })
         }
@@ -960,8 +934,9 @@ mod tests {
 
     #[test]
     fn nested_aggregate_over_sequence_match_fuses_inner() {
-        // Plan: Limit(Aggregate(SequenceMatch(...)))
-        // The fusion pass recurses into the Limit and fuses the inner pair.
+        // Plan: FusedSegment([Limit])(Aggregate(SequenceMatch(...)))
+        // The fusion pass recurses through the FusedSegment Limit step
+        // and fuses the inner pair.
         let match_schema = match_output_schema();
         let inner_agg_schema =
             OperatorSchema::new(vec![ColumnDef::nullable("reached", BqlType::Int)]).unwrap();
@@ -980,23 +955,24 @@ mod tests {
             output_schema: inner_agg_schema.clone(),
         });
 
-        let plan = PhysicalPlan::Limit(crate::physical::LimitPhysical {
-            count: 10,
+        let plan = PhysicalPlan::FusedSegment(crate::physical::FusedSegmentPhysical {
             input: Box::new(agg),
+            steps: vec![crate::physical::FusedSegmentStep::Limit(10)],
+            sparsity_factor: crate::physical::DEFAULT_SPARSITY_FACTOR,
             output_schema: inner_agg_schema.clone(),
         });
 
         let result = fuse_match_aggregate(plan);
 
-        let PhysicalPlan::Limit(limit) = result else {
-            panic!("expected Limit at root");
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment at root");
         };
-        let PhysicalPlan::SequenceMatch(fused) = *limit.input else {
-            panic!("expected fused SequenceMatch under Limit");
+        let PhysicalPlan::SequenceMatch(fused) = *seg.input else {
+            panic!("expected fused SequenceMatch under FusedSegment");
         };
         assert!(
             fused.fused_aggregate.is_some(),
-            "inner Aggregate must be fused through Limit wrapper"
+            "inner Aggregate must be fused through FusedSegment wrapper"
         );
     }
 

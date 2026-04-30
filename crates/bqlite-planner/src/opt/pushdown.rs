@@ -1,40 +1,48 @@
-//! Predicate pushdown optimizer pass (TASK-227).
+//! Predicate pushdown optimizer pass (TASK-227, retargeted by TASK-519).
 //!
-//! Walks the physical plan looking for a [`FilterPhysical`] directly above a
-//! [`ScanPhysical`] and moves conjuncts that the storage layer can evaluate
-//! (per [`CompiledExpr::supported_pushdown_shape`]) into
-//! `ScanPhysical::scan_predicates`. The residual conjuncts stay in
-//! `FilterPhysical`; the filter is elided when no residue remains.
+//! Walks the physical plan looking for a [`FusedSegmentPhysical`] whose first
+//! [`FusedSegmentStep`] is a `Filter` and whose `input` is a [`ScanPhysical`].
+//! For that shape, the pass moves conjuncts that the storage layer can
+//! evaluate (per [`CompiledExpr::supported_pushdown_shape`]) into
+//! `ScanPhysical::scan_predicates`. Residual conjuncts stay in the same
+//! `Filter` step; the step is dropped when no residue remains. When dropping
+//! the step empties the segment, the bare scan is returned directly.
 //!
 //! # Algorithm
 //!
-//! 1. Walk the tree recursively (depth-first, post-order for inner nodes).
-//! 2. When visiting a `Filter(Scan(…))` pattern:
+//! 1. Walk the tree recursively.
+//! 2. When visiting `FusedSegment(steps=[Filter, …], input=Scan)`:
 //!    - Decompose the predicate into top-level conjuncts (if the predicate is
 //!      a variadic `And`, use its operands; otherwise treat the whole
 //!      expression as one conjunct).
 //!    - Ask each conjunct `supported_pushdown_shape()`.
 //!    - Pushable conjuncts → `scan.scan_predicates`.
-//!    - Residual conjuncts → reconstruct `FilterPhysical` (single expression
-//!      or a new `And` from the residue list).
-//!    - If residue is empty → return the `Scan` directly (filter elided).
-//! 3. For `Filter` over any other child → recurse into the child, then
-//!    reassemble the filter unchanged.
-//! 4. For every other interior node (`Project`, `Limit`, `Explain`) → recurse
-//!    into child inputs and reassemble.
+//!    - Residual conjuncts → rebuild the `Filter` step at index 0 with the
+//!      conjoined residue.
+//!    - If the residue is empty → drop the `Filter` step. If the segment now
+//!      has zero steps, return the bare `Scan`; otherwise rebuild the segment
+//!      without the leading Filter.
+//! 3. For any other [`FusedSegmentPhysical`] shape — recurse into `input`
+//!    (so a nested `FusedSegment(Filter+Scan)` deeper in the tree is still
+//!    rewritten), then reassemble.
+//! 4. For every interior non-stateless node — recurse into children and
+//!    reassemble.
 //! 5. Leaf nodes (`Scan`, DDL, `Insert`) → return unchanged.
 //!
 //! # Conservatism
 //!
-//! Only the direct `Filter(Scan)` pattern is rewritten. Filters above
-//! `Project(Scan)`, `Limit(Scan)`, or deeper trees are recursed into but not
-//! moved. Wave 2 scope per TASK-227.
+//! Only the `FusedSegment(Filter[0]+Scan)` pattern is rewritten. A `Filter`
+//! step at index ≥ 1 is **not** pushed, even if the underlying input is a
+//! `Scan`: the preceding `Project` step has already rewritten the schema, so
+//! the Filter's column references no longer correspond to the Scan's columns
+//! and pushing would silently misroute them. This matches the Wave 2
+//! conservatism (`engine/operator-fusion.md` §6.4 / `D2` of TASK-519's plan).
 
 use bqlite_core::BqlType;
 
 use crate::compiled::{CompiledExpr, CompiledNode, LogicalKernel};
 use crate::physical::{
-    ExplainPhysical, FilterPhysical, LimitPhysical, PhysicalPlan, ProjectPhysical, ScanPhysical,
+    ExplainPhysical, FusedSegmentPhysical, FusedSegmentStep, PhysicalPlan, ScanPhysical,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -43,39 +51,13 @@ use crate::physical::{
 
 /// Run the predicate pushdown pass over a [`PhysicalPlan`] tree.
 ///
-/// Returns a new tree with pushable predicates migrated from
-/// `FilterPhysical.predicate` into the nearest `ScanPhysical.scan_predicates`
-/// when a `Filter(Scan)` pattern is detected. All other nodes are returned
-/// structurally unchanged (but recursed into so nested patterns are handled).
+/// Returns a new tree with pushable predicates migrated from a leading
+/// `FusedSegmentStep::Filter` into the nearest `ScanPhysical::scan_predicates`
+/// whenever the segment's input is a `Scan`. All other nodes are returned
+/// structurally unchanged but recursed into so nested patterns are handled.
 pub fn pushdown_predicates(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::Filter(filter) => push_filter(filter),
-
-        PhysicalPlan::Project(proj) => {
-            let ProjectPhysical {
-                expressions,
-                input,
-                output_schema,
-            } = proj;
-            PhysicalPlan::Project(ProjectPhysical {
-                expressions,
-                input: Box::new(pushdown_predicates(*input)),
-                output_schema,
-            })
-        }
-
-        PhysicalPlan::Limit(limit) => {
-            let LimitPhysical {
-                count,
-                input,
-                output_schema,
-            } = limit;
-            PhysicalPlan::Limit(LimitPhysical {
-                count,
-                input: Box::new(pushdown_predicates(*input)),
-                output_schema,
-            })
-        }
+        PhysicalPlan::FusedSegment(seg) => push_fused_segment(seg),
 
         PhysicalPlan::Explain(explain) => {
             let ExplainPhysical {
@@ -149,58 +131,88 @@ pub fn pushdown_predicates(plan: PhysicalPlan) -> PhysicalPlan {
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Handle a `FilterPhysical` node: push into a direct `ScanPhysical` child if
-/// present, otherwise recurse into the child and reassemble.
-fn push_filter(filter: FilterPhysical) -> PhysicalPlan {
-    let FilterPhysical {
-        predicate,
+/// Handle a [`FusedSegmentPhysical`]: push the leading Filter step into a
+/// direct `ScanPhysical` child if eligible, otherwise recurse into the child
+/// and reassemble.
+fn push_fused_segment(seg: FusedSegmentPhysical) -> PhysicalPlan {
+    let FusedSegmentPhysical {
         input,
-        tile_size,
+        steps,
+        sparsity_factor,
         output_schema,
-    } = filter;
+    } = seg;
 
-    match *input {
-        PhysicalPlan::Scan(scan) => {
-            // Direct Filter-over-Scan: attempt pushdown.
-            let (pushed, residue) = split_conjuncts(predicate);
+    // Eligible shape: steps[0] is a Filter, *input is a Scan.
+    let leading_is_filter = matches!(steps.first(), Some(FusedSegmentStep::Filter { .. }));
+    let input_is_scan = matches!(*input, PhysicalPlan::Scan(_));
 
-            // Merge pushed conjuncts into an updated scan (preserving any
-            // predicates already present from a prior pass or logical phase).
-            let new_scan = ScanPhysical {
-                scan_predicates: {
-                    let mut preds = scan.scan_predicates;
-                    preds.extend(pushed);
-                    preds
-                },
-                ..scan
-            };
+    if !leading_is_filter || !input_is_scan {
+        // Recurse into the child so any nested FusedSegment(Filter+Scan)
+        // pattern deeper in the tree is still rewritten, then reassemble.
+        return PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(pushdown_predicates(*input)),
+            steps,
+            sparsity_factor,
+            output_schema,
+        });
+    }
 
-            if residue.is_empty() {
-                // All conjuncts pushed → elide the filter entirely.
-                PhysicalPlan::Scan(new_scan)
-            } else {
-                // Some conjuncts remain → rebuild a narrower filter.
-                PhysicalPlan::Filter(FilterPhysical {
-                    predicate: conjoin(residue),
-                    input: Box::new(PhysicalPlan::Scan(new_scan)),
-                    tile_size,
-                    output_schema,
-                })
-            }
-        }
+    let scan = match *input {
+        PhysicalPlan::Scan(s) => s,
+        _ => unreachable!("input_is_scan guarded above"),
+    };
 
-        other_input => {
-            // Filter is not directly above a Scan: recurse into the child
-            // so any nested Filter(Scan) patterns are handled, then
-            // reassemble with the original predicate unchanged.
-            let optimized_input = pushdown_predicates(other_input);
-            PhysicalPlan::Filter(FilterPhysical {
-                predicate,
-                input: Box::new(optimized_input),
-                tile_size,
+    let mut steps_iter = steps.into_iter();
+    let leading = steps_iter.next().expect("leading_is_filter guarded above");
+    let (predicate, tile_size) = match leading {
+        FusedSegmentStep::Filter {
+            predicate,
+            tile_size,
+        } => (predicate, tile_size),
+        _ => unreachable!("leading_is_filter guarded above"),
+    };
+    let remaining_steps: Vec<FusedSegmentStep> = steps_iter.collect();
+
+    let (pushed, residue) = split_conjuncts(predicate);
+    let new_scan = ScanPhysical {
+        scan_predicates: {
+            let mut preds = scan.scan_predicates;
+            preds.extend(pushed);
+            preds
+        },
+        ..scan
+    };
+
+    if residue.is_empty() {
+        // Filter step elided.
+        if remaining_steps.is_empty() {
+            // Segment is empty — return the bare Scan directly.
+            PhysicalPlan::Scan(new_scan)
+        } else {
+            // Rebuild the segment without the leading Filter step. The
+            // segment's `output_schema` does not change (Filter is
+            // schema-transparent).
+            PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+                input: Box::new(PhysicalPlan::Scan(new_scan)),
+                steps: remaining_steps,
+                sparsity_factor,
                 output_schema,
             })
         }
+    } else {
+        // Keep a narrower Filter step over the rebuilt scan.
+        let mut new_steps = Vec::with_capacity(remaining_steps.len() + 1);
+        new_steps.push(FusedSegmentStep::Filter {
+            predicate: conjoin(residue),
+            tile_size,
+        });
+        new_steps.extend(remaining_steps);
+        PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(PhysicalPlan::Scan(new_scan)),
+            steps: new_steps,
+            sparsity_factor,
+            output_schema,
+        })
     }
 }
 
@@ -269,8 +281,8 @@ mod tests {
 
     use crate::compiled::{ArrowKernelId, CompareKernel, CompiledExpr, CompiledNode};
     use crate::physical::{
-        ExplainPhysical, FilterPhysical, LimitPhysical, PhysicalPlan, ProjectPhysical,
-        ScanPhysical, DEFAULT_FILTER_TILE_SIZE,
+        ExplainPhysical, FusedSegmentPhysical, FusedSegmentStep, PhysicalPlan, ProjectPhysicalItem,
+        ScanPhysical, DEFAULT_FILTER_TILE_SIZE, DEFAULT_SPARSITY_FACTOR,
     };
 
     use super::*;
@@ -352,14 +364,43 @@ mod tests {
         }
     }
 
-    /// Wrap `predicate` in a `FilterPhysical` over `make_scan()`.
+    /// Build a single-step `FusedSegment(Filter)` over `make_scan()` —
+    /// the canonical input shape pushdown rewrites.
     fn filter_over_scan(predicate: CompiledExpr) -> PhysicalPlan {
-        PhysicalPlan::Filter(FilterPhysical {
-            predicate,
+        filter_over_scan_with_tile(predicate, DEFAULT_FILTER_TILE_SIZE)
+    }
+
+    fn filter_over_scan_with_tile(predicate: CompiledExpr, tile_size: usize) -> PhysicalPlan {
+        PhysicalPlan::FusedSegment(FusedSegmentPhysical {
             input: Box::new(PhysicalPlan::Scan(make_scan())),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
+            steps: vec![FusedSegmentStep::Filter {
+                predicate,
+                tile_size,
+            }],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
             output_schema: empty_schema(),
         })
+    }
+
+    /// Helper: extract the leading Filter step from a result plan,
+    /// asserting the segment is otherwise well-formed.
+    fn expect_leading_filter(plan: PhysicalPlan) -> (CompiledExpr, usize, ScanPhysical) {
+        let PhysicalPlan::FusedSegment(seg) = plan else {
+            panic!("expected FusedSegment, got {plan:?}");
+        };
+        assert!(!seg.steps.is_empty(), "expected non-empty steps");
+        let step = seg.steps.into_iter().next().unwrap();
+        let (predicate, tile_size) = match step {
+            FusedSegmentStep::Filter {
+                predicate,
+                tile_size,
+            } => (predicate, tile_size),
+            other => panic!("expected Filter step, got {other:?}"),
+        };
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
+        };
+        (predicate, tile_size, scan)
     }
 
     // ── zero-residue: single pushable predicate → filter elided ─────────────
@@ -387,13 +428,8 @@ mod tests {
 
         let result = pushdown_predicates(plan);
 
-        let PhysicalPlan::Filter(filter) = result else {
-            panic!("expected Filter, got {result:?}");
-        };
-        assert_eq!(filter.predicate, pred, "predicate must be unchanged");
-        let PhysicalPlan::Scan(scan) = *filter.input else {
-            panic!("expected Scan as filter input");
-        };
+        let (residual, _, scan) = expect_leading_filter(result);
+        assert_eq!(residual, pred, "predicate must be unchanged");
         assert!(
             scan.scan_predicates.is_empty(),
             "scan should have no pushed predicates"
@@ -418,17 +454,8 @@ mod tests {
 
         let result = pushdown_predicates(plan);
 
-        let PhysicalPlan::Filter(filter) = result else {
-            panic!("expected Filter (partial residue), got {result:?}");
-        };
-        // Residue is the single non-pushable conjunct (unwrapped from And).
-        assert_eq!(
-            filter.predicate, p2,
-            "residue must be the non-pushable conjunct"
-        );
-        let PhysicalPlan::Scan(scan) = *filter.input else {
-            panic!("expected Scan as filter input");
-        };
+        let (residual, _, scan) = expect_leading_filter(result);
+        assert_eq!(residual, p2, "residue must be the non-pushable conjunct");
         assert_eq!(scan.scan_predicates.len(), 1);
         assert_eq!(
             scan.scan_predicates[0], p1,
@@ -480,11 +507,9 @@ mod tests {
 
         let result = pushdown_predicates(plan);
 
-        let PhysicalPlan::Filter(filter) = result else {
-            panic!("expected Filter, got {result:?}");
-        };
+        let (residual, _, scan) = expect_leading_filter(result);
         // Residue is reconstructed as an And of both operands.
-        match &filter.predicate.node {
+        match &residual.node {
             CompiledNode::And { operands, .. } => {
                 assert_eq!(operands.len(), 2);
                 assert_eq!(operands[0], p1);
@@ -492,9 +517,6 @@ mod tests {
             }
             other => panic!("expected And residue, got {other:?}"),
         }
-        let PhysicalPlan::Scan(scan) = *filter.input else {
-            panic!("expected Scan under filter");
-        };
         assert!(scan.scan_predicates.is_empty());
     }
 
@@ -510,98 +532,106 @@ mod tests {
         assert!(scan.scan_predicates.is_empty());
     }
 
-    // ── Filter not directly over Scan: recurse into child ───────────────────
+    // ── Filter at index ≥ 1 is NOT pushed (D2 negative test) ────────────────
 
     #[test]
-    fn filter_over_project_over_scan_is_not_pushed_but_project_child_is_walked() {
-        // Filter(Project(Scan)) — the filter is not directly over a scan, so
-        // the predicate should stay in the filter unchanged. However, the pass
-        // must recurse through `Project` so that nested `Filter(Scan)` patterns
-        // inside the project's child would be handled (none here, but the walk
-        // itself should not error).
+    fn filter_after_project_in_segment_is_not_pushed() {
+        // FusedSegment(steps=[Project, Filter], input=Scan) — the Project
+        // step has rewritten the schema, so the Filter step's column refs
+        // no longer correspond to the Scan's columns. Pushing would silently
+        // misroute. Per D2 of TASK-519's plan, only steps[0]==Filter is
+        // pushable.
         let pred = pushable_expr();
-        let scan_schema = empty_schema();
-        let project_plan = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![],
-            input: Box::new(PhysicalPlan::Scan(make_scan())),
-            output_schema: scan_schema.clone(),
-        });
-        let plan = PhysicalPlan::Filter(FilterPhysical {
+        let project_step = FusedSegmentStep::Project(vec![ProjectPhysicalItem {
+            expr: CompiledExpr {
+                node: CompiledNode::Column {
+                    index: 1,
+                    name: "amount".into(),
+                },
+                result_type: BqlType::Int,
+                nullable: true,
+            },
+            output_name: "amount".to_string(),
+        }]);
+        let filter_step = FusedSegmentStep::Filter {
             predicate: pred.clone(),
-            input: Box::new(project_plan),
             tile_size: DEFAULT_FILTER_TILE_SIZE,
-            output_schema: scan_schema,
+        };
+        let plan = PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(PhysicalPlan::Scan(make_scan())),
+            steps: vec![project_step, filter_step],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: empty_schema(),
         });
 
         let result = pushdown_predicates(plan);
 
-        // Filter must remain (not pushed across Project).
-        let PhysicalPlan::Filter(filter) = result else {
-            panic!("expected Filter, got {result:?}");
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment, got {result:?}");
         };
-        assert_eq!(filter.predicate, pred, "predicate must be unchanged");
-        assert!(matches!(*filter.input, PhysicalPlan::Project(_)));
+        // Both steps must remain; nothing pushed.
+        assert_eq!(seg.steps.len(), 2);
+        assert!(matches!(seg.steps[0], FusedSegmentStep::Project(_)));
+        let FusedSegmentStep::Filter {
+            predicate: residual,
+            ..
+        } = &seg.steps[1]
+        else {
+            panic!("expected Filter at index 1");
+        };
+        assert_eq!(*residual, pred, "Filter at index 1 must not be touched");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under segment");
+        };
+        assert!(
+            scan.scan_predicates.is_empty(),
+            "Scan must not receive pushed predicates from a non-leading Filter"
+        );
     }
 
-    // ── Project(Filter(Scan)) — project wraps a pushed plan ─────────────────
+    // ── leading Filter elided, downstream steps preserved ────────────────────
 
     #[test]
-    fn project_over_filter_over_scan_pushes_into_inner_scan() {
+    fn full_pushdown_preserves_downstream_project_and_limit_steps() {
+        // FusedSegment([Filter, Project, Limit] over Scan), Filter pushable.
+        // After pushdown the Filter step is dropped but Project and Limit
+        // must remain. (Equivalent to legacy `Limit(Project(Scan))` shape.)
         let pred = pushable_expr();
-        let schema = empty_schema();
-        let filter_plan = PhysicalPlan::Filter(FilterPhysical {
-            predicate: pred.clone(),
+        let project_step = FusedSegmentStep::Project(vec![ProjectPhysicalItem {
+            expr: CompiledExpr {
+                node: CompiledNode::Column {
+                    index: 1,
+                    name: "amount".into(),
+                },
+                result_type: BqlType::Int,
+                nullable: true,
+            },
+            output_name: "amount".to_string(),
+        }]);
+        let plan = PhysicalPlan::FusedSegment(FusedSegmentPhysical {
             input: Box::new(PhysicalPlan::Scan(make_scan())),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
-            output_schema: schema.clone(),
-        });
-        let plan = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![],
-            input: Box::new(filter_plan),
-            output_schema: schema,
+            steps: vec![
+                FusedSegmentStep::Filter {
+                    predicate: pred.clone(),
+                    tile_size: DEFAULT_FILTER_TILE_SIZE,
+                },
+                project_step,
+                FusedSegmentStep::Limit(10),
+            ],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: empty_schema(),
         });
 
         let result = pushdown_predicates(plan);
 
-        let PhysicalPlan::Project(proj) = result else {
-            panic!("expected Project, got {result:?}");
+        let PhysicalPlan::FusedSegment(seg) = result else {
+            panic!("expected FusedSegment after partial elision, got {result:?}");
         };
-        // Inner filter must have been elided; Project's input is now a Scan.
-        let PhysicalPlan::Scan(scan) = *proj.input else {
-            panic!(
-                "expected Scan under Project (filter elided), got {:?}",
-                proj.input
-            );
-        };
-        assert_eq!(scan.scan_predicates.len(), 1);
-        assert_eq!(scan.scan_predicates[0], pred);
-    }
-
-    // ── Limit(Filter(Scan)) ──────────────────────────────────────────────────
-
-    #[test]
-    fn limit_over_filter_over_scan_pushes_into_inner_scan() {
-        let pred = pushable_expr();
-        let schema = empty_schema();
-        let filter_plan = PhysicalPlan::Filter(FilterPhysical {
-            predicate: pred.clone(),
-            input: Box::new(PhysicalPlan::Scan(make_scan())),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
-            output_schema: schema.clone(),
-        });
-        let plan = PhysicalPlan::Limit(LimitPhysical {
-            count: 10,
-            input: Box::new(filter_plan),
-            output_schema: schema,
-        });
-
-        let result = pushdown_predicates(plan);
-
-        let PhysicalPlan::Limit(limit) = result else {
-            panic!("expected Limit, got {result:?}");
-        };
-        let PhysicalPlan::Scan(scan) = *limit.input else {
-            panic!("expected Scan under Limit (filter elided)");
+        assert_eq!(seg.steps.len(), 2);
+        assert!(matches!(seg.steps[0], FusedSegmentStep::Project(_)));
+        assert!(matches!(seg.steps[1], FusedSegmentStep::Limit(10)));
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under segment");
         };
         assert_eq!(scan.scan_predicates.len(), 1);
         assert_eq!(scan.scan_predicates[0], pred);
@@ -613,19 +643,12 @@ mod tests {
     fn residual_filter_preserves_tile_size() {
         let pred = nonpushable_expr();
         let custom_tile = 3_500;
-        let plan = PhysicalPlan::Filter(FilterPhysical {
-            predicate: pred.clone(),
-            input: Box::new(PhysicalPlan::Scan(make_scan())),
-            tile_size: custom_tile,
-            output_schema: empty_schema(),
-        });
+        let plan = filter_over_scan_with_tile(pred.clone(), custom_tile);
 
         let result = pushdown_predicates(plan);
 
-        let PhysicalPlan::Filter(filter) = result else {
-            panic!("expected Filter, got {result:?}");
-        };
-        assert_eq!(filter.tile_size, custom_tile);
+        let (_, tile_size, _) = expect_leading_filter(result);
+        assert_eq!(tile_size, custom_tile);
     }
 
     // ── existing scan predicates are preserved ───────────────────────────────
@@ -640,12 +663,14 @@ mod tests {
             scan_predicates: vec![existing_pred.clone()],
             ..make_scan()
         };
-        let schema = empty_schema();
-        let plan = PhysicalPlan::Filter(FilterPhysical {
-            predicate: new_pred.clone(),
+        let plan = PhysicalPlan::FusedSegment(FusedSegmentPhysical {
             input: Box::new(PhysicalPlan::Scan(scan_with_existing)),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
-            output_schema: schema,
+            steps: vec![FusedSegmentStep::Filter {
+                predicate: new_pred.clone(),
+                tile_size: DEFAULT_FILTER_TILE_SIZE,
+            }],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: empty_schema(),
         });
 
         let result = pushdown_predicates(plan);
@@ -663,17 +688,11 @@ mod tests {
     #[test]
     fn explain_wrapping_filter_over_scan_pushes_into_inner_scan() {
         let pred = pushable_expr();
-        let schema = empty_schema();
         let single_col_schema =
             OperatorSchema::new(vec![ColumnDef::required("plan", BqlType::String)]).unwrap();
-        let filter_plan = PhysicalPlan::Filter(FilterPhysical {
-            predicate: pred.clone(),
-            input: Box::new(PhysicalPlan::Scan(make_scan())),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
-            output_schema: schema,
-        });
+        let inner = filter_over_scan(pred.clone());
         let plan = PhysicalPlan::Explain(ExplainPhysical {
-            plan: Box::new(filter_plan),
+            plan: Box::new(inner),
             output_schema: single_col_schema,
         });
 

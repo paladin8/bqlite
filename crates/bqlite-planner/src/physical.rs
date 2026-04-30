@@ -84,9 +84,41 @@ const _: () = {
 
 /// Clamp a caller-supplied tile size into the `[MIN, MAX]` window.
 #[inline]
-fn clamp_filter_tile_size(raw: usize) -> usize {
+pub(crate) fn clamp_filter_tile_size(raw: usize) -> usize {
     raw.clamp(MIN_FILTER_TILE_SIZE, MAX_FILTER_TILE_SIZE)
 }
+
+/// Lowering helper that appends a stateless `step` onto a child plan,
+/// coalescing into the existing trailing [`FusedSegmentPhysical`] when
+/// possible (`docs/design/engine/operator-fusion.md` §6.4 / D1 of
+/// `docs/superpowers/plans/2026-04-30-task-519-...md`).
+///
+/// - If `child` is already a `FusedSegment`, the new step is appended to
+///   its `steps` vector and the segment's cached `output_schema` is
+///   replaced with the lowered logical node's `output_schema`.
+/// - Otherwise a new single-step segment wrapping `child` is constructed.
+fn append_stateless_step(
+    child: PhysicalPlan,
+    step: FusedSegmentStep,
+    output_schema: OperatorSchema,
+) -> PhysicalPlan {
+    match child {
+        PhysicalPlan::FusedSegment(mut seg) => {
+            seg.steps.push(step);
+            seg.output_schema = output_schema;
+            PhysicalPlan::FusedSegment(seg)
+        }
+        other => PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(other),
+            steps: vec![step],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema,
+        }),
+    }
+}
+
+/// Default sparsity threshold (`engine/operator-fusion.md` §3.4.1).
+pub const DEFAULT_SPARSITY_FACTOR: f64 = 0.10;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Physical plan enum
@@ -1230,12 +1262,11 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
         } => {
             let compiled = CompiledExpr::from_typed(&predicate);
             let child = lower_physical(*input, now_ns);
-            PhysicalPlan::Filter(FilterPhysical {
+            let step = FusedSegmentStep::Filter {
                 predicate: compiled,
-                input: Box::new(child),
                 tile_size: DEFAULT_FILTER_TILE_SIZE,
-                output_schema,
-            })
+            };
+            append_stateless_step(child, step, output_schema)
         }
 
         LogicalPlan::Project {
@@ -1251,11 +1282,8 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                 })
                 .collect();
             let child = lower_physical(*input, now_ns);
-            PhysicalPlan::Project(ProjectPhysical {
-                expressions: compiled_items,
-                input: Box::new(child),
-                output_schema,
-            })
+            let step = FusedSegmentStep::Project(compiled_items);
+            append_stateless_step(child, step, output_schema)
         }
 
         LogicalPlan::Limit {
@@ -1264,11 +1292,8 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
             output_schema,
         } => {
             let child = lower_physical(*input, now_ns);
-            PhysicalPlan::Limit(LimitPhysical {
-                count,
-                input: Box::new(child),
-                output_schema,
-            })
+            let step = FusedSegmentStep::Limit(count);
+            append_stateless_step(child, step, output_schema)
         }
 
         LogicalPlan::CreateTable {
@@ -1839,10 +1864,10 @@ mod tests {
         }
     }
 
-    // ── FilterPhysical ─────────────────────────────────────────────
+    // ── Filter logical → FusedSegment ─────────────────────────────
 
     #[test]
-    fn lower_pipeline_with_where_produces_filter_over_scan() {
+    fn lower_pipeline_with_where_produces_fused_segment_over_scan() {
         let catalog = catalog_with_events();
         // `events | where amount > 10`
         let mut pipeline = bare_pipeline("events");
@@ -1859,21 +1884,28 @@ mod tests {
         });
         let physical = plan_physical(Statement::Query(pipeline), &catalog);
 
-        let PhysicalPlan::Filter(filter) = physical else {
-            panic!("expected Filter, got {physical:?}");
+        let PhysicalPlan::FusedSegment(seg) = physical else {
+            panic!("expected FusedSegment, got {physical:?}");
+        };
+        assert_eq!(seg.steps.len(), 1);
+        let FusedSegmentStep::Filter {
+            predicate,
+            tile_size,
+        } = &seg.steps[0]
+        else {
+            panic!("expected Filter step, got {:?}", seg.steps[0]);
         };
         // Tile size defaults to DEFAULT_FILTER_TILE_SIZE.
-        assert_eq!(filter.tile_size, DEFAULT_FILTER_TILE_SIZE);
+        assert_eq!(*tile_size, DEFAULT_FILTER_TILE_SIZE);
         // Predicate must be a Bool-returning compare node.
-        assert_eq!(filter.predicate.result_type, BqlType::Bool);
-        assert!(matches!(
-            filter.predicate.node,
-            CompiledNode::Compare { .. }
-        ));
+        assert_eq!(predicate.result_type, BqlType::Bool);
+        assert!(matches!(predicate.node, CompiledNode::Compare { .. }));
         // Filter's output schema mirrors the scan's.
-        assert_eq!(filter.output_schema, *filter.input.output_schema());
+        assert_eq!(seg.output_schema, *seg.input.output_schema());
         // Child must be a Scan.
-        assert!(matches!(*filter.input, PhysicalPlan::Scan(_)));
+        assert!(matches!(*seg.input, PhysicalPlan::Scan(_)));
+        // Default sparsity threshold per §3.4.1.
+        assert!((seg.sparsity_factor - DEFAULT_SPARSITY_FACTOR).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1906,10 +1938,10 @@ mod tests {
         assert_eq!(just_right.tile_size, 2_500);
     }
 
-    // ── ProjectPhysical ────────────────────────────────────────────
+    // ── Project logical → FusedSegment ─────────────────────────────
 
     #[test]
-    fn lower_pipeline_with_select_produces_project_over_scan() {
+    fn lower_pipeline_with_select_produces_fused_segment_over_scan() {
         let catalog = catalog_with_events();
         // `events | select amount, entity_id`
         let mut pipeline = bare_pipeline("events");
@@ -1931,26 +1963,30 @@ mod tests {
         });
         let physical = plan_physical(Statement::Query(pipeline), &catalog);
 
-        let PhysicalPlan::Project(proj) = physical else {
-            panic!("expected Project, got {physical:?}");
+        let PhysicalPlan::FusedSegment(seg) = physical else {
+            panic!("expected FusedSegment, got {physical:?}");
         };
-        assert_eq!(proj.expressions.len(), 2);
-        assert_eq!(proj.expressions[0].output_name, "amount");
-        assert_eq!(proj.expressions[1].output_name, "entity_id");
-        let out_names: Vec<&str> = proj
+        assert_eq!(seg.steps.len(), 1);
+        let FusedSegmentStep::Project(items) = &seg.steps[0] else {
+            panic!("expected Project step, got {:?}", seg.steps[0]);
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].output_name, "amount");
+        assert_eq!(items[1].output_name, "entity_id");
+        let out_names: Vec<&str> = seg
             .output_schema
             .columns()
             .iter()
             .map(|c| c.name.as_str())
             .collect();
         assert_eq!(out_names, vec!["amount", "entity_id"]);
-        assert!(matches!(*proj.input, PhysicalPlan::Scan(_)));
+        assert!(matches!(*seg.input, PhysicalPlan::Scan(_)));
     }
 
-    // ── LimitPhysical ──────────────────────────────────────────────
+    // ── Limit logical → FusedSegment ───────────────────────────────
 
     #[test]
-    fn lower_pipeline_with_limit_produces_limit_over_scan() {
+    fn lower_pipeline_with_limit_produces_fused_segment_over_scan() {
         let catalog = catalog_with_events();
         let mut pipeline = bare_pipeline("events");
         pipeline.stages.push(PipelineStage::Limit {
@@ -1959,12 +1995,16 @@ mod tests {
         });
         let physical = plan_physical(Statement::Query(pipeline), &catalog);
 
-        let PhysicalPlan::Limit(limit) = physical else {
-            panic!("expected Limit, got {physical:?}");
+        let PhysicalPlan::FusedSegment(seg) = physical else {
+            panic!("expected FusedSegment, got {physical:?}");
         };
-        assert_eq!(limit.count, 10);
-        assert!(matches!(*limit.input, PhysicalPlan::Scan(_)));
-        assert_eq!(limit.output_schema, *limit.input.output_schema());
+        assert_eq!(seg.steps.len(), 1);
+        let FusedSegmentStep::Limit(n) = &seg.steps[0] else {
+            panic!("expected Limit step, got {:?}", seg.steps[0]);
+        };
+        assert_eq!(*n, 10);
+        assert!(matches!(*seg.input, PhysicalPlan::Scan(_)));
+        assert_eq!(seg.output_schema, *seg.input.output_schema());
     }
 
     // ── FusedSegmentPhysical (TASK-518 CP4) ────────────────────────
@@ -2202,11 +2242,12 @@ mod tests {
     // ── Multi-stage composition ────────────────────────────────────
 
     #[test]
-    fn lower_where_select_limit_pipeline_nests_in_correct_order() {
+    fn lower_where_select_limit_pipeline_coalesces_into_single_fused_segment() {
         // `events | where amount > 0 | select amount | limit 5`
-        // must lower to `Limit(Project(Filter(Scan)))` so that the
-        // engine bind step builds operators in the same order
-        // logical lowering folded them.
+        // must lower to a single `FusedSegment([Filter, Project, Limit])`
+        // so the engine bind step builds one segment driver instead of
+        // a stack of operators (`engine/operator-fusion.md` §4.6 / D1
+        // of TASK-519's plan).
         let catalog = catalog_with_events();
         let mut pipeline = bare_pipeline("events");
         pipeline.stages.push(PipelineStage::Where {
@@ -2236,20 +2277,16 @@ mod tests {
 
         let physical = plan_physical(Statement::Query(pipeline), &catalog);
 
-        let PhysicalPlan::Limit(limit) = physical else {
-            panic!("expected Limit at root, got {physical:?}");
+        let PhysicalPlan::FusedSegment(seg) = physical else {
+            panic!("expected FusedSegment at root, got {physical:?}");
         };
-        assert_eq!(limit.count, 5);
-        let PhysicalPlan::Project(proj) = *limit.input else {
-            panic!("expected Project under Limit");
-        };
-        assert_eq!(proj.expressions.len(), 1);
-        assert_eq!(proj.expressions[0].output_name, "amount");
-        let PhysicalPlan::Filter(filter) = *proj.input else {
-            panic!("expected Filter under Project");
-        };
-        assert_eq!(filter.predicate.result_type, BqlType::Bool);
-        assert!(matches!(*filter.input, PhysicalPlan::Scan(_)));
+        // Steps appended in source order: Filter, Project, Limit.
+        assert_eq!(seg.steps.len(), 3);
+        assert!(matches!(seg.steps[0], FusedSegmentStep::Filter { .. }));
+        assert!(matches!(seg.steps[1], FusedSegmentStep::Project(_)));
+        assert!(matches!(seg.steps[2], FusedSegmentStep::Limit(5)));
+        // Underlying input is the bare scan.
+        assert!(matches!(*seg.input, PhysicalPlan::Scan(_)));
     }
 
     // ── output_schema invariant ────────────────────────────────────
@@ -2391,7 +2428,13 @@ mod tests {
             panic!("expected Distinct, got {physical:?}");
         };
         assert_eq!(distinct.max_groups, DEFAULT_MAX_GROUPS);
-        assert!(matches!(*distinct.input, PhysicalPlan::Project(_)));
+        // Project is now emitted as a single-step FusedSegment per
+        // TASK-519 D1.
+        let PhysicalPlan::FusedSegment(seg) = *distinct.input else {
+            panic!("expected FusedSegment under Distinct");
+        };
+        assert_eq!(seg.steps.len(), 1);
+        assert!(matches!(seg.steps[0], FusedSegmentStep::Project(_)));
         assert_eq!(distinct.output_schema.columns().len(), 1);
         assert_eq!(distinct.output_schema.columns()[0].name, "entity_id");
     }

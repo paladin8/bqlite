@@ -1,34 +1,35 @@
-//! Sample pushdown optimizer pass (TASK-430).
+//! Sample pushdown optimizer pass (TASK-430, retargeted by TASK-519).
 //!
 //! Walks the physical plan looking for a [`PhysicalPlan::Sample`]
 //! whose child subtree is a [`PhysicalPlan::Scan`] — optionally
 //! reachable through entity-key-independent stateless stages
-//! ([`PhysicalPlan::Filter`] and [`PhysicalPlan::Project`]) — and
-//! moves the `(fraction, seed)` pair into
+//! (a [`PhysicalPlan::FusedSegment`] whose `steps` are all `Filter`
+//! or `Project`) — and moves the `(fraction, seed)` pair into
 //! [`ScanPhysical::sample`]. When the push succeeds the
 //! [`PhysicalPlan::Sample`] node is elided from the plan.
 //!
 //! When the path between `Sample` and the nearest `Scan` contains
 //! any stateful or population-mutating operator (aggregate,
 //! sequence match, session assignment, event-select, attribute,
-//! merge-sources, …) the pass leaves the `Sample` node in place and
-//! recurses into its child. The scan operator does not apply a
-//! post-merge sample filter in that case — the engine bind step
-//! (TASK-438) owns the fallback `SampleOperator` that will run
-//! above the stateful stage.
+//! merge-sources, …) — or a `FusedSegment` containing a `Limit`
+//! step — the pass leaves the `Sample` node in place and recurses
+//! into its child. The scan operator does not apply a post-merge
+//! sample filter in that case — the engine bind step (TASK-438)
+//! owns the fallback `SampleOperator` that will run above the
+//! stateful stage.
 //!
 //! # Correctness
 //!
 //! The design doc §17.1 proves the push is always safe across
 //! stateless filters: SAMPLE's population is the source-table entity
 //! set, so `SAMPLE ∘ F ≡ F ∘ SAMPLE` for any entity-key-independent
-//! predicate `F`. [`PhysicalPlan::Filter`] and
-//! [`PhysicalPlan::Project`] are such stages — they select or
+//! predicate `F`. `Filter` and `Project` steps inside a
+//! [`PhysicalPlan::FusedSegment`] are such stages — they select or
 //! reshape rows without changing the entity membership of the
-//! result set. [`PhysicalPlan::Limit`] is *not* commutative with
-//! SAMPLE (it truncates by row order, which depends on the sample
-//! filter's output cardinality) and is therefore treated as
-//! opaque by this pass.
+//! result set. `Limit` steps are *not* commutative with SAMPLE
+//! (they truncate by row order, which depends on the sample filter's
+//! output cardinality) and therefore make the whole segment opaque
+//! to the pass.
 //!
 //! # Joined-source scans
 //!
@@ -53,7 +54,7 @@
 //! the bind step with the filter un-pushed.
 
 use crate::physical::{
-    FilterPhysical, MergeSourcesPhysical, PhysicalPlan, ProjectPhysical, SamplePhysical,
+    FusedSegmentPhysical, FusedSegmentStep, MergeSourcesPhysical, PhysicalPlan, SamplePhysical,
     SamplePushdown, ScanPhysical,
 };
 
@@ -68,43 +69,17 @@ pub fn pushdown_sample(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
         PhysicalPlan::Sample(sample) => push_sample(sample),
 
-        PhysicalPlan::Filter(f) => {
-            let FilterPhysical {
-                predicate,
+        PhysicalPlan::FusedSegment(seg) => {
+            let FusedSegmentPhysical {
                 input,
-                tile_size,
+                steps,
+                sparsity_factor,
                 output_schema,
-            } = f;
-            PhysicalPlan::Filter(FilterPhysical {
-                predicate,
+            } = seg;
+            PhysicalPlan::FusedSegment(FusedSegmentPhysical {
                 input: Box::new(pushdown_sample(*input)),
-                tile_size,
-                output_schema,
-            })
-        }
-
-        PhysicalPlan::Project(p) => {
-            let ProjectPhysical {
-                expressions,
-                input,
-                output_schema,
-            } = p;
-            PhysicalPlan::Project(ProjectPhysical {
-                expressions,
-                input: Box::new(pushdown_sample(*input)),
-                output_schema,
-            })
-        }
-
-        PhysicalPlan::Limit(l) => {
-            let crate::physical::LimitPhysical {
-                count,
-                input,
-                output_schema,
-            } = l;
-            PhysicalPlan::Limit(crate::physical::LimitPhysical {
-                count,
-                input: Box::new(pushdown_sample(*input)),
+                steps,
+                sparsity_factor,
                 output_schema,
             })
         }
@@ -230,9 +205,9 @@ fn push_sample(sample: SamplePhysical) -> PhysicalPlan {
 }
 
 /// True iff `node` is (transitively, through stateless stages) a
-/// [`PhysicalPlan::Scan`]. Intermediate [`PhysicalPlan::Filter`] and
-/// [`PhysicalPlan::Project`] nodes are considered entity-key-
-/// independent per the population-invariance proof in design §17.1.
+/// [`PhysicalPlan::Scan`] or [`PhysicalPlan::MergeSources`].
+/// `FusedSegment` is push-through only when every step is `Filter`
+/// or `Project` — `Limit` steps are not commutative with Sample.
 fn can_push_through(node: &PhysicalPlan) -> bool {
     match node {
         PhysicalPlan::Scan(_) => true,
@@ -242,8 +217,14 @@ fn can_push_through(node: &PhysicalPlan) -> bool {
         // (fraction, seed) into every sub-scan produces the atomic
         // cross-table entity set the design requires.
         PhysicalPlan::MergeSources(_) => true,
-        PhysicalPlan::Filter(f) => can_push_through(&f.input),
-        PhysicalPlan::Project(p) => can_push_through(&p.input),
+        PhysicalPlan::FusedSegment(seg) => {
+            seg.steps.iter().all(|s| {
+                matches!(
+                    s,
+                    FusedSegmentStep::Filter { .. } | FusedSegmentStep::Project(_)
+                )
+            }) && can_push_through(&seg.input)
+        }
         _ => false,
     }
 }
@@ -270,29 +251,20 @@ fn push_into_scan(node: PhysicalPlan, fraction: f64, seed: i64) -> PhysicalPlan 
                 ..scan
             })
         }
-        PhysicalPlan::Filter(f) => {
-            let FilterPhysical {
-                predicate,
+        PhysicalPlan::FusedSegment(seg) => {
+            let FusedSegmentPhysical {
                 input,
-                tile_size,
+                steps,
+                sparsity_factor,
                 output_schema,
-            } = f;
-            PhysicalPlan::Filter(FilterPhysical {
-                predicate,
+            } = seg;
+            // `can_push_through` already verified every step is
+            // Filter or Project (no Limit), so we recurse without
+            // re-checking.
+            PhysicalPlan::FusedSegment(FusedSegmentPhysical {
                 input: Box::new(push_into_scan(*input, fraction, seed)),
-                tile_size,
-                output_schema,
-            })
-        }
-        PhysicalPlan::Project(p) => {
-            let ProjectPhysical {
-                expressions,
-                input,
-                output_schema,
-            } = p;
-            PhysicalPlan::Project(ProjectPhysical {
-                expressions,
-                input: Box::new(push_into_scan(*input, fraction, seed)),
+                steps,
+                sparsity_factor,
                 output_schema,
             })
         }
@@ -342,9 +314,46 @@ mod tests {
     use crate::compiled::{CompiledExpr, CompiledNode, LogicalKernel};
     use crate::logical::SortDirection;
     use crate::physical::{
-        FilterPhysical, LimitPhysical, MergeSourcesPhysical, PhysicalPlan, ProjectPhysical,
-        SamplePhysical, ScanPhysical, SessionizePhysical, DEFAULT_FILTER_TILE_SIZE,
+        FusedSegmentPhysical, FusedSegmentStep, MergeSourcesPhysical, PhysicalPlan,
+        ProjectPhysicalItem, SamplePhysical, ScanPhysical, SessionizePhysical,
+        DEFAULT_FILTER_TILE_SIZE, DEFAULT_SPARSITY_FACTOR,
     };
+
+    /// Wrap `input` in a single-step `FusedSegment([Filter(predicate)])`.
+    fn filter_segment(predicate: CompiledExpr, input: PhysicalPlan) -> PhysicalPlan {
+        let out = input.output_schema().clone();
+        PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(input),
+            steps: vec![FusedSegmentStep::Filter {
+                predicate,
+                tile_size: DEFAULT_FILTER_TILE_SIZE,
+            }],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: out,
+        })
+    }
+
+    /// Wrap `input` in a single-step `FusedSegment([Project(items)])`.
+    fn project_segment(items: Vec<ProjectPhysicalItem>, input: PhysicalPlan) -> PhysicalPlan {
+        let out = input.output_schema().clone();
+        PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(input),
+            steps: vec![FusedSegmentStep::Project(items)],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: out,
+        })
+    }
+
+    /// Wrap `input` in a single-step `FusedSegment([Limit(count)])`.
+    fn limit_segment(count: u64, input: PhysicalPlan) -> PhysicalPlan {
+        let out = input.output_schema().clone();
+        PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(input),
+            steps: vec![FusedSegmentStep::Limit(count)],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: out,
+        })
+    }
 
     fn schema() -> OperatorSchema {
         OperatorSchema::new(vec![
@@ -412,19 +421,14 @@ mod tests {
 
     #[test]
     fn sample_over_filter_over_scan_pushes_through_filter() {
-        let filter = PhysicalPlan::Filter(FilterPhysical {
-            predicate: trivial_and(),
-            input: Box::new(PhysicalPlan::Scan(make_scan())),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
-            output_schema: schema(),
-        });
+        let filter = filter_segment(trivial_and(), PhysicalPlan::Scan(make_scan()));
         let plan = sample_over(filter, 0.5, 42);
         let out = pushdown_sample(plan);
-        let PhysicalPlan::Filter(f) = out else {
-            panic!("expected Filter at top, got {out:?}");
+        let PhysicalPlan::FusedSegment(seg) = out else {
+            panic!("expected FusedSegment at top, got {out:?}");
         };
-        let PhysicalPlan::Scan(scan) = *f.input else {
-            panic!("expected Scan under Filter");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
         let s = scan.sample.expect("sample attached");
         assert!((s.fraction - 0.5).abs() < f64::EPSILON);
@@ -433,18 +437,14 @@ mod tests {
 
     #[test]
     fn sample_over_project_over_scan_pushes_through_project() {
-        let project = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![],
-            input: Box::new(PhysicalPlan::Scan(make_scan())),
-            output_schema: schema(),
-        });
+        let project = project_segment(vec![], PhysicalPlan::Scan(make_scan()));
         let plan = sample_over(project, 0.1, 99);
         let out = pushdown_sample(plan);
-        let PhysicalPlan::Project(p) = out else {
-            panic!("expected Project, got {out:?}");
+        let PhysicalPlan::FusedSegment(seg) = out else {
+            panic!("expected FusedSegment, got {out:?}");
         };
-        let PhysicalPlan::Scan(scan) = *p.input else {
-            panic!("expected Scan under Project");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
         assert!(scan.sample.is_some());
     }
@@ -452,27 +452,50 @@ mod tests {
     #[test]
     fn sample_over_limit_is_not_pushed() {
         // Limit changes row counts, so pushing Sample past it would
-        // change semantics. The pass must leave Sample above Limit.
-        let limited = PhysicalPlan::Limit(LimitPhysical {
-            count: 10,
-            input: Box::new(PhysicalPlan::Scan(make_scan())),
-            output_schema: schema(),
-        });
+        // change semantics. The pass must leave Sample above the
+        // FusedSegment that contains the Limit step.
+        let limited = limit_segment(10, PhysicalPlan::Scan(make_scan()));
         let plan = sample_over(limited, 0.3, 1);
         let out = pushdown_sample(plan);
         let PhysicalPlan::Sample(sample) = out else {
             panic!("expected Sample to remain, got {out:?}");
         };
         assert!((sample.fraction - 0.3).abs() < f64::EPSILON);
-        // Child is Limit → Scan, and the scan should have no sample
-        // (the sample stays above the limit).
-        let PhysicalPlan::Limit(l) = *sample.input else {
-            panic!("expected Limit");
+        let PhysicalPlan::FusedSegment(seg) = *sample.input else {
+            panic!("expected FusedSegment");
         };
-        let PhysicalPlan::Scan(scan) = *l.input else {
-            panic!("expected Scan under Limit");
+        let PhysicalPlan::Scan(scan) = *seg.input else {
+            panic!("expected Scan under FusedSegment");
         };
-        assert!(scan.sample.is_none());
+        assert!(
+            scan.sample.is_none(),
+            "Limit step blocks pushdown; scan must have no sample"
+        );
+    }
+
+    #[test]
+    fn sample_over_segment_with_filter_and_limit_is_not_pushed() {
+        // FusedSegment([Filter, Limit]) — the Limit step makes the
+        // whole segment opaque to sample pushdown, even though the
+        // Filter step would individually be pushable.
+        let scan = PhysicalPlan::Scan(make_scan());
+        let combined = PhysicalPlan::FusedSegment(FusedSegmentPhysical {
+            input: Box::new(scan),
+            steps: vec![
+                FusedSegmentStep::Filter {
+                    predicate: trivial_and(),
+                    tile_size: DEFAULT_FILTER_TILE_SIZE,
+                },
+                FusedSegmentStep::Limit(5),
+            ],
+            sparsity_factor: DEFAULT_SPARSITY_FACTOR,
+            output_schema: schema(),
+        });
+        let plan = sample_over(combined, 0.3, 1);
+        let out = pushdown_sample(plan);
+        let PhysicalPlan::Sample(_) = out else {
+            panic!("expected Sample to remain over a Limit-containing segment");
+        };
     }
 
     #[test]
@@ -586,22 +609,18 @@ mod tests {
 
     #[test]
     fn sample_over_filter_over_merge_sources_pushes_through() {
-        // Filter between Sample and MergeSources is still push-through
-        // because Filter is stateless / entity-key-independent.
+        // Filter step inside a FusedSegment between Sample and MergeSources
+        // is still push-through because Filter is stateless /
+        // entity-key-independent.
         let ms = make_merge_sources(2);
-        let filter = PhysicalPlan::Filter(FilterPhysical {
-            predicate: trivial_and(),
-            input: Box::new(ms),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
-            output_schema: schema(),
-        });
+        let filter = filter_segment(trivial_and(), ms);
         let plan = sample_over(filter, 0.5, 42);
         let out = pushdown_sample(plan);
-        let PhysicalPlan::Filter(f) = out else {
-            panic!("expected Filter at top, got {out:?}");
+        let PhysicalPlan::FusedSegment(seg) = out else {
+            panic!("expected FusedSegment at top, got {out:?}");
         };
-        let PhysicalPlan::MergeSources(ms) = *f.input else {
-            panic!("expected MergeSources under Filter");
+        let PhysicalPlan::MergeSources(ms) = *seg.input else {
+            panic!("expected MergeSources under FusedSegment");
         };
         for sub in &ms.tables {
             let s = sub.sample.as_ref().expect("sub-scan sample attached");
@@ -612,22 +631,18 @@ mod tests {
 
     #[test]
     fn sample_over_project_over_merge_sources_pushes_through() {
-        // Project is the other stateless stage in `can_push_through`;
+        // Project step is the other stateless stage in `can_push_through`;
         // ensure it composes with the MergeSources leaf the same way
         // Filter does above.
         let ms = make_merge_sources(2);
-        let project = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![],
-            input: Box::new(ms),
-            output_schema: schema(),
-        });
+        let project = project_segment(vec![], ms);
         let plan = sample_over(project, 0.2, 11);
         let out = pushdown_sample(plan);
-        let PhysicalPlan::Project(p) = out else {
-            panic!("expected Project at top, got {out:?}");
+        let PhysicalPlan::FusedSegment(seg) = out else {
+            panic!("expected FusedSegment at top, got {out:?}");
         };
-        let PhysicalPlan::MergeSources(ms) = *p.input else {
-            panic!("expected MergeSources under Project");
+        let PhysicalPlan::MergeSources(ms) = *seg.input else {
+            panic!("expected MergeSources under FusedSegment");
         };
         for sub in &ms.tables {
             let s = sub.sample.as_ref().expect("sub-scan sample attached");
@@ -668,24 +683,21 @@ mod tests {
     #[test]
     fn sample_over_limit_over_merge_sources_is_not_pushed() {
         // Limit is not commutative with Sample (changes row counts), so
-        // the Sample must remain above the Limit even when the leaf is
-        // MergeSources. The sub-scans' sample fields remain None.
+        // the Sample must remain above the FusedSegment[Limit] even when
+        // the leaf is MergeSources. The sub-scans' sample fields remain
+        // None.
         let ms = make_merge_sources(2);
-        let limited = PhysicalPlan::Limit(LimitPhysical {
-            count: 10,
-            input: Box::new(ms),
-            output_schema: schema(),
-        });
+        let limited = limit_segment(10, ms);
         let plan = sample_over(limited, 0.3, 1);
         let out = pushdown_sample(plan);
         let PhysicalPlan::Sample(s) = out else {
             panic!("expected Sample to remain above Limit, got {out:?}");
         };
-        let PhysicalPlan::Limit(l) = *s.input else {
-            panic!("expected Limit");
+        let PhysicalPlan::FusedSegment(seg) = *s.input else {
+            panic!("expected FusedSegment under Sample");
         };
-        let PhysicalPlan::MergeSources(ms) = *l.input else {
-            panic!("expected MergeSources under Limit");
+        let PhysicalPlan::MergeSources(ms) = *seg.input else {
+            panic!("expected MergeSources under FusedSegment");
         };
         assert!(ms.tables.iter().all(|t| t.sample.is_none()));
     }
