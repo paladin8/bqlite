@@ -67,8 +67,9 @@ pub enum RulePhase {
     PlanTime,
     /// Runs after cohort sizes are bound. Currently the only rule in
     /// this phase is Pass 8 (cohort/entity pushdown), owned by
-    /// TASK-522 and not registered in this task.
-    #[allow(dead_code)] // future-Wave use; framework slot
+    /// TASK-522 and not registered in production by this task. The
+    /// variant is exercised by tests that construct post-cohort
+    /// marker rules to verify framework dispatch.
     PostCohort,
 }
 
