@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-533",
+  "claimed_at": "2026-04-30T08:21:11Z",
+  "branch": "task/TASK-533",
+  "description": "Wave 4 minor planner and operator correctness fixes"
+}
