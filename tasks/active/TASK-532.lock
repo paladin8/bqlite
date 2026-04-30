@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-532",
+  "claimed_at": "2026-04-30T08:22:16Z",
+  "branch": "task/TASK-532",
+  "description": "ATTRIBUTE composition and WITHIN SESSION integration coverage"
+}
