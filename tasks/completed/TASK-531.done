@@ -3,5 +3,6 @@
   "task_id": "TASK-531",
   "claimed_at": "2026-04-30T07:47:05Z",
   "branch": "task/TASK-531",
-  "description": "EventSelect property tests and benchmarks"
+  "description": "EventSelect property tests and benchmarks",
+  "completed_at": "2026-04-30T08:45:00Z"
 }
