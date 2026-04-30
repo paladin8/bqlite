@@ -1050,7 +1050,15 @@ fn bind_physical_with_cache(
         }
 
         PhysicalPlan::Explain(explain) => {
-            let batch = build_explain_batch(explain)?;
+            // The trace-aware path goes through
+            // `Engine::query` → `execute_explain_statement` so the
+            // optimizer rule trace can be rendered alongside the plan
+            // tree. Reaching this arm means a caller invoked
+            // `bind_physical` directly on an `Explain` descriptor
+            // (engine internals / tests) — in that case we render the
+            // tree without a trace, matching the pre-TASK-521
+            // behavior.
+            let batch = build_explain_batch(explain, None)?;
             Ok(Box::new(ResultOperator::new(
                 explain.output_schema.clone(),
                 vec![batch],

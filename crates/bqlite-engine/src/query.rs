@@ -347,7 +347,7 @@ fn run_query_inner(
             .unwrap_or(i64::MAX)
     };
     let catalog = db.catalog();
-    let physical = bqlite_planner::plan_script(stmts, &catalog, now_ns)?;
+    let (physical, rule_trace) = bqlite_planner::plan_script_with_trace(stmts, &catalog, now_ns)?;
 
     // DELETE is dispatched out-of-band rather than through the
     // bind step because it produces no result rows but does
@@ -358,6 +358,16 @@ fn run_query_inner(
     // sink stays empty.
     if let PhysicalPlan::Delete(d) = &physical {
         return crate::delete::execute_delete_statement(d, db);
+    }
+
+    // EXPLAIN is dispatched out-of-band so we can render the optimizer
+    // rule trace (TASK-521) alongside the plan tree. The trace lives
+    // outside the `PhysicalPlan` value so the rest of the bind path
+    // does not need to thread it through every operator construction;
+    // EXPLAIN never executes the inner plan, so the engine's drive
+    // loop is unnecessary here.
+    if let PhysicalPlan::Explain(explain) = &physical {
+        return crate::ddl::execute_explain_statement(explain, &rule_trace);
     }
 
     let schema = physical.output_schema().clone();

@@ -298,13 +298,80 @@ pub fn build_explain_node(plan: &PhysicalPlan) -> ExplainNode {
 ///
 /// The returned string has **no trailing newline**.
 pub fn format_explain(node: &ExplainNode) -> String {
+    format_explain_with_trace(node, None)
+}
+
+/// Render an [`ExplainNode`] tree alongside an optional optimizer
+/// [`crate::opt::RuleTrace`] (TASK-521).
+///
+/// When `trace` is `Some`, the rendered output appends a
+/// `rule_trace:` section after the existing tree dump (separated by a
+/// blank line) listing every optimizer rule that ran or was eligible
+/// to run, with its outcome. The format is described in
+/// `docs/design/planner/optimizer-direction.md` §8.2.
+///
+/// When `trace` is `None`, the output is **byte-identical** to
+/// [`format_explain`]; existing call sites that want only the tree
+/// dump remain unaffected.
+///
+/// The returned string has **no trailing newline**.
+pub fn format_explain_with_trace(
+    node: &ExplainNode,
+    trace: Option<&crate::opt::RuleTrace>,
+) -> String {
     let mut buf = String::new();
     write_node(node, 0, &mut buf);
-    // Strip the trailing newline added by write_node.
+    if let Some(trace) = trace {
+        write_rule_trace(trace, &mut buf);
+    }
+    // Strip the trailing newline added by write_node / write_rule_trace.
     if buf.ends_with('\n') {
         buf.pop();
     }
     buf
+}
+
+/// Write a `rule_trace:` section into `buf`. The section is separated
+/// from any preceding tree dump by a blank line. Each rule renders on
+/// its own line, padded so the outcome column aligns at a stable
+/// offset.
+///
+/// `RuleTraceEntry::phase` is intentionally not rendered: in v1 the
+/// phase is a structural property of the registry (PlanTime vs
+/// PostCohort) and the user-visible question — "did this rule fire?"
+/// — is fully answered by the outcome column. Future renderers may
+/// surface phase if a real consumer asks for it.
+fn write_rule_trace(trace: &crate::opt::RuleTrace, buf: &mut String) {
+    if trace.entries.is_empty() {
+        return;
+    }
+    // Blank line separator from the preceding tree dump.
+    buf.push('\n');
+    buf.push_str("rule_trace:\n");
+    // Pad rule ids to a common width so the outcome column lines up.
+    let pad_width = trace
+        .entries
+        .iter()
+        .map(|e| e.rule.len())
+        .max()
+        .unwrap_or(0);
+    for entry in &trace.entries {
+        buf.push_str("  ");
+        buf.push_str(entry.rule);
+        for _ in entry.rule.len()..pad_width {
+            buf.push(' ');
+        }
+        buf.push_str("  ");
+        match &entry.outcome {
+            crate::opt::RuleTraceOutcome::Applied => buf.push_str("applied"),
+            crate::opt::RuleTraceOutcome::Skipped(reason) => {
+                buf.push_str("skipped (");
+                buf.push_str(reason);
+                buf.push(')');
+            }
+        }
+        buf.push('\n');
+    }
 }
 
 fn write_node(node: &ExplainNode, indent: usize, buf: &mut String) {
@@ -1468,6 +1535,109 @@ mod tests {
         assert!(text.contains("Sample"), "missing: {text}");
         assert!(text.contains("0.25"), "missing fraction: {text}");
         assert!(text.contains("42"), "missing seed: {text}");
+    }
+
+    // ── TASK-521: rule trace rendering ───────────────────────────────
+
+    #[test]
+    fn format_explain_with_none_trace_does_not_emit_trace_section() {
+        // Regression test: when no trace is supplied, the trace-aware
+        // entry point must NOT emit a `rule_trace:` section. This
+        // catches a refactor that accidentally renders the trace
+        // unconditionally (the byte-identical-to-`format_explain`
+        // shape alone is not enough — both sides go through the same
+        // code path now).
+        let node = ExplainNode::Filter {
+            predicate: "amount > 100".to_string(),
+            input: Box::new(ExplainNode::Scan {
+                table: "events".to_string(),
+                time_range: "none".to_string(),
+                predicates: vec![],
+                columns: vec!["amount".to_string()],
+            }),
+        };
+        let text = format_explain_with_trace(&node, None);
+        // Tree dump must still appear.
+        assert!(text.contains("Filter"), "tree dump missing: {text}");
+        assert!(text.contains("Scan(events)"), "tree dump missing: {text}");
+        // No trace artifacts.
+        assert!(
+            !text.contains("rule_trace:"),
+            "None trace must not emit rule_trace section: {text}"
+        );
+        // And the legacy shim must produce the same output as
+        // `format_explain_with_trace(node, None)`.
+        assert_eq!(text, format_explain(&node));
+    }
+
+    #[test]
+    fn format_explain_with_trace_appends_rule_trace_section() {
+        use crate::opt::{RuleTrace, RuleTraceEntry, RuleTraceOutcome};
+
+        let node = ExplainNode::Scan {
+            table: "events".to_string(),
+            time_range: "none".to_string(),
+            predicates: vec![],
+            columns: vec!["entity_id".to_string()],
+        };
+        let trace = RuleTrace {
+            entries: vec![
+                RuleTraceEntry {
+                    rule: "predicate_pushdown",
+                    phase: crate::opt::RulePhase::PlanTime,
+                    outcome: RuleTraceOutcome::Applied,
+                },
+                RuleTraceEntry {
+                    rule: "tier3_predicate_shape",
+                    phase: crate::opt::RulePhase::PlanTime,
+                    outcome: RuleTraceOutcome::Skipped("no value-set indexes registered"),
+                },
+            ],
+        };
+        let text = format_explain_with_trace(&node, Some(&trace));
+
+        // Existing tree-dump assertions must still hold.
+        assert!(text.contains("Scan(events)"), "tree dump missing: {text}");
+        // Trace section must appear after a blank-line separator.
+        assert!(
+            text.contains("\n\nrule_trace:"),
+            "rule_trace section missing or not separated: {text}"
+        );
+        // Each rule renders one line; aligned outcomes.
+        assert!(
+            text.contains("predicate_pushdown"),
+            "rule id missing: {text}"
+        );
+        assert!(text.contains("applied"), "applied outcome missing: {text}");
+        assert!(
+            text.contains("skipped (no value-set indexes registered)"),
+            "skipped outcome missing: {text}"
+        );
+        // No trailing newline.
+        assert!(!text.ends_with('\n'), "must not end with newline: {text}");
+        // ASCII only.
+        assert!(text.is_ascii(), "must be ASCII only: {text}");
+    }
+
+    #[test]
+    fn format_explain_with_empty_trace_does_not_emit_section() {
+        // An empty trace is informationally equivalent to no trace —
+        // we should not emit a stray `rule_trace:` header with no
+        // body. This keeps the EXPLAIN output stable when callers
+        // construct an empty trace as a placeholder.
+        use crate::opt::RuleTrace;
+        let node = ExplainNode::Scan {
+            table: "events".to_string(),
+            time_range: "none".to_string(),
+            predicates: vec![],
+            columns: vec!["entity_id".to_string()],
+        };
+        let trace = RuleTrace::default();
+        let text = format_explain_with_trace(&node, Some(&trace));
+        assert!(
+            !text.contains("rule_trace:"),
+            "empty trace must not emit a section header: {text}"
+        );
     }
 
     #[test]

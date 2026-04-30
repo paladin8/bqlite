@@ -83,7 +83,9 @@ pub use demand::{
     DemandCapabilities, DemandPropagation, DemandSet, FusableAggExpr, FusableAggregate,
     StepPropertyRef,
 };
-pub use explain::{build_explain_node, format_explain, format_expr, ExplainNode};
+pub use explain::{
+    build_explain_node, format_explain, format_explain_with_trace, format_expr, ExplainNode,
+};
 pub use expr::{FunctionRegistry, ScalarFunctionSig, TypedExpr, TypedExprKind};
 pub use logical::{
     classify_delete_predicate, lower_statement, lower_statements, AliasTable, CheapDeleteSpec,

@@ -18,7 +18,8 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 
 use bqlite_core::{BqliteError, Catalog, OperatorSchema, Result};
 use bqlite_operators::PhysicalOperator;
-use bqlite_planner::explain::{build_explain_node, format_explain};
+use bqlite_planner::explain::{build_explain_node, format_explain_with_trace};
+use bqlite_planner::opt::RuleTrace;
 use bqlite_planner::physical::{
     AlterTableAddColumnPhysical, CreateTablePhysical, DescribePhysical, DropTablePhysical,
     ExplainPhysical,
@@ -172,10 +173,16 @@ pub fn build_describe_batch(plan: &DescribePhysical, db: &Database) -> Result<Re
 /// Build the single-column result batch for `EXPLAIN <pipeline>`.
 ///
 /// Column: `(plan: String)` — one row containing the formatted plan
-/// tree as a multi-line string.
-pub fn build_explain_batch(plan: &ExplainPhysical) -> Result<RecordBatch> {
+/// tree as a multi-line string. When `trace` is `Some`, the optimizer
+/// rule trace (TASK-521) is appended after the plan tree, separated
+/// by a blank line, per
+/// `docs/design/planner/optimizer-direction.md` §8.2.
+pub fn build_explain_batch(
+    plan: &ExplainPhysical,
+    trace: Option<&RuleTrace>,
+) -> Result<RecordBatch> {
     let node = build_explain_node(&plan.plan);
-    let text = format_explain(&node);
+    let text = format_explain_with_trace(&node, trace);
 
     let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
         "plan",
@@ -190,6 +197,33 @@ pub fn build_explain_batch(plan: &ExplainPhysical) -> Result<RecordBatch> {
     .map_err(BqliteError::Arrow)?;
 
     Ok(batch)
+}
+
+/// Top-level dispatcher for `EXPLAIN <pipeline>` invoked directly from
+/// `Engine::query` so the optimizer rule trace can be threaded through
+/// without changing the `bind_physical` signature for every other
+/// operator.
+///
+/// Returns an [`crate::ExecutionResult`] carrying the single
+/// `(plan: String)` row produced by [`build_explain_batch`].
+///
+/// `peak_memory_bytes` is `None` because EXPLAIN does not invoke the
+/// engine's drive loop — no operator allocates from the per-query
+/// budget. This matches the precedent set by DELETE
+/// (`delete::execute_delete_statement`), which is also dispatched
+/// out-of-band from `Engine::query` and likewise reports no peak.
+pub fn execute_explain_statement(
+    plan: &ExplainPhysical,
+    trace: &RuleTrace,
+) -> Result<crate::ExecutionResult> {
+    let batch = build_explain_batch(plan, Some(trace))?;
+    Ok(crate::ExecutionResult {
+        schema: plan.output_schema.clone(),
+        rows: vec![batch],
+        rows_affected: None,
+        peak_memory_bytes: None,
+        warnings: Vec::new(),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -581,7 +615,7 @@ mod tests {
             output_schema: OperatorSchema::new(vec![ColumnDef::required("plan", BqlType::String)])
                 .unwrap(),
         };
-        let batch = build_explain_batch(&plan).unwrap();
+        let batch = build_explain_batch(&plan, None).unwrap();
 
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 1);
