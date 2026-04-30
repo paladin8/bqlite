@@ -73,8 +73,8 @@ use crate::expr::{ScalarFunctionSig, TypedExpr, TypedExprKind};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A runtime-evaluable expression tree carried by physical plan
-/// descriptors (`FilterPhysical`, `ProjectPhysical`, `ScanPhysical`'s
-/// `scan_predicates`, …).
+/// descriptors (`FusedSegmentStep::Filter`,
+/// `FusedSegmentStep::Project`, `ScanPhysical::scan_predicates`, …).
 ///
 /// Constructed exclusively from a [`TypedExpr`] via
 /// [`CompiledExpr::from_typed`]. Holding a `CompiledExpr` is proof

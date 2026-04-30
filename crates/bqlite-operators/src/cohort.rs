@@ -30,7 +30,7 @@
 //! Rows where any LHS expression evaluates to NULL are dropped. This
 //! matches the conventional SQL `IN` semantics under three-valued
 //! logic: `NULL IN (...)` is NULL (unknown), and `WHERE` drops
-//! unknowns the same way `FilterOperator` does for ordinary
+//! unknowns the same way [`crate::FilterKernel`] does for ordinary
 //! predicates. The cohort itself may contain `NULL` keys (rows from
 //! the inner subquery whose projected columns happened to be NULL),
 //! but the probe never matches them because the LHS-NULL rows are
@@ -40,9 +40,9 @@
 //!
 //! When the cohort is empty, every batch yields zero rows; the
 //! operator skips per-row probing and returns an empty filtered batch
-//! immediately. Callers that wrap this operator (e.g. `LimitOperator`
-//! over a cohort filter) tolerate mid-stream empty batches per
-//! `execution-model.md` §3.2.
+//! immediately. Callers that wrap this operator (e.g. a downstream
+//! [`crate::FusedStatelessSegment`] containing a `Limit` step) tolerate
+//! mid-stream empty batches per `execution-model.md` §3.2.
 //!
 //! ## Memory budget
 //!
@@ -557,7 +557,7 @@ impl PhysicalOperator for SubqueryFilterOperator {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        // Mirror `FilterOperator`: skip fully-rejected batches by
+        // Mirror `FilterKernel`: skip fully-rejected batches by
         // re-pulling the child rather than emitting empty batches
         // mid-stream when cheap.
         loop {

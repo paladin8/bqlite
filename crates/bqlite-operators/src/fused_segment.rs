@@ -312,10 +312,7 @@ mod tests {
     use bqlite_planner::expr::{FunctionRegistry, TypedExpr};
 
     use super::*;
-    use crate::filter::FilterOperator;
-    use crate::kernel::{FilterKernel, ProjectKernel};
-    use crate::limit::LimitOperator;
-    use crate::project::{ProjectOperator, ProjectionExpr};
+    use crate::kernel::{FilterKernel, ProjectKernel, ProjectionExpr};
 
     // ── Fixtures ──────────────────────────────────────────────────────
 
@@ -742,66 +739,6 @@ mod tests {
         cancel.cancel();
         let err = seg.next_batch().expect_err("cancelled must surface");
         assert!(matches!(err, BqliteError::Cancelled));
-    }
-
-    // ── Equivalence with legacy operators ─────────────────────────────
-
-    #[test]
-    fn equivalent_to_legacy_filter_project_limit_chain() {
-        // Compare segment output against
-        // Limit(Project(Filter(scan))) on hand-built batches.
-        let schema = int_schema();
-        let predicate = value_gt(15, &schema);
-        let (project_kernel, project_schema) = make_id_project_kernel();
-
-        let child_for_segment = Box::new(RecordingChild::new(vec![
-            make_batch(vec![1, 2, 3], vec![10, 20, 30]),
-            make_batch(vec![4, 5, 6], vec![40, 50, 60]),
-        ]));
-        let kernels = vec![
-            KernelStep::Filter(make_filter_kernel(predicate.clone())),
-            KernelStep::Project(project_kernel),
-            KernelStep::Limit,
-        ];
-        let mut seg = FusedStatelessSegment::for_test(
-            child_for_segment,
-            kernels,
-            project_schema.clone(),
-            Some(3),
-        );
-
-        // Legacy chain on the same child input.
-        let child_for_legacy = Box::new(RecordingChild::new(vec![
-            make_batch(vec![1, 2, 3], vec![10, 20, 30]),
-            make_batch(vec![4, 5, 6], vec![40, 50, 60]),
-        ]));
-        let legacy_filter =
-            FilterOperator::with_default_tile_size(child_for_legacy, predicate.clone());
-        let legacy_proj_exprs = vec![ProjectionExpr {
-            expr: compile(col("id"), &schema),
-            output_name: "id".to_string(),
-        }];
-        let legacy_project = ProjectOperator::new(
-            Box::new(legacy_filter),
-            legacy_proj_exprs,
-            project_schema.clone(),
-        );
-        let mut legacy = LimitOperator::new(Box::new(legacy_project), 3);
-
-        fn drain(op: &mut dyn PhysicalOperator) -> Vec<i64> {
-            let mut out = Vec::new();
-            while let Some(b) = op.next_batch().unwrap() {
-                let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-                out.extend(ids.iter().flatten());
-            }
-            out
-        }
-
-        let segment_rows = drain(&mut seg);
-        let legacy_rows = drain(&mut legacy);
-        assert_eq!(segment_rows, legacy_rows);
-        // Sanity: the chain should keep 3 rows (ids 2, 3, 4).
-        assert_eq!(segment_rows, vec![2, 3, 4]);
     }
 
     // ── Boundary materialization ──────────────────────────────────────

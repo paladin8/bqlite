@@ -107,7 +107,7 @@
 //! - `next_batch()` pulls from the merge, post-filters, and returns
 //!   the first non-empty result. Fully rejected batches cause the
 //!   operator to loop back and pull the merge again, matching the
-//!   `FilterOperator` convention so downstream operators rarely see
+//!   `FilterKernel` convention so downstream operators rarely see
 //!   zero-row batches.
 //! - `close()` drops the merge (which releases every per-segment
 //!   scan) and marks the operator exhausted. Subsequent calls to
@@ -371,11 +371,11 @@ impl ScanOperator {
     ///   A non-empty list must include the entity-key and timestamp
     ///   columns so the k-way merge has a sort key; a list missing
     ///   either returns [`BqliteError::Schema`].
-    /// - `scan_predicates` — the `Vec<CompiledExpr>` TASK-227's
-    ///   predicate-pushdown pass lifted out of a parent
-    ///   `FilterPhysical`. Every entry is re-evaluated post-decode
-    ///   for exact semantics; the convertible subset additionally
-    ///   drives zone-map pruning at row-group granularity.
+    /// - `scan_predicates` — the `Vec<CompiledExpr>` the predicate-
+    ///   pushdown pass lifted out of a leading
+    ///   `FusedSegmentStep::Filter`. Every entry is re-evaluated
+    ///   post-decode for exact semantics; the convertible subset
+    ///   additionally drives zone-map pruning at row-group granularity.
     /// - `cancel` — shared cancellation token.
     ///
     /// # Errors
@@ -2731,7 +2731,7 @@ mod tests {
     fn every_row_rejected_forces_next_batch_loop() {
         // First merged batch fails every row; the operator must
         // drop it entirely and pull another, rather than emit an
-        // empty batch to downstream. Mirrors the FilterOperator
+        // empty batch to downstream. Mirrors the FilterKernel
         // "re-pull on empty" convention.
         let output_schema = OperatorSchema::new(minimal_schema().columns().to_vec()).unwrap();
         let pred = compile_predicate(

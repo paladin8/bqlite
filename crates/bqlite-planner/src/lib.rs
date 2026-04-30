@@ -16,7 +16,9 @@
 //!
 //! - `Statement::Query(Pipeline)` — bare source, plus `WHERE`,
 //!   `SELECT`, and `LIMIT` pipeline stages. Lowers to
-//!   `Scan` / `Filter` / `Project` / `Limit` physical descriptors.
+//!   `Scan` / `FusedSegment` physical descriptors (the stateless
+//!   chain coalesces into a single multi-step `FusedSegmentPhysical`
+//!   per `docs/design/engine/operator-fusion.md` §6.4).
 //! - `Statement::Explain(Pipeline)` — lowers the inner pipeline and
 //!   wraps it in [`PhysicalPlan::Explain`].
 //! - DDL (`Statement::CreateTable` / `DropTable` / `AlterTable` /
@@ -96,11 +98,11 @@ pub use logical::{
 pub use physical::{
     lower_physical, AggregatePhysical, AlterTableAddColumnPhysical, AttributePhysical, CompiledAgg,
     CreateTablePhysical, DeletePhysical, DescribePhysical, DistinctPhysical, DropTablePhysical,
-    EventSelectPhysical, ExplainPhysical, FilterPhysical, InsertPhysical, LimitPhysical,
-    MergeSourcesPhysical, PhysicalDeleteFilter, PhysicalPlan, ProjectPhysical, ProjectPhysicalItem,
-    SamplePhysical, ScanPhysical, SequenceMatchPhysical, SessionizePhysical, SortPhysical,
-    SubqueryFilterPhysical, DEFAULT_FILTER_TILE_SIZE, DEFAULT_MAX_GROUPS, DEFAULT_SAMPLE_SEED,
-    DEFAULT_SORT_MAX_ROWS, MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
+    EventSelectPhysical, ExplainPhysical, FusedSegmentPhysical, FusedSegmentStep, InsertPhysical,
+    MergeSourcesPhysical, PhysicalDeleteFilter, PhysicalPlan, ProjectPhysicalItem, SamplePhysical,
+    ScanPhysical, SequenceMatchPhysical, SessionizePhysical, SortPhysical, SubqueryFilterPhysical,
+    DEFAULT_FILTER_TILE_SIZE, DEFAULT_MAX_GROUPS, DEFAULT_SAMPLE_SEED, DEFAULT_SORT_MAX_ROWS,
+    DEFAULT_SPARSITY_FACTOR, MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
 };
 pub use stats::{CohortId, PlannerStats, PlannerStatsView, StatsBudget};
 

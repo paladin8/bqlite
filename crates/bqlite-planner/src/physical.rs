@@ -7,14 +7,17 @@
 //! engine's bind step (TASK-232) walks this tree and materializes one
 //! `Box<dyn PhysicalOperator>` per descriptor.
 //!
-//! ## Scope (TASK-226)
+//! ## Scope (TASK-226, retargeted by TASK-519)
 //!
-//! - **Descriptors**: `ScanPhysical`, `FilterPhysical`, `ProjectPhysical`,
-//!   `LimitPhysical`, `CreateTablePhysical`, `DropTablePhysical`,
+//! - **Descriptors**: `ScanPhysical`, `FusedSegmentPhysical` (with
+//!   `FusedSegmentStep::{Filter, Project, Limit}` for stateless work),
+//!   `CreateTablePhysical`, `DropTablePhysical`,
 //!   `AlterTableAddColumnPhysical`, `DescribePhysical`, `InsertPhysical`,
 //!   `ExplainPhysical`. Each mirrors the corresponding
 //!   [`LogicalPlan`] variant from `docs/design/planner/logical-plan-nodes.md`
-//!   §4.1–§4.10 one-for-one.
+//!   §4.1–§4.10 one-for-one (Filter / Project / Limit logical nodes
+//!   coalesce into a single multi-step `FusedSegmentPhysical` per
+//!   `engine/operator-fusion.md` §6.4).
 //! - **Lowering**: [`lower_physical`] is an infallible structural
 //!   walk. The logical plan has already been validated at construction
 //!   (§4.5 of planner-pipeline.md) so physical lowering never rejects
@@ -58,21 +61,20 @@ use crate::logical::{EventSelectKind, InsertLogicalBody, LogicalPlan, ProjectIte
 // Tunables
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Default per-tile batch size used by [`FilterPhysical`].
+/// Default per-tile batch size used by the runtime `FilterKernel`
+/// (consumed via [`FusedSegmentStep::Filter`]).
 ///
 /// Per `docs/design/execution-model.md` §3.6 the filter kernel walks
 /// its input in cache-friendly tiles so the predicate evaluation stays
 /// L1/L2-resident. 2,048 rows is the §3.6 default; it is clamped to
 /// [`MIN_FILTER_TILE_SIZE`] / [`MAX_FILTER_TILE_SIZE`] by
-/// [`FilterPhysical::new`]. TASK-226 only sets the default — TASK-231
-/// (filter operator) and TASK-232 (engine bind) thread it through to
-/// the runtime.
+/// [`clamp_filter_tile_size`].
 pub const DEFAULT_FILTER_TILE_SIZE: usize = 2_048;
 
-/// Minimum legal tile size for [`FilterPhysical::tile_size`].
+/// Minimum legal tile size for [`FusedSegmentStep::Filter::tile_size`].
 pub const MIN_FILTER_TILE_SIZE: usize = 1_024;
 
-/// Maximum legal tile size for [`FilterPhysical::tile_size`].
+/// Maximum legal tile size for [`FusedSegmentStep::Filter::tile_size`].
 pub const MAX_FILTER_TILE_SIZE: usize = 4_096;
 
 // Compile-time invariant: future edits to the tile-size constants
@@ -83,6 +85,11 @@ const _: () = {
 };
 
 /// Clamp a caller-supplied tile size into the `[MIN, MAX]` window.
+///
+/// Used by tests pinning the clamp invariant. Production lowering
+/// pins [`DEFAULT_FILTER_TILE_SIZE`] (already in-range), so the helper
+/// is not exercised on the hot path.
+#[cfg(test)]
 #[inline]
 pub(crate) fn clamp_filter_tile_size(raw: usize) -> usize {
     raw.clamp(MIN_FILTER_TILE_SIZE, MAX_FILTER_TILE_SIZE)
@@ -138,12 +145,6 @@ pub const DEFAULT_SPARSITY_FACTOR: f64 = 0.10;
 pub enum PhysicalPlan {
     /// Entity-sorted scan over a catalog table. §4.1 / §9.5.
     Scan(ScanPhysical),
-    /// Row-level filter over a child plan. §4.2.
-    Filter(FilterPhysical),
-    /// Column projection over a child plan. §4.3.
-    Project(ProjectPhysical),
-    /// Row cap over a child plan. §4.4.
-    Limit(LimitPhysical),
     /// `CREATE TABLE` DDL. §4.5.
     CreateTable(CreateTablePhysical),
     /// `DROP TABLE` DDL. §4.6.
@@ -198,11 +199,11 @@ pub enum PhysicalPlan {
     Delete(DeletePhysical),
 
     // ── Wave 5 variants ────────────────────────────────────────────────────
-    /// Fused stateless segment (filter / project / limit chain).
-    /// Wave 5 (TASK-518). The optimizer rule that emits this variant
-    /// lands in TASK-519; CP4 of TASK-518 only adds the descriptor +
-    /// engine bind path. See `docs/design/engine/operator-fusion.md`
-    /// §4.6.
+    /// Fused stateless segment — the canonical descriptor for every
+    /// Filter / Project / Limit chain post TASK-519. Lowering coalesces
+    /// adjacent stateless logical nodes into a single multi-step
+    /// `FusedSegmentPhysical` per `docs/design/engine/operator-fusion.md`
+    /// §4.6 / §6.4.
     FusedSegment(FusedSegmentPhysical),
 }
 
@@ -217,9 +218,6 @@ impl PhysicalPlan {
     pub fn output_schema(&self) -> &OperatorSchema {
         match self {
             PhysicalPlan::Scan(n) => &n.output_schema,
-            PhysicalPlan::Filter(n) => &n.output_schema,
-            PhysicalPlan::Project(n) => &n.output_schema,
-            PhysicalPlan::Limit(n) => &n.output_schema,
             PhysicalPlan::CreateTable(n) => &n.output_schema,
             PhysicalPlan::DropTable(n) => &n.output_schema,
             PhysicalPlan::AlterTableAddColumn(n) => &n.output_schema,
@@ -271,7 +269,7 @@ pub struct ScanPhysical {
     pub reader_range: Option<bqlite_core::TimeRange>,
     /// Scan-level predicates populated by the predicate-pushdown pass
     /// (TASK-227). Empty at lowering time; TASK-227 rewrites
-    /// `FilterPhysical`-above-`ScanPhysical` patterns to move pushable
+    /// `FusedSegment(Filter+Scan)` patterns to move pushable
     /// conjuncts into this vec.
     pub scan_predicates: Vec<CompiledExpr>,
     /// Column names the scan must decode, populated by the projection-
@@ -324,101 +322,32 @@ pub struct SamplePushdown {
     pub seed: i64,
 }
 
-/// Plain-data description of a vectorized row filter.
+/// A single output item in a [`FusedSegmentStep::Project`].
 ///
-/// Wave 2 ships the copy-based filter from TASK-231. The
-/// `tile_size` field is carried through from the descriptor so the
-/// engine bind step (TASK-232) can hand a construction-time parameter
-/// to `FilterOperator::new`. Later waves that fuse filter into scan
-/// replace this node rather than adding fields.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FilterPhysical {
-    /// The predicate to evaluate against every input row. Guaranteed
-    /// to have `result_type == BqlType::Bool` because the logical
-    /// constructor enforces this invariant (see
-    /// [`LogicalPlan::filter`]).
-    pub predicate: CompiledExpr,
-    /// The child plan feeding this filter.
-    pub input: Box<PhysicalPlan>,
-    /// Tile size handed to `FilterOperator::new`; clamped to
-    /// `[MIN_FILTER_TILE_SIZE, MAX_FILTER_TILE_SIZE]` at construction.
-    pub tile_size: usize,
-    /// Identical to `input.output_schema()` — filter never changes
-    /// the column shape.
-    pub output_schema: OperatorSchema,
-}
-
-impl FilterPhysical {
-    /// Construct a filter descriptor with a caller-supplied tile
-    /// size, clamped into the legal window.
-    pub fn new(predicate: CompiledExpr, input: PhysicalPlan, tile_size: usize) -> Self {
-        let output_schema = input.output_schema().clone();
-        Self {
-            predicate,
-            input: Box::new(input),
-            tile_size: clamp_filter_tile_size(tile_size),
-            output_schema,
-        }
-    }
-
-    /// Construct a filter descriptor using [`DEFAULT_FILTER_TILE_SIZE`].
-    pub fn with_default_tile_size(predicate: CompiledExpr, input: PhysicalPlan) -> Self {
-        Self::new(predicate, input, DEFAULT_FILTER_TILE_SIZE)
-    }
-}
-
-/// Plain-data description of a projection operator.
-///
-/// The output schema is built at lowering time from each expression's
-/// `result_type` / `nullable`; projecting a column through a
-/// `CompiledExpr::Column` preserves its input-side type verbatim.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProjectPhysical {
-    /// Ordered output expressions, each paired with its emitted name.
-    pub expressions: Vec<ProjectPhysicalItem>,
-    /// The child plan feeding this projection.
-    pub input: Box<PhysicalPlan>,
-    /// Output schema — derived from `expressions` at lowering time.
-    /// Cached so the engine bind step (and EXPLAIN) does not pay a
-    /// schema rebuild per traversal.
-    pub output_schema: OperatorSchema,
-}
-
-/// A single output item in a [`ProjectPhysical`].
+/// Pairs a compiled output expression with the column name it should
+/// emit. Consumed by the engine's `bind_fused_segment` and the
+/// runtime `ProjectKernel`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectPhysicalItem {
     /// The compiled output expression. Evaluated per input batch by
-    /// TASK-231's project operator.
+    /// the runtime `ProjectKernel`.
     pub expr: CompiledExpr,
     /// Final output column name — carried through from the logical
     /// [`ProjectItem::output_name`] unchanged.
     pub output_name: String,
 }
 
-/// Plain-data description of a row-count limit.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LimitPhysical {
-    /// Maximum number of rows to emit.
-    pub count: u64,
-    /// The child plan feeding this limit.
-    pub input: Box<PhysicalPlan>,
-    /// Identical to `input.output_schema()`.
-    pub output_schema: OperatorSchema,
-}
-
 /// Plain-data description of a fused stateless segment.
 ///
-/// Wave 5 (`docs/design/engine/operator-fusion.md` §4.6). The
-/// optimizer's "fuse adjacent stateless operators" pass collapses a
-/// chain of [`PhysicalPlan::Filter`] / [`PhysicalPlan::Project`] /
-/// [`PhysicalPlan::Limit`] descriptors into a single
-/// `FusedSegmentPhysical`. The engine's bind step instantiates a
-/// `FusedStatelessSegment` operator from the descriptor.
+/// Wave 5 (`docs/design/engine/operator-fusion.md` §4.6 / §6.4). Every
+/// stateless logical run (Filter / Project / Limit) is lowered into a
+/// single multi-step `FusedSegmentPhysical` by [`lower_physical`]'s
+/// `append_stateless_step` helper. The engine's bind step instantiates
+/// a `FusedStatelessSegment` operator from the descriptor.
 ///
-/// TASK-518 lands the descriptor and bind path. The optimizer rule
-/// that *emits* this descriptor lives in TASK-519; until that rule
-/// flips, this variant is constructed only by direct callers (tests,
-/// hand-written plans).
+/// The legacy `FilterPhysical` / `ProjectPhysical` / `LimitPhysical`
+/// descriptors and their corresponding operators were retired in
+/// TASK-519.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FusedSegmentPhysical {
     /// The child plan feeding this segment.
@@ -1910,32 +1839,17 @@ mod tests {
 
     #[test]
     fn filter_tile_size_clamped_into_legal_window() {
-        // Build a trivial filter directly to exercise `FilterPhysical::new`.
-        let scan = PhysicalPlan::Scan(ScanPhysical {
-            table: "events".into(),
-            query_range: None,
-            reader_range: None,
-            scan_predicates: Vec::new(),
-            projected_columns: Vec::new(),
-            output_schema: OperatorSchema::from_table(&events_schema()),
-            entity_key_col: "entity_id".to_string(),
-            timestamp_col: "ts".to_string(),
-            sample: None,
-        });
-        let pred = CompiledExpr {
-            node: CompiledNode::Literal(bqlite_core::PropertyValue::Bool(true)),
-            result_type: BqlType::Bool,
-            nullable: false,
-        };
-
-        let too_small = FilterPhysical::new(pred.clone(), scan.clone(), 16);
-        assert_eq!(too_small.tile_size, MIN_FILTER_TILE_SIZE);
-
-        let too_big = FilterPhysical::new(pred.clone(), scan.clone(), 1_000_000);
-        assert_eq!(too_big.tile_size, MAX_FILTER_TILE_SIZE);
-
-        let just_right = FilterPhysical::new(pred, scan, 2_500);
-        assert_eq!(just_right.tile_size, 2_500);
+        // Lowering inserts the default tile size; explicit non-default
+        // values produced by user-tuned plans must clamp into the
+        // documented `[MIN, MAX]` window. Use the lowering helper to
+        // exercise the post-clamp invariant.
+        assert_eq!(clamp_filter_tile_size(16), MIN_FILTER_TILE_SIZE);
+        assert_eq!(clamp_filter_tile_size(1_000_000), MAX_FILTER_TILE_SIZE);
+        assert_eq!(clamp_filter_tile_size(2_500), 2_500);
+        assert_eq!(
+            clamp_filter_tile_size(DEFAULT_FILTER_TILE_SIZE),
+            DEFAULT_FILTER_TILE_SIZE,
+        );
     }
 
     // ── Project logical → FusedSegment ─────────────────────────────

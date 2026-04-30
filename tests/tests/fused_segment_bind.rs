@@ -1,10 +1,8 @@
-//! Integration test for the TASK-518 CP4 `FusedSegmentPhysical` bind
-//! path.
+//! Integration test for the `FusedSegmentPhysical` bind path.
 //!
-//! The optimizer rule that *emits* `FusedSegmentPhysical` lands in
-//! TASK-519 — until that rule flips, this descriptor is constructed
-//! only by hand-written tests and the bind step is the contract this
-//! test pins.
+//! Post TASK-519 lowering emits `FusedSegmentPhysical` for every
+//! stateless run. This test pins the bind step's translation of a
+//! hand-built descriptor onto a runtime `FusedStatelessSegment`.
 //!
 //! Lives in `tests/` (not in `crates/bqlite-engine/src/bind.rs`)
 //! because the test needs to construct `CompiledExpr` values from raw
@@ -183,109 +181,17 @@ fn bind_fused_segment_filter_project_limit_returns_expected_rows() {
     assert_eq!(user_ids, vec!["alice", "bob"]);
 }
 
-/// Equivalence check: the rows produced by `FusedSegmentPhysical(filter,
-/// project, limit)` must match the rows produced by the legacy
-/// `Limit(Project(Filter(scan)))` chain on the same input — the
-/// load-bearing correctness invariant from operator-fusion.md §7.2.
-#[test]
-fn fused_segment_bind_path_matches_legacy_chain_output() {
-    let (mut db_a, _scratch_a) = db_with_events_rows();
-    let (mut db_b, _scratch_b) = db_with_events_rows();
-
-    let events_schema = db_a
-        .catalog()
-        .resolve_table("events")
-        .expect("events table");
-    let scan_schema = OperatorSchema::from_table(&events_schema);
-
-    let filter_pred = compile(
-        sp(Expr::Compare {
-            op: CompareOp::Equal,
-            left: Box::new(col("event_type")),
-            right: Box::new(str_lit("click")),
-        }),
-        &scan_schema,
-    );
-
-    let project_items = vec![ProjectPhysicalItem {
-        expr: compile(col("user_id"), &scan_schema),
-        output_name: "user_id".to_string(),
-    }];
-    let project_schema = OperatorSchema::new(vec![ColumnDef::required(
-        "user_id",
-        bqlite_core::BqlType::String,
-    )])
-    .unwrap();
-
-    fn make_scan(scan_schema: &OperatorSchema) -> PhysicalPlan {
-        PhysicalPlan::Scan(ScanPhysical {
-            table: "events".to_string(),
-            query_range: None,
-            reader_range: None,
-            scan_predicates: Vec::new(),
-            projected_columns: Vec::new(),
-            output_schema: scan_schema.clone(),
-            entity_key_col: "user_id".to_string(),
-            timestamp_col: "ts".to_string(),
-            sample: None,
-        })
-    }
-
-    // Fused chain.
-    let fused = PhysicalPlan::FusedSegment(FusedSegmentPhysical {
-        input: Box::new(make_scan(&scan_schema)),
-        steps: vec![
-            FusedSegmentStep::Filter {
-                predicate: filter_pred.clone(),
-                tile_size: DEFAULT_FILTER_TILE_SIZE,
-            },
-            FusedSegmentStep::Project(project_items.clone()),
-            FusedSegmentStep::Limit(2),
-        ],
-        sparsity_factor: 0.10,
-        output_schema: project_schema.clone(),
-    });
-
-    // Legacy chain: Limit(Project(Filter(scan))).
-    let legacy = PhysicalPlan::Limit(bqlite_planner::physical::LimitPhysical {
-        count: 2,
-        input: Box::new(PhysicalPlan::Project(
-            bqlite_planner::physical::ProjectPhysical {
-                expressions: project_items,
-                input: Box::new(PhysicalPlan::Filter(
-                    bqlite_planner::physical::FilterPhysical::with_default_tile_size(
-                        filter_pred,
-                        make_scan(&scan_schema),
-                    ),
-                )),
-                output_schema: project_schema.clone(),
-            },
-        )),
-        output_schema: project_schema.clone(),
-    });
-
-    fn drive(plan: &PhysicalPlan, db: &mut Database) -> Vec<String> {
-        let mut op = bind_physical(plan, db, &QueryContext::unbounded()).expect("bind");
-        op.open().unwrap();
-        let mut out = Vec::new();
-        while let Some(b) = op.next_batch().unwrap() {
-            let users = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::StringViewArray>()
-                .expect("user_id column");
-            for i in 0..b.num_rows() {
-                out.push(users.value(i).to_string());
-            }
-        }
-        op.close().unwrap();
-        out
-    }
-
-    let mut fused_rows = drive(&fused, &mut db_a);
-    let mut legacy_rows = drive(&legacy, &mut db_b);
-    fused_rows.sort();
-    legacy_rows.sort();
-    assert_eq!(fused_rows, legacy_rows);
-    assert_eq!(fused_rows.len(), 2);
-}
+// The previous `fused_segment_bind_path_matches_legacy_chain_output`
+// test was retired in TASK-519 CP2 alongside the legacy
+// FilterPhysical / ProjectPhysical / LimitPhysical descriptors —
+// lowering now produces `FusedSegmentPhysical` exclusively, so an
+// equivalence comparison against the deleted descriptors is no longer
+// constructible. The end-to-end shape is exercised by:
+//   - `bind_fused_segment_filter_project_limit_returns_expected_rows`
+//     above (this file),
+//   - the lowering tests in `crates/bqlite-planner/src/physical.rs`
+//     (`lower_pipeline_with_where_produces_fused_segment_over_scan`,
+//     `lower_where_select_limit_pipeline_coalesces_into_single_fused_segment`,
+//     etc.), and
+//   - `fused_stateless_segment_records_selection_vector_metrics` in
+//     `tests/tests/wave2_acceptance.rs`.

@@ -76,10 +76,9 @@ use bqlite_operators::matcher::SequenceMatchState;
 use bqlite_operators::operator::EntityOperator;
 use bqlite_operators::{
     Accumulator, AttributeOperator, CohortHashSet, DistinctOperator, EventSelectOperator,
-    FilterKernel, FilterOperator, FusedStatelessSegment, HashAccumulator, HashAggregateOperator,
-    KernelStep, LimitOperator, PhysicalOperator, ProjectKernel, ProjectOperator, ProjectionExpr,
-    ScanOperator, SequenceMatchOperator, SessionizeOperator, SortOperator, StatelessKernel,
-    SubqueryFilterOperator,
+    FilterKernel, FusedStatelessSegment, HashAccumulator, HashAggregateOperator, KernelStep,
+    PhysicalOperator, ProjectKernel, ProjectionExpr, ScanOperator, SequenceMatchOperator,
+    SessionizeOperator, SortOperator, StatelessKernel, SubqueryFilterOperator,
 };
 use bqlite_planner::compiled::{
     ArrowKernelId, CompareKernel, CompareOp, CompiledExpr, CompiledNode,
@@ -776,14 +775,10 @@ impl PhysicalOperator for SampleFilterOperator {
 fn entity_key_col_name(plan: &PhysicalPlan) -> &str {
     match plan {
         PhysicalPlan::Scan(scan) => scan.entity_key_col.as_str(),
-        PhysicalPlan::Filter(filter) => entity_key_col_name(&filter.input),
-        PhysicalPlan::Project(proj) => entity_key_col_name(&proj.input),
-        PhysicalPlan::Limit(limit) => entity_key_col_name(&limit.input),
         // FusedSegment is column-transparent on the entity-key axis:
         // even a Project step would emit an `entity_id`-named output if
         // it forwarded the column, but in practice the segment carries
-        // its child's entity-key column unchanged. Recurse into the
-        // input the same way the legacy stateless arms did.
+        // its child's entity-key column unchanged.
         PhysicalPlan::FusedSegment(seg) => entity_key_col_name(&seg.input),
         // Wave 4 passthrough operators — entity key column name propagates
         // unchanged through these nodes.
@@ -963,39 +958,13 @@ fn bind_physical_with_cache(
         // the only consumer — no pushdown ever travels past a Scan.
         PhysicalPlan::Scan(scan) => bind_scan(scan, db, ctx, std::mem::take(pending_pushdowns)),
 
-        // Pass-through operators: the operator preserves entity-id
-        // semantics (every output row carries the same entity-id as
-        // its input row), so any pending cohort entity-id pushdown
-        // is still valid for the underlying scan.
-        PhysicalPlan::Filter(filter) => {
-            let child =
-                bind_physical_with_cache(&filter.input, db, ctx, cohorts, pending_pushdowns)?;
-            Ok(Box::new(FilterOperator::new(
-                child,
-                filter.predicate.clone(),
-                filter.tile_size,
-            )))
-        }
-
-        PhysicalPlan::Project(project) => {
-            let child =
-                bind_physical_with_cache(&project.input, db, ctx, cohorts, pending_pushdowns)?;
-            Ok(Box::new(ProjectOperator::from_physical_items(
-                child,
-                project.expressions.clone(),
-                project.output_schema.clone(),
-            )))
-        }
-
-        PhysicalPlan::Limit(limit) => {
-            let child =
-                bind_physical_with_cache(&limit.input, db, ctx, cohorts, pending_pushdowns)?;
-            Ok(Box::new(LimitOperator::new(child, limit.count)))
-        }
-
-        // ── Wave 5 fused stateless segment (TASK-518 CP4) ─────────
-        // FusedSegment chains stateless kernels that preserve
-        // entity-id; safe to propagate.
+        // Stateless segment driver: every Filter/Project/Limit logical
+        // run lowers into a `FusedSegmentPhysical` per
+        // `engine/operator-fusion.md` §6.4. The driver preserves
+        // entity-id semantics on every step (Filter narrows, Project
+        // rewrites columns not entity-id, Limit truncates), so pending
+        // cohort entity-id pushdown remains valid for the underlying
+        // scan.
         PhysicalPlan::FusedSegment(seg) => {
             bind_fused_segment(seg, db, ctx, cohorts, pending_pushdowns)
         }
@@ -1185,18 +1154,19 @@ impl CohortCache {
 /// list into runtime [`KernelStep`]s and assemble a
 /// [`FusedStatelessSegment`].
 ///
-/// `tile_size` is threaded through verbatim from each `Filter` step
-/// (the descriptor already clamps via
-/// [`bqlite_planner::physical::clamp_filter_tile_size`] at construction
-/// time, but the kernel re-clamps defensively).
+/// `tile_size` is threaded through verbatim from each `Filter` step.
+/// The runtime [`FilterKernel`] re-clamps to
+/// `[MIN_FILTER_TILE_SIZE, MAX_FILTER_TILE_SIZE]` defensively;
+/// production lowering writes [`DEFAULT_FILTER_TILE_SIZE`] which is
+/// already in-range.
 ///
 /// LIMIT is collapsed to a single `Option<u64>` budget on the segment
 /// (the design only specifies one LIMIT per stateless chain — multiple
 /// LIMITs would be a planner bug, not a runtime contract violation).
 /// If multiple `Limit` steps are present, the **last** one wins, since
 /// successive LIMITs are equivalent to applying the smallest, and the
-/// optimizer rule (TASK-519) is responsible for collapsing them at
-/// plan time.
+/// lowering helper `append_stateless_step` is responsible for collapsing
+/// adjacent stateless logical nodes at plan time.
 fn bind_fused_segment(
     seg: &FusedSegmentPhysical,
     db: &mut Database,
@@ -1263,9 +1233,7 @@ fn bind_fused_segment(
 /// segment-wide output, but each `Project` step in the chain rewrites
 /// the schema seen by subsequent `Filter` kernels — this helper
 /// reconstructs that intermediate schema from the compiled
-/// expression's `result_type` / `nullable` fields, matching how the
-/// legacy `ProjectPhysical` builds its `output_schema` at lowering
-/// time.
+/// expression's `result_type` / `nullable` fields.
 fn project_output_schema(
     items: &[bqlite_planner::physical::ProjectPhysicalItem],
 ) -> OperatorSchema {
@@ -2219,7 +2187,8 @@ mod tests {
     #[test]
     fn wave3_order_by_ts_desc_limit() {
         // events | ORDER BY ts DESC | LIMIT 3
-        // Tests the Sort + Limit bind arms (SortOperator + LimitOperator).
+        // Tests the Sort + Limit bind arms (SortOperator + the Limit
+        // step inside FusedStatelessSegment).
         let scratch = Scratch::new("wave3-sort-limit");
         let (mut db, engine) = create_db_with_events_table(scratch.path());
 

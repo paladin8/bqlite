@@ -32,12 +32,39 @@ use bqlite_core::encoded::SelectionVector;
 use bqlite_core::{BqliteError, OperatorSchema, Result};
 use bqlite_planner::compiled::CompiledExpr;
 use bqlite_planner::physical::{
-    DEFAULT_FILTER_TILE_SIZE, MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
+    ProjectPhysicalItem, DEFAULT_FILTER_TILE_SIZE, MAX_FILTER_TILE_SIZE, MIN_FILTER_TILE_SIZE,
 };
 
 use crate::eval;
 use crate::filtered_batch::FilteredBatch;
-use crate::project::ProjectionExpr;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ProjectionExpr — input shape for ProjectKernel
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single projection item for [`ProjectKernel`].
+///
+/// Pairs a compiled output expression with the column name it should
+/// emit. Mirrors the shape of [`ProjectPhysicalItem`] without forcing
+/// callers outside the planner to import the planner's physical
+/// module just to name the type.
+#[derive(Debug, Clone)]
+pub struct ProjectionExpr {
+    /// The compiled expression whose array value becomes the output
+    /// column.
+    pub expr: CompiledExpr,
+    /// Final output column name.
+    pub output_name: String,
+}
+
+impl From<ProjectPhysicalItem> for ProjectionExpr {
+    fn from(item: ProjectPhysicalItem) -> Self {
+        Self {
+            expr: item.expr,
+            output_name: item.output_name,
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Trait
@@ -85,9 +112,10 @@ pub trait StatelessKernel: Send + Sync {
 /// Per §3.3.1 the output always carries `selection: Some(_)` — even
 /// when every row passes.
 ///
-/// Tile-loop predicate evaluation (`evaluate_tiled_mask`) is preserved
-/// from the legacy `FilterOperator`; the kernel surface is what
-/// changes, not the inner predicate kernel choice.
+/// Predicate evaluation walks the input in cache-friendly tiles
+/// (`evaluate_tiled_mask`) so per-tile boolean masks stay
+/// L1/L2-resident; the inner predicate-kernel choice is whatever
+/// [`bqlite_planner::compiled::CompiledExpr`] resolves to.
 pub struct FilterKernel {
     predicate: CompiledExpr,
     tile_size: usize,
@@ -168,7 +196,7 @@ impl StatelessKernel for FilterKernel {
 
 /// Convert a (possibly-null) boolean mask into a `SelectionVector`,
 /// treating null as "drop" (SQL `WHERE` semantics — three-valued
-/// logic per the legacy `FilterOperator` contract).
+/// logic).
 fn bool_mask_to_selection(mask: &BooleanArray, row_count: usize) -> SelectionVector {
     let len = row_count.min(mask.len());
     // Pre-size to true_count() when the kernel can compute it cheaply.
@@ -209,9 +237,8 @@ fn intersect_with_mask(sv_in: &SelectionVector, mask: &BooleanArray) -> Selectio
 /// In v1 the kernel evaluates each expression against the full input
 /// batch and `take`s the live indices for the `Some(sv)` case. The
 /// "pre-size and write directly into post-selection buffers"
-/// optimization is the responsibility of TASK-519 once the legacy
-/// operators are retired and the eval evaluator can be specialized
-/// for selection-vector inputs.
+/// optimization is a follow-up — it requires specializing the
+/// expression evaluator for selection-vector inputs.
 pub struct ProjectKernel {
     expressions: Vec<ProjectionExpr>,
     output_schema: OperatorSchema,
@@ -220,8 +247,8 @@ pub struct ProjectKernel {
 
 impl ProjectKernel {
     /// Construct a project kernel with a pre-built output
-    /// `OperatorSchema` (the planner's
-    /// `ProjectPhysical::output_schema`).
+    /// `OperatorSchema` (computed by `bind_fused_segment` from the
+    /// `FusedSegmentStep::Project` items at engine bind time).
     pub fn new(expressions: Vec<ProjectionExpr>, output_schema: OperatorSchema) -> Self {
         let arrow_schema = Arc::new(output_schema.to_arrow_schema());
         Self {

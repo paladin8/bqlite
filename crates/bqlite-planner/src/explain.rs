@@ -7,10 +7,14 @@
 //!
 //! ## Wave 2 scope
 //!
-//! Four Wave 2 pipeline variants: `Scan`, `Filter`, `Project`, `Limit`.
-//! `Explain` is transparently unwrapped so callers can pass a
-//! `PhysicalPlan::Explain` directly. DDL / DML leaf nodes are not
-//! reachable from `build_explain_node`.
+//! Two Wave 2 plan variants: `Scan` and `FusedSegment`. The
+//! `FusedSegment` arm walks each `FusedSegmentStep` in source order
+//! and wraps the input in `Filter` / `Project` / `Limit` `ExplainNode`s
+//! so the rendered tree preserves the legacy
+//! `Limit(Project(Filter(Scan)))` shape exactly. `Explain` is
+//! transparently unwrapped so callers can pass a `PhysicalPlan::Explain`
+//! directly. DDL / DML leaf nodes are not reachable from
+//! `build_explain_node`.
 //!
 //! ## Wave 3 scope (TASK-317)
 //!
@@ -194,22 +198,6 @@ pub fn build_explain_node(plan: &PhysicalPlan) -> ExplainNode {
                 columns,
             }
         }
-        PhysicalPlan::Filter(filter) => ExplainNode::Filter {
-            predicate: format_expr(&filter.predicate),
-            input: Box::new(build_explain_node(&filter.input)),
-        },
-        PhysicalPlan::Project(project) => ExplainNode::Project {
-            columns: project
-                .expressions
-                .iter()
-                .map(|item| item.output_name.clone())
-                .collect(),
-            input: Box::new(build_explain_node(&project.input)),
-        },
-        PhysicalPlan::Limit(limit) => ExplainNode::Limit {
-            count: limit.count,
-            input: Box::new(build_explain_node(&limit.input)),
-        },
         // FusedSegment renders one ExplainNode per step. Steps are
         // appended in source order during lowering — index 0 is the
         // innermost (closest to the scan) and the last index is the

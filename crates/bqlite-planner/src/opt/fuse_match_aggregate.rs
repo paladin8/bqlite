@@ -501,9 +501,8 @@ mod tests {
     use crate::compiled::{ArrowKernelId, CompareKernel, CompiledExpr, CompiledNode};
     use crate::demand::DemandSet;
     use crate::physical::{
-        AggregatePhysical, CompiledAgg, FilterPhysical, PhysicalPlan, ProjectPhysical,
-        ProjectPhysicalItem, ScanPhysical, SequenceMatchPhysical, DEFAULT_FILTER_TILE_SIZE,
-        DEFAULT_MAX_GROUPS,
+        AggregatePhysical, CompiledAgg, PhysicalPlan, ProjectPhysicalItem, ScanPhysical,
+        SequenceMatchPhysical, DEFAULT_FILTER_TILE_SIZE, DEFAULT_MAX_GROUPS,
     };
 
     use super::*;
@@ -736,12 +735,15 @@ mod tests {
             BqlType::Int,
         )])
         .unwrap();
-        let project = PhysicalPlan::Project(ProjectPhysical {
-            expressions: vec![ProjectPhysicalItem {
-                expr: col_ref("step_reached", 1, BqlType::Int, false),
-                output_name: "step_reached_renamed".into(),
-            }],
+        let project = PhysicalPlan::FusedSegment(crate::physical::FusedSegmentPhysical {
             input: Box::new(PhysicalPlan::SequenceMatch(seq)),
+            steps: vec![crate::physical::FusedSegmentStep::Project(vec![
+                ProjectPhysicalItem {
+                    expr: col_ref("step_reached", 1, BqlType::Int, false),
+                    output_name: "step_reached_renamed".into(),
+                },
+            ])],
+            sparsity_factor: crate::physical::DEFAULT_SPARSITY_FACTOR,
             output_schema: proj_out.clone(),
         });
 
@@ -765,10 +767,14 @@ mod tests {
             panic!("expected Aggregate root (no fusion), got {result:?}");
         };
 
-        // The intermediate Project must be preserved.
-        let PhysicalPlan::Project(_) = agg.input.as_ref() else {
-            panic!("expected Project under Aggregate after no-fusion");
+        // The intermediate FusedSegment(Project) must be preserved.
+        let PhysicalPlan::FusedSegment(seg) = agg.input.as_ref() else {
+            panic!("expected FusedSegment under Aggregate after no-fusion");
         };
+        assert!(matches!(
+            seg.steps.as_slice(),
+            [crate::physical::FusedSegmentStep::Project(_)]
+        ));
     }
 
     // ── Test: filter between match and aggregate does not fuse in Wave 3 ────────
@@ -783,11 +789,15 @@ mod tests {
         let match_schema = match_output_schema();
         let seq = seq_match_physical(match_schema.clone());
 
-        // Filter on step_reached > 0.
-        let filter = PhysicalPlan::Filter(FilterPhysical {
-            predicate: compare_pred("step_reached", 1),
+        // Filter step on step_reached > 0 wrapped as a single-step
+        // FusedSegment.
+        let filter = PhysicalPlan::FusedSegment(crate::physical::FusedSegmentPhysical {
             input: Box::new(PhysicalPlan::SequenceMatch(seq)),
-            tile_size: DEFAULT_FILTER_TILE_SIZE,
+            steps: vec![crate::physical::FusedSegmentStep::Filter {
+                predicate: compare_pred("step_reached", 1),
+                tile_size: DEFAULT_FILTER_TILE_SIZE,
+            }],
+            sparsity_factor: crate::physical::DEFAULT_SPARSITY_FACTOR,
             output_schema: match_schema.clone(),
         });
 
@@ -815,10 +825,15 @@ mod tests {
             );
         };
 
-        // The Filter must be preserved directly under the Aggregate.
-        let PhysicalPlan::Filter(_) = agg.input.as_ref() else {
-            panic!("expected Filter under Aggregate after no-fusion (Wave 3 scope)");
+        // The FusedSegment(Filter) must be preserved directly under
+        // the Aggregate.
+        let PhysicalPlan::FusedSegment(seg) = agg.input.as_ref() else {
+            panic!("expected FusedSegment under Aggregate after no-fusion (Wave 3 scope)");
         };
+        assert!(matches!(
+            seg.steps.as_slice(),
+            [crate::physical::FusedSegmentStep::Filter { .. }]
+        ));
     }
 
     // ── Test: ineligible — aggregate arg references a scan column (not in match)
