@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-522",
   "claimed_at": "2026-04-30T06:07:22Z",
+  "completed_at": "2026-04-30T08:50:00Z",
   "branch": "task/TASK-522",
   "description": "Cohort/entity pushdown into scan"
 }
