@@ -59,6 +59,7 @@ pub mod eval;
 pub mod event_select;
 pub mod filter;
 pub mod filtered_batch;
+pub mod fused_segment;
 pub mod kernel;
 pub mod limit;
 pub mod matcher;
@@ -87,6 +88,7 @@ pub use encoded_filter::{
 pub use event_select::EventSelectOperator;
 pub use filter::FilterOperator;
 pub use filtered_batch::FilteredBatch;
+pub use fused_segment::{FusedStatelessSegment, KernelStep, SPARSITY_FACTOR_DEFAULT};
 pub use kernel::{FilterKernel, ProjectKernel, StatelessKernel};
 pub use limit::LimitOperator;
 pub use matcher::SequenceMatchOperator;
