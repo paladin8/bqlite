@@ -101,6 +101,7 @@ fn nfa_a_then_b_with_binding(window: Option<i64>) -> CompiledNfa {
         global_window: window,
         session_window: false,
         emit_all: false,
+        brackets: None,
         state_to_step: vec![0, 1, 2],
     }
 }

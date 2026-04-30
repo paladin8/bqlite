@@ -1186,6 +1186,7 @@ mod tests {
             global_window: None,
             session_window: false,
             emit_all: false,
+            brackets: None,
             state_to_step: vec![0, 1, 2, 3],
         }
     }
@@ -1231,6 +1232,7 @@ mod tests {
             global_window: None,
             session_window: false,
             emit_all: false,
+            brackets: None,
             state_to_step: vec![0, 1, 2, 3],
         }
     }
@@ -1506,6 +1508,7 @@ mod tests {
             global_window: None,
             session_window: false,
             emit_all: false,
+            brackets: None,
             state_to_step: vec![0, 1],
         };
         let sim = StepCounterSimulator::new(nfa, false);
@@ -1714,6 +1717,7 @@ mod tests {
             global_window: None,
             session_window: false,
             emit_all: false,
+            brackets: None,
             state_to_step: vec![0, 1, 2],
         };
 

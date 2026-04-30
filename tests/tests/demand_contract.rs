@@ -55,6 +55,7 @@ fn minimal_sequence_match_operator() -> impl EntityOperator {
         emit_all: false,
         global_window: None,
         session_window: false,
+        brackets: None,
         state_to_step: vec![0, 1],
     };
 

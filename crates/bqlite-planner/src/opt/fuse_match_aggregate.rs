@@ -556,6 +556,7 @@ mod tests {
             global_window: None,
             session_window: false,
             emit_all,
+            brackets: None,
             state_to_step: vec![0, 1],
         }
     }

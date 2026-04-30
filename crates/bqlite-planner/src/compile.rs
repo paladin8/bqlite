@@ -19,7 +19,9 @@
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use bqlite_ast::expr::{CompareOp, Expr, InRhs, Spanned};
-use bqlite_ast::pattern::{MatchMode, MatchPattern, MatchWindow, Repetition, Step, StepEvent};
+use bqlite_ast::pattern::{
+    BracketSpec, MatchMode, MatchPattern, MatchWindow, Repetition, Step, StepEvent,
+};
 use bqlite_core::{BqliteError, OperatorSchema, Result};
 
 use crate::compiled::CompiledExpr;
@@ -59,6 +61,13 @@ pub struct CompiledNfa {
     pub session_window: bool,
     /// Whether EMIT ALL is enabled.
     pub emit_all: bool,
+    /// `BRACKETS [d_0, d_1, …]` retention time slicing
+    /// (query-language.md §4.12). When set, the matcher's output layer
+    /// expands each `(entity, binding track)` into per-bracket rows
+    /// using `durations` for the bracket-window check and `cumulative`
+    /// for the partial-sum semantics. Mutually exclusive with
+    /// `global_window` / `session_window` (parser-enforced).
+    pub brackets: Option<BracketSpec>,
     /// Map from NFA state index to logical step number (0-indexed).
     /// For linear patterns, state N maps to step N.
     /// Accept state maps to `num_steps`.
@@ -277,6 +286,15 @@ pub fn compile_pattern(
 
     let emit_all = pattern.emit_all || pattern.mode == MatchMode::EmitAll;
 
+    // Parser/desugar invariant: BRACKETS is mutually exclusive with both
+    // `WITHIN <duration>` and `WITHIN SESSION` (query-language.md §4.13,
+    // pattern.rs `parse_match_modifiers`). Catch any future regression
+    // before the matcher sees a contradictory NFA.
+    debug_assert!(
+        pattern.brackets.is_none() || (global_window.is_none() && !session_window),
+        "BRACKETS must not coexist with WITHIN/WITHIN SESSION on a CompiledNfa"
+    );
+
     Ok(CompiledNfa {
         states,
         accept_state,
@@ -286,6 +304,7 @@ pub fn compile_pattern(
         global_window,
         session_window,
         emit_all,
+        brackets: pattern.brackets.clone(),
         state_to_step,
     })
 }

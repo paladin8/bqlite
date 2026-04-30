@@ -678,6 +678,7 @@ mod tests {
             global_window: None,
             session_window: false,
             emit_all: false,
+            brackets: None,
             state_to_step,
         }
     }
