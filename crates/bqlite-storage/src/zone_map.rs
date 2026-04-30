@@ -969,4 +969,61 @@ mod tests {
         // Column "missing" not in the row-group → conservative accept.
         assert!(accepts_row_group_inline(&pred, &rg, &cols));
     }
+
+    // ── ScanConjunct::EntityIn (TASK-522) ────────────────────────────
+
+    fn entity_id_schema_cols() -> Vec<ColumnDef> {
+        vec![ColumnDef {
+            name: "entity_id".into(),
+            bql_type: bqlite_core::BqlType::Int,
+            nullable: false,
+            default_value: None,
+        }]
+    }
+
+    #[test]
+    fn inline_entity_in_prunes_row_group_disjoint_from_cohort() {
+        let conj = ScanConjunct::entity_in(
+            "entity_id".into(),
+            vec![PropertyValue::Int(1000), PropertyValue::Int(2000)],
+        )
+        .expect("non-empty");
+        let pred = ScanPredicate::new(vec![conj]);
+        let rg = make_rg(vec![make_ccm(
+            0,
+            Some(PropertyValue::Int(0)),
+            Some(PropertyValue::Int(100)),
+        )]);
+        // Cohort range [1000, 2000] does not overlap zone [0, 100] → reject.
+        assert!(!accepts_row_group_inline(
+            &pred,
+            &rg,
+            &entity_id_schema_cols(),
+        ));
+    }
+
+    #[test]
+    fn inline_entity_in_accepts_row_group_overlapping_cohort() {
+        let conj = ScanConjunct::entity_in(
+            "entity_id".into(),
+            vec![
+                PropertyValue::Int(50),
+                PropertyValue::Int(75),
+                PropertyValue::Int(150),
+            ],
+        )
+        .expect("non-empty");
+        let pred = ScanPredicate::new(vec![conj]);
+        let rg = make_rg(vec![make_ccm(
+            0,
+            Some(PropertyValue::Int(0)),
+            Some(PropertyValue::Int(100)),
+        )]);
+        // Cohort range [50, 150] overlaps zone [0, 100] → accept.
+        assert!(accepts_row_group_inline(
+            &pred,
+            &rg,
+            &entity_id_schema_cols(),
+        ));
+    }
 }

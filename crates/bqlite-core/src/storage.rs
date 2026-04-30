@@ -323,6 +323,56 @@ pub enum ScanConjunct {
         /// Column this conjunct filters on.
         column: String,
     },
+    /// `entity_id ∈ <materialised cohort>` — the runtime form of cohort
+    /// entity-id pushdown described in
+    /// `docs/design/language/cohorts-aliases-joins.md` §4.3 / §5.2 step 6
+    /// and gated per `docs/design/planner/optimizer-direction.md` §7 row 9.
+    ///
+    /// Constructed by the engine's query coordinator (TASK-522) after a
+    /// `SubqueryFilter` materialises its cohort. The `values` set is the
+    /// cohort's entity-id column, deduplicated; `set_min` / `set_max`
+    /// are the precomputed bounds used for O(1) row-group zone-map
+    /// acceptance.
+    ///
+    /// Functionally similar to a giant `InSet` on the entity-id column
+    /// but kept structurally distinct for two reasons:
+    ///
+    /// 1. The post-scan `SubqueryFilterOperator` is the source of truth
+    ///    for the row-level probe; this conjunct exists *only* to drive
+    ///    zone-map row-group skipping and must not duplicate per-row
+    ///    work.
+    /// 2. The values live behind an `Arc<Vec<...>>` so the same
+    ///    materialised cohort can back several `EntityIn` instances
+    ///    (one per scan that the cohort filters) without a deep clone.
+    ///    `InSet`'s un-shared `Vec<PropertyValue>` would force a deep
+    ///    clone per scan.
+    ///
+    /// Construct via [`ScanConjunct::entity_in`] — struct-literal
+    /// construction must preserve `values` sorted and deduplicated with
+    /// `set_min == values[0]` and `set_max == values[len - 1]`.
+    EntityIn {
+        /// Outer scan's entity-key column name (typically `"entity_id"`).
+        column: String,
+        /// Sorted, deduplicated cohort entity-id values. Held behind
+        /// `Arc` so the engine can share one set across multiple scans
+        /// without cloning. The storage layer only consults
+        /// `[set_min, set_max]` for row-group acceptance; this vector
+        /// is preserved so future per-row dictionary or bloom kernels
+        /// can binary-search it without re-deduplicating, and so the
+        /// pushdown is stably equality-comparable for plan-tree diffs.
+        ///
+        /// `PropertyValue` is `Eq + Ord` but not `Hash`, so a sorted
+        /// `Vec` is the right shape — `HashSet` would require an
+        /// additional trait surface that is not load-bearing for the
+        /// pushdown path.
+        values: Arc<Vec<PropertyValue>>,
+        /// Pre-computed minimum entity-id (`values[0]` after sort).
+        /// Carried with the conjunct so `accepts_zone` does not
+        /// re-walk the vector per row-group.
+        set_min: PropertyValue,
+        /// Pre-computed maximum entity-id (`values[len - 1]`).
+        set_max: PropertyValue,
+    },
 }
 
 impl ScanConjunct {
@@ -337,8 +387,31 @@ impl ScanConjunct {
             | ScanConjunct::Range { column, .. }
             | ScanConjunct::InSet { column, .. }
             | ScanConjunct::IsNull { column }
-            | ScanConjunct::IsNotNull { column } => column,
+            | ScanConjunct::IsNotNull { column }
+            | ScanConjunct::EntityIn { column, .. } => column,
         }
+    }
+
+    /// Build an [`ScanConjunct::EntityIn`] from a `Vec` of cohort
+    /// entity-id values. The constructor sorts and deduplicates the
+    /// vector, capturing `set_min` / `set_max` from the resulting
+    /// boundary entries so per-row-group acceptance stays O(1)
+    /// regardless of cohort size. Returns `None` when `values` is
+    /// empty — an empty cohort filters every outer row, but this case
+    /// is already handled by the post-scan `SubqueryFilterOperator`
+    /// (which probes against an empty set and rejects every row);
+    /// the pushdown adds nothing in that degenerate case.
+    pub fn entity_in(column: String, mut values: Vec<PropertyValue>) -> Option<Self> {
+        values.sort_unstable();
+        values.dedup();
+        let set_min = values.first()?.clone();
+        let set_max = values.last()?.clone();
+        Some(ScanConjunct::EntityIn {
+            column,
+            values: Arc::new(values),
+            set_min,
+            set_max,
+        })
     }
 
     /// Per-conjunct zone-map acceptance — implements the Wave 2 rule
@@ -403,6 +476,18 @@ impl ScanConjunct {
             // `IS NOT NULL`: accept if the row-group has at least one
             // non-null row.
             ScanConjunct::IsNotNull { .. } => nulls < rows,
+            // `EntityIn`: accept iff the cohort's value range overlaps
+            // the row-group's [min, max]. Pre-computed bounds make this
+            // O(1) per row-group regardless of cohort size. NULL rows
+            // produce UNKNOWN under set membership and the filter
+            // operator drops them; reject row-groups that are all-null.
+            ScanConjunct::EntityIn {
+                set_min, set_max, ..
+            } => {
+                nulls < rows
+                    && zone.min.as_ref().is_none_or(|m| m <= set_max)
+                    && zone.max.as_ref().is_none_or(|x| set_min <= x)
+            }
         }
     }
 }
@@ -683,10 +768,11 @@ impl Predicate for ScanPredicate {
 
     fn resolve_dictionary_codes(&self, column: &str, dict: &DictionaryIndex<'_>) -> DictRewrite {
         // Walk conjuncts on `column`, collecting resolved codes from
-        // every Equal / InSet. Range, NotEqual, IsNull, IsNotNull are
-        // never dictionary-rewritable — they fall through to zone-map
-        // pruning plus post-filter. If every literal fails to resolve,
-        // the conjunct definitely-rejects every row in the segment.
+        // every Equal / InSet. Range, NotEqual, IsNull, IsNotNull,
+        // EntityIn are never dictionary-rewritable — they fall through
+        // to zone-map pruning plus post-filter. If every literal fails
+        // to resolve, the conjunct definitely-rejects every row in the
+        // segment.
         let mut any_rewritable = false;
         let mut codes: Vec<u32> = Vec::new();
         for conj in &self.conjuncts {
@@ -1666,6 +1752,131 @@ mod tests {
         assert!(conj.accepts_zone(&int_zone(1, 100, 64)));
         assert!(conj.accepts_zone(&int_zone_with_nulls(1, 100, 5, 64)));
         assert!(!conj.accepts_zone(&ZoneMap::all_null(64)));
+    }
+
+    // ── ScanConjunct::EntityIn (TASK-522) ────────────────────────────
+
+    #[test]
+    fn entity_in_accepts_overlapping_zone() {
+        let conj = ScanConjunct::entity_in(
+            "entity_id".into(),
+            vec![
+                PropertyValue::Int(10),
+                PropertyValue::Int(20),
+                PropertyValue::Int(30),
+            ],
+        )
+        .expect("non-empty");
+        assert!(conj.accepts_zone(&int_zone(15, 25, 100)));
+    }
+
+    #[test]
+    fn entity_in_rejects_disjoint_zone_above() {
+        let conj = ScanConjunct::entity_in(
+            "entity_id".into(),
+            vec![PropertyValue::Int(10), PropertyValue::Int(20)],
+        )
+        .expect("non-empty");
+        assert!(!conj.accepts_zone(&int_zone(50, 60, 100)));
+    }
+
+    #[test]
+    fn entity_in_rejects_disjoint_zone_below() {
+        let conj = ScanConjunct::entity_in(
+            "entity_id".into(),
+            vec![PropertyValue::Int(50), PropertyValue::Int(60)],
+        )
+        .expect("non-empty");
+        assert!(!conj.accepts_zone(&int_zone(10, 20, 100)));
+    }
+
+    #[test]
+    fn entity_in_rejects_all_null_zone() {
+        let conj = ScanConjunct::entity_in("entity_id".into(), vec![PropertyValue::Int(10)])
+            .expect("non-empty");
+        assert!(!conj.accepts_zone(&ZoneMap::all_null(100)));
+    }
+
+    #[test]
+    fn entity_in_accepts_when_zone_bounds_missing_with_some_nonnulls() {
+        // Conservative-accept: writers always populate bounds when
+        // nulls < rows in v1, but a hypothetical partial-bound writer
+        // must not be pruned away.
+        let conj = ScanConjunct::entity_in("entity_id".into(), vec![PropertyValue::Int(10)])
+            .expect("non-empty");
+        let zone = ZoneMap {
+            min: None,
+            max: None,
+            null_count: 5,
+            row_count: 100,
+        };
+        assert!(conj.accepts_zone(&zone));
+    }
+
+    #[test]
+    fn entity_in_string_values_accept_string_zone() {
+        let conj = ScanConjunct::entity_in(
+            "entity_id".into(),
+            vec![
+                PropertyValue::String("u3".into()),
+                PropertyValue::String("u7".into()),
+            ],
+        )
+        .expect("non-empty");
+        let zone = ZoneMap {
+            min: Some(PropertyValue::String("u1".into())),
+            max: Some(PropertyValue::String("u9".into())),
+            null_count: 0,
+            row_count: 100,
+        };
+        assert!(conj.accepts_zone(&zone));
+    }
+
+    #[test]
+    fn entity_in_constructor_rejects_empty_vec() {
+        assert!(ScanConjunct::entity_in("entity_id".into(), Vec::new()).is_none());
+    }
+
+    #[test]
+    fn entity_in_constructor_sorts_and_dedups() {
+        let conj = ScanConjunct::entity_in(
+            "entity_id".into(),
+            vec![
+                PropertyValue::Int(30),
+                PropertyValue::Int(10),
+                PropertyValue::Int(20),
+                PropertyValue::Int(10), // duplicate
+            ],
+        )
+        .expect("non-empty");
+        match conj {
+            ScanConjunct::EntityIn {
+                ref values,
+                ref set_min,
+                ref set_max,
+                ..
+            } => {
+                assert_eq!(set_min, &PropertyValue::Int(10));
+                assert_eq!(set_max, &PropertyValue::Int(30));
+                assert_eq!(
+                    values.as_slice(),
+                    &[
+                        PropertyValue::Int(10),
+                        PropertyValue::Int(20),
+                        PropertyValue::Int(30),
+                    ]
+                );
+            }
+            _ => panic!("expected EntityIn"),
+        }
+    }
+
+    #[test]
+    fn entity_in_referenced_column_propagates_into_predicate() {
+        let conj = ScanConjunct::entity_in("entity_id".into(), vec![PropertyValue::Int(1)])
+            .expect("non-empty");
+        let predicate = ScanPredicate::new(vec![conj]);
+        assert_eq!(predicate.referenced_columns(), &["entity_id"]);
     }
 
     // ── ScanPredicate ────────────────────────────────────────────────
