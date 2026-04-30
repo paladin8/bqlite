@@ -164,6 +164,14 @@ pub enum PhysicalPlan {
     /// re-walking the AST. See `docs/design/storage/deletes.md` §3 / §4
     /// for the cheap-class taxonomy and the `ALLOW SCAN` opt-in.
     Delete(DeletePhysical),
+
+    // ── Wave 5 variants ────────────────────────────────────────────────────
+    /// Fused stateless segment (filter / project / limit chain).
+    /// Wave 5 (TASK-518). The optimizer rule that emits this variant
+    /// lands in TASK-519; CP4 of TASK-518 only adds the descriptor +
+    /// engine bind path. See `docs/design/engine/operator-fusion.md`
+    /// §4.6.
+    FusedSegment(FusedSegmentPhysical),
 }
 
 impl PhysicalPlan {
@@ -199,6 +207,8 @@ impl PhysicalPlan {
             PhysicalPlan::Sample(n) => &n.output_schema,
             PhysicalPlan::MergeSources(n) => &n.output_schema,
             PhysicalPlan::Delete(n) => &n.output_schema,
+            // Wave 5 variants.
+            PhysicalPlan::FusedSegment(n) => &n.output_schema,
         }
     }
 }
@@ -362,6 +372,52 @@ pub struct LimitPhysical {
     pub input: Box<PhysicalPlan>,
     /// Identical to `input.output_schema()`.
     pub output_schema: OperatorSchema,
+}
+
+/// Plain-data description of a fused stateless segment.
+///
+/// Wave 5 (`docs/design/engine/operator-fusion.md` §4.6). The
+/// optimizer's "fuse adjacent stateless operators" pass collapses a
+/// chain of [`PhysicalPlan::Filter`] / [`PhysicalPlan::Project`] /
+/// [`PhysicalPlan::Limit`] descriptors into a single
+/// `FusedSegmentPhysical`. The engine's bind step instantiates a
+/// `FusedStatelessSegment` operator from the descriptor.
+///
+/// TASK-518 lands the descriptor and bind path. The optimizer rule
+/// that *emits* this descriptor lives in TASK-519; until that rule
+/// flips, this variant is constructed only by direct callers (tests,
+/// hand-written plans).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedSegmentPhysical {
+    /// The child plan feeding this segment.
+    pub input: Box<PhysicalPlan>,
+    /// Kernels in pull order. An empty vec is legal but degenerate
+    /// (the segment becomes a pass-through over its child).
+    pub steps: Vec<FusedSegmentStep>,
+    /// Sparsity threshold for the per-step materialization trigger.
+    /// Defaults to `0.10` per §3.4.1; the planner can override per
+    /// segment to surface a non-default value through EXPLAIN.
+    pub sparsity_factor: f64,
+    /// Output schema — the last kernel's schema, cached so EXPLAIN
+    /// and the bind step do not pay a per-traversal rebuild.
+    pub output_schema: OperatorSchema,
+}
+
+/// One step in a [`FusedSegmentPhysical::steps`] list.
+///
+/// Mirrors the `KernelStep` runtime enum in `bqlite-operators`. Filter
+/// carries a `tile_size` already clamped to the legal window via
+/// [`clamp_filter_tile_size`]. Project carries a list of expressions
+/// pre-built into [`ProjectPhysicalItem`] form. Limit carries the row
+/// budget; the segment driver owns the running counter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FusedSegmentStep {
+    Filter {
+        predicate: CompiledExpr,
+        tile_size: usize,
+    },
+    Project(Vec<ProjectPhysicalItem>),
+    Limit(u64),
 }
 
 /// Plain-data description of `CREATE TABLE`.
@@ -1909,6 +1965,62 @@ mod tests {
         assert_eq!(limit.count, 10);
         assert!(matches!(*limit.input, PhysicalPlan::Scan(_)));
         assert_eq!(limit.output_schema, *limit.input.output_schema());
+    }
+
+    // ── FusedSegmentPhysical (TASK-518 CP4) ────────────────────────
+
+    #[test]
+    fn fused_segment_descriptor_builds_with_steps() {
+        // Hand-build a descriptor over a bare scan and confirm the
+        // PhysicalPlan accessor / output_schema delegation works.
+        let catalog = catalog_with_events();
+        let bare = plan_physical(Statement::Query(bare_pipeline("events")), &catalog);
+        let scan_schema = bare.output_schema().clone();
+
+        let pred = compile_bool_lit_predicate(true, &scan_schema);
+        let seg = FusedSegmentPhysical {
+            input: Box::new(bare),
+            steps: vec![
+                FusedSegmentStep::Filter {
+                    predicate: pred,
+                    tile_size: DEFAULT_FILTER_TILE_SIZE,
+                },
+                FusedSegmentStep::Limit(10),
+            ],
+            sparsity_factor: 0.10,
+            output_schema: scan_schema.clone(),
+        };
+
+        let plan = PhysicalPlan::FusedSegment(seg);
+        // The PhysicalPlan accessor delegates to FusedSegmentPhysical's
+        // cached `output_schema`.
+        assert_eq!(plan.output_schema(), &scan_schema);
+    }
+
+    #[test]
+    fn fused_segment_step_variants_round_trip_through_clone_and_eq() {
+        // Plain-data invariants the rest of the planner relies on.
+        let catalog = catalog_with_events();
+        let bare = plan_physical(Statement::Query(bare_pipeline("events")), &catalog);
+        let scan_schema = bare.output_schema().clone();
+        let pred = compile_bool_lit_predicate(true, &scan_schema);
+
+        let step_filter = FusedSegmentStep::Filter {
+            predicate: pred,
+            tile_size: 1024,
+        };
+        let step_limit = FusedSegmentStep::Limit(5);
+        assert_eq!(step_filter.clone(), step_filter);
+        assert_eq!(step_limit.clone(), step_limit);
+        assert_ne!(step_filter, step_limit);
+    }
+
+    fn compile_bool_lit_predicate(value: bool, schema: &OperatorSchema) -> CompiledExpr {
+        use crate::expr::{FunctionRegistry, TypedExpr};
+        let ast: Spanned<Expr> = Spanned::new(Expr::Literal(Literal::Bool(value)), Span::EMPTY);
+        let reg = FunctionRegistry::with_builtins();
+        let typed = TypedExpr::from_ast(&ast, schema, &reg).expect("type check");
+        CompiledExpr::from_typed(&typed)
     }
 
     // ── DDL variants ───────────────────────────────────────────────

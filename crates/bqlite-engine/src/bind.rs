@@ -75,13 +75,15 @@ use bqlite_operators::matcher::SequenceMatchState;
 use bqlite_operators::operator::EntityOperator;
 use bqlite_operators::{
     Accumulator, AttributeOperator, CohortHashSet, DistinctOperator, EventSelectOperator,
-    FilterOperator, HashAccumulator, HashAggregateOperator, LimitOperator, PhysicalOperator,
-    ProjectOperator, ScanOperator, SequenceMatchOperator, SessionizeOperator, SortOperator,
+    FilterKernel, FilterOperator, FusedStatelessSegment, HashAccumulator, HashAggregateOperator,
+    KernelStep, LimitOperator, PhysicalOperator, ProjectKernel, ProjectOperator, ProjectionExpr,
+    ScanOperator, SequenceMatchOperator, SessionizeOperator, SortOperator, StatelessKernel,
     SubqueryFilterOperator,
 };
 use bqlite_planner::compiled::{
     ArrowKernelId, CompareKernel, CompareOp, CompiledExpr, CompiledNode,
 };
+use bqlite_planner::physical::{FusedSegmentPhysical, FusedSegmentStep};
 use bqlite_planner::{
     AttributePhysical, EventSelectPhysical, MergeSourcesPhysical, PhysicalPlan, SamplePhysical,
     ScanPhysical, SequenceMatchPhysical, SessionizePhysical, SubqueryFilterPhysical,
@@ -973,6 +975,9 @@ fn bind_physical_with_cache(
             Ok(Box::new(LimitOperator::new(child, limit.count)))
         }
 
+        // ── Wave 5 fused stateless segment (TASK-518 CP4) ─────────
+        PhysicalPlan::FusedSegment(seg) => bind_fused_segment(seg, db, ctx, cohorts),
+
         // ── Wave 3 operators (TASK-323) ───────────────────────────
         PhysicalPlan::Sort(sort) => {
             let child = bind_physical_with_cache(&sort.input, db, ctx, cohorts)?;
@@ -1122,6 +1127,106 @@ impl CohortCache {
     fn insert(&mut self, subquery: PhysicalPlan, cohort: Arc<CohortHashSet>) {
         self.entries.push((subquery, cohort));
     }
+}
+
+/// Bind a [`FusedSegmentPhysical`] — translate its [`FusedSegmentStep`]
+/// list into runtime [`KernelStep`]s and assemble a
+/// [`FusedStatelessSegment`].
+///
+/// `tile_size` is threaded through verbatim from each `Filter` step
+/// (the descriptor already clamps via
+/// [`bqlite_planner::physical::clamp_filter_tile_size`] at construction
+/// time, but the kernel re-clamps defensively).
+///
+/// LIMIT is collapsed to a single `Option<u64>` budget on the segment
+/// (the design only specifies one LIMIT per stateless chain — multiple
+/// LIMITs would be a planner bug, not a runtime contract violation).
+/// If multiple `Limit` steps are present, the **last** one wins, since
+/// successive LIMITs are equivalent to applying the smallest, and the
+/// optimizer rule (TASK-519) is responsible for collapsing them at
+/// plan time.
+fn bind_fused_segment(
+    seg: &FusedSegmentPhysical,
+    db: &mut Database,
+    ctx: &QueryContext,
+    cohorts: &mut CohortCache,
+) -> Result<Box<dyn PhysicalOperator>> {
+    let child = bind_physical_with_cache(&seg.input, db, ctx, cohorts)?;
+    let mut limit_remaining: Option<u64> = None;
+    let mut runtime_steps: Vec<KernelStep> = Vec::with_capacity(seg.steps.len());
+    let mut step_input_schema = seg.input.output_schema().clone();
+    for step in &seg.steps {
+        match step {
+            FusedSegmentStep::Filter {
+                predicate,
+                tile_size,
+            } => {
+                let kernel: Arc<dyn StatelessKernel> = Arc::new(FilterKernel::new(
+                    predicate.clone(),
+                    *tile_size,
+                    step_input_schema.clone(),
+                ));
+                runtime_steps.push(KernelStep::Filter(kernel));
+                // Filter never reshapes columns.
+            }
+            FusedSegmentStep::Project(items) => {
+                let projection_exprs: Vec<ProjectionExpr> =
+                    items.iter().cloned().map(ProjectionExpr::from).collect();
+                let project_schema = project_output_schema(items);
+                let kernel: Arc<dyn StatelessKernel> =
+                    Arc::new(ProjectKernel::new(projection_exprs, project_schema.clone()));
+                runtime_steps.push(KernelStep::Project(kernel));
+                step_input_schema = project_schema;
+            }
+            FusedSegmentStep::Limit(n) => {
+                runtime_steps.push(KernelStep::Limit);
+                limit_remaining = Some(*n);
+            }
+        }
+    }
+    // Metrics: until the engine threads a per-query `Metrics` handle
+    // through `QueryContext` (TASK-524 / `--explain-perf`), the
+    // segment uses `NoopMetrics` at bind time. The `Metrics` trait
+    // surface and the segment's metric call sites are already in
+    // place — wiring them through is a follow-up that does not block
+    // the optimizer flip in TASK-519.
+    let metrics: Arc<dyn bqlite_core::metrics::Metrics> =
+        Arc::new(bqlite_core::metrics::NoopMetrics::new());
+    let segment = FusedStatelessSegment::new(
+        child,
+        runtime_steps,
+        seg.output_schema.clone(),
+        limit_remaining,
+        metrics,
+        ctx.cancellation().clone(),
+    )
+    .with_sparsity_factor(seg.sparsity_factor);
+    Ok(Box::new(segment))
+}
+
+/// Compute the post-projection [`OperatorSchema`] from a list of
+/// project items. The descriptor's
+/// [`FusedSegmentPhysical::output_schema`] already carries the
+/// segment-wide output, but each `Project` step in the chain rewrites
+/// the schema seen by subsequent `Filter` kernels — this helper
+/// reconstructs that intermediate schema from the compiled
+/// expression's `result_type` / `nullable` fields, matching how the
+/// legacy `ProjectPhysical` builds its `output_schema` at lowering
+/// time.
+fn project_output_schema(
+    items: &[bqlite_planner::physical::ProjectPhysicalItem],
+) -> OperatorSchema {
+    let columns = items
+        .iter()
+        .map(|item| {
+            if item.expr.nullable {
+                bqlite_core::ColumnDef::nullable(&item.output_name, item.expr.result_type.clone())
+            } else {
+                bqlite_core::ColumnDef::required(&item.output_name, item.expr.result_type.clone())
+            }
+        })
+        .collect();
+    OperatorSchema::new(columns).expect("project output schema construction must succeed")
 }
 
 /// Bind a [`SubqueryFilterPhysical`] — materialize its inner subquery
@@ -1898,6 +2003,66 @@ mod tests {
             .query("events | limit 2", &mut db)
             .expect("query with LIMIT");
         assert_eq!(result.row_count(), 2, "LIMIT 2 should cap at 2 rows");
+    }
+
+    // ── TASK-518 CP4: FusedSegmentPhysical bind path ────────────────────
+
+    #[test]
+    fn bind_empty_fused_segment_acts_as_pass_through() {
+        // Empty-steps FusedSegmentPhysical exercises the bind path
+        // without constructing CompiledExpr from raw AST (which would
+        // require a `bqlite-ast` dependency on `bqlite-engine`,
+        // forbidden by `scripts/check-dep-direction.sh`). Filter +
+        // project chains are tested in the `tests/` integration
+        // crate.
+        let scratch = Scratch::new("fused-empty");
+        let mut db = create_db_with_bootstrap(scratch.path());
+
+        let scan = bootstrap_scan_descriptor();
+        let scan_schema = scan.output_schema().clone();
+
+        let seg = FusedSegmentPhysical {
+            input: Box::new(scan),
+            steps: Vec::new(),
+            sparsity_factor: 0.10,
+            output_schema: scan_schema.clone(),
+        };
+        let plan = PhysicalPlan::FusedSegment(seg);
+
+        let mut op = bind_physical(&plan, &mut db, &QueryContext::unbounded())
+            .expect("bind FusedSegment with empty steps must succeed");
+        assert_eq!(op.output_schema(), &scan_schema);
+        op.open().expect("open");
+        // Empty events table → no rows; segment driver propagates
+        // child exhaustion.
+        assert!(op.next_batch().expect("next_batch").is_none());
+        op.close().expect("close");
+    }
+
+    #[test]
+    fn bind_fused_segment_with_limit_only_short_circuits() {
+        // Limit-only FusedSegmentPhysical — exercises the LIMIT
+        // ownership path on the segment without touching kernels.
+        let scratch = Scratch::new("fused-limit");
+        let mut db = create_db_with_bootstrap(scratch.path());
+
+        let scan = bootstrap_scan_descriptor();
+        let scan_schema = scan.output_schema().clone();
+
+        let seg = FusedSegmentPhysical {
+            input: Box::new(scan),
+            steps: vec![FusedSegmentStep::Limit(0)],
+            sparsity_factor: 0.10,
+            output_schema: scan_schema.clone(),
+        };
+        let plan = PhysicalPlan::FusedSegment(seg);
+
+        let mut op =
+            bind_physical(&plan, &mut db, &QueryContext::unbounded()).expect("bind must succeed");
+        op.open().unwrap();
+        // LIMIT 0 short-circuits without pulling the child.
+        assert!(op.next_batch().unwrap().is_none());
+        op.close().unwrap();
     }
 
     // ── TASK-323: Wave 3 pipeline shape end-to-end tests ────────────────

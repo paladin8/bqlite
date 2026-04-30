@@ -99,7 +99,7 @@ pub use materialize::{
 pub use operator::{
     CancellationToken, EntityOperator, PhysicalOperator, DEFAULT_OUTPUT_BATCH_SIZE,
 };
-pub use project::ProjectOperator;
+pub use project::{ProjectOperator, ProjectionExpr};
 pub use scan::{ScanOperator, ScanPath};
 pub use selection::{is_dense, selection_as_vector, selection_to_bool_array};
 pub use sessionize::{SessionizeOperator, SessionizeState, DEFAULT_SESSION_EVENT_CAP};
