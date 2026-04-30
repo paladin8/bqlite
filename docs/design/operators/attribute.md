@@ -290,17 +290,41 @@ The conversion-emission filter is internal to the operator. The planner threads 
 
 ## 13. Fused Aggregate Shapes
 
-ATTRIBUTE in v1 emits flat per-touchpoint rows to downstream STATS. **No `ATTRIBUTE -> STATS` fusion in v1.**
+ATTRIBUTE participates in stateful-to-aggregate fusion as of TASK-520.
+The operator advertises `supports_aggregation_fusion: true`; the planner
+pass `fuse_match_aggregate` detects `Aggregate(Attribute)` adjacency and
+absorbs the downstream `Aggregate` into a `CompiledFusableAggregate`
+carried on `AttributePhysical.fused_aggregate`.
 
-The three shapes enumerated in planner-pipeline.md Section 7.4.4 remain on the Wave 5 fusion menu:
+### 13.1 v1 Implementation — Default `finish_entity_into` Path
 
-| Fusion pattern | Description | Benefit |
+Per `engine/operator-fusion.md` §5.1, ATTRIBUTE rides the default
+`finish_entity_into` path: the operator emits its flat per-touchpoint
+rows in the native schema and the engine adapter feeds the resulting
+`RecordBatch` to `HashAccumulator::update_batch`. The three-row-shape
+emission semantics (§4.1: normal, null-key, LEFT-UNNEST) are preserved
+verbatim — the accumulator simply hashes each row by its group-by key
+the same way it would for the unfused path.
+
+The pre-fusion native schema is preserved on the descriptor in
+`pre_fusion_output_schema` (TASK-520 plumbing); the operator reads
+`desc.native_output_schema()` at construction time so the per-entity
+flat-row builder keeps the native column shape regardless of the
+externally-advertised aggregate schema.
+
+### 13.2 Fusion Eligibility
+
+| Fusion pattern | Status | Notes |
 |---|---|---|
-| `STATS COUNT(*) GROUP BY touchpoint_key` | Direct per-key counting | Eliminates flat-row materialization |
-| `STATS SUM(<conv.prop>) GROUP BY touchpoint_key` | Aggregated conversion property per key | Same |
-| `WHERE touchpoint_ts IS NOT NULL \| STATS COUNT(*) GROUP BY touchpoint_key` | LEFT-UNNEST rows filtered at emission time; fused counter | LEFT-UNNEST rows never leave the operator |
+| `STATS COUNT(*) GROUP BY touchpoint_key` | ✅ Fused | Group-by is a simple column ref to the native `touchpoint_key` output. |
+| `STATS SUM(<conv.prop>) GROUP BY touchpoint_key` | ✅ Fused (when `<conv.prop>` is a simple column ref present in the native output) | Forwarded conversion props live in the native schema; non-trivial agg-arg expressions block fusion (B4 invariant). |
+| `WHERE touchpoint_ts IS NOT NULL \| STATS COUNT(*) GROUP BY touchpoint_key` | ❌ Not fused | This is the FilterThenAggregate shape, still deferred for all four operators (planner-pipeline.md §7.2 rule 1, see also `fuse_match_aggregate.rs` module doc). |
 
-**Design rationale.** Same rationale as SESSIONIZE Section 10 — `FusedDownstream` is an explicit Wave 5 concern per planner-pipeline.md Section 5.3. ATTRIBUTE's unfused path is already efficient because the operator emits flat rows (no list to UNNEST, no intermediate structure to collapse). Getting boundary rules, scan widening, and state cap right matters more than shaving per-row materialization now.
+For the un-filtered shapes the fused path produces a result that is
+identical to the unfused path: the operator emits the same three row
+shapes, and the accumulator collapses null-key (row shape 2) and
+LEFT-UNNEST (row shape 3) into the same `NULL` group key, exactly as
+the unfused `HashAggregateOperator` would.
 
 ---
 

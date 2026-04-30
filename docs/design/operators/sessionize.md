@@ -519,24 +519,52 @@ Sessions can be long (thousands of events in a 30-minute gap window). Buffering 
 
 ---
 
-## 10. Fused Aggregate Shapes — Deferred to Wave 5
+## 10. Fused Aggregate Shapes
 
-SESSIONIZE in v1 emits full per-session rows to the downstream STATS operator. No `SESSIONIZE -> STATS` fusion.
+SESSIONIZE participates in stateful-to-aggregate fusion as of TASK-520. The
+operator advertises `supports_aggregation_fusion: true` and the planner pass
+`fuse_match_aggregate` (despite the legacy name, it now handles all four
+stateful operators) detects `Aggregate(Sessionize)` adjacency and absorbs
+the downstream `Aggregate` into a `CompiledFusableAggregate` carried on
+`SessionizePhysical.fused_aggregate`.
 
-### 10.1 Candidates for Wave 5
+### 10.1 v1 Implementation — Default `finish_entity_into` Path
 
-These are documented as future fusion opportunities, not v1 requirements:
+Per `engine/operator-fusion.md` §5.1, SESSIONIZE rides the default
+`finish_entity_into` impl: the operator emits one `RecordBatch` per
+session (in the operator's native schema), and the engine adapter feeds
+it into a `HashAccumulator::update_batch` call. No specialised hot-loop
+override; correctness matches the unfused path by construction. The
+fusion eligibility check restricts both aggregate args and group-by keys
+to simple column references because `update_batch` resolves columns by
+name (see `bqlite-planner/src/opt/fuse_match_aggregate.rs::is_eligible`).
 
-| Downstream pattern | Fused strategy | What's avoided |
+### 10.2 Future Optimization Candidates
+
+These remain follow-on perf optimizations (not correctness items):
+
+| Downstream pattern | Specialised strategy | What it would avoid |
 |---|---|---|
-| `STATS sessions = COUNT_DISTINCT(session_id) GROUP BY entity_id` | Per-entity session counter | No `session_id` on every event |
-| `STATS avg = AVG(session_duration)` | Running `(sum, count)` of session durations | No per-event annotation |
-| `STATS events = COUNT(*) GROUP BY session_id` | Events-per-session counter | No column materialization |
+| `STATS sessions = COUNT_DISTINCT(session_id) GROUP BY entity_id` | Per-entity session counter | The default-path RecordBatch construction per session |
+| `STATS avg = AVG(session_duration)` | Running `(sum, count)` of session durations | Per-session column materialization |
+| `STATS events = COUNT(*) GROUP BY session_id` | Events-per-session counter | Per-session row build |
 | `STATS first_page = FIRST_VALUE(page) GROUP BY session_id` | Per-session accumulator with column forwarding (planner-pipeline.md §8.3) | Full `session_id` materialization |
 
-### 10.2 Rationale for Deferral
+These would require a specialised override on `SessionizeOperator::finish_entity_into`
+analogous to the matcher's. Benchmarks would need to show the per-session
+RecordBatch cost dominates a real workload before this optimization is
+worth the implementation complexity.
 
-Fusion is a cross-cutting Wave 5 concern per planner-pipeline.md §5.3. The `FusedDownstream` annotation is explicitly deferred. Getting SESSIONIZE's emission semantics, state cap, and boundary rules right matters more than shaving per-session row construction in v1. The non-fused path (§8.5 default `finish_entity_into`) always works as the fallback (execution-model.md §8.7).
+### 10.3 Pre-Fusion Schema Preservation
+
+When fusion fires, the planner replaces `SessionizePhysical.output_schema`
+with the aggregate's output schema. The operator's *native* per-session
+schema (`input cols + session_id + session_duration`) is preserved in
+the new `pre_fusion_output_schema: Option<OperatorSchema>` field so
+construction-time slot-mapping continues to work against the native
+shape. `SessionizeOperator::new` reads
+`desc.native_output_schema()` (= `pre_fusion_output_schema.as_ref().unwrap_or(&output_schema)`)
+for all internal Arrow-schema and slot-map computation.
 
 ---
 

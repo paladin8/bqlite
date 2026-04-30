@@ -573,22 +573,44 @@ When a query constrains the outer time range (e.g., `events LAST 30d | FIRST(sig
 
 ---
 
-## 12. Fused Aggregate Shapes — Deferred to Wave 5
+## 12. Fused Aggregate Shapes
 
-EventSelect in v1 emits full per-entity rows to the downstream STATS operator. No `EventSelect -> STATS` fusion.
+EventSelect participates in stateful-to-aggregate fusion as of TASK-520.
+The operator advertises `supports_aggregation_fusion: true`; the planner
+pass `fuse_match_aggregate` detects `Aggregate(EventSelect)` adjacency
+and absorbs the downstream `Aggregate` into a `CompiledFusableAggregate`
+carried on `EventSelectPhysical.fused_aggregate`.
 
-### 12.1 Candidates for Wave 5
+### 12.1 v1 Implementation — Default `finish_entity_into` Path
 
-These are documented as future fusion opportunities, not v1 requirements:
+EventSelect rides the default `finish_entity_into` per
+`engine/operator-fusion.md` §5.1: the operator emits the candidate row
+as a 1-row `RecordBatch` (in the native schema), and the engine adapter
+feeds it into `HashAccumulator::update_batch`. Eligibility checks
+restrict aggregate args and group-by keys to simple column refs.
 
-| Downstream pattern | Fused strategy | What's avoided |
+Pre-fusion schema preservation works the same way SESSIONIZE handles it:
+the planner replaces `EventSelectPhysical.output_schema` with the
+aggregate's schema and stashes the operator's native schema in
+`pre_fusion_output_schema`. `EventSelectOperator::new` reads
+`desc.native_output_schema()` for slot-map / required-column resolution.
+
+### 12.2 Future Optimization — Skip the 1-Row Batch
+
+The default path builds a 1-row `RecordBatch` per entity and feeds it
+through `update_batch`'s scalar-by-scalar `extract_scalar` loop. A
+follow-on optimization could call `Accumulator::update(group_key, &values)`
+directly with the candidate's `ScalarValue`s, skipping the RecordBatch
+build. The operator already holds a `Vec<ScalarValue>` per candidate
+(§8.2) so the data shape is right. Benchmarks (TASK-531) should
+demonstrate the per-entity RecordBatch allocation dominates before this
+specialised override is implemented; until then the default path's
+correctness and simplicity wins.
+
+| Downstream pattern | Specialised strategy | What it would avoid |
 |---|---|---|
-| `FIRST(event) \| STATS COUNT(*)` | Per-entity presence boolean aggregated into a single counter | No per-entity row materialization |
-| `FIRST(event) \| STATS AVG(property) GROUP BY group_key` | Single-row-per-entity extraction fed directly into grouped aggregate | Intermediate RecordBatch construction |
-
-### 12.2 Rationale for Deferral
-
-Same rationale as SESSIONIZE Section 10 and ATTRIBUTE Section 13. `FusedDownstream` is an explicit Wave 5 concern per planner-pipeline.md Section 5.3. Unfused EventSelect is cheap — per-entity state is a single candidate row; typical output row counts are per-entity (millions, not billions). The overhead of materializing a single-row RecordBatch per entity and feeding it to STATS is minimal.
+| `FIRST(event) \| STATS COUNT(*)` | Per-entity presence boolean aggregated into a single counter | The 1-row RecordBatch build per entity |
+| `FIRST(event) \| STATS AVG(property) GROUP BY group_key` | Direct `Accumulator::update` with candidate scalars | `extract_scalar` loop in `update_batch` |
 
 ---
 
