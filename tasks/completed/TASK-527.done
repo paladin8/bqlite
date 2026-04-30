@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-527",
   "claimed_at": "2026-04-30T07:12:36Z",
+  "completed_at": "2026-04-30T08:05:21Z",
   "branch": "task/TASK-527",
   "description": "Scan-adjacent optimizer rule pack"
 }
