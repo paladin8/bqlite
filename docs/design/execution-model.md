@@ -718,7 +718,7 @@ The parallelism model has three distinct concepts that used to be conflated unde
 | **Morsel** | A contiguous entity-id range *within* one shard, generated dynamically | The shard's segment inventory and current load |
 | **Worker** | A thread in the engine's Rayon worker pool | `num_cores` |
 
-A query's execution proceeds as: for each shard the query touches, the engine generates morsels lazily and feeds them to the worker pool. Workers pull morsels with a work-stealing scheduler. Each worker runs the full pipeline (scan → stateless segment → entity operator → partial aggregate) on its current morsel and produces a partial result.
+A query's execution proceeds as: for each shard the query touches, the engine generates morsels lazily and feeds them to a single per-query lock-free MPMC queue. Workers pull morsels with **centralized lock-free dispatch + consumer-side load balancing** — any worker can pull any shard's morsels off the shared queue, which gives the load-balancing behaviour of a work-stealing scheduler without per-worker steal-deque infrastructure. Each worker runs the full pipeline (scan → stateless segment → entity operator → partial aggregate) on its current morsel and produces a partial result. See `engine/morsel-scheduler.md` §4.1–§4.2 for the queue / dispatch protocol.
 
 ### 9.2 Why Three Concepts
 
@@ -740,15 +740,15 @@ The contract is: every entity touched by the query is fully processed by exactly
 
 ### 9.4 Thread Pool, Morsel Queue, Query Queuing
 
-- **Worker pool.** Fixed-size Rayon thread pool of `num_cores` workers (configurable). Used for both query work and compaction (Section 11) with active-count cooperation.
-- **Morsel queue.** Per-query lock-free MPMC queue. The morsel generator (one per `(query, shard)`) lazily produces morsels onto the queue; workers pull morsels with `try_pop`. Lazy generation keeps in-flight memory bounded by the worker pool's queue depth, not by the total morsel count for the shard.
+- **Worker pool.** Fixed-size Rayon thread pool of `num_cores` workers (configurable through `EngineConfig::query_threads`). Shared across queries; compaction has its own pool and acquires from a `CoreBudget` semaphore with the same contract (Section 11, `engine/morsel-scheduler.md` §7). Sharing one `CoreBudget` *instance* between the engine and the storage compaction scheduler — so a running query actually pre-empts new compaction permit acquisitions — is forward-compatible follow-on work; the v1 engine constructs its own `CoreBudget`, and the public `acquire_n` contract is identical regardless of who owns the underlying instance.
+- **Morsel queue.** **One lock-free MPMC queue per query**, fed by **one generator per shard** (the per-shard generators push into the shared queue). Workers pull morsels with `try_pop`. Lazy generation keeps in-flight memory bounded by `2 × num_workers` morsel descriptors, not by the total morsel count for the shard. See `engine/morsel-scheduler.md` §3.5 / §4.1 for the per-query / per-shard split and the lazy-generation contract.
 - **Default shard count: 32** (storage-format.md). On machines with `num_cores < 32`, multiple shards' morsels interleave on the same worker — that is the *point* of the morsel queue. On machines with `num_cores > 32`, the morsel generator can produce more morsels than there are shards, keeping all cores busy on skewed workloads.
-- **Query queuing.** Queries submit their morsel generators to the engine's query queue in FIFO order. If the worker pool has capacity, generators start immediately; otherwise the query waits for the previous query's morsels to drain. Queries do **not** preempt each other mid-morsel.
+- **Query queuing.** Queries submit their morsel generators to the engine's query queue in FIFO order. The serialization point is the shared `CoreBudget` semaphore: each query atomically acquires `query_threads` permits at submit time via `CoreBudget::acquire_n` (`engine/morsel-scheduler.md` §7.1) and holds them until finalize. Compaction acquires permits per row group and releases at row-group boundaries, so a queued query is unblocked once active compaction drops below the query's permit demand. Queries do **not** preempt each other mid-morsel.
 - **Concurrent queries.** Multiple queries can have morsels in flight if the pool has capacity. The memory budget is divided across the fixed worker pool (Section 10.2), so per-worker bounds are stable regardless of how many queries are active.
 
 ### 9.5 Partial Aggregation and Final Merge
 
-Each worker accumulates partial aggregation results into a thread-local accumulator owned by the morsel generator's `(query, shard)` context. Multiple morsels in the same shard merge into the same partial accumulator (one per shard, not one per morsel) — the coordinator thread then performs a final merge across shards:
+Each query owns one **per-shard `Mutex<Box<dyn Accumulator>>`** (an `AccumulatorHandle`), constructed by the coordinator at query start. Workers running morsels for shard *S* lock that handle's mutex at fused-entity-operator `finish_entity_into` boundaries (per-entity grain — design `engine/morsel-scheduler.md` §6.2 / §6.3). Multiple morsels in the same shard mutate the same accumulator, and the coordinator thread then performs a final merge across shards:
 
 - `COUNT` / `SUM`: sum the partial values.
 - `MIN` / `MAX`: min/max across partials.
@@ -932,17 +932,19 @@ Running aggregation state is small per group (counts, sums, min/max — see `Agg
 
 ### 11.1 Compaction Thread Pool
 
-Compaction runs on a separate pool of up to `num_cores` threads, independent from query worker threads. The number of **active** compaction threads is dynamically bounded:
+Compaction runs on a separate pool of up to `num_cores` threads, independent from query worker threads. The number of **active** compaction threads is dynamically bounded by the shared `CoreBudget` semaphore (`storage/compaction-concurrency.md` §4 / `engine/morsel-scheduler.md` §7):
 
 ```
 active_compaction_threads ≤ num_cores - active_query_threads
 ```
 
-This is a resource management decision, not a concurrency concern — compaction and queries can safely run concurrently due to manifest-based MVCC (storage-format.md Section 7.6). The bound ensures compaction uses only spare CPU and I/O capacity, yielding to queries when the machine is busy.
+The semaphore is loaded with `num_cores` permits at engine startup. Queries call `CoreBudget::acquire_n(query_threads)` at submit time (`engine/morsel-scheduler.md` §7.1) and hold those permits until finalize. Compaction acquires one permit per row group and releases at row-group boundaries. The arithmetic invariant above is therefore enforced naturally by the semaphore — no separate "active count" check is required.
+
+This is a resource management decision, not a concurrency concern — compaction and queries can safely run concurrently due to manifest-based MVCC (storage-format.md Section 7.6). The semaphore ensures compaction uses only spare CPU and I/O capacity, yielding to queries when the machine is busy.
 
 - **When query load is low:** compaction uses most cores, clearing backlog quickly.
 - **When query load is high:** compaction scales down to zero active threads, resuming when query threads free up.
-- **Mechanism:** compaction tasks check the query thread pool's active count before each work chunk and yield if no spare capacity remains.
+- **Mechanism:** compaction acquires its per-row-group permit through the same `CoreBudget` semaphore queries use. A queued query holds `query_threads` permits up front, so compaction's next `acquire()` blocks until the query releases on finalize.
 
 Since each `(window, shard)` compacts independently (storage-format.md Section 7.1), compaction is embarrassingly parallel — multiple compaction tasks can run simultaneously on different `(window, shard)` pairs when capacity permits.
 

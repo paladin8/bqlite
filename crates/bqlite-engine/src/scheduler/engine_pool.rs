@@ -200,10 +200,7 @@ impl MorselScheduler {
         // variant, callers must dispatch only against non-empty
         // shards.
         assert!(
-            snapshot
-                .windows
-                .iter()
-                .any(|w| !w.segments.is_empty()),
+            snapshot.windows.iter().any(|w| !w.segments.is_empty()),
             "run_degenerate requires a non-empty shard snapshot; use \
              submit() for queries that may not produce a worker call",
         );

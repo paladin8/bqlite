@@ -165,8 +165,11 @@ even if no queries are active.
 ### 4.4 TASK-408 Integration
 
 The scheduler exposes `CompactionScheduler::acquire_core_budget(&semaphore) -> Permit`
-as a sub-call in the worker's row-group loop. Query execution (TASK-438
-onwards) acquires its permits on query start via the same semaphore.
+as a sub-call in the worker's row-group loop. Query execution (TASK-523)
+acquires its permits on query start via `CoreBudget::acquire_n(query_threads)`
+on the same semaphore — see `engine/morsel-scheduler.md` §7.1 for the
+atomic batch-acquisition contract that resolves the partial-acquisition
+deadlock between concurrent queries on a saturated worker pool.
 
 **Why this shape:** A plain active-count check either over- or
 under-provisions compaction. Semaphore-based gating naturally interleaves
@@ -412,8 +415,15 @@ from this protocol:
   manifest publish protocol, per-table lock acquisition, retired-manifest
   list + 10s reclamation sweep, startup orphan sweep, mid-job abort + 60s
   retry cooldown, `compaction_backlog_l0_segments` metric.
-- **TASK-438 (engine bind step)** -- must acquire `core_budget` permits
-  for query workers on query start and release on finalization (SS4
+- **TASK-438 (engine bind step)** -- engine-level wiring of cohort /
+  subquery materialization at query start. The query-side
+  `core_budget` permit acquisition itself is TASK-523's responsibility
+  via `CoreBudget::acquire_n(query_threads)` (`engine/morsel-scheduler.md`
+  §7.1).
+- **TASK-523 (morsel scheduler + partial-aggregate handoff)** --
+  extends `core_budget` with `acquire_n` (atomic batch acquisition,
+  head-of-line FIFO) and acquires `query_threads` permits on query
+  start through the engine-side `MorselScheduler::submit` path (SS4
   symmetry).
 - **TASK-404 (tombstone semantics)** -- SS9 pins tombstone
   snapshot-at-job-start and manifest-first reclamation ordering.
@@ -468,10 +478,17 @@ SS6 all-or-nothing publish guarantee is preserved.
   `Database::remove_segments_atomic` and still runs reclamation to
   clear the entries that caused the full drop. Query-time
   scan-wrapping is TASK-434.
-- SS4 query-side permit acquisition is TASK-438's job. TASK-408 ships
-  the `CoreBudget` type and the per-job acquire/release inside the
-  worker; until TASK-438 wires query workers into the same semaphore,
-  the compaction worker effectively never blocks.
+- SS4 query-side permit acquisition lands with TASK-523. TASK-408
+  shipped the `CoreBudget` type and the per-job acquire/release
+  inside the worker; TASK-523 (`engine/morsel-scheduler.md` §7.1)
+  extends `CoreBudget` with `acquire_n` (atomic batch, head-of-line
+  FIFO) so the engine acquires `query_threads` permits on query start
+  through `MorselScheduler::submit`. Sharing one `CoreBudget` instance
+  between the engine and the storage compaction scheduler — so a
+  running query actually pre-empts new compaction permit acquisitions
+  — is forward-compatible follow-on work; the v1 engine constructs
+  its own `CoreBudget`, and the public `acquire_n` contract is
+  identical regardless of who owns the underlying instance.
 
 ### 12.1 Streaming row-group writer (Wave 5 follow-on)
 
