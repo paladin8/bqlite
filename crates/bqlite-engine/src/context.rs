@@ -67,7 +67,7 @@ pub const MIN_QUERY_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Host-level configuration for an [`crate::Engine`] instance.
 ///
-/// All fields are bytes. Defaults match § 2.2 of the design doc. The
+/// All byte fields are bytes. Defaults match § 2.2 of the design doc. The
 /// compaction and ingest fields are placeholders for the schedulers that
 /// own those budgets; `QueryContext` consumes only `query_memory_budget_bytes`.
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +82,12 @@ pub struct EngineConfig {
     /// Ingest partitioner ceiling (out of scope for the query
     /// pipeline; consumed by `Partitioner::new`).
     pub ingest_memory_budget_bytes: u64,
+    /// Worker pool size for the engine's morsel scheduler
+    /// (engine/morsel-scheduler.md §5.1). `None` defaults to
+    /// `available_parallelism()`, falling back to 4 when the platform
+    /// cannot report. Capped at the underlying [`bqlite_storage::CoreBudget`]
+    /// permit count, which is initialised to `num_cores`.
+    pub query_threads: Option<usize>,
 }
 
 impl Default for EngineConfig {
@@ -90,7 +96,22 @@ impl Default for EngineConfig {
             query_memory_budget_bytes: DEFAULT_QUERY_BUDGET_BYTES,
             compaction_memory_budget_bytes: DEFAULT_COMPACTION_BUDGET_BYTES,
             ingest_memory_budget_bytes: DEFAULT_INGEST_BUDGET_BYTES,
+            query_threads: None,
         }
+    }
+}
+
+impl EngineConfig {
+    /// Resolve the effective worker count, applying the
+    /// `available_parallelism` default when `query_threads` is unset.
+    /// Per design §5.1 the fallback is 4 when the platform cannot
+    /// report.
+    pub fn resolve_query_threads(&self) -> usize {
+        self.query_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
     }
 }
 

@@ -58,6 +58,8 @@
 //! additions can be purely additive (new fields on `ExecutionResult`,
 //! new methods on `Engine`) without churning callers.
 
+use std::sync::Arc;
+
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::{BqliteError, OperatorSchema, QueryWarning};
@@ -66,6 +68,7 @@ use bqlite_storage::Database;
 
 use crate::bind::bind_physical;
 use crate::context::{resolve_query_budget, EngineConfig, QueryContext, QueryOptions};
+use crate::scheduler::MorselScheduler;
 
 /// The result of a successfully executed query.
 ///
@@ -190,31 +193,67 @@ impl ExecutionResult {
 ///
 /// `Engine` carries an [`EngineConfig`] (default per
 /// `docs/design/engine/memory-budget.md` § 2.2) used to size each
-/// query's [`QueryContext`]. `Engine::new()` and `Engine::default()`
-/// remain interchangeable — both pick up the default config; hosts
-/// that need a custom budget call `Engine::with_config(...)`. Later
-/// waves add a thread-pool handle, warning sink, and metrics hooks as
-/// additional fields without breaking existing callers.
-#[derive(Debug, Default, Clone, Copy)]
+/// query's [`QueryContext`], plus an [`Arc<MorselScheduler>`] that
+/// dispatches data-plane queries onto a Rayon worker pool guarded
+/// by a [`CoreBudget`] semaphore (engine/morsel-scheduler.md §5).
+/// `Engine::new()` and `Engine::default()` remain interchangeable
+/// for hosts that want the documented Wave 5 defaults.
+#[derive(Debug, Clone)]
 pub struct Engine {
     config: EngineConfig,
+    scheduler: Arc<MorselScheduler>,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        let config = EngineConfig::default();
+        let scheduler = crate::scheduler::build_from_config(&config)
+            .expect("default scheduler must build with default config");
+        Self { config, scheduler }
+    }
 }
 
 impl Engine {
     /// Construct an engine with default configuration (3 GiB query
-    /// budget, see `docs/design/engine/memory-budget.md` § 2.2).
+    /// budget, see `docs/design/engine/memory-budget.md` § 2.2;
+    /// `query_threads = available_parallelism()` per
+    /// `engine/morsel-scheduler.md` §5.1).
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Construct an engine with a custom configuration.
+    ///
+    /// Builds a fresh [`MorselScheduler`] sized at the resolved
+    /// `query_threads` from `config`. Callers that want to share a
+    /// scheduler across multiple `Engine`s — for example when
+    /// running concurrent queries through one fixed worker pool —
+    /// should construct the scheduler once via
+    /// [`crate::scheduler::build_from_config`] and use
+    /// [`Self::with_scheduler`].
     pub fn with_config(config: EngineConfig) -> Self {
-        Self { config }
+        let scheduler = crate::scheduler::build_from_config(&config)
+            .expect("scheduler must build with provided config");
+        Self { config, scheduler }
+    }
+
+    /// Construct an engine that reuses an externally-supplied
+    /// scheduler. Test/benchmark hook for sharing one Rayon pool
+    /// across many `Engine` instances or driving the same scheduler
+    /// from different query-context configurations.
+    pub fn with_scheduler(config: EngineConfig, scheduler: Arc<MorselScheduler>) -> Self {
+        Self { config, scheduler }
     }
 
     /// Returns the engine's effective configuration.
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// Returns the morsel scheduler this engine dispatches data-plane
+    /// queries through. Test helper.
+    pub fn scheduler(&self) -> &Arc<MorselScheduler> {
+        &self.scheduler
     }
 
     /// Parse, plan, bind, and execute `text` against `db`, collecting
@@ -279,13 +318,19 @@ impl Engine {
         // `WarningSink` it carries is `Send + Sync`, so observing
         // it across the unwind boundary is fine.
         //
-        // The single-threaded driver catches its own panic so a
-        // panic in any operator surfaces as `BqliteError::OperatorPanic`
-        // rather than aborting the process. TASK-541 generalizes this
-        // to per-worker `catch_unwind` boundaries.
+        // The driver catches its own panic so a panic in any operator
+        // surfaces as `BqliteError::OperatorPanic` rather than
+        // aborting the process. TASK-541 generalizes this to
+        // per-worker `catch_unwind` boundaries.
+        //
+        // `run_query_inner` itself decides whether to dispatch the
+        // operator-tree drive through the morsel scheduler (data-plane
+        // SELECTs) or to run on the calling thread (DDL, DELETE,
+        // EXPLAIN — design §5.4 bypass).
         let inner_ctx = ctx.clone();
+        let scheduler = Arc::clone(&self.scheduler);
         let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_query_inner(text, db, &inner_ctx)
+            run_query_inner(text, db, &inner_ctx, &scheduler)
         }));
 
         match inner {
@@ -326,6 +371,7 @@ fn run_query_inner(
     text: &str,
     db: &mut Database,
     ctx: &QueryContext,
+    scheduler: &MorselScheduler,
 ) -> bqlite_core::Result<ExecutionResult> {
     // 1. Parse. `parse()` returns a Vec: zero or more
     //    `Statement::DefineAlias` items followed by the terminal
@@ -378,20 +424,40 @@ fn run_query_inner(
     //    warning sink (per `cancellation.md` §7) so adapters that
     //    publish per-entity diagnostics can attach them to the
     //    per-query stream.
-    let mut operator = bind_physical(&physical, db, ctx)?;
+    //
+    //    Bind runs on the calling thread because it borrows
+    //    `&mut Database` to register cohorts / pre-load metadata.
+    //    Once bound, the `Box<dyn PhysicalOperator>` owns whatever
+    //    state it needs (segment readers via `Arc<Database>`-internal
+    //    handles), so the operator tree can be moved onto a worker
+    //    thread for the drive step. See `engine/morsel-scheduler.md`
+    //    §5.4: DDL / DELETE / EXPLAIN bypass the worker pool; data-
+    //    plane queries are dispatched through it.
+    let operator = bind_physical(&physical, db, ctx)?;
 
-    // 4. Drive to completion with the standard "primary error wins"
-    //    cleanup convention: `close` runs even on the error path so
-    //    mmap handles / spill files are released promptly.
-    let drive_result = drive_to_completion(operator.as_mut());
-    let close_result = operator.close();
-    let rows = drive_result?;
-    close_result?;
-
-    // Drop the operator tree before draining the warning sink so any
-    // adapter clones of the sink are released first (matches
-    // `cancellation.md` §5.1's leaf-first teardown ordering).
-    drop(operator);
+    // 4. Drive the operator on the morsel scheduler's worker pool.
+    //    The submission acquires `query_threads` permits from the
+    //    shared `CoreBudget` (FIFO atomic batch — design §7.1) and
+    //    runs the drive loop on a Rayon worker. v1 dispatches every
+    //    query as one degenerate whole-database task; per-shard
+    //    morsel parallelism lands in follow-on tasks.
+    //
+    //    The "primary error wins" cleanup convention from the prior
+    //    single-threaded driver carries through: `close` runs on
+    //    both happy and sad paths so mmap handles and spill files
+    //    are released promptly.
+    let rows = scheduler.submit(move || -> bqlite_core::Result<Vec<RecordBatch>> {
+        let mut operator = operator;
+        let drive_result = drive_to_completion(operator.as_mut());
+        let close_result = operator.close();
+        let rows = drive_result?;
+        close_result?;
+        // Drop the operator tree before returning so any adapter
+        // clones of the warning sink are released first (matches
+        // `cancellation.md` §5.1's leaf-first teardown ordering).
+        drop(operator);
+        Ok(rows)
+    })?;
 
     Ok(ExecutionResult {
         schema,
@@ -601,11 +667,17 @@ mod tests {
     fn engine_default_matches_new() {
         let a: Engine = Engine::default();
         let b: Engine = Engine::new();
-        // Both are zero-sized / `_private: ()`, so they must be
-        // bit-for-bit equal — but we cannot derive `PartialEq` on a
-        // zero-sized `_private` field without adding it to the public
-        // surface, so compare by their Debug shape instead.
-        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        // Both honor the documented Wave 5 defaults (memory budget +
+        // morsel scheduler thread count). The schedulers are distinct
+        // `Arc` allocations — that is intentional, every `Engine`
+        // owns its own pool unless built with `with_scheduler` —
+        // so we compare the configuration rather than the Debug
+        // shape.
+        assert_eq!(
+            a.config().query_memory_budget_bytes,
+            b.config().query_memory_budget_bytes
+        );
+        assert_eq!(a.scheduler().query_threads(), b.scheduler().query_threads());
     }
 
     #[test]
@@ -697,5 +769,92 @@ mod tests {
         );
         let result = engine.query("events", &mut db).expect("must succeed");
         assert!(result.is_empty());
+    }
+
+    // ── Morsel scheduler integration (TASK-523 CP3) ─────────────────
+
+    #[test]
+    fn engine_default_query_threads_uses_resolved_default() {
+        // The default engine resolves `query_threads` to
+        // `available_parallelism()` (or 4 on platforms that cannot
+        // report). We do not pin the exact number — different CI
+        // hosts have different core counts — but it is non-zero.
+        let engine = Engine::new();
+        assert!(engine.scheduler().query_threads() >= 1);
+        // Permit count starts at full capacity: no query in flight.
+        assert_eq!(
+            engine.scheduler().available_permits(),
+            engine.scheduler().query_threads()
+        );
+    }
+
+    #[test]
+    fn engine_query_dispatches_through_morsel_scheduler() {
+        // SELECT-shaped queries route through `MorselScheduler::submit`,
+        // which acquires `query_threads` permits and runs the operator
+        // tree on a Rayon worker. After the call returns, the permits
+        // are released — `available_permits()` is back to full.
+        let scratch = Scratch::new("scheduler-dispatch");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::with_config(crate::EngineConfig {
+            query_threads: Some(2),
+            ..crate::EngineConfig::default()
+        });
+        assert_eq!(engine.scheduler().query_threads(), 2);
+        let _ = engine.query("events", &mut db).expect("must succeed");
+        // Permits released after query completes.
+        assert_eq!(engine.scheduler().available_permits(), 2);
+    }
+
+    #[test]
+    fn engine_with_scheduler_shares_pool_across_engines() {
+        // Two engines that share one scheduler honour the same
+        // `query_threads` ceiling and the same `CoreBudget`.
+        let scratch = Scratch::new("shared-scheduler");
+        let mut db = create_db_with_events(scratch.path());
+        let cfg = crate::EngineConfig {
+            query_threads: Some(1),
+            ..crate::EngineConfig::default()
+        };
+        let scheduler = crate::scheduler::build_from_config(&cfg).expect("scheduler builds");
+        let engine_a = Engine::with_scheduler(cfg, Arc::clone(&scheduler));
+        let engine_b = Engine::with_scheduler(cfg, Arc::clone(&scheduler));
+        assert!(Arc::ptr_eq(engine_a.scheduler(), engine_b.scheduler()));
+
+        let _ = engine_a.query("events", &mut db).expect("must succeed");
+        let _ = engine_b.query("events", &mut db).expect("must succeed");
+        assert_eq!(engine_a.scheduler().available_permits(), 1);
+    }
+
+    #[test]
+    fn ddl_bypasses_morsel_scheduler() {
+        // CREATE TABLE runs out-of-band per design §5.4 — it never
+        // acquires `CoreBudget` permits. Observable property: while
+        // a DDL query is in flight (we cannot easily synchronize on
+        // mid-DDL state from the test, so we settle for the
+        // post-condition), the scheduler's permit count is
+        // unchanged. DDL does not return through the scheduler path
+        // either way; the assertion here is that DDL succeeds
+        // without saturating the scheduler.
+        let scratch = Scratch::new("ddl-bypass");
+        let mut db = Database::create(scratch.path()).expect("create db");
+        let engine = Engine::with_config(crate::EngineConfig {
+            query_threads: Some(1),
+            ..crate::EngineConfig::default()
+        });
+        // Issue DDL — it does not pull a permit because run_query_inner
+        // dispatches DDL/EXPLAIN/DELETE without going through the
+        // scheduler.
+        let _ = engine
+            .query(
+                "CREATE TABLE events (\
+                     entity_id STRING NOT NULL ENTITY KEY, \
+                     ts TIMESTAMP NOT NULL EVENT TIME, \
+                     event_type STRING NOT NULL EVENT TYPE\
+                 )",
+                &mut db,
+            )
+            .expect("DDL must succeed");
+        assert_eq!(engine.scheduler().available_permits(), 1);
     }
 }

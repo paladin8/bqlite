@@ -35,12 +35,14 @@
 //! - Surface the §8 metrics counters — owned by TASK-524.
 
 pub mod accumulator;
+pub mod engine_pool;
 pub mod morsel;
 pub mod policy;
 pub mod queue;
 pub mod worker;
 
 pub use accumulator::{AccumulatorHandle, ShardDoneSignal};
+pub use engine_pool::{build_from_config, BuildError, MorselScheduler};
 pub use morsel::{EntityRange, Morsel, MorselGenerator, ShardSnapshot, WindowSegments};
 pub use policy::{MorselSizePolicy, MorselSizeState};
 pub use queue::{MorselQueue, MorselQueueDrained, MorselQueueFull};
