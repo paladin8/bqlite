@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-3",
+  "task_id": "TASK-521",
+  "claimed_at": "2026-04-30T05:31:26Z",
+  "branch": "task/TASK-521",
+  "description": "Optimizer framework + rule-trace surface"
+}
