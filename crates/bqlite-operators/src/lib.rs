@@ -59,6 +59,7 @@ pub mod eval;
 pub mod event_select;
 pub mod filter;
 pub mod filtered_batch;
+pub mod kernel;
 pub mod limit;
 pub mod matcher;
 pub mod materialize;
@@ -86,10 +87,12 @@ pub use encoded_filter::{
 pub use event_select::EventSelectOperator;
 pub use filter::FilterOperator;
 pub use filtered_batch::FilteredBatch;
+pub use kernel::{FilterKernel, ProjectKernel, StatelessKernel};
 pub use limit::LimitOperator;
 pub use matcher::SequenceMatchOperator;
 pub use materialize::{
-    materialize_selected, materialize_selected_with_metrics, materialize_stitched,
+    materialize_filtered_batch, materialize_selected, materialize_selected_with_metrics,
+    materialize_stitched,
 };
 pub use operator::{
     CancellationToken, EntityOperator, PhysicalOperator, DEFAULT_OUTPUT_BATCH_SIZE,

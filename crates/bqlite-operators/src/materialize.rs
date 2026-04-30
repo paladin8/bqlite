@@ -34,6 +34,7 @@ use bqlite_core::{BqlType, BqliteError, Result};
 use bqlite_storage::{materialize_encoded_column, materialize_encoded_column_selected};
 
 use crate::filtered_batch::FilteredBatch;
+use crate::selection::selection_to_bool_array;
 
 /// Materialize an [`EncodedBatch`] narrowed by `selection` into a dense
 /// [`FilteredBatch`] with `selection: None`.
@@ -119,6 +120,60 @@ pub fn materialize_selected_with_metrics(
         m.record_bytes_materialized_after_filter(record_batch_bytes(&record));
     }
     Ok(FilteredBatch::dense(record))
+}
+
+/// Collapse a [`FilteredBatch`] from the post-boundary kernel chain
+/// into a contiguous [`RecordBatch`].
+///
+/// This is the §3.4 / §4.3 boundary helper from
+/// `docs/design/engine/operator-fusion.md`. It is the **only** call
+/// site that increments `selection_vector_materializations` —
+/// short-circuit paths skip the metric, so the counter cleanly
+/// measures actual-copy activity inside the segment driver.
+///
+/// Three paths:
+///
+/// 1. `selection: None` — return the inner batch unchanged. No copy,
+///    no metric increment.
+/// 2. `selection: Some(sv)` with `sv.len() == batch.num_rows()` —
+///    every row is live (the all-pass shape per §3.3.1). Soundness:
+///    [`SelectionVector`] is sorted-ascending and unique, so
+///    `len() == num_rows()` ⇒ `sv == 0..num_rows()`. Return the inner
+///    batch; no copy, no metric increment.
+/// 3. `selection: Some(sv)` with `sv.len() < batch.num_rows()` —
+///    rebuild a contiguous batch via `arrow::compute::filter_record_batch`,
+///    incrementing the materialization counter by 1 (per call, not
+///    per row, per §3.5).
+///
+/// The helper is intentionally distinct from [`materialize_selected`]:
+/// that helper is the *encoded-path* boundary
+/// (`EncodedBatch + RowSelection -> RecordBatch`); this one is the
+/// *post-boundary* boundary (`FilteredBatch -> RecordBatch`). The two
+/// share `selection_to_bool_array` but tag different metrics.
+pub fn materialize_filtered_batch(fb: FilteredBatch, metrics: &dyn Metrics) -> Result<RecordBatch> {
+    let FilteredBatch { batch, selection } = fb;
+    match selection {
+        None => Ok(batch),
+        Some(sv) if sv.len() == batch.num_rows() => {
+            // Sound by SelectionVector's strictly-ascending invariant
+            // — a length-equal selection is the dense identity.
+            Ok(batch)
+        }
+        Some(sv) => {
+            metrics.record_selection_vector_materializations(1);
+            let row_count_u32 = u32::try_from(batch.num_rows()).map_err(|_| {
+                BqliteError::Execution(format!(
+                    "materialize_filtered_batch: row count {} exceeds u32",
+                    batch.num_rows()
+                ))
+            })?;
+            let mask = selection_to_bool_array(
+                &bqlite_core::encoded::RowSelection::from_indices(sv),
+                row_count_u32,
+            );
+            arrow::compute::filter_record_batch(&batch, &mask).map_err(BqliteError::Arrow)
+        }
+    }
 }
 
 /// Approximate the total bytes of Arrow array buffers in a record
@@ -580,6 +635,95 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(ints.values(), &[300i64, 1000, 100, 2000, 200]);
+    }
+
+    // ── materialize_filtered_batch (TASK-518) ─────────────────────────
+
+    #[test]
+    fn materialize_filtered_batch_dense_input_returns_inner_batch_no_metric() {
+        use crate::filtered_batch::FilteredBatch;
+        use bqlite_core::metrics::AtomicMetrics;
+        let metrics = AtomicMetrics::default();
+        let batch = RecordBatch::try_new(
+            i64_schema(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .unwrap();
+        let out =
+            crate::materialize::materialize_filtered_batch(FilteredBatch::dense(batch), &metrics)
+                .unwrap();
+        assert_eq!(out.num_rows(), 3);
+        // §4.3: short-circuit path — no metric increment.
+        assert_eq!(metrics.snapshot().selection_vector_materializations, 0);
+    }
+
+    #[test]
+    fn materialize_filtered_batch_full_cover_selection_short_circuits() {
+        // selection.len() == batch.num_rows() ⇒ the all-pass dense
+        // shape from §3.3.1. Sound by the SelectionVector
+        // ascending+unique invariant. Should return inner batch
+        // without copying or incrementing the metric.
+        use crate::filtered_batch::FilteredBatch;
+        use bqlite_core::metrics::AtomicMetrics;
+        let metrics = AtomicMetrics::default();
+        let batch = RecordBatch::try_new(
+            i64_schema(),
+            vec![Arc::new(Int64Array::from(vec![10_i64, 20, 30])) as ArrayRef],
+        )
+        .unwrap();
+        let sv = SelectionVector::from_sorted(vec![0, 1, 2]);
+        let out = crate::materialize::materialize_filtered_batch(
+            FilteredBatch::with_selection(batch, sv),
+            &metrics,
+        )
+        .unwrap();
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(metrics.snapshot().selection_vector_materializations, 0);
+    }
+
+    #[test]
+    fn materialize_filtered_batch_sparse_selection_copies_and_increments() {
+        use crate::filtered_batch::FilteredBatch;
+        use bqlite_core::metrics::AtomicMetrics;
+        let metrics = AtomicMetrics::default();
+        let batch = RecordBatch::try_new(
+            i64_schema(),
+            vec![Arc::new(Int64Array::from(vec![10_i64, 20, 30, 40, 50])) as ArrayRef],
+        )
+        .unwrap();
+        let sv = SelectionVector::from_sorted(vec![0, 2, 4]);
+        let out = crate::materialize::materialize_filtered_batch(
+            FilteredBatch::with_selection(batch, sv),
+            &metrics,
+        )
+        .unwrap();
+        assert_eq!(out.num_rows(), 3);
+        let ints = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ints.values(), &[10i64, 30, 50]);
+        // Exactly one materialization recorded — per call, not per row.
+        assert_eq!(metrics.snapshot().selection_vector_materializations, 1);
+    }
+
+    #[test]
+    fn materialize_filtered_batch_empty_selection_returns_zero_rows() {
+        use crate::filtered_batch::FilteredBatch;
+        use bqlite_core::metrics::AtomicMetrics;
+        let metrics = AtomicMetrics::default();
+        let batch = RecordBatch::try_new(
+            i64_schema(),
+            vec![Arc::new(Int64Array::from(vec![10_i64, 20])) as ArrayRef],
+        )
+        .unwrap();
+        let sv = SelectionVector::new();
+        let out = crate::materialize::materialize_filtered_batch(
+            FilteredBatch::with_selection(batch, sv),
+            &metrics,
+        )
+        .unwrap();
+        assert_eq!(out.num_rows(), 0);
+        // Empty selection still goes through the actual-copy path (it
+        // is not a "full-cover" no-op for any non-empty batch).
+        assert_eq!(metrics.snapshot().selection_vector_materializations, 1);
     }
 
     #[test]
