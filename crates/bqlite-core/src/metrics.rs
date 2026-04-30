@@ -96,6 +96,17 @@ pub struct MetricsSnapshot {
     /// inside a fused stateless segment. Lets ops answer "how much row
     /// work did the chain skip" without reading per-row counters.
     pub selection_vector_dropped_rows: u64,
+
+    // ── Spill bytes (TASK-524) ───────────────────────────────────────
+    //
+    // Per-query bytes written to spill files. Populated by
+    // [`TempSpillFile::Drop`] when the guard was constructed with a
+    // [`Metrics`] handle (`bqlite-core::spill`); zero for query paths
+    // that never spilled. Surfaced through `--explain-perf` per
+    // `docs/design/execution-model.md` §14.1.
+    /// Total bytes written across every `TempSpillFile` opened by this
+    /// query.
+    pub spill_bytes_written: u64,
 }
 
 impl MetricsSnapshot {
@@ -138,6 +149,9 @@ impl MetricsSnapshot {
         self.selection_vector_dropped_rows = self
             .selection_vector_dropped_rows
             .saturating_add(other.selection_vector_dropped_rows);
+        self.spill_bytes_written = self
+            .spill_bytes_written
+            .saturating_add(other.spill_bytes_written);
     }
 
     /// Return the component-wise sum of `self` and `other` without
@@ -162,6 +176,7 @@ impl MetricsSnapshot {
             && self.materialized_rows == 0
             && self.selection_vector_materializations == 0
             && self.selection_vector_dropped_rows == 0
+            && self.spill_bytes_written == 0
     }
 }
 
@@ -252,6 +267,14 @@ pub trait Metrics: Send + Sync {
     #[inline]
     fn record_selection_vector_dropped_rows(&self, _n: u64) {}
 
+    /// Add `n` to the spill-bytes-written counter (TASK-524). Called
+    /// once per [`crate::spill::TempSpillFile`] when its `Drop` runs,
+    /// flushing the guard's running write counter into the per-query
+    /// total. Surfaced through `--explain-perf` per
+    /// `docs/design/execution-model.md` §14.1.
+    #[inline]
+    fn record_spill_bytes_written(&self, _n: u64) {}
+
     /// Take a point-in-time snapshot of the current counter values.
     ///
     /// Not called on the hot path. The returned snapshot is a value
@@ -291,6 +314,8 @@ pub struct AtomicMetrics {
 
     selection_vector_materializations: AtomicU64,
     selection_vector_dropped_rows: AtomicU64,
+
+    spill_bytes_written: AtomicU64,
 }
 
 impl AtomicMetrics {
@@ -366,6 +391,11 @@ impl Metrics for AtomicMetrics {
             .fetch_add(n, Ordering::Relaxed);
     }
 
+    #[inline]
+    fn record_spill_bytes_written(&self, n: u64) {
+        self.spill_bytes_written.fetch_add(n, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             rows_in: self.rows_in.load(Ordering::Relaxed),
@@ -390,6 +420,7 @@ impl Metrics for AtomicMetrics {
             selection_vector_dropped_rows: self
                 .selection_vector_dropped_rows
                 .load(Ordering::Relaxed),
+            spill_bytes_written: self.spill_bytes_written.load(Ordering::Relaxed),
         }
     }
 }
@@ -853,6 +884,45 @@ mod tests {
         let m = NoopMetrics::new();
         m.record_selection_vector_materializations(99);
         m.record_selection_vector_dropped_rows(99);
+        assert_eq!(m.snapshot(), MetricsSnapshot::zero());
+    }
+
+    // ── Spill counter (TASK-524) ─────────────────────────────────────
+
+    #[test]
+    fn snapshot_is_zero_includes_spill_counter() {
+        let mut s = MetricsSnapshot::zero();
+        assert!(s.is_zero());
+        s.spill_bytes_written = 1;
+        assert!(!s.is_zero());
+    }
+
+    #[test]
+    fn snapshot_merge_sums_spill_counter() {
+        let mut a = MetricsSnapshot {
+            spill_bytes_written: 1024,
+            ..Default::default()
+        };
+        let b = MetricsSnapshot {
+            spill_bytes_written: 2048,
+            ..Default::default()
+        };
+        a.merge(&b);
+        assert_eq!(a.spill_bytes_written, 3072);
+    }
+
+    #[test]
+    fn atomic_metrics_spill_counter_accumulates() {
+        let m = AtomicMetrics::new();
+        m.record_spill_bytes_written(1024);
+        m.record_spill_bytes_written(2048);
+        assert_eq!(m.snapshot().spill_bytes_written, 3072);
+    }
+
+    #[test]
+    fn noop_metrics_default_body_accepts_spill_writes() {
+        let m = NoopMetrics::new();
+        m.record_spill_bytes_written(9_999);
         assert_eq!(m.snapshot(), MetricsSnapshot::zero());
     }
 

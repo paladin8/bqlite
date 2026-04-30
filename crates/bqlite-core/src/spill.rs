@@ -54,9 +54,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::BqliteError;
+use crate::metrics::Metrics;
 use crate::Result;
 
 // ---------------------------------------------------------------------------
@@ -111,11 +112,26 @@ impl std::fmt::Display for SpillQueryId {
 /// no spill file survives a failed query (cancellation.md § 5.1 step 2).
 /// Drop does not log or panic on failure; a failed unlink is reclaimed
 /// by the per-query / engine-open sweep (`spill.md` § 8.3 / § 9.1).
-#[derive(Debug)]
 pub struct TempSpillFile {
     path: PathBuf,
     file: File,
     bytes_written: u64,
+    /// Optional per-query metrics handle. When attached, `Drop` flushes
+    /// `bytes_written` into [`Metrics::record_spill_bytes_written`] so
+    /// the per-query `spill_bytes_written` row in
+    /// `docs/design/execution-model.md` §14.1 is populated without each
+    /// operator having to remember (TASK-524).
+    metrics: Option<Arc<dyn Metrics>>,
+}
+
+impl std::fmt::Debug for TempSpillFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TempSpillFile")
+            .field("path", &self.path)
+            .field("bytes_written", &self.bytes_written)
+            .field("has_metrics", &self.metrics.is_some())
+            .finish()
+    }
 }
 
 impl TempSpillFile {
@@ -148,10 +164,22 @@ impl TempSpillFile {
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
     }
+
+    /// Attach a per-query metrics handle. When set, `Drop` flushes
+    /// `bytes_written` into [`Metrics::record_spill_bytes_written`].
+    /// Re-attaching replaces the previous handle (most recent wins);
+    /// in normal operation the engine calls this exactly once after
+    /// [`SpillFs::open_spill`].
+    pub fn attach_metrics(&mut self, metrics: Arc<dyn Metrics>) {
+        self.metrics = Some(metrics);
+    }
 }
 
 impl Drop for TempSpillFile {
     fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_spill_bytes_written(self.bytes_written);
+        }
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -378,6 +406,7 @@ impl SpillFs {
             path,
             file,
             bytes_written: 0,
+            metrics: None,
         })
     }
 
@@ -696,6 +725,64 @@ mod tests {
         assert_eq!(guard.bytes_written(), 7);
         drop(guard);
         assert!(!path.exists(), "Drop must delete the file");
+    }
+
+    // ── Drop-time metrics flush (TASK-524) ───────────────────────────
+
+    #[test]
+    fn temp_spill_file_drop_flushes_bytes_to_attached_metrics() {
+        use crate::metrics::{AtomicMetrics, Metrics};
+
+        let scratch = Scratch::new("drop-flush");
+        let fs_handle = SpillFs::open(scratch.default_spill_root(), scratch.db_root()).unwrap();
+        let qid = fs_handle.new_query_id();
+
+        let metrics: Arc<dyn Metrics> = Arc::new(AtomicMetrics::new());
+        {
+            let mut guard = fs_handle.open_spill(qid, "sort-run").unwrap();
+            guard.attach_metrics(Arc::clone(&metrics));
+            guard.file_mut().write_all(b"hello world").unwrap();
+            guard.record_bytes_written(11);
+            // bytes flushed on drop here
+        }
+        assert_eq!(metrics.snapshot().spill_bytes_written, 11);
+    }
+
+    #[test]
+    fn temp_spill_file_drop_without_metrics_is_noop() {
+        // Default-constructed guard (no `attach_metrics` call) must not
+        // panic on drop and must leave any unrelated metrics untouched.
+        use crate::metrics::{AtomicMetrics, Metrics};
+
+        let scratch = Scratch::new("drop-no-metrics");
+        let fs_handle = SpillFs::open(scratch.default_spill_root(), scratch.db_root()).unwrap();
+        let qid = fs_handle.new_query_id();
+        {
+            let mut guard = fs_handle.open_spill(qid, "sort-run").unwrap();
+            guard.record_bytes_written(42);
+            // dropped here, no metrics attached
+        }
+        let unrelated: Arc<dyn Metrics> = Arc::new(AtomicMetrics::new());
+        assert_eq!(unrelated.snapshot().spill_bytes_written, 0);
+    }
+
+    #[test]
+    fn temp_spill_file_drop_flushes_zero_when_no_writes_recorded() {
+        // Attached metrics handle must still be charged with zero — the
+        // flush is unconditional. Verifies the no-op record_spill_bytes_written(0)
+        // path on AtomicMetrics behaves cleanly.
+        use crate::metrics::{AtomicMetrics, Metrics};
+
+        let scratch = Scratch::new("drop-flush-zero");
+        let fs_handle = SpillFs::open(scratch.default_spill_root(), scratch.db_root()).unwrap();
+        let qid = fs_handle.new_query_id();
+
+        let metrics: Arc<dyn Metrics> = Arc::new(AtomicMetrics::new());
+        {
+            let mut guard = fs_handle.open_spill(qid, "sort-run").unwrap();
+            guard.attach_metrics(Arc::clone(&metrics));
+        }
+        assert_eq!(metrics.snapshot().spill_bytes_written, 0);
     }
 
     // ── cleanup_query ────────────────────────────────────────────────
