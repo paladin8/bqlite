@@ -54,6 +54,7 @@ use std::collections::HashMap;
 use arrow::array::{Array, Int64Array, StringViewArray, TimestampNanosecondArray};
 use bqlite_engine::{Database, Engine, ExecutionResult};
 use bqlite_tests::common::TempDb;
+use proptest::prelude::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixture helpers
@@ -605,4 +606,111 @@ fn sessionize_stats_per_entity_session_count_uses_group_by() {
     expected.insert("bob".into(), 1);
     expected.insert("carol".into(), 2);
     assert_eq!(got, expected);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WITHIN SESSION property tests (sessionize.md §12, TASK-444 §12, TASK-532)
+//
+// Strengthens the example tests above with property-based assertions that
+// hold for arbitrary numbers of events per session, not just the specific
+// fixtures used in the example tests.
+// ─────────────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
+
+    /// TASK-444 §12 / sessionize.md §12.1 — WITHIN SESSION never produces a
+    /// match whose anchor event and completion event are in different sessions.
+    ///
+    /// Strategy: place all `search` events in session 1 (before a 2-hour gap)
+    /// and all `checkout` events in session 2 (after the gap).  The 2-hour
+    /// inter-session gap is larger than the 30-minute sessionize threshold, so
+    /// the two groups are always in distinct sessions.  MATCH WITHIN SESSION
+    /// for `search THEN checkout` must return 0 rows for all (n_searches,
+    /// n_checkouts) combinations because no checkout can follow a search
+    /// inside the same session.
+    #[test]
+    fn within_session_cross_session_match_never_fires(
+        n_searches in 1usize..4usize,
+        n_checkouts in 1usize..4usize,
+    ) {
+        let (_tmp, mut db, engine) = fresh_db("ws-prop-neg");
+
+        // Session 1: n_searches search events spaced 1 minute apart.
+        // Session 2: n_checkouts checkout events 2 hours after session 1.
+        // Inter-session gap (2h) > sessionize gap (30m) → guaranteed session break.
+        let mut rows: Vec<(&str, i64, &str)> = Vec::new();
+        for i in 0..n_searches {
+            rows.push(("alice", T0 + (i as i64) * M, "search"));
+        }
+        for i in 0..n_checkouts {
+            rows.push(("alice", T0 + 2 * H + (i as i64) * M, "checkout"));
+        }
+        insert_rows(&engine, &mut db, &rows);
+
+        let result = engine
+            .query(
+                "events | SESSIONIZE(gap: 30m) \
+                 | MATCH FIRST SEQUENCE(search THEN checkout) WITHIN SESSION",
+                &mut db,
+            )
+            .expect("cross-session WITHIN SESSION query must not error");
+
+        // All search events are in session 1; all checkout events are in
+        // session 2.  The session boundary between them must expire every
+        // active NFA candidate started by a search, leaving no candidates
+        // alive when the first checkout arrives.
+        prop_assert_eq!(
+            result.row_count(),
+            0,
+            "cross-session (search → checkout) must not fire WITHIN SESSION \
+             (n_searches={}, n_checkouts={})",
+            n_searches,
+            n_checkouts
+        );
+    }
+
+    /// Positive counterpart: intra-session (search, checkout) pairs in the
+    /// same session must still fire, confirming WITHIN SESSION does not
+    /// suppress intra-session matches.
+    ///
+    /// Strategy: all events are spaced 1 minute apart (well under the 30m
+    /// gap), so they are always in a single session.  n_searches search
+    /// events then n_checkouts checkout events → at least one MATCH FIRST
+    /// result.
+    #[test]
+    fn within_session_intra_session_match_fires(
+        n_searches in 1usize..4usize,
+        n_checkouts in 1usize..4usize,
+    ) {
+        let (_tmp, mut db, engine) = fresh_db("ws-prop-pos");
+
+        // Single session: searches first, then checkouts, each 1m apart.
+        let mut rows: Vec<(&str, i64, &str)> = Vec::new();
+        for i in 0..n_searches {
+            rows.push(("alice", T0 + (i as i64) * M, "search"));
+        }
+        for i in 0..n_checkouts {
+            rows.push(("alice", T0 + (n_searches as i64 + i as i64) * M, "checkout"));
+        }
+        insert_rows(&engine, &mut db, &rows);
+
+        let result = engine
+            .query(
+                "events | SESSIONIZE(gap: 30m) \
+                 | MATCH FIRST SEQUENCE(search THEN checkout) WITHIN SESSION",
+                &mut db,
+            )
+            .expect("intra-session WITHIN SESSION query must not error");
+
+        // At least one search followed by a checkout in the same session;
+        // MATCH FIRST must find it.
+        prop_assert!(
+            result.row_count() >= 1,
+            "intra-session (search → checkout) must produce at least one match \
+             (n_searches={}, n_checkouts={})",
+            n_searches,
+            n_checkouts
+        );
+    }
 }
