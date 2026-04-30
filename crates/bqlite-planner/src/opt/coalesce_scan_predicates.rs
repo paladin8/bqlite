@@ -642,6 +642,7 @@ mod tests {
             session_window: false,
             emit_all: false,
             state_to_step: vec![],
+            brackets: None,
         };
         let sm_schema =
             OperatorSchema::new(vec![ColumnDef::required("entity_id", BqlType::String)]).unwrap();
