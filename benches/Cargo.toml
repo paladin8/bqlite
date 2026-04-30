@@ -65,6 +65,13 @@ name = "acceptance"
 path = "wave2/acceptance.rs"
 harness = false
 
+# TASK-519: operator-level FusedStatelessSegment microbenches per
+# `engine/operator-fusion.md` §7.2.
+[[bench]]
+name = "fused_segment"
+path = "wave2/fused_segment.rs"
+harness = false
+
 # Wave 3 benchmark: DDSketch percentile throughput (TASK-327).
 [[bench]]
 name = "percentile"
