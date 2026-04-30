@@ -377,14 +377,19 @@ impl PhysicalOperator for SequenceMatchAdapter {
 /// required by [`EntityOperator`]. Output batches are buffered in
 /// `pending` and returned one at a time on each `next_batch` call.
 ///
-/// ## Wave 4 fused-aggregate deferrals
+/// ## Stateful-to-aggregate fusion (TASK-520)
 ///
-/// `SessionizeOperator`, `EventSelectOperator`, and `AttributeOperator`
-/// all assert that their `fused_aggregate` field is `None` at operator
-/// construction time (per the Wave 4/5 deferral contract). This adapter
-/// therefore has no fused path — it always routes output through the
-/// non-fused `pending` buffer. The fused path will be added in Wave 5
-/// alongside the operator-side changes that enable it.
+/// When the planner sets `fused_aggregate` on a Wave 4 stateful
+/// descriptor, the adapter switches to a path that mirrors
+/// [`SequenceMatchAdapter`]'s fused logic:
+/// - The adapter holds an [`EntityFusedAccState`] containing a
+///   [`HashAccumulator`] built from the descriptor's
+///   `CompiledFusableAggregate`.
+/// - Each entity is finalized through
+///   [`EntityOperator::finish_entity_into`], which by default builds a
+///   per-entity native batch and feeds it to `update_batch`.
+/// - After the child is exhausted the adapter emits a single result
+///   batch from `accumulator.finish()`.
 ///
 /// ## TODO(Wave 5 follow-up)
 ///
@@ -420,6 +425,24 @@ struct EntityOperatorAdapter<Op: EntityOperator> {
     /// `ExecutionResult.warnings` surface. `None` for stand-alone
     /// tests constructed via the legacy single-arg path.
     warnings: Option<WarningSink>,
+    /// Fused-aggregate accumulator state. `Some` when the descriptor
+    /// carries `fused_aggregate`. Mirrors `SequenceMatchAdapter`'s
+    /// `FusedAccState` (TASK-520).
+    fused: Option<EntityFusedAccState>,
+}
+
+/// Accumulated state for the stateful-to-aggregate fused path on
+/// `EntityOperatorAdapter`. Parallel shape to
+/// `SequenceMatchAdapter::FusedAccState`.
+struct EntityFusedAccState {
+    accumulator: HashAccumulator,
+    /// `true` when the fused aggregate has no group-by columns. Drives
+    /// the post-exhaustion `ensure_default_group` call so a query like
+    /// `SESSIONIZE | STATS COUNT(*)` emits one row even when the input
+    /// was empty.
+    ungrouped: bool,
+    /// `true` once the aggregate result batch has been returned.
+    emitted: bool,
 }
 
 impl<Op: EntityOperator> EntityOperatorAdapter<Op> {
@@ -440,23 +463,89 @@ impl<Op: EntityOperator> EntityOperatorAdapter<Op> {
             pending: VecDeque::new(),
             exhausted: false,
             warnings,
+            fused: None,
         }
     }
 
-    /// Finalize the in-flight entity: drain warnings, call `finish_entity`,
-    /// and buffer the result.
+    /// Variant constructor that wires a fused-aggregate accumulator.
+    /// Used by the wave-4 stateful descriptor binders when
+    /// `fused_aggregate` is populated by the planner pass.
+    fn new_fused(
+        operator: Op,
+        child: Box<dyn PhysicalOperator>,
+        output_schema: OperatorSchema,
+        entity_id_col_idx: usize,
+        warnings: Option<WarningSink>,
+        fused_aggregate: &bqlite_planner::demand::CompiledFusableAggregate,
+    ) -> Self {
+        let functions = fused_aggregate
+            .aggregates
+            .iter()
+            .map(|a| a.function)
+            .collect();
+        let input_types = fused_aggregate.aggregates.iter().map(|_| None).collect();
+        let group_by_columns = fused_aggregate
+            .group_by
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect::<Vec<_>>();
+        // For aggregate-arg columns: COUNT(*) → None; otherwise resolve
+        // by the simple-column-ref name. The fusion eligibility check in
+        // the planner ensures only simple column refs reach this code,
+        // so we use the column's underlying name (parsed from the
+        // CompiledExpr) as the lookup key on the per-entity batch.
+        let agg_arg_columns = fused_aggregate
+            .aggregates
+            .iter()
+            .map(|a| a.arg.as_ref().and_then(simple_column_name))
+            .collect::<Vec<_>>();
+        let ungrouped = group_by_columns.is_empty();
+        let accumulator = HashAccumulator::new(
+            functions,
+            input_types,
+            fused_aggregate.output_schema.clone(),
+            group_by_columns,
+            agg_arg_columns,
+            fused_aggregate.max_groups,
+        );
+        Self {
+            operator,
+            child,
+            output_schema,
+            entity_id_col_idx,
+            current_entity: None,
+            current_state: None,
+            pending: VecDeque::new(),
+            exhausted: false,
+            warnings,
+            fused: Some(EntityFusedAccState {
+                accumulator,
+                ungrouped,
+                emitted: false,
+            }),
+        }
+    }
+
+    /// Finalize the in-flight entity: drain warnings, then either
+    /// (a) call `finish_entity_into` and update the fused accumulator, or
+    /// (b) call `finish_entity` and buffer the result.
     ///
-    /// Unlike `SequenceMatchAdapter::finalize_entity`, the entity-id column
-    /// is filled by the operator itself (Wave 4 operators always write the
-    /// entity id into their output rows). The id is still required as an
-    /// argument because [`EntityOperator::take_pending_warnings`] uses it
-    /// to attribute the warning when the operator's state does not carry
-    /// the id. See `docs/design/engine/cancellation.md` §7.4.
+    /// Warnings are drained *before* state is moved into the finisher so
+    /// the `take_pending_warnings(&mut state, …)` call has a live state
+    /// reference. Mirrors `SequenceMatchAdapter::finalize_entity`
+    /// ordering — see `docs/design/engine/cancellation.md` §7.4.
     fn finalize_entity(&mut self, entity: &EntityId, mut state: Op::State) -> Result<()> {
         if let Some(sink) = &self.warnings {
             sink.record_many(self.operator.take_pending_warnings(&mut state, entity));
         }
-        if let Some(batch) = self.operator.finish_entity(state) {
+        if let Some(fused) = &mut self.fused {
+            // Fused path: route the per-entity output through the
+            // accumulator. The default `finish_entity_into` calls
+            // `finish_entity` to get a native-schema batch and feeds it
+            // to `update_batch`, which resolves columns by name.
+            let acc: &mut dyn Accumulator = &mut fused.accumulator;
+            self.operator.finish_entity_into(state, acc)?;
+        } else if let Some(batch) = self.operator.finish_entity(state) {
             self.pending.push_back(batch);
         }
         Ok(())
@@ -516,6 +605,21 @@ impl<Op: EntityOperator> PhysicalOperator for EntityOperatorAdapter<Op> {
             }
 
             if self.exhausted {
+                // Fused path: emit the accumulator result once after
+                // all entities have been processed. Mirrors
+                // `SequenceMatchAdapter::next_batch` (TASK-320).
+                if let Some(fused) = &mut self.fused {
+                    if !fused.emitted {
+                        fused.emitted = true;
+                        if fused.ungrouped {
+                            fused.accumulator.ensure_default_group()?;
+                        }
+                        let result = fused.accumulator.finish()?;
+                        if result.num_rows() > 0 {
+                            return Ok(Some(result));
+                        }
+                    }
+                }
                 return Ok(None);
             }
 
@@ -528,7 +632,7 @@ impl<Op: EntityOperator> PhysicalOperator for EntityOperatorAdapter<Op> {
                         self.finalize_entity(&entity, state)?;
                     }
                     self.exhausted = true;
-                    // Loop once more to drain `pending`.
+                    // Loop once more to drain `pending` / emit fused.
                 }
                 Some(batch) => {
                     if batch.num_rows() == 0 {
@@ -538,6 +642,19 @@ impl<Op: EntityOperator> PhysicalOperator for EntityOperatorAdapter<Op> {
                 }
             }
         }
+    }
+}
+
+/// Extract the column name from a `CompiledExpr` if it is a simple
+/// `Column` node. Used by the fused adapter to resolve the column name
+/// for `update_batch`'s name-based aggregate-argument lookup. Returns
+/// `None` for any non-trivial expression — but the fusion eligibility
+/// check in `fuse_stateful_aggregate.rs` rejects those, so callers can
+/// rely on `Some(_)` for any aggregate that survived eligibility.
+fn simple_column_name(expr: &CompiledExpr) -> Option<String> {
+    match &expr.node {
+        CompiledNode::Column { name, .. } => Some(name.clone()),
+        _ => None,
     }
 }
 
@@ -1288,12 +1405,13 @@ fn bind_sessionize(
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "SessionizeAdapter")?;
     let operator = SessionizeOperator::new(sess);
-    Ok(Box::new(EntityOperatorAdapter::new_with_sink(
+    Ok(Box::new(make_entity_adapter(
         operator,
         child,
         sess.output_schema.clone(),
         entity_id_col_idx,
         Some(ctx.warnings().clone()),
+        sess.fused_aggregate.as_ref(),
     )))
 }
 
@@ -1318,12 +1436,13 @@ fn bind_event_select(
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "EventSelectAdapter")?;
     let operator = EventSelectOperator::new(es, es.input.output_schema());
-    Ok(Box::new(EntityOperatorAdapter::new_with_sink(
+    Ok(Box::new(make_entity_adapter(
         operator,
         child,
         es.output_schema.clone(),
         entity_id_col_idx,
         Some(ctx.warnings().clone()),
+        es.fused_aggregate.as_ref(),
     )))
 }
 
@@ -1332,8 +1451,8 @@ fn bind_event_select(
 ///
 /// `AttributeOperator::from_physical` validates the descriptor (non-empty
 /// conversion/touchpoint event lists, String touchpoint_key, non-negative
-/// window, fused_aggregate == None) and returns a typed error on any
-/// violation.
+/// window) and returns a typed error on any violation. Stateful-to-aggregate
+/// fusion (TASK-520) is honoured when `fused_aggregate` is populated.
 fn bind_attribute(
     attr: &AttributePhysical,
     db: &mut Database,
@@ -1345,13 +1464,45 @@ fn bind_attribute(
     let entity_id_col_idx =
         resolve_entity_key_col(child.as_ref(), ek_col_name, "AttributeAdapter")?;
     let operator = AttributeOperator::from_physical(attr)?;
-    Ok(Box::new(EntityOperatorAdapter::new_with_sink(
+    Ok(Box::new(make_entity_adapter(
         operator,
         child,
         attr.output_schema.clone(),
         entity_id_col_idx,
         Some(ctx.warnings().clone()),
+        attr.fused_aggregate.as_ref(),
     )))
+}
+
+/// Construct an [`EntityOperatorAdapter`] in either fused or non-fused
+/// shape based on the descriptor's `fused_aggregate`. Shared helper for
+/// the wave-4 stateful binders (Sessionize, EventSelect, Attribute) so
+/// the fused-vs-not-fused branch lives in one place. TASK-520.
+fn make_entity_adapter<Op: EntityOperator + 'static>(
+    operator: Op,
+    child: Box<dyn PhysicalOperator>,
+    output_schema: OperatorSchema,
+    entity_id_col_idx: usize,
+    warnings: Option<WarningSink>,
+    fused_aggregate: Option<&bqlite_planner::demand::CompiledFusableAggregate>,
+) -> EntityOperatorAdapter<Op> {
+    match fused_aggregate {
+        Some(fa) => EntityOperatorAdapter::new_fused(
+            operator,
+            child,
+            output_schema,
+            entity_id_col_idx,
+            warnings,
+            fa,
+        ),
+        None => EntityOperatorAdapter::new_with_sink(
+            operator,
+            child,
+            output_schema,
+            entity_id_col_idx,
+            warnings,
+        ),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

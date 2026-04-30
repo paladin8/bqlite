@@ -34,7 +34,7 @@ use arrow::record_batch::RecordBatch;
 
 use bqlite_core::{EntityId, OperatorSchema, ScalarValue};
 use bqlite_planner::compiled::CompiledExpr;
-use bqlite_planner::demand::DemandCapabilities;
+use bqlite_planner::demand::{CompiledFusableAggregate, DemandCapabilities};
 use bqlite_planner::logical::EventSelectKind;
 use bqlite_planner::physical::EventSelectPhysical;
 
@@ -213,6 +213,15 @@ pub struct EventSelectOperator {
     /// Column names required from the input batch (drives scan
     /// projection pruning in the engine's physical planning).
     required_column_names: Vec<String>,
+
+    /// Fused aggregate descriptor when stateful-to-aggregate fusion is
+    /// active (TASK-520). When `Some`, the physical descriptor's
+    /// `output_schema` is the aggregate's output, while
+    /// `pre_fusion_output_schema` carries the operator's native single-
+    /// row-per-entity schema. The runtime always emits per-entity rows
+    /// in the native schema; the fused adapter feeds them into a
+    /// downstream `HashAccumulator`.
+    fused_aggregate: Option<CompiledFusableAggregate>,
 }
 
 impl EventSelectOperator {
@@ -222,13 +231,12 @@ impl EventSelectOperator {
     /// (i.e. `desc.input.output_schema()`). Column indices are
     /// resolved once here so per-row access is branchless.
     pub fn new(desc: &EventSelectPhysical, input_schema: &OperatorSchema) -> Self {
-        // Fused-aggregate path deferred to Wave 5; assert here so a planner
-        // bug that sets fused_aggregate: Some(...) fails loudly at bind time
-        // rather than silently producing unfused output.
-        assert!(
-            desc.fused_aggregate.is_none(),
-            "EventSelect fused aggregates are deferred to Wave 5"
-        );
+        // TASK-520: stateful-to-aggregate fusion is now supported. When
+        // the planner replaces `desc.output_schema` with the aggregate's,
+        // the operator continues to build per-entity batches in the
+        // native (pre-fusion) schema so `HashAccumulator::update_batch`
+        // can resolve forwarded columns by name.
+        let native_output_schema = desc.native_output_schema().clone();
 
         // Nth(0) is invalid: the spec says n >= 1 (event-select-sample.md
         // §4.2). The parser/planner enforces this; guard defensively here so
@@ -255,15 +263,17 @@ impl EventSelectOperator {
 
         // Map each output schema column to its input index (may be None
         // for columns not present in the input — emitted as NULL).
-        let output_col_to_input_idx: Vec<Option<usize>> = desc
-            .output_schema
+        // Resolved against the native (pre-fusion) schema so per-entity
+        // candidate-row construction keeps the same shape regardless of
+        // whether the descriptor advertises an aggregate output.
+        let output_col_to_input_idx: Vec<Option<usize>> = native_output_schema
             .columns()
             .iter()
             .map(|col| input_schema.column(&col.name).map(|(idx, _)| idx))
             .collect();
 
         // Build required column names:
-        // always-needed + output schema columns + predicate columns.
+        // always-needed + native output columns + predicate columns.
         // `__seq_id` is intentionally not required — see the doc on
         // `EventSelectInputMap`.
         let mut required = vec![
@@ -271,8 +281,8 @@ impl EventSelectOperator {
             TS_COL.to_string(),
             EVENT_TYPE_COL.to_string(),
         ];
-        // Add output schema columns.
-        for col in desc.output_schema.columns() {
+        // Add native-output columns.
+        for col in native_output_schema.columns() {
             if !required.contains(&col.name) {
                 required.push(col.name.clone());
             }
@@ -286,11 +296,22 @@ impl EventSelectOperator {
             kind: desc.kind,
             event_types,
             predicate: desc.predicate.clone(),
-            output_schema: desc.output_schema.clone(),
+            output_schema: native_output_schema,
             input_map,
             output_col_to_input_idx,
             required_column_names: required,
+            fused_aggregate: desc.fused_aggregate.clone(),
         }
+    }
+
+    /// Returns `true` when stateful-to-aggregate fusion is active.
+    pub fn is_fused(&self) -> bool {
+        self.fused_aggregate.is_some()
+    }
+
+    /// Access the fused aggregate descriptor when fusion is active.
+    pub fn fused_aggregate(&self) -> Option<&CompiledFusableAggregate> {
+        self.fused_aggregate.as_ref()
     }
 
     /// Extract a [`CandidateRow`] for the qualifying event at `row_idx`
@@ -454,10 +475,9 @@ impl EntityOperator for EventSelectOperator {
     }
 
     fn supported_demands(&self) -> DemandCapabilities {
-        DemandCapabilities {
-            supports_forwarded_columns: true,
-            ..DemandCapabilities::none()
-        }
+        // Mirrors `EventSelectPhysical::DEMAND_CAPS`. TASK-520 turned on
+        // `supports_aggregation_fusion`.
+        EventSelectPhysical::DEMAND_CAPS
     }
 }
 
@@ -794,6 +814,7 @@ mod tests {
             fused_aggregate: None,
             input: Box::new(PhysicalPlan::Scan(make_scan_physical(scan_schema))),
             output_schema,
+            pre_fusion_output_schema: None,
         }
     }
 
@@ -1433,7 +1454,8 @@ mod tests {
         let caps = op.supported_demands();
 
         assert!(caps.supports_forwarded_columns);
-        assert!(!caps.supports_aggregation_fusion);
+        // TASK-520 turned on stateful-to-aggregate fusion for EventSelect.
+        assert!(caps.supports_aggregation_fusion);
         assert!(!caps.supports_step_reached);
     }
 
@@ -1450,6 +1472,43 @@ mod tests {
             op.supported_demands(),
             bqlite_planner::physical::EventSelectPhysical::DEMAND_CAPS
         );
+    }
+
+    // ── TASK-520 fusion smoke test ──────────────────────────────────────
+    //
+    // Construction with `pre_fusion_output_schema: Some(_)` differing from
+    // `output_schema` simulates the post-fusion descriptor shape. The
+    // operator must use the native (pre-fusion) schema for slot-mapping
+    // and required-column resolution.
+
+    #[test]
+    fn fused_construction_uses_native_schema_for_internal_state() {
+        use bqlite_planner::demand::CompiledFusableAggregate;
+
+        let mut desc = make_physical(
+            EventSelectKind::First,
+            vec!["purchase"],
+            output_schema_minimal(),
+        );
+        let native = desc.output_schema.clone();
+        // Replace external output_schema with an unrelated aggregate
+        // schema while keeping the native schema available via
+        // `pre_fusion_output_schema`.
+        let agg_schema =
+            OperatorSchema::new(vec![ColumnDef::nullable("total", BqlType::Int)]).unwrap();
+        desc.pre_fusion_output_schema = Some(native.clone());
+        desc.output_schema = agg_schema.clone();
+        desc.fused_aggregate = Some(CompiledFusableAggregate {
+            aggregates: vec![],
+            group_by: vec![],
+            output_schema: agg_schema,
+            max_groups: crate::aggregate::DEFAULT_MAX_GROUPS,
+        });
+
+        let op = EventSelectOperator::new(&desc, &input_schema());
+        assert_eq!(op.output_schema(), &native);
+        assert!(op.is_fused());
+        assert!(op.fused_aggregate().is_some());
     }
 
     // ── NTH ordering edge cases ──────────────────────────────────────────────
@@ -1571,6 +1630,7 @@ mod tests {
             fused_aggregate: None,
             input: Box::new(PhysicalPlan::Scan(make_scan_physical(scan_schema))),
             output_schema,
+            pre_fusion_output_schema: None,
         }
     }
 

@@ -29,7 +29,7 @@ use compact_str::CompactString;
 
 use bqlite_core::{BqlType, EntityId, OperatorSchema};
 use bqlite_planner::compiled::{CompiledExpr, CompiledNode};
-use bqlite_planner::demand::{ColumnId, DemandCapabilities};
+use bqlite_planner::demand::{ColumnId, CompiledFusableAggregate, DemandCapabilities};
 use bqlite_planner::physical::AttributePhysical;
 
 use crate::eval;
@@ -119,6 +119,11 @@ pub struct AttributeOperator {
     /// BqlType per forwarded conversion column, cached from the output
     /// schema so builders can be materialized in one pass.
     forwarded_types: Vec<BqlType>,
+    /// Fused aggregate descriptor when stateful-to-aggregate fusion is
+    /// active (TASK-520). When `Some`, per-entity rows continue to be
+    /// emitted in the operator's native flat-row schema; the engine
+    /// adapter feeds them into a `HashAccumulator::update_batch` call.
+    fused_aggregate: Option<CompiledFusableAggregate>,
 }
 
 impl std::fmt::Debug for AttributeOperator {
@@ -148,7 +153,6 @@ impl AttributeOperator {
     /// * Forwarded column with an unsupported type (the in-memory row
     ///   buffer supports Bool/Int/Float/String/Timestamp — List/Map are
     ///   deferred).
-    /// * A populated `fused_aggregate` — v1 rejects fusion per §13.
     pub fn from_physical(desc: &AttributePhysical) -> bqlite_core::Result<Self> {
         if desc.conversion_events.is_empty() {
             return Err(bqlite_core::BqliteError::Execution(
@@ -172,31 +176,41 @@ impl AttributeOperator {
                 desc.window_ns
             )));
         }
-        if desc.fused_aggregate.is_some() {
-            return Err(bqlite_core::BqliteError::Execution(
-                "AttributeOperator v1 does not support fused aggregates (Wave 5 — TASK-503)".into(),
-            ));
-        }
+        // TASK-520: stateful-to-aggregate fusion is supported. The
+        // descriptor's `output_schema` may have been replaced by the
+        // planner with the aggregate's output; per-entity rows are still
+        // emitted in the native (pre-fusion) schema below.
+        let native_output_schema = desc.native_output_schema().clone();
 
-        // Resolve forwarded column BqlTypes against the output schema.
+        // Resolve forwarded column BqlTypes against the native output
+        // schema. The aggregate output schema (when fused) does not
+        // necessarily contain forwarded columns; the native one always
+        // does.
         let mut forwarded_types = Vec::with_capacity(desc.forwarded_conversion_columns.len());
         for name in &desc.forwarded_conversion_columns {
-            let (_, col) = desc.output_schema.column(name).ok_or_else(|| {
+            let (_, col) = native_output_schema.column(name).ok_or_else(|| {
                 bqlite_core::BqliteError::Schema(format!(
-                    "AttributeOperator forwarded column `{name}` missing from output schema"
+                    "AttributeOperator forwarded column `{name}` missing from native output schema"
                 ))
             })?;
             assert_supported_forwarded_type(&col.bql_type, name)?;
             forwarded_types.push(col.bql_type.clone());
         }
 
-        // Resolve entity_id output column type (String or Int).
-        let (_, entity_id_col) = desc.output_schema.column("entity_id").ok_or_else(|| {
-            bqlite_core::BqliteError::Schema(
-                "AttributeOperator output_schema is missing `entity_id`".into(),
-            )
-        })?;
-        match entity_id_col.bql_type {
+        // Resolve entity_id output column type (String or Int) from the
+        // native schema — the aggregate schema may have stripped or
+        // renamed it.
+        let entity_id_type = native_output_schema
+            .column("entity_id")
+            .ok_or_else(|| {
+                bqlite_core::BqliteError::Schema(
+                    "AttributeOperator native output schema is missing `entity_id`".into(),
+                )
+            })?
+            .1
+            .bql_type
+            .clone();
+        match entity_id_type {
             BqlType::String | BqlType::Int => {}
             ref other => {
                 return Err(bqlite_core::BqliteError::Schema(format!(
@@ -226,13 +240,24 @@ impl AttributeOperator {
             window_ns: desc.window_ns,
             touchpoint_key: desc.touchpoint_key.clone(),
             forwarded_conversion_columns: desc.forwarded_conversion_columns.clone(),
-            output_schema: desc.output_schema.clone(),
+            output_schema: native_output_schema,
             required_column_names: required,
             conversion_range: desc.conversion_range,
             deque_cap: DEFAULT_ATTRIBUTE_DEQUE_CAP,
-            entity_id_type: entity_id_col.bql_type.clone(),
+            entity_id_type,
             forwarded_types,
+            fused_aggregate: desc.fused_aggregate.clone(),
         })
+    }
+
+    /// Returns `true` when stateful-to-aggregate fusion is active.
+    pub fn is_fused(&self) -> bool {
+        self.fused_aggregate.is_some()
+    }
+
+    /// Access the fused aggregate descriptor when fusion is active.
+    pub fn fused_aggregate(&self) -> Option<&CompiledFusableAggregate> {
+        self.fused_aggregate.as_ref()
     }
 
     /// Override the default per-entity deque cap. Intended for tests that
@@ -748,6 +773,8 @@ impl EntityOperator for AttributeOperator {
     }
 
     fn supported_demands(&self) -> DemandCapabilities {
+        // Always defers to the planner-side `DEMAND_CAPS` constant. After
+        // TASK-520 this includes `supports_aggregation_fusion: true`.
         AttributePhysical::DEMAND_CAPS
     }
 
@@ -943,6 +970,7 @@ mod tests {
             conversion_range,
             input: Box::new(child),
             output_schema: out_schema,
+            pre_fusion_output_schema: None,
         };
         AttributeOperator::from_physical(&desc).expect("operator should construct")
     }
@@ -1039,15 +1067,25 @@ mod tests {
                 sample: None,
             })),
             output_schema: out,
+            pre_fusion_output_schema: None,
         };
         assert!(AttributeOperator::from_physical(&desc).is_err());
     }
 
     #[test]
-    fn rejects_fused_aggregate_in_v1() {
-        // We build a fused_aggregate via the demand module.
+    fn accepts_fused_aggregate_after_task520() {
+        // TASK-520: ATTRIBUTE now supports stateful-to-aggregate fusion.
+        // Construction must succeed when `fused_aggregate` is populated,
+        // and internal state must be resolved against the native
+        // (pre-fusion) schema rather than the aggregate output schema.
         use bqlite_planner::demand::CompiledFusableAggregate;
-        let out = basic_output_schema(&[]);
+        let native = basic_output_schema(&[]);
+        // Replace the external output_schema with a different aggregate
+        // schema (the shape the planner pass produces). The operator
+        // must still resolve `entity_id`, `conversion_ts`, etc. against
+        // the native schema preserved in `pre_fusion_output_schema`.
+        let agg_schema =
+            OperatorSchema::new(vec![ColumnDef::nullable("total", BqlType::Int)]).unwrap();
         let desc = AttributePhysical {
             conversion_events: vec!["p".into()],
             touchpoint_events: vec!["c".into()],
@@ -1057,7 +1095,7 @@ mod tests {
             fused_aggregate: Some(CompiledFusableAggregate {
                 aggregates: vec![],
                 group_by: vec![],
-                output_schema: out.clone(),
+                output_schema: agg_schema.clone(),
                 max_groups: crate::aggregate::DEFAULT_MAX_GROUPS,
             }),
             conversion_range: None,
@@ -1072,9 +1110,16 @@ mod tests {
                 timestamp_col: "ts".into(),
                 sample: None,
             })),
-            output_schema: out,
+            output_schema: agg_schema,
+            pre_fusion_output_schema: Some(native.clone()),
         };
-        assert!(AttributeOperator::from_physical(&desc).is_err());
+        let op = AttributeOperator::from_physical(&desc).expect("fused construction");
+        // Operator's self-reported output_schema is the native one (used
+        // for per-entity batch construction). Aggregate schema lives on
+        // the descriptor's `fused_aggregate.output_schema`.
+        assert_eq!(op.output_schema(), &native);
+        assert!(op.is_fused());
+        assert!(op.fused_aggregate().is_some());
     }
 
     #[test]
@@ -1515,6 +1560,7 @@ mod tests {
             conversion_range: None,
             input: Box::new(build_scan_child()),
             output_schema: basic_output_schema(&[]),
+            pre_fusion_output_schema: None,
         }
     }
 
@@ -1650,6 +1696,7 @@ mod tests {
             conversion_range: None,
             input: Box::new(child),
             output_schema: out_schema,
+            pre_fusion_output_schema: None,
         };
         let op = AttributeOperator::from_physical(&desc).unwrap();
         let mut state = op.create_state(&EntityId::Int(42));
@@ -1726,6 +1773,7 @@ mod tests {
             conversion_range: None,
             input: Box::new(child),
             output_schema: out_schema,
+            pre_fusion_output_schema: None,
         };
         let op = AttributeOperator::from_physical(&desc).unwrap();
         let mut state = op.create_state(&EntityId::String("user-1".into()));

@@ -640,12 +640,27 @@ pub struct SessionizePhysical {
     /// Columns that downstream operators need forwarded through the
     /// session buffer.
     pub forwarded_columns: Vec<ColumnId>,
-    /// Fused aggregate specification. Always `None` in v1 (Wave 5).
+    /// Fused aggregate specification. `Some` after the stateful-aggregate
+    /// fusion pass replaces a downstream `Aggregate` with a fused per-entity
+    /// accumulator update. See `docs/design/planner-pipeline.md` §7.4.2 and
+    /// `docs/design/engine/operator-fusion.md` §5.1 (TASK-520).
     pub fused_aggregate: Option<CompiledFusableAggregate>,
     /// Child plan feeding this sessionize operator.
     pub input: Box<PhysicalPlan>,
-    /// Output schema: input columns + `session_id` + `session_duration`.
+    /// Output schema. When `fused_aggregate` is `None`, this is the
+    /// operator's native session-row schema (`input ∪ {session_id,
+    /// session_duration}`). When `fused_aggregate` is `Some`, the fusion
+    /// pass replaces this with the aggregate's output schema and stashes
+    /// the original native schema in [`pre_fusion_output_schema`] so the
+    /// runtime operator can still construct per-entity batches.
     pub output_schema: OperatorSchema,
+    /// Native operator-output schema preserved across fusion. `None`
+    /// before fusion (or when no fusion fires); `Some(_)` after fusion
+    /// stores the schema that `output_schema` had immediately before it
+    /// was replaced with the aggregate output schema. Operators read
+    /// `pre_fusion_output_schema.as_ref().unwrap_or(&output_schema)` to
+    /// know the native schema for batch building. See TASK-520.
+    pub pre_fusion_output_schema: Option<OperatorSchema>,
 }
 
 impl SessionizePhysical {
@@ -655,11 +670,20 @@ impl SessionizePhysical {
         supports_step_reached: false,
         supports_match_count: false,
         supports_full_detail: false,
-        supports_aggregation_fusion: false,
+        supports_aggregation_fusion: true,
         supports_step_property_forwarding: false,
         supports_forwarded_columns: true,
         supports_eager_group_emit: false,
     };
+
+    /// Native (pre-fusion) output schema. Returns
+    /// `pre_fusion_output_schema` when populated by the fusion pass, else
+    /// `output_schema` (which is the native schema when not fused).
+    pub fn native_output_schema(&self) -> &OperatorSchema {
+        self.pre_fusion_output_schema
+            .as_ref()
+            .unwrap_or(&self.output_schema)
+    }
 }
 
 /// Physical descriptor for EventSelect (FIRST/LAST/NTH). Wave 4.
@@ -683,12 +707,19 @@ pub struct EventSelectPhysical {
     /// Columns that downstream operators need forwarded through the
     /// candidate row.
     pub forwarded_columns: Vec<ColumnId>,
-    /// Fused aggregate specification. Always `None` in v1 (Wave 5).
+    /// Fused aggregate specification. `Some` after stateful-aggregate
+    /// fusion (TASK-520). See planner-pipeline.md §7.4.3.
     pub fused_aggregate: Option<CompiledFusableAggregate>,
     /// Child plan feeding this event-select operator.
     pub input: Box<PhysicalPlan>,
-    /// Output schema: source-table columns (one row per entity).
+    /// Output schema. Native single-row-per-entity schema when not fused;
+    /// aggregate output schema when `fused_aggregate.is_some()`. The
+    /// pre-fusion native schema is preserved in
+    /// [`pre_fusion_output_schema`].
     pub output_schema: OperatorSchema,
+    /// Native (pre-fusion) output schema preserved across fusion. See
+    /// `SessionizePhysical::pre_fusion_output_schema`.
+    pub pre_fusion_output_schema: Option<OperatorSchema>,
 }
 
 impl EventSelectPhysical {
@@ -698,11 +729,18 @@ impl EventSelectPhysical {
         supports_step_reached: false,
         supports_match_count: false,
         supports_full_detail: false,
-        supports_aggregation_fusion: false,
+        supports_aggregation_fusion: true,
         supports_step_property_forwarding: false,
         supports_forwarded_columns: true,
         supports_eager_group_emit: false,
     };
+
+    /// Native (pre-fusion) output schema.
+    pub fn native_output_schema(&self) -> &OperatorSchema {
+        self.pre_fusion_output_schema
+            .as_ref()
+            .unwrap_or(&self.output_schema)
+    }
 }
 
 /// Physical descriptor for the ATTRIBUTE operator. Wave 4.
@@ -725,7 +763,8 @@ pub struct AttributePhysical {
     pub touchpoint_key: CompiledExpr,
     /// Demand-driven forwarded conversion properties.
     pub forwarded_conversion_columns: Vec<ColumnId>,
-    /// Fused aggregate specification. Always `None` in v1 (Wave 5).
+    /// Fused aggregate specification. `Some` after stateful-aggregate
+    /// fusion (TASK-520). See planner-pipeline.md §7.4.4.
     pub fused_aggregate: Option<CompiledFusableAggregate>,
     /// Original query time range `(start_ns, end_ns)` for scan-extension-
     /// aware conversion emission filtering. When the planner widens the
@@ -736,10 +775,13 @@ pub struct AttributePhysical {
     pub conversion_range: Option<(i64, i64)>,
     /// Child plan feeding this attribute operator.
     pub input: Box<PhysicalPlan>,
-    /// Output schema: `entity_id`, `conversion_ts`,
-    /// demand-forwarded conversion properties, `touchpoint_ts?`,
-    /// `touchpoint_key?`.
+    /// Output schema. Native flat-row schema when not fused; aggregate
+    /// schema when `fused_aggregate.is_some()`. Pre-fusion native schema
+    /// preserved in [`pre_fusion_output_schema`].
     pub output_schema: OperatorSchema,
+    /// Native (pre-fusion) output schema preserved across fusion. See
+    /// `SessionizePhysical::pre_fusion_output_schema`.
+    pub pre_fusion_output_schema: Option<OperatorSchema>,
 }
 
 impl AttributePhysical {
@@ -749,11 +791,18 @@ impl AttributePhysical {
         supports_step_reached: false,
         supports_match_count: false,
         supports_full_detail: false,
-        supports_aggregation_fusion: false,
+        supports_aggregation_fusion: true,
         supports_step_property_forwarding: false,
         supports_forwarded_columns: true,
         supports_eager_group_emit: false,
     };
+
+    /// Native (pre-fusion) output schema.
+    pub fn native_output_schema(&self) -> &OperatorSchema {
+        self.pre_fusion_output_schema
+            .as_ref()
+            .unwrap_or(&self.output_schema)
+    }
 }
 
 /// Physical descriptor for cohort-based SubqueryFilter. Wave 4.
@@ -1427,6 +1476,7 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                 fused_aggregate,
                 input: Box::new(child),
                 output_schema,
+                pre_fusion_output_schema: None,
             })
         }
 
@@ -1452,6 +1502,7 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                 fused_aggregate,
                 input: Box::new(child),
                 output_schema,
+                pre_fusion_output_schema: None,
             })
         }
 
@@ -1483,6 +1534,7 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                 conversion_range: final_conversion_range,
                 input: Box::new(child),
                 output_schema,
+                pre_fusion_output_schema: None,
             })
         }
 

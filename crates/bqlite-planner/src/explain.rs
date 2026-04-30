@@ -1426,6 +1426,7 @@ mod tests {
             fused_aggregate: None,
             input: Box::new(PhysicalPlan::Scan(scan)),
             output_schema: events_schema_os(),
+            pre_fusion_output_schema: None,
         };
         let node = build_explain_node(&PhysicalPlan::Sessionize(sess));
         let text = format_explain(&node);

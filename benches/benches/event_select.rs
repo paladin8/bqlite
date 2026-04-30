@@ -99,6 +99,7 @@ fn make_desc(
         fused_aggregate: None,
         input: Box::new(PhysicalPlan::Scan(scan_physical(in_schema))),
         output_schema: output_schema(),
+        pre_fusion_output_schema: None,
     }
 }
 

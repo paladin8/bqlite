@@ -30,8 +30,16 @@
 //!   is skipped; the fact is recorded on the state for the adapter to
 //!   surface as a warning (§11). The warning-channel plumbing itself is
 //!   deferred (§11.4) — v1 exposes the flag on state.
-//! - Fused aggregate shapes are deferred to Wave 5 (§10); `fused_aggregate`
-//!   is always `None` on the physical descriptor.
+//! - Stateful-to-aggregate fusion landed in TASK-520. When
+//!   `SessionizePhysical.fused_aggregate` is populated, the planner has
+//!   replaced `desc.output_schema` with the aggregate's output schema
+//!   and stashed the operator's native session-row schema in
+//!   `desc.pre_fusion_output_schema`. The runtime path continues to
+//!   build per-entity batches in the native schema so the downstream
+//!   `HashAccumulator::update_batch` can resolve columns by name. The
+//!   adapter (in `bqlite-engine`) emits one aggregate result batch on
+//!   exhaustion. See `docs/design/planner-pipeline.md` §7.4.2 and
+//!   `docs/design/engine/operator-fusion.md` §5.1.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -42,7 +50,7 @@ use arrow::datatypes::{Int32Type, Schema as ArrowSchema, SchemaRef};
 
 use bqlite_core::arrow::bql_type_to_arrow;
 use bqlite_core::{EntityId, OperatorSchema};
-use bqlite_planner::demand::DemandCapabilities;
+use bqlite_planner::demand::{CompiledFusableAggregate, DemandCapabilities};
 use bqlite_planner::physical::SessionizePhysical;
 
 use crate::operator::EntityOperator;
@@ -139,6 +147,14 @@ pub struct SessionizeOperator {
 
     /// Per-entity event cap (§11).
     session_event_cap: usize,
+
+    /// Fused aggregate descriptor when stateful-to-aggregate fusion is
+    /// active (TASK-520). When `Some`, the operator's externally-advertised
+    /// `output_schema` (advertised on the physical descriptor) is the
+    /// aggregate output schema, but `finish_entity` still emits per-entity
+    /// rows in `native_output_schema` so that the engine adapter can feed
+    /// them into a `HashAccumulator::update_batch` call.
+    fused_aggregate: Option<CompiledFusableAggregate>,
 }
 
 impl SessionizeOperator {
@@ -153,10 +169,14 @@ impl SessionizeOperator {
 
     /// Variant of [`Self::new`] that lets tests override the per-entity cap.
     pub fn new_with_cap(desc: &SessionizePhysical, session_event_cap: usize) -> Self {
-        assert!(
-            desc.fused_aggregate.is_none(),
-            "SESSIONIZE fused aggregates are deferred to Wave 5 (sessionize.md §10)"
-        );
+        // TASK-520: stateful-to-aggregate fusion is now supported. When
+        // `desc.fused_aggregate` is `Some`, the planner has replaced
+        // `desc.output_schema` with the aggregate's output schema and
+        // preserved the operator's native schema in
+        // `desc.pre_fusion_output_schema`. Use the latter for all internal
+        // batch construction so that the per-entity rows we emit from
+        // `flush_session` keep the native column shape.
+        let native_output_schema = desc.native_output_schema().clone();
 
         let input_schema = desc.input.output_schema();
 
@@ -222,7 +242,7 @@ impl SessionizeOperator {
         // the actual batch. The sessionize lowering already strips them
         // from `output_schema`; this is a belt-and-suspenders fence
         // against a planner that hasn't been updated.
-        for col in desc.output_schema.columns() {
+        for col in native_output_schema.columns() {
             if col.nullable {
                 continue;
             }
@@ -263,8 +283,13 @@ impl SessionizeOperator {
         let buffered_arrow_schema: SchemaRef = Arc::new(ArrowSchema::new(buffered_arrow_fields));
 
         // ── Build full output Arrow schema ───────────────────────────────
-        let output_arrow_fields: Vec<_> = desc
-            .output_schema
+        // The Arrow schema used to assemble per-entity emission batches is
+        // always the *native* schema. When fused (TASK-520), the externally
+        // advertised `output_schema` differs (it is the aggregate output),
+        // but the per-entity batch handed to `update_batch` keeps the
+        // native shape so the accumulator can resolve forwarded columns
+        // by name.
+        let output_arrow_fields: Vec<_> = native_output_schema
             .columns()
             .iter()
             .map(|c| {
@@ -274,19 +299,17 @@ impl SessionizeOperator {
         let output_arrow_schema: SchemaRef = Arc::new(ArrowSchema::new(output_arrow_fields));
 
         // ── Map each output-schema column back to its buffered slot ──────
-        let (session_id_out_idx, _) = desc
-            .output_schema
+        let (session_id_out_idx, _) = native_output_schema
             .column("session_id")
-            .expect("SESSIONIZE output schema must contain `session_id`");
-        let (session_duration_out_idx, _) = desc
-            .output_schema
+            .expect("SESSIONIZE native output schema must contain `session_id`");
+        let (session_duration_out_idx, _) = native_output_schema
             .column("session_duration")
-            .expect("SESSIONIZE output schema must contain `session_duration`");
+            .expect("SESSIONIZE native output schema must contain `session_duration`");
 
         let mut output_to_buffer_slot: Vec<Option<usize>> =
-            Vec::with_capacity(desc.output_schema.columns().len());
+            Vec::with_capacity(native_output_schema.columns().len());
         let mut null_padded_output_indices: Vec<usize> = Vec::new();
-        for (out_idx, col) in desc.output_schema.columns().iter().enumerate() {
+        for (out_idx, col) in native_output_schema.columns().iter().enumerate() {
             if out_idx == session_id_out_idx || out_idx == session_duration_out_idx {
                 output_to_buffer_slot.push(None);
                 continue;
@@ -311,7 +334,7 @@ impl SessionizeOperator {
             gap_ns: desc.gap_ns,
             end_events,
             end_events_list,
-            output_schema: desc.output_schema.clone(),
+            output_schema: native_output_schema,
             buffered_arrow_schema,
             output_arrow_schema,
             input_columns: SessionizeInputMap {
@@ -325,7 +348,19 @@ impl SessionizeOperator {
             session_duration_out_idx,
             output_to_buffer_slot,
             session_event_cap,
+            fused_aggregate: desc.fused_aggregate.clone(),
         }
+    }
+
+    /// Returns `true` when stateful-to-aggregate fusion is active.
+    pub fn is_fused(&self) -> bool {
+        self.fused_aggregate.is_some()
+    }
+
+    /// Access the fused aggregate descriptor when fusion is active. Used
+    /// by the engine bind step to build the downstream `HashAccumulator`.
+    pub fn fused_aggregate(&self) -> Option<&CompiledFusableAggregate> {
+        self.fused_aggregate.as_ref()
     }
 }
 
@@ -677,10 +712,10 @@ impl EntityOperator for SessionizeOperator {
     }
 
     fn supported_demands(&self) -> DemandCapabilities {
-        DemandCapabilities {
-            supports_forwarded_columns: true,
-            ..DemandCapabilities::none()
-        }
+        // Mirrors `SessionizePhysical::DEMAND_CAPS`. TASK-520 turned on
+        // `supports_aggregation_fusion`; the planner-side capability
+        // declaration must agree (enforced by the planner contract test).
+        SessionizePhysical::DEMAND_CAPS
     }
 
     fn take_pending_warnings(
@@ -1587,6 +1622,47 @@ mod tests {
         assert_eq!(out.num_rows(), 5);
         let (sids, _) = read_session_columns(&out);
         assert_eq!(sids, vec![1, 2, 3, 4, 5]);
+    }
+
+    // ── TASK-520 fusion smoke test ──────────────────────────────────────
+    //
+    // Construction with `pre_fusion_output_schema: Some(_)` and an
+    // unrelated aggregate `output_schema` simulates the post-fusion
+    // descriptor shape. The operator must keep building per-entity
+    // batches against the *native* schema; checking that
+    // `op.output_schema()` returns the native schema (not the aggregate
+    // one) verifies that the slot-mapping plumbing is reading
+    // `desc.native_output_schema()` correctly.
+
+    #[test]
+    fn fused_construction_uses_native_schema_for_internal_state() {
+        use bqlite_planner::demand::CompiledFusableAggregate;
+
+        let schema = events_schema_no_amount();
+        let mut phys = build_physical(schema.clone(), 10, vec![], vec![]);
+        // Stash the native schema, then replace `output_schema` with an
+        // unrelated single-column aggregate schema (mirroring what the
+        // CP2 planner pass will do).
+        let native = phys.output_schema.clone();
+        let agg_schema =
+            OperatorSchema::new(vec![ColumnDef::nullable("total", BqlType::Int)]).unwrap();
+        phys.pre_fusion_output_schema = Some(native.clone());
+        phys.output_schema = agg_schema.clone();
+        phys.fused_aggregate = Some(CompiledFusableAggregate {
+            aggregates: vec![],
+            group_by: vec![],
+            output_schema: agg_schema,
+            max_groups: crate::aggregate::DEFAULT_MAX_GROUPS,
+        });
+
+        // Construction must succeed (no panic) and the operator's
+        // self-reported output schema is the *native* one. The aggregate
+        // schema lives only on the descriptor; the engine adapter reads
+        // it from `desc.fused_aggregate` directly.
+        let op = SessionizeOperator::new(&phys);
+        assert_eq!(op.output_schema(), &native);
+        assert!(op.is_fused());
+        assert!(op.fused_aggregate().is_some());
     }
 }
 

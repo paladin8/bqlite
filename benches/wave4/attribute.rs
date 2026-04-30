@@ -150,6 +150,7 @@ fn build_operator(conversion: &[&str], touchpoints: &[&str], window_ns: i64) -> 
             sample: None,
         })),
         output_schema: output_schema(),
+        pre_fusion_output_schema: None,
     };
     AttributeOperator::from_physical(&desc).expect("valid descriptor")
 }

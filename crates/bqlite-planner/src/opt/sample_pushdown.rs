@@ -488,6 +488,7 @@ mod tests {
             fused_aggregate: None,
             input: Box::new(scan),
             output_schema: schema(),
+            pre_fusion_output_schema: None,
         });
         let plan = sample_over(sessionize, 0.2, 5);
         let out = pushdown_sample(plan);

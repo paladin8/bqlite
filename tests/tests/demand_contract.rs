@@ -108,29 +108,30 @@ fn sequence_match_operator_caps_match_physical() {
 //   fn attribute_operator_caps_match_physical() { ... }
 
 #[test]
-fn sessionize_physical_caps_are_forwarded_only() {
+fn sessionize_physical_caps_advertise_forwarding_and_fusion() {
+    // TASK-520 turned on `supports_aggregation_fusion`.
     let caps = SessionizePhysical::DEMAND_CAPS;
     assert!(caps.supports_forwarded_columns);
+    assert!(caps.supports_aggregation_fusion);
     assert!(!caps.supports_step_reached);
     assert!(!caps.supports_match_count);
     assert!(!caps.supports_full_detail);
-    assert!(!caps.supports_aggregation_fusion);
     assert!(!caps.supports_step_property_forwarding);
     assert!(!caps.supports_eager_group_emit);
 }
 
 #[test]
-fn event_select_physical_caps_are_forwarded_only() {
+fn event_select_physical_caps_advertise_forwarding_and_fusion() {
     let caps = EventSelectPhysical::DEMAND_CAPS;
     assert!(caps.supports_forwarded_columns);
+    assert!(caps.supports_aggregation_fusion);
     assert!(!caps.supports_step_reached);
-    assert!(!caps.supports_aggregation_fusion);
 }
 
 #[test]
-fn attribute_physical_caps_are_forwarded_only() {
+fn attribute_physical_caps_advertise_forwarding_and_fusion() {
     let caps = AttributePhysical::DEMAND_CAPS;
     assert!(caps.supports_forwarded_columns);
+    assert!(caps.supports_aggregation_fusion);
     assert!(!caps.supports_step_reached);
-    assert!(!caps.supports_aggregation_fusion);
 }

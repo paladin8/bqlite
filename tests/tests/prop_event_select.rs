@@ -121,6 +121,7 @@ fn make_op(kind: EventSelectKind) -> EventSelectOperator {
             sample: None,
         })),
         output_schema: output_schema(),
+        pre_fusion_output_schema: None,
     };
     EventSelectOperator::new(&desc, &in_schema)
 }
