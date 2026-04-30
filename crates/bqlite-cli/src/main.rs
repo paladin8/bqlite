@@ -67,7 +67,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bqlite_engine::{format_result_as_text_limited, init_tracing, Database, Engine};
+use bqlite_engine::{
+    format_perf_explain, format_result_as_text_limited, init_tracing, Database, Engine,
+    QueryOptions,
+};
 
 use format::{has_explicit_limit, maybe_inject_limit, DEFAULT_LIMIT};
 
@@ -104,7 +107,7 @@ fn main() -> ExitCode {
 const USAGE: &str = "\
 Usage:
   bqlite init   <path> [--shards N]
-  bqlite query  <bql> --db <path> [--limit N | --no-limit]
+  bqlite query  <bql> --db <path> [--limit N | --no-limit] [--explain-perf]
   bqlite ingest <file> --table <name> --db <path> [--format csv] [--map src=dst,...]
 
 Commands:
@@ -118,6 +121,10 @@ Options:
 Query options:
   --limit N       Cap output at N rows (default: 1000). Overrides auto-limit.
   --no-limit      Disable row cap; return all rows.
+  --explain-perf  Run the query but print the per-query metrics
+                  footer (`docs/design/execution-model.md` §14.1)
+                  in place of the row table. Opts the query into
+                  CPU-cost sampling.
 
 Ingest options:
   --table <name>  Target table name (required).
@@ -272,7 +279,7 @@ fn run_init(rest: &[String], out: &mut dyn Write) -> Result<(), CliError> {
 // query subcommand
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parsed shape of `bqlite query <bql> --db <path> [--limit N | --no-limit]`.
+/// Parsed shape of `bqlite query <bql> --db <path> [--limit N | --no-limit] [--explain-perf]`.
 ///
 /// A dedicated struct (instead of a tuple) keeps the tests readable
 /// and makes it obvious which field is which.
@@ -286,6 +293,10 @@ struct QueryArgs {
     limit: Option<usize>,
     /// `--no-limit` flag: disables the auto-limit row cap entirely.
     no_limit: bool,
+    /// `--explain-perf` flag: discard row output and render the
+    /// per-query metrics footer instead. Implies opt-in CPU-cost
+    /// sampling via `QueryOptions::collect_cpu_metrics`.
+    explain_perf: bool,
 }
 
 /// Parse the argv tail of `bqlite query ...`.
@@ -298,6 +309,7 @@ fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
     let mut db_path: Option<PathBuf> = None;
     let mut limit: Option<usize> = None;
     let mut no_limit = false;
+    let mut explain_perf = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -362,6 +374,15 @@ fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
                 no_limit = true;
                 i += 1;
             }
+            "--explain-perf" => {
+                if explain_perf {
+                    return Err(CliError::Usage(
+                        "--explain-perf specified more than once".to_string(),
+                    ));
+                }
+                explain_perf = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 return Err(CliError::Usage(
                     "help for 'query' not implemented yet — use `bqlite --help`".to_string(),
@@ -387,6 +408,14 @@ fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
             "--limit and --no-limit are mutually exclusive".to_string(),
         ));
     }
+    if limit.is_some() && explain_perf {
+        return Err(CliError::Usage(
+            "--limit and --explain-perf are mutually exclusive: \
+             --explain-perf needs the un-truncated pipeline so the \
+             metrics reflect the full query"
+                .to_string(),
+        ));
+    }
 
     let bql = bql.ok_or_else(|| CliError::Usage("missing BQL text".to_string()))?;
     let db_path = db_path.ok_or_else(|| CliError::Usage("missing --db <path>".to_string()))?;
@@ -396,6 +425,7 @@ fn parse_query_args(rest: &[String]) -> Result<QueryArgs, CliError> {
         db_path,
         limit,
         no_limit,
+        explain_perf,
     })
 }
 
@@ -418,10 +448,12 @@ fn run_query(rest: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Resu
 
     // Determine whether to inject an auto-limit and what the display cap
     // should be passed to the renderer.
+    //
+    // `--explain-perf` discards row output but still drives the query
+    // to completion, so auto-limit injection would silently hide
+    // upstream work. Skip injection on the perf path.
     let (query_to_run, display_limit): (String, Option<usize>) =
-        if parsed.no_limit || has_explicit_limit(&parsed.bql) {
-            // No auto-injection: user opted out or the query is already
-            // limited. Render with no truncation footer.
+        if parsed.explain_perf || parsed.no_limit || has_explicit_limit(&parsed.bql) {
             (parsed.bql.clone(), None)
         } else {
             let cap = parsed.limit.unwrap_or(DEFAULT_LIMIT);
@@ -431,9 +463,23 @@ fn run_query(rest: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Resu
         };
 
     let engine = Engine::new();
+    let options = QueryOptions {
+        collect_cpu_metrics: parsed.explain_perf,
+        ..Default::default()
+    };
     let result = engine
-        .query(&query_to_run, &mut db)
+        .query_with_options(&query_to_run, &mut db, &options)
         .map_err(|e| CliError::Runtime(format!("query failed: {e}")))?;
+
+    if parsed.explain_perf {
+        // Render the per-query metrics footer instead of the row
+        // table. `format_perf_explain` returns a multi-section text
+        // block already terminated with newlines.
+        let rendered = format_perf_explain(&result.metrics);
+        out.write_all(rendered.as_bytes())
+            .map_err(|e| CliError::Runtime(format!("failed to write output: {e}")))?;
+        return Ok(());
+    }
 
     // `format_result_as_text_limited` always ends with a newline; use
     // `write!` (not `writeln!`) to avoid doubling it.
@@ -778,6 +824,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_query_args_accepts_explain_perf_flag() {
+        let parsed =
+            parse_query_args(&sv(&["events", "--db", "/tmp/db", "--explain-perf"])).unwrap();
+        assert!(parsed.explain_perf);
+    }
+
+    #[test]
+    fn parse_query_args_explain_perf_default_is_off() {
+        let parsed = parse_query_args(&sv(&["events", "--db", "/tmp/db"])).unwrap();
+        assert!(!parsed.explain_perf);
+    }
+
+    #[test]
+    fn parse_query_args_rejects_limit_with_explain_perf() {
+        match parse_query_args(&sv(&[
+            "events",
+            "--db",
+            "/db",
+            "--limit",
+            "10",
+            "--explain-perf",
+        ])) {
+            Err(CliError::Usage(msg)) => assert!(msg.contains("--explain-perf")),
+            other => panic!("expected usage error for --limit + --explain-perf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_query_args_rejects_duplicate_explain_perf() {
+        match parse_query_args(&sv(&[
+            "events",
+            "--db",
+            "/db",
+            "--explain-perf",
+            "--explain-perf",
+        ])) {
+            Err(CliError::Usage(msg)) => assert!(msg.contains("--explain-perf")),
+            other => panic!("expected usage error for duplicate --explain-perf, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_query_args_limit_and_no_limit_mutually_exclusive() {
         match parse_query_args(&sv(&[
             "events",
@@ -933,6 +1021,96 @@ mod tests {
         assert!(
             out_text.contains("(2 rows)"),
             "expected '(2 rows)' footer, got:\n{out_text}"
+        );
+    }
+
+    // ── --explain-perf footer (TASK-524) ────────────────────────────
+
+    #[test]
+    fn query_with_explain_perf_emits_perf_footer_and_no_row_table() {
+        let scratch = Scratch::new("explain-perf-footer");
+        init_db_with_events(&scratch);
+        let db = insert_events(
+            &scratch,
+            "('alice', 1700000000000000000, 'login'), \
+             ('bob',   1700000001000000000, 'logout')",
+        );
+
+        let args = sv(&["query", "events", "--db", &db, "--explain-perf"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query --explain-perf must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+
+        // Every section header must be present so the footer is
+        // self-evidently "the perf surface" and not something else.
+        for header in [
+            "bqlite query perf metrics",
+            "Throughput",
+            "CPU",
+            "Skew",
+            "Spill",
+        ] {
+            assert!(
+                out_text.contains(header),
+                "perf footer missing '{header}': {out_text}"
+            );
+        }
+
+        // The row-table renderer always emits a `(N rows)` footer; the
+        // perf path must not render one.
+        assert!(
+            !out_text.contains("(2 rows)"),
+            "perf-only path must not render the row table: {out_text}"
+        );
+        assert!(
+            !out_text.contains("(0 rows)"),
+            "perf-only path must not render the row table: {out_text}"
+        );
+
+        // Wall-clock duration must surface (non-zero on any sane clock).
+        assert!(
+            out_text.contains("wall_clock_ns"),
+            "perf footer missing wall_clock_ns row: {out_text}"
+        );
+        // CPU sampling flag must reflect that --explain-perf opted in.
+        assert!(
+            out_text.contains("cpu_metrics_enabled        : true"),
+            "expected cpu_metrics_enabled: true on --explain-perf path: {out_text}"
+        );
+    }
+
+    #[test]
+    fn explain_perf_against_empty_table_still_renders_footer() {
+        let scratch = Scratch::new("explain-perf-empty");
+        init_db_with_events(&scratch);
+        let db_path_str = scratch.path().to_string_lossy().to_string();
+
+        let args = sv(&["query", "events", "--db", &db_path_str, "--explain-perf"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run(&args, &mut out, &mut err).expect("query --explain-perf must succeed");
+        let out_text = String::from_utf8(out).unwrap();
+
+        // Section headers always render even when every row is zero.
+        for header in ["Throughput", "CPU", "Skew", "Spill"] {
+            assert!(out_text.contains(header), "missing {header}: {out_text}");
+        }
+        // CPU sampling is opt-in via --explain-perf, so the flag is true
+        // but the actual counters are zero (PerfCounters stub).
+        assert!(
+            out_text.contains("cpu_metrics_enabled        : true"),
+            "{out_text}"
+        );
+        assert!(
+            out_text.contains("total_cpu_cycles           : 0"),
+            "{out_text}"
+        );
+        // cycles_per_event is undefined when events_processed is zero;
+        // renderer prints em-dash regardless of cpu_metrics_enabled.
+        assert!(
+            out_text.contains("cycles_per_event           : —"),
+            "expected em-dash for undefined cycles_per_event: {out_text}"
         );
     }
 
