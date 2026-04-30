@@ -56,6 +56,7 @@ pub mod context;
 pub mod ddl;
 pub mod delete;
 pub mod ingest;
+pub mod perf;
 pub mod query;
 pub mod render;
 pub mod scheduler;
@@ -66,6 +67,7 @@ pub use context::{
     EngineConfig, QueryContext, QueryOptions, DEFAULT_COMPACTION_BUDGET_BYTES,
     DEFAULT_INGEST_BUDGET_BYTES, DEFAULT_QUERY_BUDGET_BYTES, MIN_QUERY_BUDGET_BYTES,
 };
+pub use perf::{format_perf_explain, PerfCounters, QueryMetrics, WorkerMetricsSnapshot};
 pub use query::{Engine, ExecutionFailure, ExecutionResult};
 pub use render::{format_result_as_text, format_result_as_text_limited};
 pub use warning_sink::{WarningSink, WorkerContext};
