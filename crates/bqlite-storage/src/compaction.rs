@@ -28,7 +28,7 @@
 //! semaphore, and metric surfaces so they can be reused without
 //! pulling in the executor's dependency graph.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -92,8 +92,23 @@ impl Default for CompactionConfig {
 /// row-group loop).
 #[derive(Debug)]
 pub struct CoreBudget {
-    state: Mutex<usize>,
+    state: Mutex<CoreBudgetState>,
     cv: Condvar,
+}
+
+#[derive(Debug)]
+struct CoreBudgetState {
+    /// Currently available permits.
+    available: usize,
+    /// Head-of-line FIFO of waiting acquirers, identified by ticket.
+    /// Each ticket records the requested permit count. Both `acquire`
+    /// and `acquire_n` enqueue here on entry so compaction's per-job
+    /// `acquire(1)` cannot jump ahead of a queued query waiting on
+    /// `acquire_n(query_threads)` — see compaction-concurrency.md §4.1
+    /// and engine/morsel-scheduler.md §7.1.
+    waiters: VecDeque<(u64, usize)>,
+    /// Monotonically increasing ticket counter; never reused.
+    next_ticket: u64,
 }
 
 /// RAII guard for one acquired permit. Releasing happens on drop.
@@ -102,39 +117,132 @@ pub struct CoreBudgetPermit<'a> {
     budget: &'a CoreBudget,
 }
 
+/// RAII guard for `n` permits acquired atomically.
+///
+/// All `n` permits are released together when the guard drops;
+/// partial release is not possible. See
+/// `docs/design/engine/morsel-scheduler.md` §7.1 for the protocol
+/// rationale (avoiding the partial-acquisition deadlock between
+/// concurrent queries on a saturated worker pool).
+#[derive(Debug)]
+pub struct CoreBudgetPermitBatch<'a> {
+    budget: &'a CoreBudget,
+    n: usize,
+}
+
+impl CoreBudgetPermitBatch<'_> {
+    /// Number of permits this guard owns.
+    pub fn count(&self) -> usize {
+        self.n
+    }
+}
+
 impl CoreBudget {
     /// Construct a budget pre-loaded with `permits` and return it
     /// behind an `Arc` so it can be shared across the scheduler's
     /// worker threads.
     pub fn new(permits: usize) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(permits),
+            state: Mutex::new(CoreBudgetState {
+                available: permits,
+                waiters: VecDeque::new(),
+                next_ticket: 0,
+            }),
             cv: Condvar::new(),
         })
     }
 
     /// Acquire one permit, blocking until one is available.
+    ///
+    /// Equivalent to `acquire_n(1)` returning the smaller permit
+    /// guard for backwards compatibility with compaction's per-job
+    /// acquisition path. Both flavours share the same FIFO queue,
+    /// so a busy compaction stream cannot starve a queued
+    /// `acquire_n(N)` query waiter.
     pub fn acquire(&self) -> CoreBudgetPermit<'_> {
-        let mut g = self.state.lock().expect("CoreBudget mutex poisoned");
-        while *g == 0 {
-            g = self.cv.wait(g).expect("CoreBudget condvar poisoned");
-        }
-        *g -= 1;
+        self.acquire_inner(1);
         CoreBudgetPermit { budget: self }
     }
 
+    /// Acquire `n` permits atomically — either all are granted or
+    /// the caller blocks until all `n` are simultaneously available.
+    ///
+    /// Implements the head-of-line FIFO protocol from
+    /// `docs/design/engine/morsel-scheduler.md` §7.1: a waiter only
+    /// proceeds when its ticket is at the front of the queue **and**
+    /// `available >= n`, even if a later waiter could be served from
+    /// the current free pool.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` — every caller wants at least one permit.
+    pub fn acquire_n(&self, n: usize) -> CoreBudgetPermitBatch<'_> {
+        assert!(n > 0, "CoreBudget::acquire_n requires n > 0");
+        self.acquire_inner(n);
+        CoreBudgetPermitBatch { budget: self, n }
+    }
+
+    fn acquire_inner(&self, n: usize) {
+        let mut g = self.state.lock().expect("CoreBudget mutex poisoned");
+        let ticket = g.next_ticket;
+        g.next_ticket += 1;
+        g.waiters.push_back((ticket, n));
+        loop {
+            // Granted iff at the head of the queue and the demand
+            // can be filled in one shot.
+            if g.waiters.front().map(|(t, _)| *t) == Some(ticket) && g.available >= n {
+                g.waiters.pop_front();
+                g.available -= n;
+                // Wake every waiter so the new head, if any, can
+                // re-check its eligibility. notify_one would be
+                // sufficient when the new head wants one permit at
+                // most, but a head-waiter wanting more permits than
+                // are free should still get its wake — `notify_all`
+                // matches the loop's "every waiter re-checks after
+                // any release/acquire transition" invariant.
+                self.cv.notify_all();
+                return;
+            }
+            g = self.cv.wait(g).expect("CoreBudget condvar poisoned");
+        }
+    }
+
+    fn release_inner(&self, n: usize) {
+        let mut g = self.state.lock().expect("CoreBudget mutex poisoned");
+        g.available += n;
+        self.cv.notify_all();
+    }
+
     /// Currently available permits. Test/observability helper; the
-    /// hot path acquires permits via [`Self::acquire`].
+    /// hot path acquires permits via [`Self::acquire`] or
+    /// [`Self::acquire_n`].
     pub fn available(&self) -> usize {
-        *self.state.lock().expect("CoreBudget mutex poisoned")
+        self.state
+            .lock()
+            .expect("CoreBudget mutex poisoned")
+            .available
+    }
+
+    /// Number of waiters currently parked on the FIFO queue.
+    /// Test/observability helper.
+    pub fn waiters(&self) -> usize {
+        self.state
+            .lock()
+            .expect("CoreBudget mutex poisoned")
+            .waiters
+            .len()
     }
 }
 
 impl Drop for CoreBudgetPermit<'_> {
     fn drop(&mut self) {
-        let mut g = self.budget.state.lock().expect("CoreBudget mutex poisoned");
-        *g += 1;
-        self.budget.cv.notify_one();
+        self.budget.release_inner(1);
+    }
+}
+
+impl Drop for CoreBudgetPermitBatch<'_> {
+    fn drop(&mut self) {
+        self.budget.release_inner(self.n);
     }
 }
 
@@ -1289,6 +1397,21 @@ mod tests {
         assert_eq!(cfg.retry_cooldown, Duration::from_secs(60));
     }
 
+    /// Busy-wait until `budget.waiters() >= target` or the deadline
+    /// elapses. Replaces fixed `sleep(20ms)` ordering primitives in
+    /// the FIFO tests below — a fixed gap is flaky under CI load,
+    /// while polling the observable enqueue count is deterministic.
+    fn wait_for_waiters(budget: &CoreBudget, target: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while budget.waiters() < target {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiters never reached {target}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn core_budget_acquire_release_round_trip() {
         let budget = CoreBudget::new(2);
@@ -1318,6 +1441,120 @@ mod tests {
         drop(p1);
         handle.join().expect("acquirer thread panicked");
         assert_eq!(budget.available(), 1);
+    }
+
+    #[test]
+    fn core_budget_acquire_n_grants_when_available() {
+        let budget = CoreBudget::new(4);
+        let p = budget.acquire_n(3);
+        assert_eq!(p.count(), 3);
+        assert_eq!(budget.available(), 1);
+        drop(p);
+        assert_eq!(budget.available(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "acquire_n requires n > 0")]
+    fn core_budget_acquire_n_zero_panics() {
+        let budget = CoreBudget::new(4);
+        let _ = budget.acquire_n(0);
+    }
+
+    #[test]
+    fn core_budget_acquire_n_unblocks_when_enough_permits_freed() {
+        let budget = CoreBudget::new(3);
+        let p1 = budget.acquire_n(2);
+        let b2 = budget.clone();
+        let handle = std::thread::spawn(move || {
+            // Demand 3; only 1 free → blocks.
+            let p = b2.acquire_n(3);
+            assert_eq!(p.count(), 3);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(budget.available(), 1);
+        assert_eq!(budget.waiters(), 1);
+        // Release the 2 held permits → available rises to 3, waiter wakes.
+        drop(p1);
+        handle.join().expect("acquirer thread panicked");
+        assert_eq!(budget.available(), 3);
+        assert_eq!(budget.waiters(), 0);
+    }
+
+    #[test]
+    fn core_budget_acquire_n_is_fifo_head_of_line() {
+        // 4-permit budget, head waiter wants 4, second waiter wants 1.
+        // Hold all 4; release them; assert head waiter (wants 4) is
+        // served before the second (wants 1), even though the second
+        // could be filled out of any single permit.
+        let budget = CoreBudget::new(4);
+        let p_all = budget.acquire_n(4);
+
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let b_a = budget.clone();
+        let order_a = Arc::clone(&order);
+        let h_a = std::thread::spawn(move || {
+            let _p = b_a.acquire_n(4);
+            order_a.lock().unwrap().push("big");
+        });
+        // Synchronize on the observable enqueue count rather than a
+        // fixed sleep — busy-waiting eliminates the latent CI flake.
+        wait_for_waiters(&budget, 1);
+
+        let b_b = budget.clone();
+        let order_b = Arc::clone(&order);
+        let h_b = std::thread::spawn(move || {
+            let _p = b_b.acquire_n(1);
+            order_b.lock().unwrap().push("small");
+        });
+        wait_for_waiters(&budget, 2);
+        assert_eq!(budget.waiters(), 2);
+
+        drop(p_all);
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+
+        let observed = order.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec!["big", "small"],
+            "head-of-line FIFO must serve the big request first"
+        );
+    }
+
+    #[test]
+    fn core_budget_single_acquire_respects_fifo_queue() {
+        // Compaction's per-job acquire(1) goes through the FIFO too,
+        // so a queued query waiting on acquire_n(N) cannot be starved
+        // by a hot stream of single-permit acquirers.
+        let budget = CoreBudget::new(2);
+        let p_all = budget.acquire_n(2);
+
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let b_q = budget.clone();
+        let order_q = Arc::clone(&order);
+        let h_q = std::thread::spawn(move || {
+            let _p = b_q.acquire_n(2);
+            order_q.lock().unwrap().push("query");
+        });
+        wait_for_waiters(&budget, 1);
+
+        let b_c = budget.clone();
+        let order_c = Arc::clone(&order);
+        let h_c = std::thread::spawn(move || {
+            let _p = b_c.acquire();
+            order_c.lock().unwrap().push("compaction");
+        });
+        wait_for_waiters(&budget, 2);
+        assert_eq!(budget.waiters(), 2);
+
+        drop(p_all);
+        h_q.join().unwrap();
+        h_c.join().unwrap();
+
+        let observed = order.lock().unwrap().clone();
+        assert_eq!(observed, vec!["query", "compaction"]);
     }
 
     #[test]
