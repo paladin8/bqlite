@@ -72,95 +72,28 @@ use crate::physical::{
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Run the match-aggregate fusion optimizer pass over a [`PhysicalPlan`] tree.
+/// Run the stateful-aggregate fusion optimizer pass over a [`PhysicalPlan`] tree.
 ///
-/// Returns a new tree where eligible `Aggregate(SequenceMatch(...))` patterns
-/// are fused: the aggregate descriptor is compiled into the SequenceMatch's
-/// `fused_aggregate` field, the SequenceMatch's `output_schema` is updated to
-/// the aggregate's output schema, and the `Aggregate` node is elided.
+/// Detects `Aggregate(Stateful(...))` adjacency where `Stateful` is one of
+/// the four fusion-eligible operators — `SequenceMatch`, `Sessionize`,
+/// `EventSelect`, or `Attribute` — and fuses the aggregate into the
+/// stateful node's `fused_aggregate` field, eliding the standalone
+/// `Aggregate` node. Originally TASK-320 (MATCH only); extended in
+/// TASK-520 to cover the three Wave 4 stateful operators.
 ///
-/// All other nodes are recursed into so nested eligible patterns are found.
+/// For each fused operator the pass:
+/// - Builds a [`CompiledFusableAggregate`] from the aggregate descriptor.
+/// - Replaces the operator's `output_schema` with the aggregate's output
+///   schema and stashes the operator's pre-fusion native schema in
+///   `pre_fusion_output_schema` so the runtime operator can keep building
+///   per-entity batches in the native shape.
+///
+/// All other nodes are recursed into so nested eligible patterns are
+/// found.
 pub fn fuse_match_aggregate(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
-        // ── Aggregate: attempt fusion with an immediately adjacent SequenceMatch
-        PhysicalPlan::Aggregate(agg) => {
-            let AggregatePhysical {
-                aggregates,
-                group_by,
-                max_groups,
-                input,
-                output_schema: agg_output_schema,
-            } = agg;
-
-            match *input {
-                // Direct adjacency: Aggregate(SequenceMatch(...))
-                PhysicalPlan::SequenceMatch(seq_match) => {
-                    // Collect column names in the SequenceMatch output schema.
-                    let match_col_names: HashSet<&str> = seq_match
-                        .output_schema
-                        .columns()
-                        .iter()
-                        .map(|c| c.name.as_str())
-                        .collect();
-
-                    if is_eligible(&aggregates, &group_by, &match_col_names) {
-                        // Build the CompiledFusableAggregate from the aggregate descriptor.
-                        // CompiledAgg (physical.rs) and CompiledAggExpr (demand.rs) are
-                        // structurally identical; we copy field-by-field.
-                        // max_groups is propagated from the originating AggregatePhysical
-                        // so the fused HashAccumulator enforces the same cardinality cap
-                        // as the non-fused path.
-                        let fused = CompiledFusableAggregate {
-                            aggregates: aggregates
-                                .iter()
-                                .map(|a| CompiledAggExpr {
-                                    function: a.function,
-                                    arg: a.arg.clone(),
-                                    output_name: a.output_name.clone(),
-                                })
-                                .collect(),
-                            group_by: group_by.clone(),
-                            output_schema: agg_output_schema.clone(),
-                            max_groups,
-                        };
-
-                        // Fuse: embed the aggregate in the SequenceMatch and elide
-                        // the Aggregate node. The output schema changes to the
-                        // aggregate's output schema.
-                        PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
-                            fused_aggregate: Some(fused),
-                            output_schema: agg_output_schema,
-                            ..*seq_match
-                        }))
-                    } else {
-                        // Not eligible — reassemble unchanged, recurse into SequenceMatch.
-                        let seq_input =
-                            fuse_match_aggregate(PhysicalPlan::SequenceMatch(seq_match));
-                        PhysicalPlan::Aggregate(AggregatePhysical {
-                            aggregates,
-                            group_by,
-                            max_groups,
-                            input: Box::new(seq_input),
-                            output_schema: agg_output_schema,
-                        })
-                    }
-                }
-
-                // Non-adjacent: Aggregate over something other than SequenceMatch.
-                // Recurse into the child so nested patterns deeper in the tree
-                // are still discovered.
-                other_input => {
-                    let recursed = fuse_match_aggregate(other_input);
-                    PhysicalPlan::Aggregate(AggregatePhysical {
-                        aggregates,
-                        group_by,
-                        max_groups,
-                        input: Box::new(recursed),
-                        output_schema: agg_output_schema,
-                    })
-                }
-            }
-        }
+        // ── Aggregate: attempt fusion with an immediately adjacent stateful op
+        PhysicalPlan::Aggregate(agg) => fuse_aggregate_node(agg),
 
         // ── Recursive cases: recurse into child plans ─────────────────────────
         PhysicalPlan::Filter(filter) => {
@@ -259,6 +192,23 @@ pub fn fuse_match_aggregate(plan: PhysicalPlan) -> PhysicalPlan {
             }))
         }
 
+        // ── Wave 4 stateful operators: recurse into child, preserve any
+        // existing fused_aggregate. Same rationale as SequenceMatch above.
+        PhysicalPlan::Sessionize(mut sess) => {
+            sess.input = Box::new(fuse_match_aggregate(*sess.input));
+            PhysicalPlan::Sessionize(sess)
+        }
+
+        PhysicalPlan::EventSelect(mut es) => {
+            es.input = Box::new(fuse_match_aggregate(*es.input));
+            PhysicalPlan::EventSelect(es)
+        }
+
+        PhysicalPlan::Attribute(mut attr) => {
+            attr.input = Box::new(fuse_match_aggregate(*attr.input));
+            PhysicalPlan::Attribute(attr)
+        }
+
         PhysicalPlan::Explain(explain) => {
             let ExplainPhysical {
                 plan: inner,
@@ -276,22 +226,222 @@ pub fn fuse_match_aggregate(plan: PhysicalPlan) -> PhysicalPlan {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Per-stateful-operator dispatch
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dispatch an `Aggregate` node to the appropriate fusion arm based on its
+/// immediate child. Falls back to recursive descent through the child when
+/// the child is not a fusion-eligible stateful operator. TASK-520.
+fn fuse_aggregate_node(agg: AggregatePhysical) -> PhysicalPlan {
+    let AggregatePhysical {
+        aggregates,
+        group_by,
+        max_groups,
+        input,
+        output_schema: agg_output_schema,
+    } = agg;
+
+    match *input {
+        // Direct adjacency with a SequenceMatch — the original TASK-320 case.
+        PhysicalPlan::SequenceMatch(seq_match) => {
+            let native_cols: HashSet<&str> = seq_match
+                .output_schema
+                .columns()
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            if is_eligible(&aggregates, &group_by, &native_cols) {
+                let fused = build_compiled_fusable(
+                    &aggregates,
+                    &group_by,
+                    agg_output_schema.clone(),
+                    max_groups,
+                );
+                PhysicalPlan::SequenceMatch(Box::new(SequenceMatchPhysical {
+                    fused_aggregate: Some(fused),
+                    output_schema: agg_output_schema,
+                    ..*seq_match
+                }))
+            } else {
+                let seq_input = fuse_match_aggregate(PhysicalPlan::SequenceMatch(seq_match));
+                PhysicalPlan::Aggregate(AggregatePhysical {
+                    aggregates,
+                    group_by,
+                    max_groups,
+                    input: Box::new(seq_input),
+                    output_schema: agg_output_schema,
+                })
+            }
+        }
+
+        // ── Wave 4 stateful fusion targets ────────────────────────────────
+        PhysicalPlan::Sessionize(sess) => {
+            let native_cols: HashSet<&str> = sess
+                .output_schema
+                .columns()
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            // Don't double-fuse if a prior pass already set fused_aggregate.
+            if sess.fused_aggregate.is_none() && is_eligible(&aggregates, &group_by, &native_cols) {
+                let fused = build_compiled_fusable(
+                    &aggregates,
+                    &group_by,
+                    agg_output_schema.clone(),
+                    max_groups,
+                );
+                let mut sess = sess;
+                // Stash the native schema so the runtime operator can keep
+                // building per-entity batches in the native shape.
+                sess.pre_fusion_output_schema = Some(sess.output_schema.clone());
+                sess.fused_aggregate = Some(fused);
+                sess.output_schema = agg_output_schema;
+                sess.input = Box::new(fuse_match_aggregate(*sess.input));
+                PhysicalPlan::Sessionize(sess)
+            } else {
+                let recursed = fuse_match_aggregate(PhysicalPlan::Sessionize(sess));
+                PhysicalPlan::Aggregate(AggregatePhysical {
+                    aggregates,
+                    group_by,
+                    max_groups,
+                    input: Box::new(recursed),
+                    output_schema: agg_output_schema,
+                })
+            }
+        }
+
+        PhysicalPlan::EventSelect(es) => {
+            let native_cols: HashSet<&str> = es
+                .output_schema
+                .columns()
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            if es.fused_aggregate.is_none() && is_eligible(&aggregates, &group_by, &native_cols) {
+                let fused = build_compiled_fusable(
+                    &aggregates,
+                    &group_by,
+                    agg_output_schema.clone(),
+                    max_groups,
+                );
+                let mut es = es;
+                es.pre_fusion_output_schema = Some(es.output_schema.clone());
+                es.fused_aggregate = Some(fused);
+                es.output_schema = agg_output_schema;
+                es.input = Box::new(fuse_match_aggregate(*es.input));
+                PhysicalPlan::EventSelect(es)
+            } else {
+                let recursed = fuse_match_aggregate(PhysicalPlan::EventSelect(es));
+                PhysicalPlan::Aggregate(AggregatePhysical {
+                    aggregates,
+                    group_by,
+                    max_groups,
+                    input: Box::new(recursed),
+                    output_schema: agg_output_schema,
+                })
+            }
+        }
+
+        PhysicalPlan::Attribute(attr) => {
+            let native_cols: HashSet<&str> = attr
+                .output_schema
+                .columns()
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            if attr.fused_aggregate.is_none() && is_eligible(&aggregates, &group_by, &native_cols) {
+                let fused = build_compiled_fusable(
+                    &aggregates,
+                    &group_by,
+                    agg_output_schema.clone(),
+                    max_groups,
+                );
+                let mut attr = attr;
+                attr.pre_fusion_output_schema = Some(attr.output_schema.clone());
+                attr.fused_aggregate = Some(fused);
+                attr.output_schema = agg_output_schema;
+                attr.input = Box::new(fuse_match_aggregate(*attr.input));
+                PhysicalPlan::Attribute(attr)
+            } else {
+                let recursed = fuse_match_aggregate(PhysicalPlan::Attribute(attr));
+                PhysicalPlan::Aggregate(AggregatePhysical {
+                    aggregates,
+                    group_by,
+                    max_groups,
+                    input: Box::new(recursed),
+                    output_schema: agg_output_schema,
+                })
+            }
+        }
+
+        // Non-adjacent: Aggregate over something other than a fusion target.
+        // Recurse into the child so nested patterns deeper in the tree are
+        // still discovered.
+        other_input => {
+            let recursed = fuse_match_aggregate(other_input);
+            PhysicalPlan::Aggregate(AggregatePhysical {
+                aggregates,
+                group_by,
+                max_groups,
+                input: Box::new(recursed),
+                output_schema: agg_output_schema,
+            })
+        }
+    }
+}
+
+/// Build a [`CompiledFusableAggregate`] from the aggregate descriptor
+/// fields. `CompiledAgg` (physical.rs) and `CompiledAggExpr` (demand.rs)
+/// are structurally identical; we copy field-by-field.
+fn build_compiled_fusable(
+    aggregates: &[crate::physical::CompiledAgg],
+    group_by: &[(CompiledExpr, String)],
+    output_schema: bqlite_core::OperatorSchema,
+    max_groups: usize,
+) -> CompiledFusableAggregate {
+    CompiledFusableAggregate {
+        aggregates: aggregates
+            .iter()
+            .map(|a| CompiledAggExpr {
+                function: a.function,
+                arg: a.arg.clone(),
+                output_name: a.output_name.clone(),
+            })
+            .collect(),
+        group_by: group_by.to_vec(),
+        output_schema,
+        max_groups,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Eligibility helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Return `true` when all aggregate argument and group-by expressions
-/// reference only columns present in `match_col_names`.
+/// reference only columns present in `native_cols`.
 ///
-/// This ensures the aggregate can be evaluated purely from the SequenceMatch's
-/// output, without needing any columns that were dropped at the match boundary.
+/// This ensures the aggregate can be evaluated purely from the upstream
+/// stateful operator's output, without needing any columns that were
+/// dropped at its boundary.
 fn is_eligible(
     aggregates: &[crate::physical::CompiledAgg],
     group_by: &[(CompiledExpr, String)],
-    match_col_names: &HashSet<&str>,
+    native_cols: &HashSet<&str>,
 ) -> bool {
-    // Check group-by expressions.
+    // Group-by expressions: the fused path resolves group-by columns by
+    // name (HashAccumulator::update_batch reads `group_by_columns` as
+    // strings — see aggregate/mod.rs). A non-trivial expression like
+    // `UPPER(col)` would survive eligibility but then fail at runtime
+    // because the engine adapter only stores the *output* name as the
+    // lookup key. Restrict group-by to simple column references for the
+    // same reason aggregate args are restricted (TASK-520 bugfix to the
+    // pre-existing TASK-320 helper).
     for (expr, _name) in group_by {
-        if !refs_only_match_cols(expr, match_col_names) {
+        if !is_simple_column_ref(expr) {
+            return false;
+        }
+        if !refs_only_match_cols(expr, native_cols) {
             return false;
         }
     }
@@ -300,18 +450,17 @@ fn is_eligible(
     //
     // Non-trivial expressions (CAST, Compare, Arith, etc.) are NOT
     // eligible for fusion because the fused path in
-    // `finish_entity_into` passes intermediate match-output batches
-    // through `update_batch`, which resolves columns by name. It
-    // cannot evaluate compiled expressions. These aggregates must go
-    // through the non-fused `HashAggregateOperator` path, which uses
-    // `eval::evaluate` to compute expressions against each batch.
+    // `finish_entity_into` passes intermediate per-entity output batches
+    // through `update_batch`, which resolves columns by name. It cannot
+    // evaluate compiled expressions. These aggregates must go through
+    // the non-fused `HashAggregateOperator` path.
     for agg in aggregates {
         if let Some(arg) = &agg.arg {
             // Only fuse simple column references, not computed expressions.
             if !is_simple_column_ref(arg) {
                 return false;
             }
-            if !refs_only_match_cols(arg, match_col_names) {
+            if !refs_only_match_cols(arg, native_cols) {
                 return false;
             }
         }
@@ -940,6 +1089,285 @@ mod tests {
         assert!(
             child_seq.fused_aggregate.is_none(),
             "SequenceMatch must not have fused_aggregate when arg is a CAST expression"
+        );
+    }
+
+    // ── TASK-520: Wave 4 stateful operators ─────────────────────────────────
+
+    use crate::demand::DemandSet as DemandSet2;
+    use crate::physical::{AttributePhysical, EventSelectPhysical, SessionizePhysical};
+
+    /// Build a `SessionizePhysical` with the given native output schema.
+    fn sess_physical(output_schema: OperatorSchema) -> SessionizePhysical {
+        SessionizePhysical {
+            gap_ns: 1_000,
+            end_events: Vec::new(),
+            demand: DemandSet2::default(),
+            forwarded_columns: Vec::new(),
+            fused_aggregate: None,
+            input: Box::new(minimal_scan()),
+            output_schema,
+            pre_fusion_output_schema: None,
+        }
+    }
+
+    /// Native sessionize output schema: input cols + session_id + session_duration.
+    fn sess_native_output() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+            ColumnDef::required("session_id", BqlType::Int),
+            ColumnDef::required("session_duration", BqlType::Int),
+        ])
+        .expect("sessionize native output schema")
+    }
+
+    #[test]
+    fn aggregate_over_sessionize_count_star_fuses() {
+        // STATS COUNT(*) over a sessionize → simplest fusion shape.
+        let agg_schema = OperatorSchema::new(vec![ColumnDef::required("n", BqlType::Int)]).unwrap();
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Count,
+                arg: None,
+                output_name: "n".into(),
+            }],
+            group_by: vec![],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::Sessionize(
+                sess_physical(sess_native_output()),
+            )),
+            output_schema: agg_schema.clone(),
+        });
+        let result = fuse_match_aggregate(plan);
+        let PhysicalPlan::Sessionize(fused) = result else {
+            panic!("expected fused Sessionize root, got something else");
+        };
+        assert!(fused.fused_aggregate.is_some());
+        assert!(fused.pre_fusion_output_schema.is_some());
+        assert_eq!(fused.output_schema, agg_schema);
+        // Native schema preserved.
+        assert_eq!(
+            fused.pre_fusion_output_schema.as_ref().unwrap(),
+            &sess_native_output()
+        );
+    }
+
+    #[test]
+    fn aggregate_over_sessionize_group_by_session_id_fuses() {
+        let agg_schema = OperatorSchema::new(vec![
+            ColumnDef::required("session_id", BqlType::Int),
+            ColumnDef::required("n", BqlType::Int),
+        ])
+        .unwrap();
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Count,
+                arg: None,
+                output_name: "n".into(),
+            }],
+            group_by: vec![(
+                col_ref("session_id", 3, BqlType::Int, false),
+                "session_id".into(),
+            )],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::Sessionize(
+                sess_physical(sess_native_output()),
+            )),
+            output_schema: agg_schema.clone(),
+        });
+        let result = fuse_match_aggregate(plan);
+        let PhysicalPlan::Sessionize(fused) = result else {
+            panic!("expected fused Sessionize root");
+        };
+        assert!(fused.fused_aggregate.is_some());
+        assert_eq!(fused.output_schema, agg_schema);
+    }
+
+    #[test]
+    fn aggregate_over_sessionize_referencing_scan_column_does_not_fuse() {
+        // SUM over `amount` — not in sessionize native output → block fusion.
+        let agg_schema =
+            OperatorSchema::new(vec![ColumnDef::nullable("total", BqlType::Int)]).unwrap();
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Sum,
+                arg: Some(col_ref("amount", 5, BqlType::Int, true)),
+                output_name: "total".into(),
+            }],
+            group_by: vec![],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::Sessionize(
+                sess_physical(sess_native_output()),
+            )),
+            output_schema: agg_schema,
+        });
+        let result = fuse_match_aggregate(plan);
+        // Aggregate stays at root because `amount` is not in sess output.
+        assert!(matches!(&result, PhysicalPlan::Aggregate(_)));
+    }
+
+    /// Build a minimal `EventSelectPhysical` with the given native output schema.
+    fn es_physical(output_schema: OperatorSchema) -> EventSelectPhysical {
+        EventSelectPhysical {
+            kind: crate::logical::EventSelectKind::First,
+            event_types: vec!["purchase".into()],
+            predicate: None,
+            lookback: None,
+            forwarded_columns: vec![],
+            fused_aggregate: None,
+            input: Box::new(minimal_scan()),
+            output_schema,
+            pre_fusion_output_schema: None,
+        }
+    }
+
+    fn es_native_output() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+        ])
+        .expect("event_select native output schema")
+    }
+
+    #[test]
+    fn aggregate_over_event_select_count_star_fuses() {
+        let agg_schema = OperatorSchema::new(vec![ColumnDef::required("n", BqlType::Int)]).unwrap();
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Count,
+                arg: None,
+                output_name: "n".into(),
+            }],
+            group_by: vec![],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::EventSelect(es_physical(es_native_output()))),
+            output_schema: agg_schema.clone(),
+        });
+        let result = fuse_match_aggregate(plan);
+        let PhysicalPlan::EventSelect(fused) = result else {
+            panic!("expected fused EventSelect root");
+        };
+        assert!(fused.fused_aggregate.is_some());
+        assert!(fused.pre_fusion_output_schema.is_some());
+        assert_eq!(fused.output_schema, agg_schema);
+    }
+
+    /// Build a minimal `AttributePhysical` with the given native output schema.
+    fn attr_physical(output_schema: OperatorSchema) -> AttributePhysical {
+        // touchpoint_key: a Column expression that always references the
+        // first input column. Real lowering produces a typed column ref;
+        // for the optimizer test we just need any CompiledExpr of String
+        // type — the optimizer pass does not introspect it.
+        let touchpoint_key = CompiledExpr {
+            node: CompiledNode::Column {
+                index: 0,
+                name: "entity_id".into(),
+            },
+            result_type: BqlType::String,
+            nullable: false,
+        };
+        AttributePhysical {
+            conversion_events: vec!["purchase".into()],
+            touchpoint_events: vec!["click".into()],
+            window_ns: 1_000,
+            touchpoint_key,
+            forwarded_conversion_columns: vec![],
+            fused_aggregate: None,
+            conversion_range: None,
+            input: Box::new(minimal_scan()),
+            output_schema,
+            pre_fusion_output_schema: None,
+        }
+    }
+
+    fn attr_native_output() -> OperatorSchema {
+        OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("conversion_ts", BqlType::Timestamp),
+            ColumnDef::nullable("touchpoint_ts", BqlType::Timestamp),
+            ColumnDef::nullable("touchpoint_key", BqlType::String),
+        ])
+        .expect("attribute native output schema")
+    }
+
+    #[test]
+    fn aggregate_over_attribute_group_by_touchpoint_key_fuses() {
+        let agg_schema = OperatorSchema::new(vec![
+            ColumnDef::nullable("touchpoint_key", BqlType::String),
+            ColumnDef::required("n", BqlType::Int),
+        ])
+        .unwrap();
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Count,
+                arg: None,
+                output_name: "n".into(),
+            }],
+            group_by: vec![(
+                col_ref("touchpoint_key", 3, BqlType::String, true),
+                "touchpoint_key".into(),
+            )],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::Attribute(attr_physical(attr_native_output()))),
+            output_schema: agg_schema.clone(),
+        });
+        let result = fuse_match_aggregate(plan);
+        let PhysicalPlan::Attribute(fused) = result else {
+            panic!("expected fused Attribute root");
+        };
+        assert!(fused.fused_aggregate.is_some());
+        assert_eq!(fused.output_schema, agg_schema);
+    }
+
+    // ── B4 fix: group-by with non-trivial expression must not fuse ─────────
+    //
+    // `HashAccumulator::update_batch` resolves group-by columns by name.
+    // A group-by like `UPPER(col)` would survive a refs-only check but
+    // then fail at runtime because the engine adapter only registers the
+    // column's *output name* as the lookup key, not the expression. The
+    // updated `is_eligible` helper now applies `is_simple_column_ref` to
+    // group-by expressions for the same reason it already applied to
+    // aggregate args.
+
+    #[test]
+    fn group_by_non_trivial_expression_blocks_fusion() {
+        let cast_group_by = CompiledExpr {
+            node: CompiledNode::Cast {
+                input: Box::new(col_ref("step_reached", 1, BqlType::Int, false)),
+                target_type: BqlType::String,
+                kernel: crate::compiled::CastKernel::ArrowKernel(
+                    crate::compiled::ArrowKernelId::CastIntToString,
+                ),
+            },
+            result_type: BqlType::String,
+            nullable: false,
+        };
+        let agg_schema = OperatorSchema::new(vec![
+            ColumnDef::required("step_reached_str", BqlType::String),
+            ColumnDef::required("n", BqlType::Int),
+        ])
+        .unwrap();
+        let plan = PhysicalPlan::Aggregate(AggregatePhysical {
+            aggregates: vec![CompiledAgg {
+                function: AggFunction::Count,
+                arg: None,
+                output_name: "n".into(),
+            }],
+            group_by: vec![(cast_group_by, "step_reached_str".into())],
+            max_groups: DEFAULT_MAX_GROUPS,
+            input: Box::new(PhysicalPlan::SequenceMatch(seq_match_physical(
+                match_output_schema(),
+            ))),
+            output_schema: agg_schema,
+        });
+        let result = fuse_match_aggregate(plan);
+        // Aggregate must stay at root — the non-trivial group-by blocks fusion.
+        assert!(
+            matches!(&result, PhysicalPlan::Aggregate(_)),
+            "non-trivial group-by must not fuse (B4 fix)"
         );
     }
 }
