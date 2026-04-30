@@ -78,6 +78,24 @@ pub struct MetricsSnapshot {
     pub selected_rows_before_materialization: u64,
     /// Rows actually materialized into Arrow arrays at the boundary.
     pub materialized_rows: u64,
+
+    // ── Fused-stateless-segment counters ─────────────────────────────
+    //
+    // Wave 5 (`docs/design/engine/operator-fusion.md` §3.5) tracks
+    // post-boundary selection-vector usage inside the
+    // `FusedStatelessSegment` driver. These complement the encoded-path
+    // copy-budget counters above: the encoded-path counters measure
+    // bytes at the scan boundary; the segment counters measure
+    // selection-vector activity inside the post-boundary kernel chain.
+    /// Number of `materialize_filtered_batch` calls that produced a
+    /// fresh `RecordBatch` (the actual-copy path). Short-circuit paths
+    /// — `selection: None` and full-cover `Some(sv)` — never increment
+    /// this counter.
+    pub selection_vector_materializations: u64,
+    /// Sum of `(input_rows - live_rows)` across kernel-step inputs
+    /// inside a fused stateless segment. Lets ops answer "how much row
+    /// work did the chain skip" without reading per-row counters.
+    pub selection_vector_dropped_rows: u64,
 }
 
 impl MetricsSnapshot {
@@ -114,6 +132,12 @@ impl MetricsSnapshot {
         self.materialized_rows = self
             .materialized_rows
             .saturating_add(other.materialized_rows);
+        self.selection_vector_materializations = self
+            .selection_vector_materializations
+            .saturating_add(other.selection_vector_materializations);
+        self.selection_vector_dropped_rows = self
+            .selection_vector_dropped_rows
+            .saturating_add(other.selection_vector_dropped_rows);
     }
 
     /// Return the component-wise sum of `self` and `other` without
@@ -136,6 +160,8 @@ impl MetricsSnapshot {
             && self.bytes_materialized_after_filter == 0
             && self.selected_rows_before_materialization == 0
             && self.materialized_rows == 0
+            && self.selection_vector_materializations == 0
+            && self.selection_vector_dropped_rows == 0
     }
 }
 
@@ -210,6 +236,22 @@ pub trait Metrics: Send + Sync {
     #[inline]
     fn record_materialized_rows(&self, _n: u64) {}
 
+    /// Add `n` to the fused-stateless-segment materialization counter
+    /// (`docs/design/engine/operator-fusion.md` §3.5). The
+    /// `materialize_filtered_batch` helper is the only call site —
+    /// short-circuit paths inside that helper do not increment this
+    /// counter, so it cleanly measures actual-copy activity inside the
+    /// kernel chain.
+    #[inline]
+    fn record_selection_vector_materializations(&self, _n: u64) {}
+
+    /// Add `n` to the dropped-rows tally inside a fused stateless
+    /// segment (`docs/design/engine/operator-fusion.md` §3.5). Recorded
+    /// per kernel-step input as `input_rows - live_rows` (per-batch,
+    /// not per-row).
+    #[inline]
+    fn record_selection_vector_dropped_rows(&self, _n: u64) {}
+
     /// Take a point-in-time snapshot of the current counter values.
     ///
     /// Not called on the hot path. The returned snapshot is a value
@@ -246,6 +288,9 @@ pub struct AtomicMetrics {
     bytes_materialized_after_filter: AtomicU64,
     selected_rows_before_materialization: AtomicU64,
     materialized_rows: AtomicU64,
+
+    selection_vector_materializations: AtomicU64,
+    selection_vector_dropped_rows: AtomicU64,
 }
 
 impl AtomicMetrics {
@@ -309,6 +354,18 @@ impl Metrics for AtomicMetrics {
         self.materialized_rows.fetch_add(n, Ordering::Relaxed);
     }
 
+    #[inline]
+    fn record_selection_vector_materializations(&self, n: u64) {
+        self.selection_vector_materializations
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_selection_vector_dropped_rows(&self, n: u64) {
+        self.selection_vector_dropped_rows
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             rows_in: self.rows_in.load(Ordering::Relaxed),
@@ -327,6 +384,12 @@ impl Metrics for AtomicMetrics {
                 .selected_rows_before_materialization
                 .load(Ordering::Relaxed),
             materialized_rows: self.materialized_rows.load(Ordering::Relaxed),
+            selection_vector_materializations: self
+                .selection_vector_materializations
+                .load(Ordering::Relaxed),
+            selection_vector_dropped_rows: self
+                .selection_vector_dropped_rows
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -739,6 +802,57 @@ mod tests {
         m.record_bytes_scanned(100);
         m.record_bytes_materialized_before_filter(999);
         m.record_materialized_rows(42);
+        assert_eq!(m.snapshot(), MetricsSnapshot::zero());
+    }
+
+    // ── Fused-stateless-segment counters (TASK-518) ──────────────────
+
+    #[test]
+    fn snapshot_is_zero_includes_segment_counters() {
+        let mut s = MetricsSnapshot::zero();
+        assert!(s.is_zero());
+        s.selection_vector_materializations = 1;
+        assert!(!s.is_zero());
+        s.selection_vector_materializations = 0;
+        s.selection_vector_dropped_rows = 1;
+        assert!(!s.is_zero());
+    }
+
+    #[test]
+    fn snapshot_merge_sums_segment_counters() {
+        let mut a = MetricsSnapshot {
+            selection_vector_materializations: 4,
+            selection_vector_dropped_rows: 100,
+            ..Default::default()
+        };
+        let b = MetricsSnapshot {
+            selection_vector_materializations: 3,
+            selection_vector_dropped_rows: 50,
+            ..Default::default()
+        };
+        a.merge(&b);
+        assert_eq!(a.selection_vector_materializations, 7);
+        assert_eq!(a.selection_vector_dropped_rows, 150);
+    }
+
+    #[test]
+    fn atomic_metrics_segment_counters_accumulate() {
+        let m = AtomicMetrics::new();
+        m.record_selection_vector_materializations(1);
+        m.record_selection_vector_materializations(2);
+        m.record_selection_vector_dropped_rows(8);
+        m.record_selection_vector_dropped_rows(16);
+
+        let s = m.snapshot();
+        assert_eq!(s.selection_vector_materializations, 3);
+        assert_eq!(s.selection_vector_dropped_rows, 24);
+    }
+
+    #[test]
+    fn noop_metrics_default_bodies_accept_segment_writes() {
+        let m = NoopMetrics::new();
+        m.record_selection_vector_materializations(99);
+        m.record_selection_vector_dropped_rows(99);
         assert_eq!(m.snapshot(), MetricsSnapshot::zero());
     }
 
