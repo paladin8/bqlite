@@ -43,8 +43,8 @@
 //! lives in `lib.rs` tests.
 
 use crate::opt::{
-    fuse_match_aggregate::fuse_match_aggregate, prune::prune_columns,
-    pushdown::pushdown_predicates, sample_pushdown::pushdown_sample,
+    filter_order::order_stateless_filters, fuse_match_aggregate::fuse_match_aggregate,
+    prune::prune_columns, pushdown::pushdown_predicates, sample_pushdown::pushdown_sample,
 };
 use crate::physical::PhysicalPlan;
 use crate::stats::{PlannerStats, PlannerStatsView, StatsBudget};
@@ -208,6 +208,7 @@ impl OptimizerPipeline {
     /// 4. Pass 4 (physical) — `projection_pruning`
     /// 5. Pass 6.5 — `tier3_predicate_shape` (TASK-527 stub)
     /// 6. Pass 7 — `match_anchor_presence` (TASK-527 stub)
+    /// 7. Pass 9 — `stateless_filter_order` (TASK-527)
     ///
     /// Phase-5.2 rules: none registered here. TASK-522 will register
     /// Pass 8 (cohort/entity pushdown) on top of this baseline.
@@ -219,6 +220,7 @@ impl OptimizerPipeline {
             .with(Box::new(ProjectionPruningRule))
             .with(Box::new(crate::opt::rules::Tier3PredicateShapeRule))
             .with(Box::new(crate::opt::rules::MatchAnchorPresenceRule))
+            .with(Box::new(StatelessFilterOrderingRule))
     }
 
     /// Run every plan-time (`RulePhase::PlanTime`) rule in registration
@@ -375,6 +377,26 @@ impl OptimizerRule for ProjectionPruningRule {
     }
     fn apply(&self, plan: PhysicalPlan, _ctx: &mut RuleContext<'_>) -> PhysicalPlan {
         prune_columns(plan)
+    }
+}
+
+/// Wraps [`order_stateless_filters`] (Pass 9, TASK-527). See
+/// `optimizer-direction.md` §7 row 10 — pure structural reorder of
+/// top-level conjuncts in fused-segment Filter steps; no stats access.
+pub struct StatelessFilterOrderingRule;
+
+impl OptimizerRule for StatelessFilterOrderingRule {
+    fn id(&self) -> &'static str {
+        "stateless_filter_order"
+    }
+    fn phase(&self) -> RulePhase {
+        RulePhase::PlanTime
+    }
+    fn budget(&self) -> StatsBudget {
+        StatsBudget::none()
+    }
+    fn apply(&self, plan: PhysicalPlan, _ctx: &mut RuleContext<'_>) -> PhysicalPlan {
+        order_stateless_filters(plan)
     }
 }
 
@@ -568,9 +590,9 @@ mod tests {
     }
 
     #[test]
-    fn v1_registers_six_rules_in_documented_order() {
+    fn v1_registers_seven_rules_in_documented_order() {
         let pipeline = OptimizerPipeline::v1();
-        assert_eq!(pipeline.rule_count(), 6);
+        assert_eq!(pipeline.rule_count(), 7);
         let stats = PlannerStats::empty();
         let mut trace = RuleTrace::default();
         let _ = pipeline.run_plan_time(dummy_scan(), &stats, &mut trace);
@@ -584,6 +606,7 @@ mod tests {
                 "projection_pruning",
                 "tier3_predicate_shape",
                 "match_anchor_presence",
+                "stateless_filter_order",
             ]
         );
     }
@@ -594,8 +617,9 @@ mod tests {
         let stats = PlannerStats::empty();
         let mut trace = RuleTrace::default();
         let _ = pipeline.run_plan_time(dummy_scan(), &stats, &mut trace);
-        // The four wrappers report Applied; the two TASK-527 stubs
-        // report Skipped because the registry is empty.
+        // The four pass wrappers + Pass 9 reorder report Applied; the
+        // two TASK-527 stubs (6.5 / 7) report Skipped because the
+        // registry is empty.
         let by_id: Vec<_> = trace
             .entries
             .iter()
@@ -616,6 +640,7 @@ mod tests {
                     "match_anchor_presence",
                     RuleTraceOutcome::Skipped("no entity-presence bitmaps registered")
                 ),
+                ("stateless_filter_order", RuleTraceOutcome::Applied),
             ]
         );
     }

@@ -44,6 +44,7 @@
 //! |--------|---------|------|
 //! | [`registry`] | `OptimizerRule` trait, `OptimizerPipeline` driver, `RuleTrace` for EXPLAIN | TASK-521 |
 //! | [`rules`] | Pass 6.5 / Pass 7 stub rules (TASK-527 fills in the bodies) | TASK-521 / TASK-527 |
+//! | [`filter_order`] | Pass 9 — stateless filter conjunct ordering inside fused segment | TASK-527 |
 //!
 //! The Wave 0 / Wave 2 / Wave 3 / Wave 4 passes above are wrapped as
 //! [`OptimizerRule`](registry::OptimizerRule) implementations in
@@ -55,6 +56,7 @@
 
 pub mod desugar_funnel;
 pub mod desugar_retention;
+pub mod filter_order;
 pub mod fuse_match_aggregate;
 pub mod prune;
 pub mod pushdown;
@@ -64,13 +66,14 @@ pub mod sample_pushdown;
 
 pub use desugar_funnel::desugar_funnel;
 pub use desugar_retention::desugar_retention;
+pub use filter_order::order_stateless_filters;
 pub use fuse_match_aggregate::fuse_match_aggregate;
 pub use prune::prune_columns;
 pub use pushdown::pushdown_predicates;
 pub use registry::{
     FuseMatchAggregateRule, OptimizerPipeline, OptimizerRule, PredicatePushdownRule,
     ProjectionPruningRule, RuleContext, RulePhase, RuleTrace, RuleTraceEntry, RuleTraceOutcome,
-    SamplePushdownRule,
+    SamplePushdownRule, StatelessFilterOrderingRule,
 };
 pub use rules::{MatchAnchorPresenceRule, Tier3PredicateShapeRule};
 pub use sample_pushdown::pushdown_sample;

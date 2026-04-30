@@ -578,10 +578,11 @@ mod tests {
     // ── TASK-521: optimizer pipeline + rule trace ───────────────────
 
     #[test]
-    fn plan_with_trace_returns_six_v1_rule_entries() {
-        // The Wave 5 pipeline registers exactly six rules per
-        // `optimizer-direction.md` §9; the trace surfaces every one
-        // regardless of whether the rule modified the plan.
+    fn plan_with_trace_returns_seven_v1_rule_entries() {
+        // The Wave 5 pipeline registers exactly seven rules per
+        // `optimizer-direction.md` §9 (Passes 6, 6.5, 7, 9 plus the
+        // Wave 0/2/4 wrappers); the trace surfaces every one regardless
+        // of whether the rule modified the plan.
         let catalog = InMemoryCatalog::default().with(events_schema());
         let stmt = Statement::Query(bare_pipeline("events"));
         let (_plan, trace) = plan_with_trace(stmt, &catalog, 0).unwrap();
@@ -595,6 +596,7 @@ mod tests {
                 "projection_pruning",
                 "tier3_predicate_shape",
                 "match_anchor_presence",
+                "stateless_filter_order",
             ]
         );
     }

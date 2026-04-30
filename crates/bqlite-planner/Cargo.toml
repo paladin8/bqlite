@@ -10,3 +10,6 @@ repository.workspace = true
 bqlite-core = { workspace = true }
 bqlite-ast = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
