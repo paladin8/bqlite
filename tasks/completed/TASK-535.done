@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-535",
   "claimed_at": "2026-05-02T04:41:54Z",
+  "completed_at": "2026-05-02T05:20:00Z",
   "branch": "task/TASK-535",
   "description": "Sessionize multi-end-event-type benchmark"
 }
