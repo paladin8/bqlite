@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-528",
+  "claimed_at": "2026-05-02T05:34:36Z",
+  "branch": "task/TASK-528",
+  "description": "Wave 5 acceptance gate"
+}
