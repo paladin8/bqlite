@@ -24,7 +24,7 @@ benches/wave4/
 ├── ingest.rs            # JSONL + Parquet end-to-end ingest
 ├── pfor.rs              # PFOR codec (TASK-450)
 ├── sample.rs            # SampleFilter per-row throughput + selectivity
-├── sessionize.rs        # SessionizeOperator throughput (TASK-428)
+├── sessionize.rs        # SessionizeOperator throughput (TASK-428, TASK-535)
 └── tombstone_scan.rs    # TombstoneFilter query-time + compact_now tombstone overhead (TASK-534)
 ```
 
@@ -82,6 +82,7 @@ Provenance labels:
 | `tombstone_scan/query_time/time_range_10pct/rows_per_sec_m` | ≥ 100 M rows/sec | **[floor]** single time-range covering 10% of rows |
 | `tombstone_scan/query_time/mixed/rows_per_sec_m` | ≥ 50 M rows/sec | **[floor]** entity + time-range + row tombstones active simultaneously |
 | `tombstone_scan/compaction/tombstoned_10pct/clean_to_tombstoned_ratio` | ≤ 2.0 | **[floor]** compaction overhead at 10% entity-tombstone density must not exceed 2× |
+| `sessionize/multi_end_event/dict_3_vs_1_slowdown_ratio` | ≤ 1.5 | **[floor]** `EndEventCodeSet` O(1) `HashSet<i32>` probe: 3-type cost ≤ 1.5× 1-type baseline (TASK-535) |
 
 ### Not covered (intentional)
 
