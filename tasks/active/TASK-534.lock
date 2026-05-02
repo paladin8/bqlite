@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-534",
+  "claimed_at": "2026-05-02T04:33:19Z",
+  "branch": "task/TASK-534",
+  "description": "Tombstone scan filter microbenchmark"
+}
