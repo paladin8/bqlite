@@ -1,7 +1,7 @@
 {
-  "agent_id": "agent-1",
+  "agent_id": "agent-3",
   "task_id": "TASK-526",
-  "claimed_at": "2026-05-02T04:23:38Z",
+  "claimed_at": "2026-05-02T04:23:40Z",
   "branch": "task/TASK-526",
   "description": "Wave 5 benchmark suite + regression-gate refresh"
 }
