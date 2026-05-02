@@ -201,3 +201,12 @@ harness = false
 name = "zero_copy_scan"
 path = "wave5/zero_copy_scan.rs"
 harness = false
+
+# Wave 5 stateful-to-aggregate fusion bench (TASK-526, TASK-520).
+# Compares SESSIONIZE → STATS throughput between fusion-eligible and
+# fusion-ineligible queries to surface regressions in the TASK-520
+# inline-accumulator path.
+[[bench]]
+name = "stateful_aggregate_fusion"
+path = "wave5/stateful_aggregate_fusion.rs"
+harness = false

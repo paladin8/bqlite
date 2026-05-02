@@ -17,11 +17,12 @@ the CI gate enforces. Adding a bench means adding a row below.
 
 ```
 benches/wave5/
-├── README.md            # this file
-└── zero_copy_scan.rs    # Zero-copy scan/filter copy budget (CP1)
+├── README.md                        # this file
+├── zero_copy_scan.rs                # Zero-copy scan/filter copy budget (CP1)
+└── stateful_aggregate_fusion.rs     # Stateful → aggregate fusion throughput (CP2)
 ```
 
-CP2–CP5 land additional bench files alongside `zero_copy_scan.rs`.
+CP3–CP5 land additional bench files alongside the CP1/CP2 ones.
 Each follow-up checkpoint adds its own row to the *Coverage matrix*
 and *Reference-machine targets* tables below.
 
@@ -30,6 +31,7 @@ and *Reference-machine targets* tables below.
 | TASK-526 area | Bench file | Main API / metric |
 |---|---|---|
 | Zero-copy scan/filter copy budget | `zero_copy_scan.rs` | `SegmentScan::next_encoded_row_group` + `apply_encoded_eq` + `materialize_selected`; `MetricsSnapshot::{bytes_materialized_before_filter, bytes_decompressed, bytes_scanned}` |
+| Stateful → aggregate fusion (TASK-520) | `stateful_aggregate_fusion.rs` | `Engine::query` end-to-end on `SESSIONIZE → STATS`; fused vs unfused wall-clock ratio |
 
 ## Reference-machine targets
 
@@ -52,6 +54,7 @@ Provenance labels:
 | `wave5/zero_copy_scan/low_card_dict/pre_filter_materialization_ratio` | ≤ 0.0 | **[spec]** `zero-copy-scan-filter.md` §3 + `MetricsSnapshot` doc comment ("`bytes_materialized_before_filter == 0` on uncompressed dictionary / RLE / constant-encoded scan paths") |
 | `wave5/zero_copy_scan/lz4_payload/decompress_ratio` | ≥ 1.0 | **[spec]** `zero-copy-scan-filter.md` §3 + `MetricsSnapshot` doc comment ("`bytes_decompressed == payload_bytes` on LZ4-wrapped segments"); the ratio measures `bytes_decompressed / bytes_scanned` |
 | `wave5/zero_copy_scan/lz4_payload/pre_filter_materialization_ratio` | ≤ 0.0 | **[spec]** same — pre-filter materialisation must remain zero on the encoded path even when LZ4 fired |
+| `wave5/stateful_aggregate_fusion/fusion_speedup_ratio` | ≥ 0.95 | **[floor]** `engine/operator-fusion.md` does not pin a numerical ratio; this is a regression tripwire that catches the fusion pass silently no-op'ing or the inline-accumulator path landing on a slow branch. The 0.95 threshold absorbs CI runner noise around the no-effect point of 1.0. Fused query: `SESSIONIZE → STATS MAX(session_id)`; unfused baseline: `SESSIONIZE → STATS SUM(amount)` |
 
 ### Not covered (intentional)
 
@@ -84,10 +87,12 @@ Provenance labels:
 ```bash
 # Default CI mode — scaled-down fixtures, no hard targets enforced.
 cargo bench -p bqlite-benches --bench zero_copy_scan
+cargo bench -p bqlite-benches --bench stateful_aggregate_fusion
 
 # Reference mode — full-scale fixtures with hard targets. Only
 # meaningful on the pinned reference hardware.
 BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench zero_copy_scan
+BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench stateful_aggregate_fusion
 ```
 
 Each bench also runs under `cargo test --all-targets` /
@@ -117,4 +122,6 @@ iterations continues to use Criterion's own sample-level comparison.
 - `docs/design/engine/operator-fusion.md` §7.2 — fused-stateless
   microbenches landed in `benches/wave2/fused_segment.rs` (out of
   scope for this README's coverage matrix; cross-linked here so the
-  Wave 5 reader can find them).
+  Wave 5 reader can find them). The TASK-520 stateful-to-aggregate
+  fusion path (no §-pinned target) is what `stateful_aggregate_fusion.rs`
+  measures.
