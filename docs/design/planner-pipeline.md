@@ -1163,6 +1163,13 @@ pub enum ExplainNode {
         steps: usize,
         window: Option<String>,
         emit_all: bool,
+        /// Bracket upper-bound durations in nanoseconds when `MATCH …
+        /// BRACKETS [..]` is set. `None` for non-bracketed matches.
+        brackets: Option<Vec<i64>>,
+        /// Whether the bracket spec is `CUMULATIVE`. Only meaningful
+        /// when `brackets` is `Some`; for `None` the renderer omits the
+        /// bracket / cumulative lines entirely.
+        cumulative: bool,
         fused_agg: Option<Vec<String>>,
         fused_filter: Option<String>,
         step_properties: Vec<String>,

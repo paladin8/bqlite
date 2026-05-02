@@ -320,11 +320,15 @@ MATCH FIRST SEQUENCE(signup THEN purchase) BRACKETS CUMULATIVE [1d, 7d, 14d, 30d
 | Column | Type | Nullable | Description |
 |---|---|---|---|
 | `bracket` | Int | no | Bracket index (0-indexed) |
-| `bracket_end` | Int | no | Bracket upper bound (nanos) for display |
+| `bracket_end` | Int | no | Anchor-relative bracket upper-bound duration in nanoseconds |
 
 One row per `(entity, binding track, bracket)`. Without EMIT ALL, only brackets where the step completed are emitted. With EMIT ALL, every bracket is emitted regardless of completion — `step_reached` distinguishes completed brackets from dropouts.
 
+**Bracket window convention.** Bracket 0 covers the closed interval `[0, durations[0]]` — both endpoints inclusive, so the anchor itself (delta `0`) and any activity at exactly `durations[0]` belong to bracket 0. Bracket `i > 0` covers `(durations[i-1], durations[i]]` — left-open / right-closed. The activity event with anchor-relative delta `D = activity_ts − anchor_ts` falls in the smallest bracket `b` whose upper bound satisfies `D ≤ durations[b]`. Activity events whose `D > durations[N-1]` (past the last bracket) are not retained in any bracket. Under EMIT ALL, dropouts past the final bracket still produce N rows per track with `step_reached = 0` on the unattained brackets — the bracket structure is reported in full for every entity that entered the NFA, regardless of where the activity fell.
+
 **Bracket index semantics.** Brackets are 0-indexed from the anchor event. `bracket = 0` means "between anchor time and first bracket boundary." `bracket = 1` means "between first and second boundaries." The highest index is the final bracket (`N-1` for N boundaries).
+
+**`bracket_end` semantics.** `bracket_end` carries the **relative bracket upper-bound duration in nanoseconds** (`durations[bracket]`), not an absolute epoch. This is anchor-independent so all entities in a cohort share identical `bracket_end` values for the same bracket index — which is what the desugared `STATS … GROUP BY bracket` (Section 6.3) and explicit `MATCH … BRACKETS` queries need for cohort aggregation. To recover an absolute upper-bound timestamp for a specific row, compute `anchor_ts + bracket_end` downstream; the planner does not pre-materialize that addition because anchors are per-entity and pushing them into every output row would defeat the cohort-uniform shape.
 
 **BRACKETS and WITHIN are mutually exclusive** — BRACKETS defines its own time structure. The planner rejects queries that specify both.
 

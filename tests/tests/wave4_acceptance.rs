@@ -741,6 +741,51 @@ fn retention_invariance_under_compaction() {
     // entity's bracket counts.
     assert_eq!(post.row_count(), pre_logical.row_count());
     assert!(pre.row_count() >= post.row_count());
+
+    // Tighter assertion (TASK-529): per-bracket retention rates must
+    // be byte-identical pre- and post-compaction. The tombstone scan
+    // and on-disk segment rewrites preserve the row-level facts that
+    // feed the matcher, so any drift in a specific bracket's rate
+    // would indicate that compaction is altering — not just
+    // physically reorganizing — retention-relevant data.
+    let pre_rates = bracket_retention_pairs(&pre_logical);
+    let post_rates = bracket_retention_pairs(&post);
+    assert_eq!(
+        pre_rates, post_rates,
+        "compaction must preserve per-bracket retention rates"
+    );
+}
+
+/// Collect `(bracket_index, retention_rate)` pairs from a
+/// RETENTION query result, sorted by bracket. The desugared output
+/// columns are `bracket: Int64` and `retention_rate: Float64` per
+/// `crates/bqlite-planner/src/opt/desugar_retention.rs:155`.
+///
+/// Float comparison through `Vec` equality is exact here: both
+/// queries route through the same aggregation kernel on the same
+/// post-DELETE row set, so the produced doubles are bitwise equal.
+fn bracket_retention_pairs(result: &ExecutionResult) -> Vec<(i64, f64)> {
+    use arrow::array::Float64Array;
+    let mut pairs: Vec<(i64, f64)> = Vec::new();
+    for batch in &result.rows {
+        let bracket_col = batch
+            .column_by_name("bracket")
+            .expect("`bracket` column present")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("`bracket` column is Int64");
+        let rate_col = batch
+            .column_by_name("retention_rate")
+            .expect("`retention_rate` column present")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("`retention_rate` column is Float64");
+        for i in 0..batch.num_rows() {
+            pairs.push((bracket_col.value(i), rate_col.value(i)));
+        }
+    }
+    pairs.sort_by_key(|(b, _)| *b);
+    pairs
 }
 
 #[test]

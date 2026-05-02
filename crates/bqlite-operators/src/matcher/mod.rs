@@ -1058,4 +1058,238 @@ mod tests {
         let op = SequenceMatchOperator::from_compiled_nfa(nfa, false, schema.clone());
         assert_eq!(op.output_schema().columns().len(), schema.columns().len());
     }
+
+    /// Build a 2-step NFA with `$plan` binding on step 1 (signup) and a
+    /// check on step 2 (purchase). Mirrors `prop_bindings.rs::nfa_a_then_b_with_binding`
+    /// but uses signup/purchase event types so the test reads naturally.
+    fn brackets_with_binding_nfa(brackets: BracketSpec, emit_all: bool) -> CompiledNfa {
+        use bqlite_planner::compile::VariableBindingDef;
+        let mut relevant = BTreeSet::new();
+        relevant.insert("signup".to_string());
+        relevant.insert("purchase".to_string());
+        CompiledNfa {
+            states: vec![
+                NfaState {
+                    transitions: vec![Transition {
+                        event_type: "signup".into(),
+                        predicates: Vec::new(),
+                        bind_variables: vec![0],
+                        check_variables: Vec::new(),
+                        target: 1,
+                    }],
+                    poison_transitions: Vec::new(),
+                },
+                NfaState {
+                    transitions: vec![Transition {
+                        event_type: "purchase".into(),
+                        predicates: Vec::new(),
+                        bind_variables: Vec::new(),
+                        check_variables: vec![0],
+                        target: 2,
+                    }],
+                    poison_transitions: Vec::new(),
+                },
+                NfaState {
+                    transitions: Vec::new(),
+                    poison_transitions: Vec::new(),
+                },
+            ],
+            accept_state: 2,
+            relevant_event_types: relevant,
+            pattern_class: PatternClass::GeneralNfa,
+            variable_bindings: vec![VariableBindingDef {
+                name: "plan".into(),
+                source_column: "plan".into(),
+                column_index: 2,
+                bind_step: 0,
+            }],
+            global_window: None,
+            session_window: false,
+            emit_all,
+            brackets: Some(brackets),
+            state_to_step: vec![0, 1, 2],
+        }
+    }
+
+    fn make_batch_with_plan(events: &[(&str, i64, &str)]) -> RecordBatch {
+        let event_types: Vec<&str> = events.iter().map(|(e, _, _)| *e).collect();
+        let timestamps: Vec<i64> = events.iter().map(|(_, t, _)| *t).collect();
+        let plans: Vec<&str> = events.iter().map(|(_, _, p)| *p).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("event_type", DataType::Utf8View, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("plan", DataType::Utf8View, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringViewArray::from(event_types)),
+                Arc::new(Int64Array::from(timestamps)),
+                Arc::new(StringViewArray::from(plans)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn brackets_bindings_output_schema(emit_all: bool) -> OperatorSchema {
+        let mut cols = vec![
+            ColumnDef {
+                name: "entity_id".into(),
+                bql_type: BqlType::String,
+                nullable: false,
+                default_value: None,
+            },
+            ColumnDef {
+                name: "match_duration".into(),
+                bql_type: BqlType::Int,
+                nullable: true,
+                default_value: None,
+            },
+            ColumnDef {
+                name: "$plan".into(),
+                bql_type: BqlType::String,
+                nullable: false,
+                default_value: None,
+            },
+        ];
+        if emit_all {
+            cols.push(ColumnDef {
+                name: "step_reached".into(),
+                bql_type: BqlType::Int,
+                nullable: false,
+                default_value: None,
+            });
+        }
+        cols.push(ColumnDef {
+            name: "bracket".into(),
+            bql_type: BqlType::Int,
+            nullable: false,
+            default_value: None,
+        });
+        cols.push(ColumnDef {
+            name: "bracket_end".into(),
+            bql_type: BqlType::Int,
+            nullable: false,
+            default_value: None,
+        });
+        OperatorSchema::new(cols).unwrap()
+    }
+
+    /// BRACKETS × variable-binding composition (TASK-529 plan §30.6 /
+    /// query-language.md §4.12 + §8). Two `$plan` values for one
+    /// entity, exclusive brackets, EMIT ALL: each track must produce
+    /// exactly N rows, the per-bracket `step_reached` must match the
+    /// completion's bracket, and the `$plan` column must carry the
+    /// correct binding value on every per-bracket row.
+    #[test]
+    fn brackets_compose_with_variable_bindings_emit_all_exclusive() {
+        let durations = vec![
+            86_400_000_000_000,      // 1d
+            7 * 86_400_000_000_000,  // 7d
+            14 * 86_400_000_000_000, // 14d
+            30 * 86_400_000_000_000, // 30d
+        ];
+        let nfa = brackets_with_binding_nfa(
+            BracketSpec {
+                durations: durations.clone(),
+                cumulative: false,
+                span: bqlite_ast::span::Span::EMPTY,
+            },
+            true,
+        );
+        let op = SequenceMatchOperator::from_compiled_nfa(
+            nfa,
+            false, // MATCH FIRST
+            brackets_bindings_output_schema(true),
+        );
+
+        let entity = EntityId::String("u1".into());
+        let mut state = op.create_state(&entity);
+
+        // free track: anchor=0, purchase at delta=2d → bracket 1 `(1d, 7d]`.
+        // pro  track: anchor=0, purchase at delta=20d → bracket 3 `(14d, 30d]`.
+        let day = 86_400_000_000_000_i64;
+        let batch = make_batch_with_plan(&[
+            ("signup", 0, "free"),
+            ("signup", 0, "pro"),
+            ("purchase", 2 * day, "free"),
+            ("purchase", 20 * day, "pro"),
+        ]);
+        op.process_sub_batch(&mut state, &batch);
+
+        let result = op.finish_entity(state).expect("must produce rows");
+        // 2 tracks × 4 brackets = 8 rows under EMIT ALL.
+        assert_eq!(result.num_rows(), 8);
+
+        let plan_arr = result
+            .column_by_name("$plan")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let bracket_arr = result
+            .column_by_name("bracket")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let bracket_end_arr = result
+            .column_by_name("bracket_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let step_arr = result
+            .column_by_name("step_reached")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // Group rows by `$plan` to make the assertion order-independent —
+        // track iteration order is implementation-defined in the
+        // matcher's HashMap, and asserting positionally would be a
+        // false-positive guard. Build a map of plan → ordered-by-bracket
+        // step_reached values.
+        let mut by_plan: HashMap<String, Vec<(i64, i64, i64)>> = HashMap::new();
+        for i in 0..result.num_rows() {
+            by_plan
+                .entry(plan_arr.value(i).to_string())
+                .or_default()
+                .push((
+                    bracket_arr.value(i),
+                    bracket_end_arr.value(i),
+                    step_arr.value(i),
+                ));
+        }
+        assert_eq!(by_plan.len(), 2, "expected one entry per binding track");
+        for entries in by_plan.values_mut() {
+            entries.sort_by_key(|(b, _, _)| *b);
+        }
+
+        // free: completion at delta=2d → bracket 1; bracket 0 carries
+        // anchor (step_reached=1); brackets 2, 3 are dropouts (0).
+        assert_eq!(
+            by_plan["free"],
+            vec![
+                (0, durations[0], 1),
+                (1, durations[1], 2),
+                (2, durations[2], 0),
+                (3, durations[3], 0),
+            ],
+            "free track per-bracket step_reached and bracket_end"
+        );
+        // pro: completion at delta=20d → bracket 3; bracket 0 = anchor (1);
+        // brackets 1, 2 dropouts (0).
+        assert_eq!(
+            by_plan["pro"],
+            vec![
+                (0, durations[0], 1),
+                (1, durations[1], 0),
+                (2, durations[2], 0),
+                (3, durations[3], 2),
+            ],
+            "pro track per-bracket step_reached and bracket_end"
+        );
+    }
 }

@@ -75,6 +75,13 @@ pub enum ExplainNode {
         step_count: usize,
         /// Whether the operator emits intermediate step-reached events.
         emit_all: bool,
+        /// Bracket upper-bound durations (nanoseconds, anchor-relative).
+        /// `None` when `BRACKETS` is not set on the pattern; otherwise a
+        /// strictly ascending list as declared by the user.
+        brackets: Option<Vec<i64>>,
+        /// Whether the bracket spec is `CUMULATIVE`. Only meaningful when
+        /// `brackets` is `Some`.
+        cumulative: bool,
         input: Box<ExplainNode>,
     },
     /// Wave 3: hash aggregate operator.
@@ -234,6 +241,17 @@ pub fn build_explain_node(plan: &PhysicalPlan) -> ExplainNode {
             strategy: format_match_strategy(&seq.strategy),
             step_count: seq.compiled_nfa.states.len(),
             emit_all: seq.demand.needs_step_reached,
+            brackets: seq
+                .compiled_nfa
+                .brackets
+                .as_ref()
+                .map(|b| b.durations.clone()),
+            cumulative: seq
+                .compiled_nfa
+                .brackets
+                .as_ref()
+                .map(|b| b.cumulative)
+                .unwrap_or(false),
             input: Box::new(build_explain_node(&seq.input)),
         },
         PhysicalPlan::Aggregate(agg) => ExplainNode::Aggregate {
@@ -431,12 +449,19 @@ fn write_node(node: &ExplainNode, indent: usize, buf: &mut String) {
             strategy,
             step_count,
             emit_all,
+            brackets,
+            cumulative,
             input,
         } => {
             buf.push_str(&format!("{pad}SequenceMatch\n"));
             buf.push_str(&format!("{pad}  strategy   : {strategy}\n"));
             buf.push_str(&format!("{pad}  steps      : {step_count}\n"));
             buf.push_str(&format!("{pad}  emit_all   : {emit_all}\n"));
+            if let Some(durations) = brackets {
+                let formatted: Vec<String> = durations.iter().map(|d| format_nanos(*d)).collect();
+                buf.push_str(&format!("{pad}  brackets   : [{}]\n", formatted.join(", ")));
+                buf.push_str(&format!("{pad}  cumulative : {cumulative}\n"));
+            }
             write_node(input, indent + 1, buf);
         }
         ExplainNode::Aggregate {
@@ -1830,5 +1855,177 @@ mod tests {
         assert!(text.contains("MergeSources"), "missing: {text}");
         assert!(text.contains("events, clicks"), "missing tables: {text}");
         assert!(text.contains("entity_id ASC"), "missing order: {text}");
+    }
+
+    #[test]
+    fn format_sequence_match_no_brackets_omits_bracket_lines() {
+        let node = ExplainNode::SequenceMatch {
+            strategy: "StepCounter".into(),
+            step_count: 3,
+            emit_all: false,
+            brackets: None,
+            cumulative: false,
+            input: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(text.contains("SequenceMatch"), "missing header: {text}");
+        assert!(text.contains("strategy   : StepCounter"));
+        assert!(text.contains("steps      : 3"));
+        assert!(text.contains("emit_all   : false"));
+        // Without brackets, no bracket / cumulative lines should render.
+        assert!(
+            !text.contains("brackets"),
+            "no-brackets case should omit the brackets line: {text}"
+        );
+        assert!(
+            !text.contains("cumulative"),
+            "no-brackets case should omit the cumulative line: {text}"
+        );
+    }
+
+    #[test]
+    fn format_sequence_match_with_brackets_renders_durations_and_cumulative() {
+        // 1d, 7d, 14d, 30d in nanoseconds.
+        let node = ExplainNode::SequenceMatch {
+            strategy: "StepCounter".into(),
+            step_count: 2,
+            emit_all: true,
+            brackets: Some(vec![
+                86_400_000_000_000,
+                7 * 86_400_000_000_000,
+                14 * 86_400_000_000_000,
+                30 * 86_400_000_000_000,
+            ]),
+            cumulative: false,
+            input: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(
+            text.contains("brackets   : [1d, 7d, 14d, 30d]"),
+            "expected formatted bracket list, got:\n{text}"
+        );
+        assert!(
+            text.contains("cumulative : false"),
+            "missing cumulative line: {text}"
+        );
+    }
+
+    #[test]
+    fn format_sequence_match_cumulative_brackets_renders_cumulative_true() {
+        let node = ExplainNode::SequenceMatch {
+            strategy: "StepCounter".into(),
+            step_count: 2,
+            emit_all: true,
+            brackets: Some(vec![86_400_000_000_000, 7 * 86_400_000_000_000]),
+            cumulative: true,
+            input: Box::new(scan_node()),
+        };
+        let text = format_explain(&node);
+        assert!(
+            text.contains("cumulative : true"),
+            "expected cumulative=true: {text}"
+        );
+    }
+
+    #[test]
+    fn build_explain_sequence_match_propagates_brackets_from_compiled_nfa() {
+        // Construct a `SequenceMatchPhysical` whose `CompiledNfa` carries
+        // a populated `BracketSpec` and verify `build_explain_node`
+        // surfaces the bracket list and cumulative flag through to the
+        // rendered EXPLAIN node — the same path RETENTION queries take
+        // after desugaring (`opt::desugar_retention` → `SequenceMatch`
+        // with `brackets` set on `CompiledNfa`).
+        use crate::compile::{CompiledNfa, MatchStrategy, NfaState, PatternClass};
+        use crate::demand::DemandSet;
+        use crate::physical::SequenceMatchPhysical;
+        use crate::BracketSpec;
+        use bqlite_ast::span::Span;
+        use bqlite_core::{BqlType, ColumnDef, OperatorSchema};
+        use std::collections::BTreeSet;
+
+        let scan = ScanPhysical {
+            table: "events".into(),
+            query_range: None,
+            reader_range: None,
+            scan_predicates: vec![],
+            projected_columns: vec![],
+            output_schema: events_schema_os(),
+            entity_key_col: "entity_id".into(),
+            timestamp_col: "ts".into(),
+            sample: None,
+        };
+        let mut relevant = BTreeSet::new();
+        relevant.insert("signup".to_string());
+        relevant.insert("purchase".to_string());
+        let compiled_nfa = CompiledNfa {
+            states: vec![
+                NfaState {
+                    transitions: vec![],
+                    poison_transitions: vec![],
+                },
+                NfaState {
+                    transitions: vec![],
+                    poison_transitions: vec![],
+                },
+                NfaState {
+                    transitions: vec![],
+                    poison_transitions: vec![],
+                },
+            ],
+            accept_state: 2,
+            relevant_event_types: relevant,
+            pattern_class: PatternClass::LinearSimple,
+            variable_bindings: vec![],
+            global_window: None,
+            session_window: false,
+            emit_all: true,
+            brackets: Some(BracketSpec {
+                durations: vec![
+                    86_400_000_000_000,
+                    7 * 86_400_000_000_000,
+                    14 * 86_400_000_000_000,
+                    30 * 86_400_000_000_000,
+                ],
+                cumulative: true,
+                span: Span::EMPTY,
+            }),
+            state_to_step: vec![0, 1, 2],
+        };
+        let output_schema = OperatorSchema::new(vec![
+            ColumnDef::required("entity_id", BqlType::String),
+            ColumnDef::required("step_reached", BqlType::Int),
+            ColumnDef::required("bracket", BqlType::Int),
+            ColumnDef::required("bracket_end", BqlType::Int),
+        ])
+        .unwrap();
+        let demand = DemandSet {
+            needs_step_reached: true,
+            ..DemandSet::default()
+        };
+        let seq = SequenceMatchPhysical {
+            compiled_nfa,
+            strategy: MatchStrategy::StepCounter,
+            match_all: false,
+            demand,
+            execution_config: crate::compile::MatchExecutionConfig::default(),
+            fused_aggregate: None,
+            input: Box::new(PhysicalPlan::Scan(scan)),
+            output_schema,
+        };
+        let plan = PhysicalPlan::SequenceMatch(Box::new(seq));
+        let node = build_explain_node(&plan);
+        let text = format_explain(&node);
+        assert!(
+            text.contains("SequenceMatch"),
+            "expected SequenceMatch header:\n{text}"
+        );
+        assert!(
+            text.contains("brackets   : [1d, 7d, 14d, 30d]"),
+            "missing bracket durations:\n{text}"
+        );
+        assert!(
+            text.contains("cumulative : true"),
+            "missing cumulative flag:\n{text}"
+        );
     }
 }

@@ -23,18 +23,13 @@
 //! | RETENTION standard brackets | runs (coverage caveat below) |
 //! | RETENTION `cumulative: true` | runs (coverage caveat below) |
 //!
-//! ## Coverage caveat for RETENTION
+//! ## RETENTION coverage (TASK-529 complete)
 //!
-//! The matcher runtime does not yet enumerate brackets — it emits a
-//! single row per match (or partial) with a null `bracket` /
-//! `bracket_end`. The planner now advertises those columns as nullable
-//! so `MATCH … BRACKETS [..]` (and the RETENTION sugar that desugars
-//! to it) complete end-to-end, but the per-bracket `GROUP BY bracket`
-//! in the desugared STATS collapses to a single null group. The
-//! RETENTION tests therefore assert only `row_count() > 0` — they
-//! verify the pipeline runs and feeds downstream STATS, not per-
-//! bracket retention rates. Per-bracket correctness requires a
-//! matcher change (bracket enumeration in `step_counter` / `nfa`).
+//! The matcher emits one row per `(entity, binding track, bracket)`
+//! with real `bracket` / `bracket_end` values, so the desugared
+//! `STATS … GROUP BY bracket` produces per-bracket retention rates.
+//! Both standard (exclusive) and cumulative bracket modes are
+//! asserted to specific rates per bracket in the tests below.
 //!
 //! FIRST/LAST/NTH previously shared a separate gated-by-`__seq_id`
 //! status; they now use the scan's `(entity_id, ts, __seq_id)`
@@ -487,29 +482,48 @@ fn nth_returns_third_matching_event() {
 // ─────────────────────────────────────────────────────────────────────────────
 // RETENTION (query-language.md §6.3)
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// RETENTION tests are currently gated with `#[ignore]` because
-// `MATCH … BRACKETS [..]` — which RETENTION desugars to per
-// `crates/bqlite-planner/src/opt/desugar_retention.rs` — panics at
-// output-batch assembly. The matcher's output builder
-// (`crates/bqlite-operators/src/matcher/output.rs` ~line 97) enforces
-// the declared non-null `bracket` column but the matcher produces a
-// null `bracket` for at least one code path, yielding:
-//
-//     "Invalid argument error: Column 'bracket' is declared as
-//      non-nullable but contains null values"
-//
-// Both the sugar path (`RETENTION(...)`) and the desugared form
-// (`MATCH FIRST SEQUENCE(...) BRACKETS [..]`) hit the same panic.
+
+/// Collect `(bracket, retention_rate)` pairs from a desugared RETENTION
+/// query result. The desugared shape is documented in
+/// `crates/bqlite-planner/src/opt/desugar_retention.rs:155` (output
+/// columns: `bracket`, `retention_rate`). Pairs are returned sorted by
+/// bracket index — the underlying STATS aggregate does not promise an
+/// order — so callers can assert positionally.
+fn collect_retention_pairs(result: &ExecutionResult) -> Vec<(i64, f64)> {
+    use arrow::array::Float64Array;
+    let mut pairs: Vec<(i64, f64)> = Vec::new();
+    for batch in &result.rows {
+        let bracket_col = batch
+            .column_by_name("bracket")
+            .expect("`bracket` column present")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("`bracket` column is Int64");
+        let rate_col = batch
+            .column_by_name("retention_rate")
+            .expect("`retention_rate` column present")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("`retention_rate` column is Float64");
+        for i in 0..batch.num_rows() {
+            pairs.push((bracket_col.value(i), rate_col.value(i)));
+        }
+    }
+    pairs.sort_by_key(|(b, _)| *b);
+    pairs
+}
 
 #[test]
 fn retention_standard_brackets_produces_expected_rates() {
-    // Three entities, one signup each on day 0, purchase on days
-    // 2, 9, 20 respectively. Expected desugared output:
+    // Three entities, one signup each on day 0; purchases on days
+    // 2, 9, 20 respectively. Brackets `[1d, 7d, 14d, 30d]` (right-closed):
+    //   - u_early (delta=2d)  → bracket 1 `(1d, 7d]`
+    //   - u_mid   (delta=9d)  → bracket 2 `(7d, 14d]`
+    //   - u_late  (delta=20d) → bracket 3 `(14d, 30d]`
+    // RETENTION desugars to:
     //   | STATS retention_rate = AVG(CAST(step_reached >= 2 AS INT))
     //     GROUP BY bracket
-    //
-    // Per desugar_retention.rs:155 the output columns are literally
+    // Per desugar_retention.rs:155 the output columns are
     // `bracket` (the bracket key) and `retention_rate`.
     let (_tmp, mut db, engine) = fresh_db("retention-standard");
     insert_rows(
@@ -531,18 +545,36 @@ fn retention_standard_brackets_produces_expected_rates() {
             &mut db,
         )
         .expect("RETENTION standard brackets");
-    assert!(
-        result.row_count() > 0,
-        "retention must produce at least one bracket row"
+
+    let pairs = collect_retention_pairs(&result);
+    assert_eq!(
+        pairs.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "expected one row per bracket index 0..=3, got {pairs:?}"
     );
+    let third = 1.0_f64 / 3.0_f64;
+    let eps = 1e-9;
+    let rates: Vec<f64> = pairs.iter().map(|(_, r)| *r).collect();
+    assert!(
+        (rates[0] - 0.0).abs() < eps,
+        "bracket 0 (delta=0) → no conversions, rate must be 0; got {rates:?}"
+    );
+    assert!((rates[1] - third).abs() < eps, "bracket 1 ≈ 1/3: {rates:?}");
+    assert!((rates[2] - third).abs() < eps, "bracket 2 ≈ 1/3: {rates:?}");
+    assert!((rates[3] - third).abs() < eps, "bracket 3 ≈ 1/3: {rates:?}");
 }
 
 #[test]
 fn retention_cumulative_brackets_are_monotone() {
-    // With `cumulative: true`, each bracket's rate includes every
-    // prior bracket's conversions; the resulting sequence of rates
-    // is non-decreasing by construction. This test asserts that
-    // monotonicity property on a three-entity, day-2/9/20 fixture.
+    // With `cumulative: true`, bracket M's rate counts entities whose
+    // activity fell in any bracket 0..=M. Same fixture as the
+    // exclusive test (purchases at days 2/9/20):
+    //   - bracket 0 (delta ≤ 1d): 0 of 3 = 0.0
+    //   - bracket 1 (delta ≤ 7d): u_early only → 1/3
+    //   - bracket 2 (delta ≤ 14d): u_early + u_mid → 2/3
+    //   - bracket 3 (delta ≤ 30d): all three → 1.0
+    // Asserting exact rates (not just monotonicity) catches off-by-one
+    // bracket-window or cumulative-pass regressions.
     let (_tmp, mut db, engine) = fresh_db("retention-cumulative");
     insert_rows(
         &engine,
@@ -568,7 +600,32 @@ fn retention_cumulative_brackets_are_monotone() {
             &mut db,
         )
         .expect("RETENTION cumulative");
-    assert!(result.row_count() > 0);
+
+    let pairs = collect_retention_pairs(&result);
+    assert_eq!(
+        pairs.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    let rates: Vec<f64> = pairs.iter().map(|(_, r)| *r).collect();
+    let third = 1.0_f64 / 3.0_f64;
+    let two_thirds = 2.0_f64 / 3.0_f64;
+    let eps = 1e-9;
+    assert!((rates[0] - 0.0).abs() < eps, "bracket 0: {rates:?}");
+    assert!((rates[1] - third).abs() < eps, "bracket 1 ≈ 1/3: {rates:?}");
+    assert!(
+        (rates[2] - two_thirds).abs() < eps,
+        "bracket 2 ≈ 2/3: {rates:?}"
+    );
+    assert!((rates[3] - 1.0).abs() < eps, "bracket 3 = 1.0: {rates:?}");
+    // Monotone non-decreasing follows from the exact values above; the
+    // explicit pairwise check is kept as a property guard in case the
+    // fixture ever drifts.
+    for w in rates.windows(2) {
+        assert!(
+            w[0] <= w[1] + eps,
+            "cumulative rates must be non-decreasing: {rates:?}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
