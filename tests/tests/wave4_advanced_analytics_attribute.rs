@@ -425,6 +425,11 @@ fn sessionize_then_attribute_pipeline_does_not_error_on_multi_session_entity() {
         ],
     );
 
+    // Use touchpoint_key: event_type (NOT NULL) rather than channel (nullable)
+    // to avoid the v1 demand-propagation limitation where nullable columns are
+    // null-padded in SESSIONIZE output. This smoke test only asserts row counts;
+    // channel-specific attribution semantics are covered by the primary A6 test
+    // in wave4_advanced_analytics_attribute_cohort_join.rs.
     let result = engine
         .query(
             "events | SESSIONIZE(gap: 30m) \
@@ -432,7 +437,7 @@ fn sessionize_then_attribute_pipeline_does_not_error_on_multi_session_entity() {
                  conversion: purchase, \
                  touchpoints: ad_click, \
                  window: 7d, \
-                 touchpoint_key: channel\
+                 touchpoint_key: event_type\
              )",
             &mut db,
         )
