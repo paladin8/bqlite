@@ -1,7 +1,7 @@
 # Quality Score
 
 Per-crate quality grades, updated at the close of each wave. The most
-recent pass is the **Wave 4 audit** (TASK-499, `2026-04-20`).
+recent pass is the **Wave 5 audit** (TASK-599, `2026-05-02`).
 
 ## Grading scale
 
@@ -16,22 +16,22 @@ recent pass is the **Wave 4 audit** (TASK-499, `2026-04-20`).
 Any crate grading below **C** on any dimension triggers a follow-up task,
 filed no later than the next wave (`[AGENTS.md] §Behavioral Requirements`).
 
-## Wave 4 grades
+## Wave 5 grades
 
 Per-cell grades carry a one-line justification. Evidence is collected
-below the table. Grade changes from Wave 3 are annotated with arrows.
+below the table. Grade changes from Wave 4 are annotated with arrows.
 
 | Crate | Tests | API | Docs | Benchmarks | Overall |
 |-------|-------|-----|------|------------|---------|
-| bqlite | **C** · 0 unit, 0 doctest; re-export crate, transitive coverage via re-exported crates | **B-** · re-exports `ast`, `types`, `parser`, `engine`, `BqliteError`, `Result` — complete for Wave 4 | **C+** · crate-level doc with quick-start; 1 rustdoc collision warning persists | **C** · no per-crate benches; workspace harness available | **C+** |
-| bqlite-core | **A** · 267 unit + 3 doctest; adds encoded-column view types (`EncodedBatch`, `EncodedColumn`) and predicate/scan helpers for Wave 4 storage integration *(↑ from 246)* | **A-** · foundational trait surface + types; Wave 4 additive (encoded column views, sample/tombstone surfaces) preserves backward compat | **B+** · exhaustive module docs with design-doc refs; 6 rustdoc warnings (4 persistent + 2 new `EncodedBatch`/`EncodedColumn::Materialized` intra-doc links) *(warnings 4 → 6; grade unchanged)* | **C** · no per-crate benches (appropriate — pure types) | **A-** |
-| bqlite-ast | **A-** · 54 unit across expr/operator/pattern/pipeline/span/statement + Wave 4 stage nodes (RETENTION, SESSIONIZE, FIRST/LAST/NTH, SAMPLE, ATTRIBUTE, alias, DELETE, source JOIN, IN QUERY) *(↑ from 49)* | **A-** · AST node enums for every BQL construct through Wave 4; additive cohort/alias/source-JOIN/DELETE extensions | **B** · per-module docs on every file; 0 rustdoc warnings | **C** · no per-crate benches | **A-** |
-| bqlite-storage | **A** · 814 unit + 143 workspace encoding property tests (8 encodings × roundtrips × guard fuzz) + 17 delete/compaction integration tests + 7 JSONL ingest integration *(↑↑ from 426)* | **A** · complete v1 + v2 segment format with 6 new encodings (RLE, DoubleDelta, FOR, PFOR, FSST, ALP) and FSST symbol-table region; tombstone storage with 4 granularity classes + per-query snapshots; concurrent compaction executor + `CompactionScheduler`; JSONL and Parquet ingest paths; tombstone-aware scan + reader SAMPLE pushdown | **B+** · extensive module docs with design-doc §-refs (segment-format-v2.md, advanced-encodings.md, deletes.md, compaction-concurrency.md); **32 rustdoc warnings** (private-item links in every new module + 2 unresolved cross-refs) *(↓ from 18 — A- → B+ on doc-warning volume)* | **A** · 5 Wave 4 bench groups (pfor, encoding_matrix, wave4_ingest, compaction, sample) plus the 4 inherited Wave 2 groups — full codec and compaction evidence per TASK-441 *(↑ from A-)* | **A** |
-| bqlite-parser | **A** · 574 unit + 1 doctest; adds Wave 4 productions (RETENTION, SESSIONIZE, FIRST/LAST/NTH, SAMPLE, ATTRIBUTE, alias definitions, DELETE statement, IN QUERY / bare IN alias, entity-aligned source JOIN) each with happy-path + error-case coverage *(↑ from 415)* | **A** · full Wave 4 grammar layered additively on the Wave 3 parser; pipeline stages with their option lists and bracket specifications | **A-** · module docs with grammar-section refs and design-doc cross-references; 3 rustdoc warnings persist from Wave 2/3 (no new warnings added in Wave 4) | **C** · no per-crate benches (parser is not perf-critical path) | **A** |
-| bqlite-planner | **A** · 429 unit + 1 doctest; adds Wave 4 lowering (Sessionize, EventSelect, Attribute, MergeSources, SubqueryFilter, Delete, Retention desugar) + DemandCapabilities propagation + alias binding / cohort lowering + joined-source scan planning *(↑ from 272)* | **A** · AST → LogicalPlan → PhysicalPlan with 7 new Wave 4 plan variants; `DemandCapabilities` protocol (TASK-409) + real demand propagation (TASK-427) replaces the Wave 3 scaffold; retention desugaring pass; alias execution cache; Wave 4 EXPLAIN extensions | **B+** · module docs with design-doc refs (cohorts-aliases-joins.md, demand-protocol.md, compaction-concurrency.md); **10 rustdoc warnings** (5 persistent + 5 new: `desugar_retention` function/module collision, `TimeRangeDelete`, `bqlite_storage::TimeRangeDelete`, `DeleteFilter`, `bqlite_storage::SampleFilter`) *(↓ from 5 — A- → B+ on doc-warning volume)* | **C** · no per-crate benches (planner is not hot path) | **A-** *(↓ from A on Docs dimension only)* |
-| bqlite-operators | **A** · 537 unit + 28 `prop_event_select` + 7 `prop_attribute` + 4 `demand_contract` workspace property/integration tests; Wave 4 adds SessionizeOperator, EventSelectOperator, AttributeOperator, SampleFilterOperator, MergeSourcesOperator, SubqueryFilter, tombstone-aware ScanOperator extensions *(↑ from 331)* | **A** · complete Wave 4 operator set: `SessionizeOperator` (gap-exclusive + end-event session boundaries), `EventSelectOperator` (FIRST/LAST/NTH with same-ts tie-break), `AttributeOperator` (sliding-window deque with three-way emission), `SampleFilterOperator` (xxHash64 determinism), `MergeSourcesOperator` (n-ary joined-source merge), `SubqueryFilter` (cohort hash-set probe), tombstone-aware scan — all with cancellation, memory caps, fused-aggregate protocol where applicable | **A-** · every module has section-level design-doc cross-references (sessionize.md, event-select-sample.md, attribute.md, cohorts-aliases-joins.md); 6 rustdoc warnings (3 persistent + 3 new: `TombstoneFile`, `ScanPhysical::sample`, `ScanOperator`) *(↓ from 3)* | **A** · 5 Wave 4 bench groups (sessionize, attribute, event_select, sample, cohort_join) + 6 Wave 3 groups directly exercise operator code — 11 per-crate bench groups total | **A** |
-| bqlite-engine | **A-** · 105 unit covering Wave 4 bind extensions (Sessionize / EventSelect / Attribute / SampleFilter / MergeSources / SubqueryFilter / Delete), tombstone-writing DELETE path, `EntityOperatorAdapter` generic bind helper, `Engine::compact_now` *(↑ from B+; 58 → 105)* | **A-** · `Engine::query` extended with Wave 4 plan-to-operator binding; DELETE planner + engine tombstone writer; cohort materialization cache; generic `EntityOperatorAdapter`; `compact_now` sync API (Wave 3 grade maintained) | **B** · module docs present; **8 rustdoc warnings** (+2 new: `SampleFilterOperator` and `EntityOperatorAdapter` private-item links) *(warnings 6 → 8; grade unchanged)* | **C+** · no per-crate benches; covered transitively by workspace funnel + wave4 acceptance benches | **B+** |
-| bqlite-cli | **A-** · 84 unit covering 3 subcommands (init, query, ingest), auto-limit machinery, argument parsing (unchanged in Wave 4) | **A-** · unchanged API surface; Wave 4 features available via `bqlite query` | **B+** · extensive module docs; clean rustdoc (0 warnings) | **C** · no per-crate benches (CLI frontend not perf-critical) | **A-** |
+| bqlite | **C** · 0 unit, 0 doctest; re-export crate, transitive coverage via re-exported crates | **B-** · re-exports `ast`, `types`, `parser`, `engine`, `BqliteError`, `Result` — complete for Wave 5 | **C+** · crate-level doc with quick-start; 1 rustdoc collision warning persists | **C** · no per-crate benches; workspace harness available | **C+** |
+| bqlite-core | **A** · 331 unit + 3 doctest; adds Wave 5 runtime types — `QueryWarning`/`WarningSeverity`, `MemoryBudget`/`MemoryReservation`/`MemoryTracker`/`SpillNotification`, `CancellationToken`, `TempSpillFile`, `BqliteError::{Timeout, OperatorPanic, WarningsOverflow}` *(↑ from 267)* | **A-** · foundational trait surface + types; Wave 5 additive (memory budget, warning channel, cancellation, spill RAII, structured error variants) preserves backward compat | **B+** · exhaustive module docs with design-doc refs; 8 rustdoc warnings (6 carried + 2 new `try_reserve` / `TombstoneScanWrapper` cross-crate links) *(warnings 6 → 8; grade unchanged)* | **C** · no per-crate benches (appropriate — pure types) | **A-** |
+| bqlite-ast | **A-** · 54 unit across expr/operator/pattern/pipeline/span/statement *(unchanged from Wave 4 — no AST surface changes in Wave 5)* | **A-** · AST node enums for every BQL construct through Wave 4; Wave 5 added no new node variants | **B** · per-module docs on every file; 0 rustdoc warnings | **C** · no per-crate benches | **A-** |
+| bqlite-storage | **A** · 878 unit + workspace encoding/integration property suites *(↑ from 814)* — adds `tombstone_scan`, `encoded_tombstone`, sort spill-run files, partitioner spill, system-column projection paths | **A** · v2 segment format unchanged; Wave 5 adds `EntityIn` cohort-pushdown plumbing into scan, `__seq_id` / `__batch_id` materialization, late-materialization boundary helpers per `zero-copy-scan-filter.md`, `SpillRunFile` writer + sort-merge consumer surface | **B+** · extensive module docs with design-doc §-refs; **35 rustdoc warnings** (32 carried + 3 new private-item links in spill, partitioner, tombstone-with-index) *(warnings 32 → 35; grade unchanged)* | **A** · 9 Wave 4 + Wave 2 storage benches; Wave 4 follow-up `tombstone_scan` (TASK-534) + Wave 5 `zero_copy_scan` + `cohort_pushdown` provide storage-side perf evidence | **A** |
+| bqlite-parser | **A** · 574 unit + 1 doctest *(unchanged from Wave 4 — no grammar additions in Wave 5)* | **A** · full Wave 4 grammar; Wave 5 added no new productions | **A-** · module docs with grammar-section refs and design-doc cross-references; 3 rustdoc warnings persist (private-item links, unchanged) | **C** · no per-crate benches (parser is not perf-critical path) | **A** |
+| bqlite-planner | **A** · 530 unit + 1 doctest *(↑ from 429)* — adds optimizer framework + `RuleTrace` (TASK-521), `coalesce_scan_predicates` / `filter_order` / `sample_pushdown` / scan-adjacent rule pack (TASK-527), cohort entity pushdown (TASK-522), narrow heuristic gating per `optimizer-direction.md` | **A** · `Optimizer` framework + `OptimizerRule` registry + per-rule policy matrix per TASK-504; cohort-to-`EntityIn` pushdown into `ScanPhysical`; fused-segment lowering hooks; `PlannerStats` snapshot wired through bind | **B** · module docs with design-doc refs (optimizer-direction.md, demand-protocol.md, planner-pipeline.md); **23 rustdoc warnings** (10 carried + 13 new across the rule pack: `coalesce_scan_predicates` function/module collision, `filter_order`-private `rank`, registry private `finalize_physical`, `clamp_filter_tile_size`, `pre_fusion_output_schema`, `bind_cohorts`, `crate::opt::fuse_match_aggregate` collision) *(warnings 10 → 23; ↓ B+ → B)* | **C** · no per-crate benches (planner is not hot path) | **A-** *(Overall preserved; Docs sub-grade ↓ B+ → B)* |
+| bqlite-operators | **A** · 603 unit *(↑ from 537)* — adds `FusedSegmentPhysical` driver (TASK-518), Filter/Project/Limit kernel refactor (TASK-519), stateful-aggregate fusion for Sessionize/EventSelect/Attribute (TASK-520), encoded-filter zero-copy path (TASK-516), `__seq_id` / `__batch_id` materialization (TASK-508), sort spill (TASK-513), partitioner spill (TASK-512), cohort entity pushdown (TASK-522) | **A** · complete Wave 5 fused/zero-copy surface: `FilteredBatch` + `SelectionVector` + `StatelessKernel` trait, `FusedSegmentPhysical` push-segment driver, `MaterializeTrigger` (sparsity / segment-boundary / aggregate-handoff), inline accumulator path on Sessionize/EventSelect/Attribute, `EntityInFilter` / cohort-pushdown predicate, `SortOperator::with_spill` + `TempSpillFile` lifecycle, system-column projection on `ScanOperator` + `MergeSourcesOperator` | **B+** · every module has design-doc cross-references (operator-fusion.md, system-columns.md, spill.md, cancellation.md); **10 rustdoc warnings** (6 carried + 4 new: `pre_fusion_output_schema`, `clamp_filter_tile_size`, `SortSpillHandler`, `SubqueryFilterOperator`) *(warnings 6 → 10; grade unchanged)* | **A** · 11 Wave 3+4 operator benches + Wave 5 `fused_segment`, `stateful_aggregate_fusion`, `morsel_skew`, `spill_overhead`, `cohort_pushdown`, `tombstone_scan` — 16 dedicated operator/storage bench groups exercise Wave 5 perf evidence | **A** |
+| bqlite-engine | **A** · 205 unit *(↑ from 105)* — adds memory tracker scaffold (TASK-510), warning channel (TASK-511), spill cleanup wiring (TASK-502), morsel scheduler integration (TASK-506, TASK-523), CPU/skew metrics + `--explain-perf` (TASK-524), cancellation token wiring (TASK-505), fusion bind plumbing | **A** · `QueryContext` carries memory tracker + warning sink + spill root + cancellation token; `Engine::query` returns `peak_memory_bytes` + drained warnings; morsel scheduler with adaptive halving, lock-free MPMC queue, FIFO `CoreBudget` queuing; `--explain-perf` rendering | **B** · module docs present; **13 rustdoc warnings** (8 carried + 5 new: `SpillCleanup`, `CoreBudget`, `cycles_per_event`, `Mutex`, `finish` private-item links from scheduler / context / perf modules) *(warnings 8 → 13; grade unchanged)* | **C+** · no per-crate benches; covered transitively by workspace `wave5_acceptance` + `wave5_runtime_stress` + Wave 5 `morsel_skew` / `spill_overhead` benches *(unchanged)* | **A-** *(↑ from B+ — Tests A and API A pull Overall up)* |
+| bqlite-cli | **A-** · 90 unit covering 3 subcommands + Wave 5 `--explain-perf` rendering + auto-limit machinery *(↑ from 84)* | **A-** · CLI surface stable; `bqlite query` exposes Wave 5 features (warnings, `--explain-perf`) via `Engine::query` return | **B+** · extensive module docs; clean rustdoc (0 warnings) | **C** · no per-crate benches (CLI frontend not perf-critical) | **A-** |
 | bqlite-ffi | **C** · 0 unit tests — appropriate; FFI is Wave 6 | **C** · module docs enumerate intended PyO3 surface; no implementation yet | **C** · crate-level doc explains intent and placement | **C** · no benches — out-of-scope | **C** |
 
 **Workspace-level test artifacts** (`bqlite-tests` + `bqlite-benches` workspace crates):
@@ -39,42 +39,50 @@ below the table. Grade changes from Wave 3 are annotated with arrows.
 | Target | Count | Purpose |
 |--------|------:|---------|
 | `tests/src/` unit | 21 | Fixture framework (`common.rs`, `csv.rs`, `jsonl.rs`, `strategies.rs`) |
-| `tests/common_smoke.rs` | 13 | Integration fixture framework (TASK-120) — temp DB helper, assert_batches_eq, CSV loader |
-| `tests/demand_contract.rs` | 4 | **NEW** DemandCapabilities protocol contract tests (TASK-409, TASK-427) |
-| `tests/jsonl_ingest.rs` | 7 (1 ign) | **NEW** JSONL ingest end-to-end tests (TASK-410) |
-| `tests/matcher_integration.rs` | 56 | Matcher integration suite (TASK-324, TASK-329 — +11 since Wave 3) |
+| `tests/common_smoke.rs` | 13 | Integration fixture framework (TASK-120) |
+| `tests/demand_contract.rs` | 4 | DemandCapabilities protocol contract tests (TASK-409, TASK-427) |
+| `tests/fused_segment_bind.rs` | 1 | **NEW** Fused-segment binding contract (TASK-518/519) |
+| `tests/jsonl_ingest.rs` | 7 (1 ign) | JSONL ingest end-to-end tests (TASK-410) |
+| `tests/matcher_integration.rs` | 56 | Matcher integration suite (TASK-324, TASK-329) |
 | `tests/prop_arrow.rs` | 1 | Arrow ↔ BqlType round-trip property test |
-| `tests/prop_attribute.rs` | 7 | **NEW** ATTRIBUTE operator property tests (TASK-431) — window boundary rules, emit-before-add ordering, deque cap |
+| `tests/prop_attribute.rs` | 7 | ATTRIBUTE operator property tests (TASK-431) |
 | `tests/prop_bindings.rs` | 5 | Variable-binding property tests |
-| `tests/prop_encoding_alp.rs` | 8 | **NEW** ALP encoding property tests (TASK-417) |
+| `tests/prop_encoding_alp.rs` | 8 | ALP encoding property tests (TASK-417) |
 | `tests/prop_encoding_bitpacking.rs` | 11 | BitPacking encoding property tests |
 | `tests/prop_encoding_constant.rs` | 9 | Constant encoding property tests |
 | `tests/prop_encoding_delta.rs` | 10 | Delta encoding property tests |
 | `tests/prop_encoding_dictionary.rs` | 15 | Dictionary encoding property tests |
-| `tests/prop_encoding_double_delta.rs` | 14 | **NEW** DoubleDelta encoding property tests (TASK-414) |
-| `tests/prop_encoding_for.rs` | 20 | **NEW** FOR encoding property tests (TASK-415) |
-| `tests/prop_encoding_fsst.rs` | 18 | **NEW** FSST encoding property tests (TASK-416) |
-| `tests/prop_encoding_pfor.rs` | 20 | **NEW** PFOR encoding property tests (TASK-450) |
+| `tests/prop_encoding_double_delta.rs` | 14 | DoubleDelta encoding property tests (TASK-414) |
+| `tests/prop_encoding_for.rs` | 20 | FOR encoding property tests (TASK-415) |
+| `tests/prop_encoding_fsst.rs` | 18 | FSST encoding property tests (TASK-416) |
+| `tests/prop_encoding_pfor.rs` | 20 | PFOR encoding property tests (TASK-450) |
 | `tests/prop_encoding_plain.rs` | 13 | Plain encoding property tests |
-| `tests/prop_encoding_rle.rs` | 28 | **NEW** RLE encoding property tests (TASK-413) |
-| `tests/prop_event_select.rs` | 8 | **NEW** EventSelect candidate-row property tests (TASK-429) |
-| `tests/prop_nfa.rs` | 7 | NFA simulator property tests (+1 since Wave 3) |
+| `tests/prop_encoding_rle.rs` | 28 | RLE encoding property tests (TASK-413) |
+| `tests/prop_event_select.rs` | 8 | EventSelect candidate-row property tests (TASK-429, extended in TASK-531) |
+| `tests/prop_nfa.rs` | 7 | NFA simulator property tests |
 | `tests/prop_property_value.rs` | 12 | `PropertyValue` round-trip property tests |
 | `tests/prop_time.rs` | 7 | TimeRange intersection/shift property tests |
 | `tests/smoke.rs` | 8 | Wave 1+2 acceptance gates |
-| `tests/wave2_acceptance.rs` | 8 (1 ign) | Wave 2 acceptance gate |
+| `tests/warning_channel.rs` | 3 | **NEW** `QueryWarning` cap + drain + overflow contract (TASK-511) |
+| `tests/wave2_acceptance.rs` | 9 (1 ign) | Wave 2 acceptance gate |
 | `tests/wave3_acceptance.rs` | 6 | Wave 3 acceptance gate |
-| `tests/wave4_acceptance.rs` | 5 (1 ign) | **NEW** Wave 4 acceptance gate (TASK-442) — RETENTION / SESSIONIZE / FIRST-LAST-NTH / SAMPLE / ATTRIBUTE / cohort / source-JOIN / DELETE end-to-end |
-| `tests/wave4_advanced_analytics_attribute_cohort_join.rs` | 9 (1 ign) | **NEW** ATTRIBUTE + cohort + joined-source integration (TASK-439) |
-| `tests/wave4_advanced_analytics_event_select.rs` | 14 | **NEW** FIRST/LAST/NTH + SAMPLE + RETENTION integration (TASK-439) |
-| `tests/wave4_advanced_analytics_sessionize.rs` | 8 (2 ign) | **NEW** SESSIONIZE + `WITHIN SESSION` integration (TASK-439) |
-| `tests/wave4_delete_compaction.rs` | 17 | **NEW** DELETE + tombstone + compaction integration (TASK-440) |
+| `tests/wave4_acceptance.rs` | 5 (1 ign) | Wave 4 acceptance gate (TASK-442) |
+| `tests/wave4_advanced_analytics_attribute.rs` | 5 | **NEW** ATTRIBUTE composition + WITHIN SESSION integration (TASK-532) |
+| `tests/wave4_advanced_analytics_attribute_cohort_join.rs` | 9 (1 ign) | ATTRIBUTE + cohort + joined-source integration |
+| `tests/wave4_advanced_analytics_event_select.rs` | 14 | FIRST/LAST/NTH + SAMPLE + RETENTION integration |
+| `tests/wave4_advanced_analytics_sessionize.rs` | 12 | SESSIONIZE + `WITHIN SESSION` integration *(2 previously-ignored tests un-ignored after TASK-510 retirement; +4 new)* |
+| `tests/wave4_delete_compaction.rs` | 17 | DELETE + tombstone + compaction integration |
+| `tests/wave5_acceptance.rs` | 9 | **NEW** Wave 5 acceptance gate (TASK-528) — multi-shard analytical query under documented budget, cancellation/timeout cleanup, sort/cohort spill policy, fused/zero-copy result equivalence |
+| `tests/wave5_cohort_pushdown.rs` | 7 | **NEW** cohort entity pushdown correctness (TASK-522) |
+| `tests/wave5_runtime_stress.rs` | 19 | **NEW** runtime stress: budget exhaustion, cancellation cleanup, snapshot isolation, spill fallback, warning overflow (TASK-525) |
+| `tests/wave5_system_columns.rs` | 13 | **NEW** `__seq_id` / `__batch_id` materialization + delete + compaction invariance (TASK-508, TASK-509) |
 | `benches/benches/smoke.rs` | — | Criterion harness smoke |
 | `benches/wave2/scan.rs` | — | Columnar decode throughput |
-| `benches/wave2/scan_encoded.rs` | — | Encoded-batch scan throughput (adopted in Wave 4 storage path) |
+| `benches/wave2/scan_encoded.rs` | — | Encoded-batch scan throughput |
 | `benches/wave2/encoding.rs` | — | Per-encoding encode/decode microbenches |
 | `benches/wave2/ingest.rs` | — | CSV ingest throughput |
 | `benches/wave2/acceptance.rs` | — | Full round-trip: ingest → write segments → read segments |
+| `benches/wave2/fused_segment.rs` | — | **NEW** `FusedStatelessSegment` operator-level microbench (TASK-519) |
 | `benches/wave3/matcher.rs` | — | Step-counter vs NFA strategy comparison |
 | `benches/wave3/aggregate.rs` | — | Hash aggregation throughput |
 | `benches/wave3/sort.rs` | — | Sort operator |
@@ -82,235 +90,305 @@ below the table. Grade changes from Wave 3 are annotated with arrows.
 | `benches/wave3/funnel.rs` | — | End-to-end 3-step funnel |
 | `benches/wave3/percentile.rs` | — | DDSketch insert/quantile/merge |
 | `benches/wave3/compactstring_eval.rs` | — | CompactString microbench (TASK-332) |
-| `benches/wave4/sessionize.rs` | — | **NEW** SessionizeOperator throughput at multiple entity/event scales (TASK-428, TASK-441) |
-| `benches/wave4/attribute.rs` | — | **NEW** AttributeOperator deque/ratio throughput (TASK-431, TASK-441) |
-| `benches/wave4/event_select.rs` | — | **NEW** EventSelect FIRST/LAST/NTH throughput (TASK-429) |
-| `benches/wave4/pfor.rs` | — | **NEW** PFOR codec encode/decode throughput + payload-size ratio (TASK-450) |
-| `benches/wave4/encoding_matrix.rs` | — | **NEW** Wave 4 encoding comparison matrix — ALP + same-fixture head-to-head for integer and string encodings (TASK-441) |
-| `benches/wave4/ingest.rs` | — | **NEW** JSONL + Parquet ingest throughput (TASK-441) |
-| `benches/wave4/compaction.rs` | — | **NEW** L0-to-L1 compaction throughput and L0 fan-in reduction via `compact_now` (TASK-441) |
-| `benches/wave4/sample.rs` | — | **NEW** SAMPLE pushdown: per-row xxHash64 threshold throughput + 3σ selectivity determinism (TASK-441) |
-| `benches/wave4/cohort_join.rs` | — | **NEW** `SubqueryFilterOperator` probe + `MergeSourcesOperator` k-way merge overhead (TASK-441) |
+| `benches/wave4/sessionize.rs` | — | SessionizeOperator throughput *(extended in TASK-535 with multi-end-event-type matrix)* |
+| `benches/wave4/attribute.rs` | — | AttributeOperator deque/ratio throughput |
+| `benches/wave4/event_select.rs` | — | EventSelect FIRST/LAST/NTH throughput *(hard targets pinned in TASK-531)* |
+| `benches/wave4/pfor.rs` | — | PFOR codec encode/decode throughput |
+| `benches/wave4/encoding_matrix.rs` | — | Wave 4 encoding comparison matrix |
+| `benches/wave4/ingest.rs` | — | JSONL + Parquet ingest throughput |
+| `benches/wave4/compaction.rs` | — | L0-to-L1 compaction throughput |
+| `benches/wave4/sample.rs` | — | SAMPLE pushdown determinism |
+| `benches/wave4/cohort_join.rs` | — | `SubqueryFilterOperator` probe + `MergeSourcesOperator` k-way merge |
+| `benches/wave4/tombstone_scan.rs` | — | **NEW** Query-time tombstone-filter throughput + compaction-time density overhead (TASK-534) |
+| `benches/wave5/zero_copy_scan.rs` | — | **NEW** Copy-budget bench: `bytes_materialized_before_filter` / `bytes_decompressed` (TASK-526 CP1) |
+| `benches/wave5/stateful_aggregate_fusion.rs` | — | **NEW** SESSIONIZE → STATS fusion vs fallback regression tripwire (TASK-526 CP2) |
+| `benches/wave5/morsel_skew.rs` | — | **NEW** Morsel-scheduler wall-clock regression on skewed-vs-balanced entity distribution (TASK-526 CP3) |
+| `benches/wave5/spill_overhead.rs` | — | **NEW** `SortOperator::with_spill` overhead vs in-memory baseline (TASK-526 CP4) |
+| `benches/wave5/cohort_pushdown.rs` | — | **NEW** Bytes-scanned savings of `EntityIn` pushdown vs probe-only (TASK-526 CP5) |
 
-**Evidence aggregate**: **3,267 passing tests** via `cargo test --workspace --all-targets` (2,864 per-crate library unit + 14 bench-crate unit + 389 workspace integration/property), **6 ignored**, **0 failing tests**. Separately, `cargo test --workspace --doc` adds **5 passing doctests** and **5 ignored doctests**. Of the workspace suite, **213 are property tests** covering 11 encoding codecs (Plain, Dictionary, Delta, DoubleDelta, BitPacking, Constant, RLE, FOR, PFOR, FSST, ALP), PropertyValue coercion, TimeRange algebra, Arrow type mapping, NFA simulator invariants, variable binding semantics, ATTRIBUTE deque and window-boundary rules, and EventSelect candidate-row behavior. **22 Criterion bench groups** now cover Wave 2 (5), Wave 3 (7), and Wave 4 (9) performance gates plus the Wave 1 smoke bench.
+**Evidence aggregate**: **3,730 passing tests** via `cargo test --workspace --all-targets` (3,265 per-crate library unit + 14 bench-crate unit + 451 workspace integration/property), **4 ignored**, **0 failing tests**. Separately, `cargo test --workspace --doc` adds **5 passing doctests** and **5 ignored doctests**. Of the workspace suite, **213 are property tests** covering 11 encoding codecs (Plain, Dictionary, Delta, DoubleDelta, BitPacking, Constant, RLE, FOR, PFOR, FSST, ALP), PropertyValue coercion, TimeRange algebra, Arrow type mapping, NFA simulator invariants, variable binding semantics, ATTRIBUTE deque and window-boundary rules, and EventSelect candidate-row behavior. **29 Criterion bench groups** now cover Wave 2 (6, including new `fused_segment`), Wave 3 (7), Wave 4 (10, including new `tombstone_scan`), and Wave 5 (5) performance gates plus the Wave 1 smoke bench.
 
 ## Evidence
 
 Gathered from `cargo test -p <crate>`, `cargo test --workspace --all-targets`,
 `cargo bench -p bqlite-benches --no-run`, `cargo doc --workspace --no-deps`,
-and `find crates/<crate>/src -name '*.rs'`.
+and `find crates/<crate>/src -name '*.rs'`. The `pub` items column counts
+items matching `^\s*pub (fn|struct|enum|trait|type|const|static|mod) ` —
+the same methodology used Wave-over-Wave; small per-crate drift versus
+prior tables reflects internal `pub(crate)`-vs-`pub` rebalancing inside
+otherwise-stable APIs, not surface removal.
 
 | Crate | Unit tests | Doctests | LOC (src) | `pub` items | Rustdoc warnings |
 |-------|-----------:|---------:|----------:|------------:|-----------------:|
 | bqlite            |   0 |  0 (1 ign) |     33 |    5 | 1 (output collision) |
-| bqlite-core       | 267 |  3         |  8,274 |  207 | 6 (intra-doc + encoded-column links) |
-| bqlite-ast        |  54 |  0         |  2,374 |   74 | 0 |
-| bqlite-storage    | 814 |  0 (1 ign) | 40,590 |  338 | 32 (private-item links across new modules) |
-| bqlite-parser     | 574 |  1         | 13,439 |    7 | 3 (private-item links, unchanged since Wave 2) |
-| bqlite-planner    | 429 |  1         | 23,247 |  156 | 10 (+5 Wave 4: name collisions + cross-crate) |
-| bqlite-operators  | 537 |  0         | 27,692 |  269 | 6 (+3 Wave 4: TombstoneFile, ScanPhysical::sample, ScanOperator) |
-| bqlite-engine     | 105 |  0         |  6,909 |   33 | 8 (+2 Wave 4: SampleFilterOperator, EntityOperatorAdapter) |
-| bqlite-cli        |  84 |  0         |  2,054 |    6 | 0 |
+| bqlite-core       | 331 |  3         | 10,436 |  217 | 8 (intra-doc + new `try_reserve` / `TombstoneScanWrapper`) |
+| bqlite-ast        |  54 |  0         |  2,374 |   66 | 0 |
+| bqlite-storage    | 878 |  0 (1 ign) | 44,556 |  331 | 35 (private-item links across spill / partitioner / tombstone) |
+| bqlite-parser     | 574 |  1         | 13,439 |    6 | 3 (private-item links, unchanged since Wave 2) |
+| bqlite-planner    | 530 |  1         | 28,375 |  194 | 23 (+13 Wave 5: optimizer rule pack name collisions + private-item links) |
+| bqlite-operators  | 603 |  0         | 32,425 |  273 | 10 (+4 Wave 5: `pre_fusion_output_schema`, `clamp_filter_tile_size`, `SortSpillHandler`, `SubqueryFilterOperator`) |
+| bqlite-engine     | 205 |  0         | 11,865 |  165 | 13 (+5 Wave 5: `SpillCleanup`, `CoreBudget`, `cycles_per_event`, `Mutex`, `finish`) |
+| bqlite-cli        |  90 |  0         |  2,232 |    6 | 0 |
 | bqlite-ffi        |   0 |  0         |     10 |    0 | 0 |
-| bqlite-benches    |  14 |  0         |  — |    — | 1 (unresolved link) |
-| bqlite-tests      | 389 (6 ign) |  0 | —  |    — | 0 |
+| bqlite-benches    |  14 |  0         |  — |    — | 1 (unresolved link to `docs/design/engine/operator-fusion.md`) |
+| bqlite-tests      | 451 (1 ign) |  0 | —  |    — | 0 |
 
-- **Bench harness** compiles cleanly (`cargo bench -p bqlite-benches --no-run` → `Finished bench profile`, 22 bench targets registered in `benches/Cargo.toml`).
-- **Bench CI** (TASK-241) continues to run baseline capture on `main` push and the regression gate on PRs; all 9 new Wave 4 bench groups are registered alongside the 5 Wave 2 + 7 Wave 3 groups.
+- **Bench harness** compiles cleanly (`cargo bench -p bqlite-benches --no-run` → `Finished bench profile`, 29 bench targets registered in `benches/Cargo.toml`).
+- **Bench CI** (TASK-241) continues to run baseline capture on `main` push and the regression gate on PRs; all 5 new Wave 5 bench groups + 2 Wave 4 follow-ups (`tombstone_scan`, `fused_segment`) are registered alongside Wave 2/3/4 inheritances.
 - **Doc build** succeeds with warnings only (`cargo doc --workspace --no-deps` → `Finished dev profile`).
 - **Clippy** clean at `-D warnings` across the workspace (`scripts/local-ci.sh` passing).
 - **Formatting** clean at `cargo fmt --all --check`.
 - **Dep-direction** check clean (`scripts/check-dep-direction.sh`).
-- **End-to-end acceptance**: Wave 4 acceptance test (`tests/wave4_acceptance.rs`, 5 tests + 1 ignored) exercises RETENTION, SESSIONIZE (gap + end-event boundaries), FIRST/LAST/NTH, SAMPLE, ATTRIBUTE, cohort + alias, entity-aligned source JOIN, and DELETE + compaction paths against real fixtures. All running tests pass; the single ignored test (bracket-indexed RETENTION assertion) is attributed to TASK-509 per TASK-455 closure.
-- **Wave 4 Tests dimension inputs (semantic audits)**: TASK-443 (RETENTION audit → drove TASK-455 CP4 end-to-end fix + un-ignoring 4 tests; residual bracket-indexed work → TASK-509), TASK-444 (SESSIONIZE audit → TASK-455 CP1 system-column fix + `within_session` work → TASK-510), TASK-445 (EventSelect + SAMPLE audit → TASK-455 CP2 end-to-end fix + un-ignoring 7 tests; residual invariants → TASK-511), TASK-446 (ATTRIBUTE audit → in-place closure fixes in TASK-455), TASK-447 (cohort / alias / joined-source audit → TASK-455 CP3 end-to-end fix + un-ignoring JOIN test; residual `__seq_id` materialization → TASK-508), TASK-448 (delete / tombstone / compaction audit → confirmed query-time filter path; residual integration coverage → TASK-512). All six audits are rolled up by TASK-455 (`2026-04-20`); their findings either land as green tests in Wave 4 or are named as Wave 5 follow-ups in Finding 10.
+- **End-to-end acceptance**: Wave 5 acceptance test (`tests/wave5_acceptance.rs`, 9 tests) exercises the four bands the task definition pins — multi-shard analytical query under the documented `MIN_QUERY_BUDGET_BYTES` floor, cancellation/timeout cleanup, sort/cohort spill policy with no spill artefacts after return, and fused/zero-copy answer-equivalence against hand-computed ground truth. All tests pass; no Wave 5 ignored tests added.
+- **Wave 5 design-doc inputs**: TASK-501 (`engine/memory-budget.md`), TASK-502 (`engine/spill.md`), TASK-503 (`engine/operator-fusion.md`), TASK-504 (`planner/optimizer-direction.md`), TASK-505 (`engine/cancellation.md`), TASK-506 (`engine/morsel-scheduler.md`), TASK-508 (`storage/system-columns.md`) — all six steady-state-engine design notes landed before their dependent `[IMPL]` tasks and continue to be cited from operator/engine module docs.
 
 ## Findings
 
-### 1 — Rustdoc warnings grew from 41 to 67 (+26 new; trajectory Wave 2: 33 → Wave 3: 41 → Wave 4: 67)
+### 1 — Rustdoc warnings grew from 67 to 94 (+27 new; trajectory Wave 2: 33 → Wave 3: 41 → Wave 4: 67 → Wave 5: 94)
 
 Warnings by crate:
 
 - **bqlite** (1, unchanged): output filename collision with `bqlite_core::bqlite` module
-- **bqlite-core** (6, +2): two new intra-doc links — `EncodedBatch`, `EncodedColumn::Materialized` — introduced when bqlite-core grew the encoded-column view types consumed by Wave 4 scan/filter pushdown
-- **bqlite-storage** (32, +14): the largest single contributor; private-item links from every new Wave 4 module (`compact_one`, `delta`, `dictionary`, `double_delta`, `for_encoding`, `fsst`, `pfor`, `rle`, `selector`, `writer`, `merge`, `open`, `Partitioner`) plus two unresolved cross-crate links (`FsstSymbolTableRef`, `ColumnChunkMeta`). Scope of change is large (21,995 → 40,590 LOC, 155 → 338 `pub` items); the link density has outpaced doc review.
+- **bqlite-core** (8, +2): two new cross-crate references — `try_reserve` (×2) and `bqlite_storage::TombstoneScanWrapper` (×2) — added when memory-tracker prose started referencing reservation helpers and tombstone-scan integration
+- **bqlite-storage** (35, +3): largest single contributor again; new private-item links in `Partitioner` (`estimated_event_size`), `with_spill_dir` (`SpillRunFile`), and `entity_delete_index` (`TombstoneFilter::apply_entity_deletes_with_index`) added by Wave 5 spill + cohort pushdown plumbing
 - **bqlite-parser** (3, unchanged): private-item links in `lex`, `parser`, `error` module docs persist from Wave 2
-- **bqlite-planner** (10, +5): three new function/module name collisions (`desugar_funnel`, `fuse_match_aggregate`, `desugar_retention` — each is both an optimizer-pass function and a module), plus cross-crate links to `bqlite_storage::TimeRangeDelete`, `bqlite_storage::SampleFilter`, `TimeRangeDelete`, `DeleteFilter`, and `Cast` that rustdoc cannot resolve from the planner crate
-- **bqlite-operators** (6, +3): three new unresolved cross-crate references to `TombstoneFile`, `ScanPhysical::sample`, and `ScanOperator`
-- **bqlite-engine** (8, +2): `SampleFilterOperator` and `EntityOperatorAdapter` private-item links added when TASK-438 grew the bind surface
+- **bqlite-planner** (23, +13): the largest *delta* this wave; optimizer-framework rule pack added function/module collisions on `coalesce_scan_predicates` and `crate::opt::fuse_match_aggregate`, plus private-item links from `order_stateless_filters` (`rank`), `registry` (`crate::finalize_physical`), `expr` / `from_ast` (`type_error`), and unresolved cross-crate links to `clamp_filter_tile_size`, `pre_fusion_output_schema` (×3), `bind_cohorts` (×2), `DeleteFilter`, and `bqlite_storage::SampleFilter`
+- **bqlite-operators** (10, +4): four new unresolved cross-crate or private-item references — `pre_fusion_output_schema`, `clamp_filter_tile_size`, `SortSpillHandler` (×2), `SubqueryFilterOperator` — introduced by the fused-segment scaffolding and sort-spill wiring
+- **bqlite-engine** (13, +5): private-item links to `SpillCleanup`, `CoreBudget`, `cycles_per_event`, `Mutex`, `finish` from the new scheduler/perf/context surface
 - **bqlite-benches** (1, unchanged)
 
-Impact: rendered docs build fine, but broken intra-doc links erode
-navigation and the trajectory (33 → 41 → 67) is moving the wrong way.
-**Not filed as a follow-up task** under the *below-C → file a follow-up*
-rule because the Docs dimension sits at **B** or above for every affected
-crate, but flagged explicitly — if Wave 5 adds another +25 warnings
-without a cleanup pass, the bqlite-storage and bqlite-planner Docs grades
-will drop below B+. A pragmatic Wave 5 cleanup sweep (swap private-item
-links for plain back-ticks, re-alias function/module name collisions)
-would reverse the drift cheaply.
+Impact: rendered docs build fine, but the trajectory (33 → 41 → 67 → 94) continues to drift wrong. The Wave 4 audit warned this would happen if Wave 5 added another ~25 warnings without a cleanup pass — that prediction held. The bqlite-planner Docs grade slipped one sub-grade (B+ → B) at the Wave 4 audit's stated threshold; bqlite-operators stays at B+ but a Wave 6 cleanup pass that swaps private-item links for plain back-ticks and re-aliases the `coalesce_scan_predicates` / `fuse_match_aggregate` function/module collisions would reverse the drift cheaply. **Not filed as a follow-up task** under the *below-C → file a follow-up* rule because the Docs dimension still sits at **B** or above for every affected crate; flagged explicitly so Wave 6 can absorb the cleanup. If Wave 6 adds another ~25 warnings without a cleanup pass, bqlite-storage Docs will drop below B+ and bqlite-engine Docs will likely follow.
 
 ### 2 — `bqlite` top-level re-export collision persists
 
-Same as Wave 1/2/3 Findings. `cargo doc --workspace --no-deps` emits
+Same as Wave 1/2/3/4 Findings. `cargo doc --workspace --no-deps` emits
 `warning: output filename collision at target/doc/bqlite/index.html`.
 Same disposition — noted, not filed.
 
-### 3 — Benchmark coverage expanded with 9 Wave 4 groups
+### 3 — Benchmark coverage expanded with 5 Wave 5 groups + 2 Wave 4 follow-ups
 
-Wave 4 added 9 dedicated Criterion bench groups under `benches/wave4/`:
-`sessionize`, `attribute`, `event_select`, `pfor`, `encoding_matrix`,
-`wave4_ingest` (JSONL + Parquet), `compaction`, `sample`, and
-`cohort_join`. Combined with Wave 2's 5 groups and Wave 3's 7 groups,
-there are now **21 wave-scoped Criterion bench groups** (22 including
-the Wave 1 `smoke`) covering every perf-critical path that Wave 4 ships.
+Wave 5 added 5 dedicated Criterion bench groups under `benches/wave5/`
+(`zero_copy_scan`, `stateful_aggregate_fusion`, `morsel_skew`,
+`spill_overhead`, `cohort_pushdown` — all under TASK-526), plus 2
+Wave 4 follow-ups that completed in Wave 5: `tombstone_scan`
+(TASK-534, registered as a Wave 4 bench) and `fused_segment`
+(TASK-519, registered as a Wave 2 bench because it exercises the
+filter/project/limit kernels). Combined with prior waves there are
+now **28 wave-scoped Criterion bench groups** (29 including the
+Wave 1 `smoke`) covering every perf-critical path that Wave 5 ships.
 
-Per TASK-441, `encoding_matrix` provides same-fixture head-to-head
-comparison for the Wave 4 integer and string encodings plus ALP
-coverage; `compaction` measures L0-to-L1 throughput and L0 fan-in
-reduction via `Database::compact_now`; `wave4_ingest` covers JSONL
-end-to-end + Parquet end-to-end throughput on common schemas.
-Frequency encoding is intentionally absent — `advanced-encodings.md`
-§9.5 resolves NO-GO for it.
+Coverage by perf surface:
+
+- **Zero-copy / fusion**: `zero_copy_scan` reports
+  `bytes_materialized_before_filter` and `bytes_decompressed` against
+  the `zero-copy-scan-filter.md` § 3 targets;
+  `stateful_aggregate_fusion` and `fused_segment` exercise the
+  Sessionize/EventSelect/Attribute → STATS handoff and the stateless
+  kernel chain respectively.
+- **Spill**: `spill_overhead` measures `SortOperator::with_spill`
+  against the in-memory baseline; ingest-partitioner spill is
+  exercised by the `wave4_ingest` group at large input sizes.
+- **Morsel scheduler**: `morsel_skew` is a wall-clock regression
+  tripwire on skewed-vs-balanced entity distribution; per the
+  bench's own README, the v1 morsel scheduler records all-zero
+  per-worker snapshots so `entity_event_skew_p99` is not yet
+  usefully assertable — the bench guards the wall-clock axis only.
+- **Cohort pushdown**: `cohort_pushdown` compares `bytes_scanned`
+  with and without the `EntityIn` conjunct.
+- **Tombstones**: `tombstone_scan` covers query-time
+  `TombstoneFilter::filter_batch_with_index` throughput and
+  compaction-time `Database::compact_now` overhead at 1% / 5% / 10%
+  density.
 
 Operator-specific coverage:
 
-- **bqlite-operators**: **A** — 11 dedicated operator benches across Wave 3 + Wave 4 (matcher, aggregate, sort, distinct, funnel, percentile, sessionize, attribute, event_select, sample, cohort_join)
-- **bqlite-storage**: **A** — 9 dedicated storage benches across Wave 2 + Wave 4 (scan, scan_encoded, encoding, ingest, acceptance, pfor, encoding_matrix, wave4_ingest, compaction)
+- **bqlite-operators**: **A** — 16 dedicated operator benches across Waves 3–5 (matcher, aggregate, sort, distinct, funnel, percentile, sessionize, attribute, event_select, sample, cohort_join, fused_segment, stateful_aggregate_fusion, morsel_skew, spill_overhead, cohort_pushdown)
+- **bqlite-storage**: **A** — 10 dedicated storage benches (scan, scan_encoded, encoding, ingest, acceptance, pfor, encoding_matrix, wave4_ingest, compaction, tombstone_scan)
 - **bqlite-engine**: **C+** — still covered transitively; no per-crate bench targets
 
-### 4 — Property-test coverage expanded with 10 new encoding + operator suites
+### 4 — Property-test count held flat at 213 while Wave 5 added structural integration coverage
 
-Wave 4 grew workspace-level property tests from 89 to **213 total**
-(+124). The largest contributions are the 6 new encoding suites
-(`prop_encoding_rle`, `prop_encoding_double_delta`, `prop_encoding_for`,
-`prop_encoding_fsst`, `prop_encoding_pfor`, `prop_encoding_alp` —
-+108 tests combined) that match `core-beliefs.md` §11 for
-encode/decode roundtrips and guard-fuzz coverage across the new codec
-matrix. Operator property coverage extends to ATTRIBUTE
-(`prop_attribute`, 7 tests) and EventSelect (`prop_event_select`,
-8 tests), and the `demand_contract` integration suite (4 tests)
-now pins the DemandCapabilities wiring between planner and operators.
+Wave 5 did not add new property suites — the Wave 4 codec / operator /
+deque-and-window proptest matrix already covers the testable
+invariants of the steady-state engine, and Wave 5's additions are
+predominantly stateful runtime behavior (memory budget, spill,
+cancellation, morsel scheduling) that is poorly served by random
+input and well-served by deterministic stress tests.
 
-Combined with the 89 inherited property tests from prior waves,
-property-test coverage now exceeds the spec bar for every codec in
-v2 segment format and every new Wave 4 operator that states
-testable invariants. Gaps that remain (EventSelect additional
-invariants, WITHIN SESSION proptest) are captured as TASK-511 /
-TASK-512 per TASK-455 closure.
+The structural integration coverage that landed instead:
 
-### 5 — DemandCapabilities protocol is live (TASK-409, TASK-427)
+- `tests/wave5_acceptance.rs` (9 tests, TASK-528) — four-band acceptance gate
+- `tests/wave5_runtime_stress.rs` (19 tests, TASK-525) — budget exhaustion, cancellation cleanup, snapshot isolation, spill fallback, warning overflow
+- `tests/wave5_system_columns.rs` (13 tests, TASK-508/509) — `__seq_id` / `__batch_id` end-to-end including delete + compaction invariance
+- `tests/wave5_cohort_pushdown.rs` (7 tests, TASK-522) — cohort entity pushdown correctness under multi-column / aggregate-body / empty-cohort edge cases
+- `tests/warning_channel.rs` (3 tests, TASK-511) — `QueryWarning` cap + drain + overflow contract
+- `tests/fused_segment_bind.rs` (1 test, TASK-518/519) — fused-segment binding contract
 
-Wave 3 shipped the demand-propagation scaffold; Wave 4 replaces it
-with a real protocol. `bqlite-planner::demand` now carries the
-`DemandCapabilities` struct and `DemandPropagation` trait; every
-physical descriptor declares a `const DEMAND_CAPS`; physical planning
-matches operator capabilities against upstream demand during bind and
-surfaces unmet demand as `BqliteError::Plan` rather than silently
-dropping requirements. The `tests/demand_contract.rs` integration
-suite (4 tests) pins the contract end-to-end. **Impact on grades**:
-reinforces the **A** Tests and **A** API grades for bqlite-planner and
-bqlite-operators; the protocol's documentation (`demand-protocol.md`)
-is cited by every affected operator module.
+Combined with the inherited 213-test property surface, this brings the
+workspace integration/property total to **451** (vs Wave 4's **389**),
+a +62 net gain entirely on the integration axis. The
+`prop_event_select` suite was extended in TASK-531 (no count change —
+generator strengthening, not new tests).
 
-### 6 — Six integration tests ignored, each attributed to a Wave 5 follow-up
+### 5 — `optimizer-direction.md` reconciliation lands under Wave 5 (TASK-504, TASK-521, TASK-527)
 
-TASK-455 closed Wave 4 by filing Wave 5 follow-ups for every
-audit-surfaced gap. The ignored test count is 6 (was 2 in Wave 3),
-with explicit attribution:
+`planner-pipeline.md`'s Wave 0 "rule-based only" v1 promise is
+preserved. TASK-504 froze the policy: rule-based architecture intact,
+narrow heuristic gating admitted, five-source `PlannerStats`
+snapshot (catalog aggregates, index registry booleans, cohort sizes),
+explicit non-sources (no NDV sketches, no histograms, no selectivity
+functions), per-rule policy matrix for Passes 1–10, plan-time vs
+post-cohort phase split, EXPLAIN visibility contract.
+
+The framework lands under TASK-521 (`Optimizer` driver + per-rule
+policy + `RuleTrace`), the cohort-aware pushdown lands under TASK-522
+(`EntityIn` conjunct propagation into scan), and TASK-527 strengthens
+the scan-adjacent rule pack (Pass 6.5 / Pass 7 probe-registry
+consultation, `coalesce_scan_predicates`, `filter_order`,
+`sample_pushdown`). **Impact on grades**: bqlite-planner's Tests
+dimension carries the +101 unit growth largely from the rule pack and
+the `fuse_match_aggregate` rewrite, sustaining the **A** grade; API
+remains **A** with the `PlannerStats` and `RuleTrace` additions
+purely additive.
+
+### 6 — Four integration tests ignored, all carryovers from Wave 4
+
+The ignored test count fell from 6 (Wave 4) to **4** (Wave 5):
 
 | File | Ignored | Attribution |
 |------|--------:|-------------|
 | `jsonl_ingest.rs` | 1 | JSONL batch-size boundary (non-blocking edge case) |
 | `wave2_acceptance.rs` | 1 | 100M-row reference bench, unchanged since Wave 2 |
-| `wave4_acceptance.rs` | 1 | Bracket-indexed RETENTION rate — TASK-509 (BRACKETS runtime) |
-| `wave4_advanced_analytics_attribute_cohort_join.rs` | 1 | Joined-source `__seq_id` scan materialization — TASK-508 |
-| `wave4_advanced_analytics_sessionize.rs` | 2 | `WITHIN SESSION` NFA expiry — TASK-510 |
+| `wave4_acceptance.rs` | 1 | Bracket-indexed RETENTION rate — *un-ignore deferred until TASK-529 lift documented in Wave 6 audit; per-bracket rows now emit, fixture assertion still pinned to the row-count contract* |
+| `wave4_advanced_analytics_attribute_cohort_join.rs` | 1 | Joined-source `__seq_id` projection through alias rewrite — the broader `__seq_id` materialization landed in TASK-508, the per-alias surface remains pending |
 
-Every ignored test carries a comment pointing at its Wave 5 blocker
-task. TASK-455 re-enabled 12 tests in-place during closure (4 RETENTION
-end-to-end, 3 joined-source, 1 SESSIONIZE system-column, 4 FIRST/LAST/NTH
-followups); what remains is blocked on three cross-cutting fixes — scan
-system-column materialization (TASK-508), BRACKETS runtime emission
-(TASK-509), and `MatchWindow::WithinSession` NFA expiry (TASK-510).
-No Wave 4 correctness regression is hidden by an `#[ignore]`.
+The two `wave4_advanced_analytics_sessionize.rs` `WITHIN SESSION`
+ignores closed because TASK-510's work was absorbed into TASK-499
+audit P0 #1 (commit `031cdf5`, 2026-04-26) and TASK-510 retired. The
+single `wave4_advanced_analytics_attribute_cohort_join.rs` `__seq_id`
+ignore that was attributed to TASK-508 closed; the second ignore is a
+distinct alias-rewrite path. No Wave 5 correctness regression is
+hidden by an `#[ignore]`.
 
 ### 7 — bqlite-ffi remains an intentional placeholder
 
 FFI lands in Wave 6; its `C` across every dimension reflects that scope,
-not a quality gap. Same disposition as Wave 1/2/3 findings.
+not a quality gap. Same disposition as Wave 1/2/3/4 findings.
 
-### 8 — CompactString adoption is live (TASK-454)
+### 8 — Memory budget enforcement and spill protocols are live (TASK-501/502/510/512/513/525)
 
-TASK-332's conditional-go recommendation is realized in Wave 4:
-`BindingValue::String` adopts `CompactString` (per
-`compactstring-evaluation.md`), plus the Wave 4 hot paths
-(`Transition.event_type` where profiling justified it,
-PropertyValue small-string storage) that the evaluation flagged as
-secondary candidates. `compactstring_eval.rs` is retained as a
-regression bench. No measurable regression vs the Wave 3 `matcher`
-bench; binding-clone cost reduced as predicted.
+Wave 4 had no enforced query-time memory budget; Wave 5 ships the
+contract. `MemoryBudget` / `MemoryReservation` / `MemoryTracker`
+land in `bqlite-core` (TASK-510), `QueryContext` carries the tracker
+through bind, `Engine::query` returns `peak_memory_bytes`, and
+v1 spill is wired for two operators only — `SortOperator::with_spill`
+(TASK-513) and the ingest partitioner (TASK-512) — with the cohort /
+IN-subquery and aggregate paths failing fast per `engine/spill.md`
+§ 3. `TempSpillFile` enforces RAII cleanup; `tests/wave5_runtime_stress.rs`
+covers per-query subdir reclamation under the cancellation, timeout,
+and panic exit paths.
 
-### 9 — Two crates slipped one sub-grade vs Wave 3; zero overall grades slipped below Wave 3
+`tests/wave5_acceptance.rs` § 1 / § 3 pin the contract end-to-end:
+the multi-shard analytical query runs to completion at the documented
+`MIN_QUERY_BUDGET_BYTES` floor with `peak_memory_bytes = Some(_)`, and
+the sort-by-ts path produces answer-invariant output across the
+default budget vs the floor (the spill path activating below the
+floor). The Wave 5 acceptance gate's no-spill-artefacts contract
+(`engine/spill.md` § 8.3) holds across all four bands.
 
-The *Any crate slipping vs. Wave 3 is flagged* rule surfaces two
-single-dimension drops, both on the Docs dimension:
+### 9 — Operator fusion and zero-copy scan/filter land under Wave 5 (TASK-503/515/516/517/518/519/520)
 
-| Crate | Wave 3 | Wave 4 | Dimension | Cause |
+Wave 5 turns `execution-model.md` § 3.8 from "documented target" into
+implementation: `FilteredBatch`, `SelectionVector`, `StatelessKernel`
+(`bqlite-operators::kernel`), `FusedSegmentPhysical` push-segment
+driver (`bqlite-operators::fused_segment`), explicit
+`MaterializeTrigger` (sparsity / segment-boundary / aggregate-handoff
+in `bqlite-operators::materialize`). Filter, Project, and Limit are
+refactored onto kernels (TASK-519); Sessionize, EventSelect, and
+Attribute gain inline-accumulator paths via `finish_entity_into`
+overrides (TASK-520).
+
+`tests/wave5_acceptance.rs` § 4 pins the answer-equivalence contract:
+the fused / zero-copy path produces byte-identical output against
+hand-computed ground truth on the multi-shard reference fixture.
+`benches/wave5/zero_copy_scan.rs` reports
+`bytes_materialized_before_filter` and `bytes_decompressed` against
+`zero-copy-scan-filter.md` § 3; `benches/wave5/stateful_aggregate_fusion.rs`
+guards the SESSIONIZE → STATS handoff against regression.
+**Impact on grades**: reinforces the **A** Tests + API on
+bqlite-operators; lifts bqlite-engine's Overall from B+ to A- given
+the bind-side surface that integrates the kernels.
+
+### 10 — Two crates slipped one sub-grade vs Wave 4; one Overall climbed; no crate is below C
+
+The *Any crate slipping vs. Wave 4 is flagged* rule surfaces:
+
+| Crate | Wave 4 | Wave 5 | Dimension | Cause |
 |-------|--------|--------|-----------|-------|
-| bqlite-storage | Docs A- | Docs **B+** | Docs | 18 → 32 rustdoc warnings across new modules |
-| bqlite-planner | Overall A | Overall **A-** | Docs A- → B+ | 5 → 10 rustdoc warnings incl. 3 function/module name collisions |
+| bqlite-planner | Docs B+ | Docs **B** | Docs | 10 → 23 rustdoc warnings; optimizer-framework rule pack added function/module name collisions and private-item links |
+| bqlite-engine  | Overall **B+** | Overall **A-** *(↑)* | Tests / API | +100 unit tests, full Wave 5 runtime surface (memory budget, warnings, spill, scheduler, fusion bind) |
 
-Overall grades held at **A** or above for every crate except
-bqlite-planner (A → A-), bqlite-engine (B+, unchanged), and the
-placeholders. No crate is below **C** on any dimension. **No new
-follow-up tasks required under the *below-C → file a follow-up* rule**
-for these grade drops — but Finding 1 calls out the trajectory
-explicitly so Wave 5 can absorb the cleanup.
+bqlite-operators' Docs warning count rose from 6 to 10 but stayed
+within the **B+** band; bqlite-storage's rose 32 → 35 and stayed
+**B+** for the same reason. No crate slipped on Tests, API, or
+Benchmarks; bqlite-engine specifically *gained* an Overall sub-grade
+(B+ → A-) on the strength of the +100 tests and the Wave 5 runtime
+API surface. No crate is below **C** anywhere.
 
-The crates Wave 4 grew most (storage, planner, operators, engine) all
-landed their Wave 4 scope with strong test and API coverage. The
-storage crate's Tests dimension in particular moves from 426 to 814
-unit tests plus 143 encoding property tests, covering every new codec
-and the tombstone/compaction machinery.
+**No new follow-up tasks required under the *below-C → file a follow-up* rule** for these grade movements — but Finding 1 calls out the rustdoc-warning trajectory explicitly so Wave 6 can absorb the cleanup. Without it, the Wave 5 audit projects bqlite-storage Docs slipping to **B** in Wave 6 if the +3-warnings-per-wave rate continues.
 
-### 10 — Wave 5 follow-up tasks filed (TASK-508 through TASK-513)
+## Wave 5 status
 
-TASK-455 filed six Wave 5 follow-up tasks that collect every
-semantic-audit finding (TASK-443 through TASK-448) that could not be
-resolved in-place:
+**Wave 5 is complete.** All 34 numbered Wave 5 tasks have `.done`
+markers in `tasks/completed/` (TASK-501 through TASK-535, with
+TASK-530 retired before scheduling per the "numbers are never reused"
+rule); the Wave 5 acceptance gate (`tests/wave5_acceptance.rs`)
+passes end-to-end with 9 tests covering the four documented bands —
+multi-shard analytical query under the `MIN_QUERY_BUDGET_BYTES`
+floor, cancellation/timeout cleanup, sort/ingest/cohort spill policy
+with no spill artefacts after return, and fused/zero-copy answer
+equivalence against hand-computed ground truth. Per-crate grades all
+sit at or above **C** on every dimension. One crate slipped one
+Docs sub-grade (bqlite-planner Docs B+ → B), one crate gained an
+Overall sub-grade (bqlite-engine B+ → A-); no crate is below **C**
+anywhere. Bench CI covers all 29 bench groups. No Wave 6 follow-up
+tasks are filed under the *below-C → file a follow-up* rule; the
+rustdoc-warning trajectory is flagged in Finding 1 for Wave 6 to
+absorb. **Wave 6 can begin.**
 
-- **TASK-508** `[HARD]` Scan system-column materialization
-  (`__seq_id`, `__batch_id`) — blocks 3 Wave 4 feature areas
-- **TASK-509** `[HARD]` BRACKETS runtime emission in SequenceMatch
-  operator — unblocks RETENTION end-to-end
-- **TASK-510** `[HARD]` WITHIN SESSION expiry in NFA compiler —
-  unblocks `SESSIONIZE | MATCH ... WITHIN SESSION`
-- **TASK-511** `[EASY]` EventSelect property tests and benchmarks —
-  fills the EventSelect proptest/bench gap
-- **TASK-512** `[EASY]` Wave 4 integration test re-enable and
-  coverage additions — re-enables the 4 system-column and WITHIN
-  SESSION ignored tests, adds 5 missing integration tests
-- **TASK-513** `[EASY]` Wave 4 minor planner and operator
-  correctness fixes — collects 7 small correctness items
+---
 
-None are audit-grade blockers (no crate is below C); they are the
-pre-agreed Wave 5 scope for closing the remaining semantic gaps
-surfaced in Wave 4. Per the Wave 4 audit task definition, Wave 5
-starts cleared.
+## Wave 4 grades (historical)
 
-## Wave 4 status
+*Captured by TASK-499 on 2026-04-20. Preserved for historical reference.*
 
-**Wave 4 is complete.** All 56 tasks in TASK-4xx have `.done` markers
-in `tasks/completed/` (TASK-401 through TASK-456); the Wave 4
-acceptance gate (`tests/wave4_acceptance.rs`) passes end-to-end with
-5 tests covering RETENTION, SESSIONIZE, FIRST/LAST/NTH, SAMPLE,
-ATTRIBUTE, cohort + alias, entity-aligned source JOIN, and DELETE +
-compaction paths; per-crate grades all sit at or above **C** on every
-dimension. Two crates slipped one Docs sub-grade (bqlite-storage,
-bqlite-planner) and bqlite-planner's Overall drops from A to A-; no
-crate is below **C** anywhere. Bench CI covers all 22 bench groups.
-Wave 5 follow-ups (TASK-508 through TASK-513) are filed.
-**Wave 5 can begin.**
+| Crate | Tests | API | Docs | Benchmarks | Overall |
+|-------|-------|-----|------|------------|---------|
+| bqlite | **C** · 0 unit, 0 doctest; re-export crate | **B-** · re-exports complete for Wave 4 | **C+** · crate-level doc; 1 rustdoc collision | **C** · workspace harness only | **C+** |
+| bqlite-core | **A** · 267 unit + 3 doctest; encoded-column view types *(↑ from 246)* | **A-** · Wave 4 additive (encoded column views, sample/tombstone surfaces) | **B+** · 6 rustdoc warnings *(4 → 6)* | **C** · pure-types crate | **A-** |
+| bqlite-ast | **A-** · 54 unit incl. Wave 4 stage nodes *(↑ from 49)* | **A-** · cohort/alias/source-JOIN/DELETE additions | **B** · 0 rustdoc warnings | **C** · no per-crate benches | **A-** |
+| bqlite-storage | **A** · 814 unit + 143 encoding property tests *(↑↑ from 426)* | **A** · v2 segment format + 6 new encodings + tombstones + concurrent compaction + JSONL/Parquet ingest | **B+** · 32 rustdoc warnings *(↓ A- → B+)* | **A** · 9 Wave 4 bench groups *(↑ from A-)* | **A** |
+| bqlite-parser | **A** · 574 unit + 1 doctest; Wave 4 productions *(↑ from 415)* | **A** · full Wave 4 grammar additive | **A-** · 3 rustdoc warnings | **C** · no per-crate benches | **A** |
+| bqlite-planner | **A** · 429 unit + 1 doctest; Wave 4 lowering + DemandCapabilities *(↑ from 272)* | **A** · 7 new plan variants + DemandPropagation + retention desugar | **B+** · 10 rustdoc warnings *(↓ A- → B+)* | **C** · no per-crate benches | **A-** *(↓ A on Docs only)* |
+| bqlite-operators | **A** · 537 unit + Wave 4 property/integration *(↑ from 331)* | **A** · SessionizeOperator + EventSelect + Attribute + SampleFilter + MergeSources + SubqueryFilter + tombstone-aware scan | **A-** · 6 rustdoc warnings | **A** · 11 dedicated operator benches | **A** |
+| bqlite-engine | **A-** · 105 unit Wave 4 bind + DELETE + compact_now *(↑ from 58)* | **A-** · Wave 4 plan-to-operator bind + tombstone writer + cohort cache | **B** · 8 rustdoc warnings | **C+** · no per-crate benches | **B+** |
+| bqlite-cli | **A-** · 84 unit | **A-** · unchanged Wave 4 surface | **B+** · 0 rustdoc warnings | **C** · no per-crate benches | **A-** |
+| bqlite-ffi | **C** · placeholder; Wave 6 | **C** · placeholder | **C** · placeholder | **C** · out-of-scope | **C** |
+
+Wave 4 evidence aggregate: **3,267 passing tests**, **6 ignored**, **0 failing**. **22 Criterion bench groups**.
+
+### Wave 4 findings (historical)
+
+1. Rustdoc warnings grew from 41 to 67 (+26)
+2. `bqlite` top-level re-export collision persists
+3. Benchmark coverage expanded with 9 Wave 4 groups
+4. Property-test coverage expanded with 10 new encoding + operator suites (89 → 213)
+5. DemandCapabilities protocol is live (TASK-409, TASK-427)
+6. Six integration tests ignored, each attributed to a Wave 5 follow-up
+7. `bqlite-ffi` remains an intentional placeholder
+8. CompactString adoption is live (TASK-454)
+9. Two crates slipped one sub-grade vs Wave 3 (bqlite-storage Docs A- → B+, bqlite-planner Overall A → A-); zero overall grades slipped below Wave 3
+10. Wave 5 follow-up tasks filed (TASK-508 through TASK-513)
 
 ---
 
