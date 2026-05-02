@@ -210,3 +210,13 @@ harness = false
 name = "stateful_aggregate_fusion"
 path = "wave5/stateful_aggregate_fusion.rs"
 harness = false
+
+# Wave 5 morsel scheduler skew bench (TASK-526). Wall-clock
+# regression tripwire for skewed-vs-balanced entity distributions.
+# v1 morsel scheduler records all-zero per-worker snapshots so
+# entity_event_skew_p99 isn't usefully assertable yet — the bench
+# guards the wall-clock axis.
+[[bench]]
+name = "morsel_skew"
+path = "wave5/morsel_skew.rs"
+harness = false
