@@ -193,3 +193,11 @@ harness = false
 name = "tombstone_scan"
 path = "wave4/tombstone_scan.rs"
 harness = false
+
+# Wave 5 zero-copy scan/filter copy-budget bench (TASK-526). Reports
+# `bytes_materialized_before_filter` and `bytes_decompressed` against
+# the targets in `docs/design/storage/zero-copy-scan-filter.md` §3.
+[[bench]]
+name = "zero_copy_scan"
+path = "wave5/zero_copy_scan.rs"
+harness = false
