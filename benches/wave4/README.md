@@ -24,7 +24,8 @@ benches/wave4/
 ├── ingest.rs            # JSONL + Parquet end-to-end ingest
 ├── pfor.rs              # PFOR codec (TASK-450)
 ├── sample.rs            # SampleFilter per-row throughput + selectivity
-└── sessionize.rs        # SessionizeOperator throughput (TASK-428)
+├── sessionize.rs        # SessionizeOperator throughput (TASK-428)
+└── tombstone_scan.rs    # TombstoneFilter query-time + compact_now tombstone overhead (TASK-534)
 ```
 
 ## Coverage matrix
@@ -38,6 +39,7 @@ benches/wave4/
 | ATTRIBUTE latency on realistic ratios | `attribute.rs` | `AttributeOperator` (existing §17.1 workloads + 10:1 / 100:1 / 1000:1 ratio sweep) |
 | Cohort / joined-source query overhead | `cohort_join.rs` | `SubqueryFilterOperator`, `MergeSourcesOperator` |
 | EventSelect FIRST/LAST/NTH throughput + entity boundary overhead | `event_select.rs` | `EventSelectOperator` (TASK-531 §21.1 workloads) |
+| Tombstone scan filter throughput + compaction overhead | `tombstone_scan.rs` | `TombstoneFilter::filter_batch_with_index`, `Database::compact_now` |
 
 ## Reference-machine targets
 
@@ -74,6 +76,12 @@ Provenance labels:
 | `event_select/kind/nth_5/events_per_sec` | ≥ 150 M events/sec | **[spec]** `event-select-sample.md` §21.1 row 3 |
 | `event_select/predicate/first/amount_gt_50/events_per_sec` | ≥ 150 M events/sec | **[spec]** `event-select-sample.md` §21.1 row 4 |
 | `event_select/density/entity_boundary_ns` | ≤ 500 ns/entity | **[spec]** `event-select-sample.md` §21.1 row 7 |
+| `tombstone_scan/query_time/entity_0/rows_per_sec_m` | ≥ 1 000 M rows/sec | **[floor]** short-circuit passthrough; any overhead above this is regression |
+| `tombstone_scan/query_time/entity_100/rows_per_sec_m` | ≥ 100 M rows/sec | **[floor]** 100-entry HashSet entity filter |
+| `tombstone_scan/query_time/entity_10000/rows_per_sec_m` | ≥ 50 M rows/sec | **[floor]** 10 000-entry HashSet entity filter |
+| `tombstone_scan/query_time/time_range_10pct/rows_per_sec_m` | ≥ 100 M rows/sec | **[floor]** single time-range covering 10% of rows |
+| `tombstone_scan/query_time/mixed/rows_per_sec_m` | ≥ 50 M rows/sec | **[floor]** entity + time-range + row tombstones active simultaneously |
+| `tombstone_scan/compaction/tombstoned_10pct/clean_to_tombstoned_ratio` | ≤ 2.0 | **[floor]** compaction overhead at 10% entity-tombstone density must not exceed 2× |
 
 ### Not covered (intentional)
 
@@ -100,6 +108,7 @@ cargo bench -p bqlite-benches --bench attribute
 cargo bench -p bqlite-benches --bench sessionize
 cargo bench -p bqlite-benches --bench pfor
 cargo bench -p bqlite-benches --bench event_select
+cargo bench -p bqlite-benches --bench tombstone_scan
 
 # Reference mode — full-scale fixtures with hard targets. Only
 # meaningful on the pinned reference hardware.
@@ -136,3 +145,6 @@ every Wave 4 bench plugs into the existing gate.
 - `docs/design/language/cohorts-aliases-joins.md` §3.8 + §4.2
   define the cohort + merge-sources semantics underpinning
   `cohort_join.rs`.
+- `docs/design/storage/deletes.md` §7 defines the scan-time tombstone
+  filter order, §12 defines the compaction-time reclamation path — both
+  underpin `tombstone_scan.rs`.

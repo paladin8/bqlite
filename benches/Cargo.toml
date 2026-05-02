@@ -184,3 +184,12 @@ harness = false
 name = "cohort_join"
 path = "wave4/cohort_join.rs"
 harness = false
+
+# Wave 4 tombstone scan filter microbenchmark (TASK-534): query-time
+# TombstoneFilter::filter_batch_with_index throughput across five
+# tombstone configurations, plus compaction-time Database::compact_now
+# overhead at 1% / 5% / 10% entity-tombstone density.
+[[bench]]
+name = "tombstone_scan"
+path = "wave4/tombstone_scan.rs"
+harness = false
