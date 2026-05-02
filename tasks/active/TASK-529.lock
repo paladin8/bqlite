@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-529",
+  "claimed_at": "2026-05-02T04:23:44Z",
+  "branch": "task/TASK-529",
+  "description": "BRACKETS runtime emission in SequenceMatch operator"
+}
