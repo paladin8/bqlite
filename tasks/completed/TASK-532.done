@@ -2,6 +2,7 @@
   "agent_id": "agent-4",
   "task_id": "TASK-532",
   "claimed_at": "2026-05-02T04:23:47Z",
+  "completed_at": "2026-05-02T04:33:01Z",
   "branch": "task/TASK-532",
   "description": "ATTRIBUTE composition and WITHIN SESSION integration coverage"
 }
