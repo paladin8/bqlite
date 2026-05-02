@@ -20,10 +20,11 @@ benches/wave5/
 ├── README.md                        # this file
 ├── zero_copy_scan.rs                # Zero-copy scan/filter copy budget (CP1)
 ├── stateful_aggregate_fusion.rs     # Stateful → aggregate fusion throughput (CP2)
-└── morsel_skew.rs                   # Morsel scheduler skew wall-clock tripwire (CP3)
+├── morsel_skew.rs                   # Morsel scheduler skew wall-clock tripwire (CP3)
+└── spill_overhead.rs                # Sort spill overhead (CP4)
 ```
 
-CP4–CP5 land additional bench files alongside the CP1–CP3 ones.
+CP5 lands the cohort pushdown bench alongside the CP1–CP4 ones.
 Each follow-up checkpoint adds its own row to the *Coverage matrix*
 and *Reference-machine targets* tables below.
 
@@ -34,6 +35,7 @@ and *Reference-machine targets* tables below.
 | Zero-copy scan/filter copy budget | `zero_copy_scan.rs` | `SegmentScan::next_encoded_row_group` + `apply_encoded_eq` + `materialize_selected`; `MetricsSnapshot::{bytes_materialized_before_filter, bytes_decompressed, bytes_scanned}` |
 | Stateful → aggregate fusion (TASK-520) | `stateful_aggregate_fusion.rs` | `Engine::query` end-to-end on `SESSIONIZE → STATS`; fused vs unfused wall-clock ratio |
 | Morsel scheduler skew (TASK-523/524) | `morsel_skew.rs` | `Engine::query` end-to-end on `STATS COUNT(*) GROUP BY entity_id`; skewed-to-balanced wall-clock ratio |
+| Sort spill overhead (TASK-502/513) | `spill_overhead.rs` | `SortOperator::with_spill` vs `SortOperator::new`; spill-tax wall-clock ratio against an in-memory baseline |
 
 ## Reference-machine targets
 
@@ -58,6 +60,7 @@ Provenance labels:
 | `wave5/zero_copy_scan/lz4_payload/pre_filter_materialization_ratio` | ≤ 0.0 | **[spec]** same — pre-filter materialisation must remain zero on the encoded path even when LZ4 fired |
 | `wave5/stateful_aggregate_fusion/fusion_speedup_ratio` | ≥ 0.95 | **[floor]** `engine/operator-fusion.md` does not pin a numerical ratio; this is a regression tripwire that catches the fusion pass silently no-op'ing or the inline-accumulator path landing on a slow branch. The 0.95 threshold absorbs CI runner noise around the no-effect point of 1.0. Fused query: `SESSIONIZE → STATS MAX(session_id)`; unfused baseline: `SESSIONIZE → STATS SUM(amount)` |
 | `wave5/morsel_skew/skew_tax_ratio` | ≤ 4.0 | **[floor]** `engine/morsel-scheduler.md` does not pin a numerical ratio. v1's single-task driver should produce roughly identical wall-clock between balanced and skewed inputs (per-entity work is sequential anyway); a >4× skew tax signals a morsel-generation regression. The future per-shard scheduler should *narrow* the tax, not widen it |
+| `wave5/spill_overhead/spill_tax_ratio` | ≤ 3.0 | **[floor]** `engine/spill.md` does not pin a numerical throughput tax (§10.3 covers `try_reserve` semantics, not throughput); this is a regression tripwire. `sort_with_spill_ns / sort_no_spill_ns ≤ 3.0` keeps headroom for the merger phase's startup overhead at small CI sizing while still catching a regression that pushes the spill drain into a slow branch |
 
 ### Not covered (intentional)
 
@@ -92,12 +95,14 @@ Provenance labels:
 cargo bench -p bqlite-benches --bench zero_copy_scan
 cargo bench -p bqlite-benches --bench stateful_aggregate_fusion
 cargo bench -p bqlite-benches --bench morsel_skew
+cargo bench -p bqlite-benches --bench spill_overhead
 
 # Reference mode — full-scale fixtures with hard targets. Only
 # meaningful on the pinned reference hardware.
 BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench zero_copy_scan
 BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench stateful_aggregate_fusion
 BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench morsel_skew
+BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench spill_overhead
 ```
 
 Each bench also runs under `cargo test --all-targets` /

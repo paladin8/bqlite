@@ -220,3 +220,12 @@ harness = false
 name = "morsel_skew"
 path = "wave5/morsel_skew.rs"
 harness = false
+
+# Wave 5 sort spill overhead bench (TASK-526). Compares
+# SortOperator::with_spill against the in-memory baseline to
+# surface regressions in the TempSpillFile drain + k-way merge
+# path landed under TASK-502 / TASK-513.
+[[bench]]
+name = "spill_overhead"
+path = "wave5/spill_overhead.rs"
+harness = false
