@@ -202,14 +202,14 @@ impl SessionizeOperator {
         // ── Determine physically-buffered columns ────────────────────────
         //
         // Policy (sessionize.md §9.2):
-        //   buffered = {entity_id, ts} ∪ forwarded ∪ {event_type if end-events set}
+        //   buffered = {entity_key, ts} ∪ forwarded ∪ {event_type if end-events set}
         //
-        // `entity_id` is always buffered — every downstream consumer
-        // (MATCH, STATS, routing) needs it and it is part of the output
-        // schema advertised as non-nullable. `ts` is always buffered
-        // because SESSIONIZE itself uses it for gap computation and
-        // duration. `event_type` is buffered only when end-events are
-        // configured.
+        // The entity-key column (name from `desc.entity_key_col`) is always
+        // buffered — every downstream consumer (MATCH, STATS, routing) needs
+        // it and it is part of the output schema advertised as non-nullable.
+        // `ts` is always buffered because SESSIONIZE itself uses it for gap
+        // computation and duration. `event_type` is buffered only when
+        // end-events are configured.
         let mut buffered_names: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
         let push_name =
@@ -218,7 +218,7 @@ impl SessionizeOperator {
                     buffered_names.push(name.to_string());
                 }
             };
-        push_name("entity_id", &mut buffered_names, &mut seen);
+        push_name(&desc.entity_key_col, &mut buffered_names, &mut seen);
         push_name("ts", &mut buffered_names, &mut seen);
         if event_type_idx.is_some() {
             push_name("event_type", &mut buffered_names, &mut seen);
@@ -960,6 +960,7 @@ mod tests {
             end_events,
             forwarded_columns: forwarded,
             fused_downstream: None,
+            entity_key_col: "entity_id".into(),
             input: Box::new(scan),
             output_schema: os,
         };
@@ -1599,6 +1600,57 @@ mod tests {
         assert!(names.contains(&"amount".to_string()));
     }
 
+    #[test]
+    fn buffered_schema_uses_actual_entity_key_not_hardcoded_name() {
+        // Regression test for TASK-444 finding B: SessionizeOperator used to
+        // hardcode "entity_id" as the buffered entity-key column name, causing
+        // a panic for tables whose entity key has a different name (e.g. "uid").
+        let uid_schema = OperatorSchema::new(vec![
+            ColumnDef::required("uid", BqlType::Int),
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("event_type", BqlType::String),
+        ])
+        .unwrap();
+        let output_schema = sess_output_schema(&uid_schema);
+        // Build the physical descriptor through LogicalPlan lowering so that
+        // entity_key_col is set from the source table's key.
+        let scan = LogicalPlan::scan(
+            bqlite_core::TableSchema::new(
+                "users",
+                uid_schema.columns().to_vec(),
+                "uid",
+                "ts",
+                "event_type",
+            )
+            .unwrap(),
+        );
+        let node = LogicalPlan::Sessionize {
+            gap: 30_000_000_000,
+            end_events: vec![],
+            forwarded_columns: vec![],
+            fused_downstream: None,
+            entity_key_col: "uid".into(),
+            input: Box::new(scan),
+            output_schema,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::Sessionize(phys) = physical else {
+            panic!("expected Sessionize");
+        };
+        assert_eq!(phys.entity_key_col, "uid");
+        let op = SessionizeOperator::new(&phys);
+        let names: Vec<_> = op
+            .buffered_arrow_schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(
+            names.contains(&"uid".to_string()),
+            "entity-key column 'uid' must be buffered; got {names:?}"
+        );
+    }
+
     // ── Multi-session output in a single entity ──────────────────────────
 
     #[test]
@@ -1733,6 +1785,7 @@ mod proptests {
             end_events,
             forwarded_columns: vec![],
             fused_downstream: None,
+            entity_key_col: "entity_id".into(),
             input: Box::new(scan),
             output_schema: os,
         };

@@ -655,8 +655,15 @@ pub struct SessionizePhysical {
     /// Demand set from downstream operators.
     pub demand: DemandSet,
     /// Columns that downstream operators need forwarded through the
-    /// session buffer.
+    /// session buffer.  Unused in v1 (always empty — demand analysis is
+    /// not yet wired to populate this set for Sessionize).
     pub forwarded_columns: Vec<ColumnId>,
+    /// Name of the entity-key column in the input schema.
+    ///
+    /// Propagated from the source table's `entity_key_column().name` so
+    /// the runtime operator can buffer the correct column without assuming
+    /// the name is always `"entity_id"` (TASK-444 finding B).
+    pub entity_key_col: String,
     /// Fused aggregate specification. `Some` after the stateful-aggregate
     /// fusion pass replaces a downstream `Aggregate` with a fused per-entity
     /// accumulator update. See `docs/design/planner-pipeline.md` §7.4.2 and
@@ -723,6 +730,14 @@ pub struct EventSelectPhysical {
     pub lookback: Option<i64>,
     /// Columns that downstream operators need forwarded through the
     /// candidate row.
+    ///
+    /// **Unused in v1.** The demand-driven forwarding path derives column
+    /// availability from `output_schema` instead: `EventSelectOperator::new`
+    /// maps each output-schema column to its input index at construction time,
+    /// so downstream column access does not need a separate forwarded-column
+    /// list. Retained as a planner-visible audit surface and for future
+    /// demand-protocol extensions (e.g. fusion passes that inspect forwarded
+    /// column sets directly).
     pub forwarded_columns: Vec<ColumnId>,
     /// Fused aggregate specification. `Some` after stateful-aggregate
     /// fusion (TASK-520). See planner-pipeline.md §7.4.3.
@@ -1464,6 +1479,7 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
             end_events,
             forwarded_columns,
             fused_downstream,
+            entity_key_col,
             input,
             output_schema,
         } => {
@@ -1484,6 +1500,7 @@ pub fn lower_physical(plan: LogicalPlan, now_ns: i64) -> PhysicalPlan {
                 demand,
                 forwarded_columns,
                 fused_aggregate,
+                entity_key_col,
                 input: Box::new(child),
                 output_schema,
                 pre_fusion_output_schema: None,
@@ -2397,6 +2414,7 @@ mod tests {
             end_events: vec!["logout".into()],
             forwarded_columns: vec![],
             fused_downstream: None,
+            entity_key_col: "entity_id".into(),
             input: Box::new(scan),
             output_schema: os.clone(),
         };
@@ -2413,6 +2431,7 @@ mod tests {
             end_events: vec!["logout".into()],
             forwarded_columns: vec!["amount".into()],
             fused_downstream: None,
+            entity_key_col: "entity_id".into(),
             input: Box::new(scan),
             output_schema: os,
         };
@@ -2427,7 +2446,54 @@ mod tests {
             vec!["amount".to_string()] as Vec<ColumnId>
         );
         assert!(sess.fused_aggregate.is_none());
+        assert_eq!(sess.entity_key_col, "entity_id");
         assert!(matches!(*sess.input, PhysicalPlan::Scan(_)));
+    }
+
+    #[test]
+    fn sessionize_entity_key_col_propagates_non_default_key() {
+        // Verify that `entity_key_col` passes through physical lowering
+        // unchanged (TASK-444 finding B / TASK-533). The logical node stores
+        // the entity-key name set by `lower_sessionize`; the physical node
+        // must carry it faithfully regardless of column ordering.
+        let uid_schema = TableSchema::new(
+            "users",
+            vec![
+                ColumnDef::required("ts", BqlType::Timestamp), // uid is NOT column 0
+                ColumnDef::required("uid", BqlType::Int),
+                ColumnDef::required("event_type", BqlType::String),
+            ],
+            "uid",
+            "ts",
+            "event_type",
+        )
+        .expect("uid schema");
+        let scan = LogicalPlan::scan(uid_schema);
+        let os = OperatorSchema::new(vec![
+            ColumnDef::required("ts", BqlType::Timestamp),
+            ColumnDef::required("uid", BqlType::Int),
+            ColumnDef::required("event_type", BqlType::String),
+            ColumnDef::required("session_id", BqlType::Int),
+            ColumnDef::required("session_duration", BqlType::Int),
+        ])
+        .expect("sessionize output schema");
+        let node = LogicalPlan::Sessionize {
+            gap: 1_800_000_000_000,
+            end_events: vec![],
+            forwarded_columns: vec![],
+            fused_downstream: None,
+            entity_key_col: "uid".into(),
+            input: Box::new(scan),
+            output_schema: os,
+        };
+        let physical = lower_physical(node, 0);
+        let PhysicalPlan::Sessionize(sess) = physical else {
+            panic!("expected Sessionize");
+        };
+        assert_eq!(
+            sess.entity_key_col, "uid",
+            "entity_key_col must be 'uid' even though 'ts' is at column index 0"
+        );
     }
 
     #[test]

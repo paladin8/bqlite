@@ -583,6 +583,8 @@ Used during ingest from Parquet/CSV and when interfacing with external Arrow dat
 
 **Timestamp normalization on ingest.** Timestamps in any Arrow TimeUnit are converted to nanoseconds. Timezone-naive timestamps are treated as UTC (with a warning). Timestamps with a non-UTC timezone are converted to UTC.
 
+**`__source_table_id` system column type.** The `__source_table_id` discriminator column injected by `MergeSources` (see `docs/design/language/cohorts-aliases-joins.md` §3.8) uses `BqlType::Int` (i64), not a narrow `Int8`. `BqlType` does not have an `Int8` variant — all integer types are represented as `Int` (i64) in the query layer regardless of their physical Arrow storage width. The column is synthesized at query time and never stored, so the width choice has no storage impact. Narrow Arrow encodings (`Int8Array`) are used for in-memory efficiency but the exposed BQL type is `Int`.
+
 ### 7.3 Round-Trip Guarantee
 
 For all BqlType variants, `BqlType::from_arrow(&bql_type.to_arrow()) == Some(bql_type)`. This is a testable invariant.

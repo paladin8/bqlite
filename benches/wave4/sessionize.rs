@@ -75,6 +75,7 @@ fn build_op(gap_ns: i64, end_events: Vec<String>) -> SessionizeOperator {
         end_events,
         forwarded_columns: vec![],
         fused_downstream: None,
+        entity_key_col: "entity_id".into(),
         input: Box::new(scan),
         output_schema: os,
     };

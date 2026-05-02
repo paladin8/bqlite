@@ -1097,6 +1097,7 @@ mod tests {
             demand: DemandSet2::default(),
             forwarded_columns: Vec::new(),
             fused_aggregate: None,
+            entity_key_col: "entity_id".into(),
             input: Box::new(minimal_scan()),
             output_schema,
             pre_fusion_output_schema: None,

@@ -1667,6 +1667,7 @@ mod tests {
             demand: crate::demand::DemandSet::default(),
             forwarded_columns: vec![],
             fused_aggregate: None,
+            entity_key_col: "entity_id".into(),
             input: Box::new(PhysicalPlan::Scan(scan)),
             output_schema: events_schema_os(),
             pre_fusion_output_schema: None,

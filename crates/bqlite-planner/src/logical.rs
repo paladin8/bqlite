@@ -316,10 +316,16 @@ pub enum LogicalPlan {
         /// Fused downstream aggregate specification (Wave 5).
         /// Always `None` in v1.
         fused_downstream: Option<FusedDownstream>,
+        /// Name of the entity-key column in the source table.
+        ///
+        /// Set from `source_table.entity_key_column().name` at logical
+        /// lowering time so physical lowering and the runtime operator
+        /// never need to guess the column name from position.
+        entity_key_col: String,
         /// Child plan feeding this sessionize operator.
         input: Box<LogicalPlan>,
-        /// Output schema: input columns + `session_id: Int64 NOT NULL` +
-        /// `session_duration: Int64 NOT NULL`.
+        /// Output schema: input columns + `session_id: Int NOT NULL` +
+        /// `session_duration: Int NOT NULL`.
         output_schema: OperatorSchema,
     },
 
@@ -1126,6 +1132,13 @@ pub fn lower_statements(statements: Vec<Statement>, catalog: &dyn Catalog) -> Re
                         "alias definitions must precede the terminal statement".into(),
                     ));
                 }
+                // Reject alias names that shadow catalog tables (J8).
+                if catalog.resolve_table(&name.text).is_ok() {
+                    return Err(BqliteError::Plan(format!(
+                        "alias '{}' shadows a catalog table with the same name",
+                        name.text
+                    )));
+                }
                 aliases.push_definition(name.text, body);
             }
             other => {
@@ -1649,10 +1662,7 @@ fn resolve_alias(name: &str, aliases: &AliasTable, catalog: &dyn Catalog) -> Res
         if path_ref.iter().any(|n| n == name) {
             let mut full_path: Vec<String> = path_ref.clone();
             full_path.push(name.to_string());
-            return Err(BqliteError::Plan(format!(
-                "alias cycle detected: {}",
-                full_path.join(" -> ")
-            )));
+            return Err(BqliteError::AliasCycle { path: full_path });
         }
     }
 
@@ -1714,11 +1724,10 @@ fn apply_subquery_filter(
         .collect();
 
     if subq_cols.len() != lhs.len() {
-        return Err(BqliteError::Plan(format!(
-            "IN QUERY arity mismatch: LHS has {} column(s), subquery produces {}",
-            lhs.len(),
-            subq_cols.len()
-        )));
+        return Err(BqliteError::IncompatibleCohortShape {
+            lhs_arity: lhs.len(),
+            rhs_arity: subq_cols.len(),
+        });
     }
 
     let outer_schema = acc.output_schema().clone();
@@ -2646,6 +2655,7 @@ fn lower_sessionize(
         end_events,
         forwarded_columns: Vec::new(),
         fused_downstream: None,
+        entity_key_col: source_table.entity_key_column().name.clone(),
         input: Box::new(acc),
         output_schema,
     })
@@ -2835,12 +2845,46 @@ fn lower_event_select(
 ///   `touchpoint_ts: Timestamp NULL`
 ///   `touchpoint_key: String NULL`
 /// Forwarded conversion properties are added by demand analysis.
+/// Returns true if `plan` is a MATCH node or any row-shape-preserving wrapper
+/// whose root is a MATCH node.  Covers Filter, Project, Limit, Sort, Distinct,
+/// Sample, and SubqueryFilter — all of which pass through match-derived rows
+/// without converting them back to raw event rows.  Used to reject ATTRIBUTE
+/// applied to MATCH output regardless of how many transparent operators sit
+/// between them.
+fn is_match_derived(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::SequenceMatch { .. } => true,
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::Sample { input, .. }
+        | LogicalPlan::SubqueryFilter { input, .. } => is_match_derived(input),
+        _ => false,
+    }
+}
+
 fn lower_attribute(
     args: bqlite_ast::Attribute,
     acc: LogicalPlan,
     registry: &FunctionRegistry,
     source_table: &TableSchema,
 ) -> Result<LogicalPlan> {
+    // ATTRIBUTE requires raw event rows as input. MATCH emits per-match
+    // rows (one row per sequence-match result, with match-level metadata),
+    // not raw event rows, so ATTRIBUTE cannot consume MATCH output.
+    // Reject this pipeline composition at plan time, including when Filter/
+    // Project/Limit wrap MATCH output transparently.
+    // Per attribute.md §2 (input requirements) and TASK-446 A2.
+    if is_match_derived(&acc) {
+        return Err(BqliteError::Plan(
+            "ATTRIBUTE cannot consume MATCH output; \
+             MATCH emits per-match rows rather than raw event rows"
+                .into(),
+        ));
+    }
+
     // window >= 0. Zero is semantically valid (every conversion LEFT-UNNESTs
     // since no touchpoint can fall in an empty lookback window); negative
     // windows have no defined semantics and are rejected.
@@ -6461,6 +6505,7 @@ mod tests {
                 end_events,
                 forwarded_columns,
                 fused_downstream,
+                entity_key_col,
                 input,
                 output_schema,
             } => {
@@ -6468,6 +6513,7 @@ mod tests {
                 assert!(end_events.is_empty());
                 assert!(forwarded_columns.is_empty());
                 assert!(fused_downstream.is_none());
+                assert_eq!(entity_key_col, "user_id");
                 assert!(matches!(*input, LogicalPlan::Scan { .. }));
                 let names: Vec<&str> = output_schema
                     .columns()
@@ -7257,6 +7303,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn attribute_after_match_is_rejected() {
+        // ATTRIBUTE cannot consume MATCH output — MATCH emits per-match rows,
+        // not raw event rows. The planner must reject this composition.
+        // TASK-446 A2.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let match_stage = PipelineStage::Match {
+            pattern: bqlite_ast::pattern::MatchPattern {
+                steps: vec![match_step(None, "ad_click"), match_step(None, "purchase")],
+                mode: bqlite_ast::MatchMode::First,
+                emit_all: false,
+                window: None,
+                brackets: None,
+                span: Span::EMPTY,
+            },
+            span: Span::EMPTY,
+        };
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![
+                match_stage,
+                attribute_stage(
+                    60_000_000_000,
+                    vec!["purchase"],
+                    vec!["ad_click"],
+                    "country",
+                ),
+            ],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(ref msg) if msg.contains("ATTRIBUTE cannot consume MATCH output")),
+            "expected MATCH→ATTRIBUTE rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn attribute_after_match_wrapped_in_filter_is_rejected() {
+        // is_match_derived recurses through Filter (and Sort/Distinct/etc.) so
+        // MATCH | WHERE ... | ATTRIBUTE is also caught, not just direct MATCH |
+        // ATTRIBUTE. TASK-446 A2.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let match_stage = PipelineStage::Match {
+            pattern: bqlite_ast::pattern::MatchPattern {
+                steps: vec![match_step(None, "ad_click"), match_step(None, "purchase")],
+                mode: bqlite_ast::MatchMode::First,
+                emit_all: false,
+                window: None,
+                brackets: None,
+                span: Span::EMPTY,
+            },
+            span: Span::EMPTY,
+        };
+        let pipeline = pipeline_with_stages(
+            "purchases",
+            vec![
+                match_stage,
+                PipelineStage::Where {
+                    predicate: lit_true(),
+                    span: Span::EMPTY,
+                },
+                attribute_stage(
+                    60_000_000_000,
+                    vec!["purchase"],
+                    vec!["ad_click"],
+                    "country",
+                ),
+            ],
+        );
+        let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(ref msg) if msg.contains("ATTRIBUTE cannot consume MATCH output")),
+            "expected MATCH→Filter→ATTRIBUTE rejection, got {err:?}"
+        );
+    }
+
     // ── Wave 4 CP3: IN QUERY → SubqueryFilter lowering ────────────────────
 
     fn in_query_single_col(outer_col: &str, inner_table: &str, inner_col: &str) -> Spanned<Expr> {
@@ -7378,7 +7500,10 @@ mod tests {
             }],
         );
         let err = lower_statement(Statement::Query(pipeline), &cat).unwrap_err();
-        assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("arity mismatch")));
+        assert!(
+            matches!(err, BqliteError::IncompatibleCohortShape { .. }),
+            "expected IncompatibleCohortShape, got {err:?}"
+        );
     }
 
     #[test]
@@ -7840,6 +7965,25 @@ mod tests {
         ));
         let err = lower_statements(vec![define_alias("a", a_body), terminal], &cat).unwrap_err();
         assert!(matches!(err, BqliteError::Plan(msg) if msg.contains("cannot reference itself")));
+    }
+
+    #[test]
+    fn alias_name_matching_table_name_is_rejected() {
+        // Defining an alias whose name equals an existing catalog table is
+        // rejected with a dedicated "shadows table" error (TASK-447 J8).
+        // The table "purchases" is registered in the catalog; an alias named
+        // "purchases" must be rejected before it overwrites the lookup.
+        let cat = InMemoryCatalog::default().with(purchases_schema());
+        let terminal = Statement::Query(bare_pipeline("purchases"));
+        let err = lower_statements(
+            vec![define_alias("purchases", vip_alias_body()), terminal],
+            &cat,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Plan(ref msg) if msg.contains("shadows a catalog table")),
+            "expected shadow-table error, got {err:?}"
+        );
     }
 
     #[test]

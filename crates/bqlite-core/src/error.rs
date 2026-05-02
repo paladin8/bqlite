@@ -102,6 +102,24 @@ pub enum BqliteError {
     /// `docs/design/engine/cancellation.md` §6.1.
     #[error("group cardinality limit exceeded: {limit} groups")]
     MaxGroupsExceeded { limit: usize },
+
+    /// An alias cycle was detected while resolving alias references.
+    ///
+    /// `path` is the full resolution path from the first alias to the one
+    /// that closes the cycle, e.g. `["A", "B", "A"]`.
+    /// See `docs/design/language/cohorts-aliases-joins.md` §2.3–§2.4.
+    #[error("alias cycle detected: {}", path.join(" -> "))]
+    AliasCycle { path: Vec<String> },
+
+    /// The LHS tuple arity and subquery column count differ in an
+    /// `IN QUERY` / `IN <alias>` cohort filter.
+    ///
+    /// Raised by `apply_subquery_filter` during logical lowering.
+    /// See `docs/design/language/cohorts-aliases-joins.md` §4.1.
+    #[error(
+        "IN QUERY arity mismatch: LHS has {lhs_arity} column(s), subquery produces {rhs_arity}"
+    )]
+    IncompatibleCohortShape { lhs_arity: usize, rhs_arity: usize },
 }
 
 /// Convenience alias: `bqlite_core::Result<T>` is `Result<T, BqliteError>`.
@@ -156,5 +174,27 @@ mod tests {
     fn max_groups_exceeded_display_has_limit() {
         let err = BqliteError::MaxGroupsExceeded { limit: 1_000_000 };
         assert!(err.to_string().contains("1000000"));
+    }
+
+    #[test]
+    fn alias_cycle_display_includes_path() {
+        let err = BqliteError::AliasCycle {
+            path: vec!["A".into(), "B".into(), "A".into()],
+        };
+        let s = err.to_string();
+        assert!(s.contains("A -> B -> A"), "{s}");
+        assert!(s.contains("cycle"), "{s}");
+    }
+
+    #[test]
+    fn incompatible_cohort_shape_display_has_arities() {
+        let err = BqliteError::IncompatibleCohortShape {
+            lhs_arity: 2,
+            rhs_arity: 3,
+        };
+        let s = err.to_string();
+        assert!(s.contains('2'), "{s}");
+        assert!(s.contains('3'), "{s}");
+        assert!(s.contains("arity mismatch"), "{s}");
     }
 }

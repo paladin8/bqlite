@@ -234,7 +234,7 @@ contributes:
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
-| `__source_table_id` | `Int8` | no | 0-indexed position in the JOIN clause |
+| `__source_table_id` | `Int` | no | 0-indexed position in the JOIN clause |
 | `__seq_id` | `Int64` | no | Synthesised per-row sequence id from the picked sub-scan's segment footer (`storage/system-columns.md` §3) |
 | `__batch_id` | `Int64` | no | Synthesised per-row batch id from the picked sub-scan's segment footer |
 
@@ -253,9 +253,9 @@ Table-qualified references (`events.signup`, `purchases.amount`) resolve through
 
 Dictionary size is bounded by table count in the JOIN, practically <= 4.
 
-**Rationale.** `i8` is the smallest representation that comfortably covers realistic JOIN widths. A dictionary registry (vs `Dictionary<Int8, Utf8>` per column) avoids duplicating the mapping in every batch. Keeps the row-level per-byte cost minimal in the hot path while preserving display / EXPLAIN ergonomics through registry lookup.
+**Rationale.** A dictionary registry (vs a `Dictionary<Int, Utf8>` per column) avoids duplicating the table-name mapping in every batch and keeps display / EXPLAIN ergonomics through registry lookup. `BqlType` uses `Int` (i64) as the smallest integer type; narrow physical encodings (`Int8` Arrow columns) are handled by the Arrow/Parquet compression layer rather than by a distinct BQL scalar type (type-system.md §7.2).
 
-**Implication for TASK-424 (planner):** `MergeSources` carries the `table_id -> name` map in its descriptor; `OperatorSchema` exposes `__source_table_id` as a non-nullable `Int8` column. EXPLAIN renders the map alongside the merge node.
+**Implication for TASK-424 (planner):** `MergeSources` carries the `table_id -> name` map in its descriptor; `OperatorSchema` exposes `__source_table_id` as a non-nullable `Int` column. EXPLAIN renders the map alongside the merge node.
 
 ### 3.9 `__source_table_id` Absent in Single-Table Queries (B8)
 
@@ -389,7 +389,7 @@ Before the main pipeline executes, the planner orchestrates a cohort-materializa
 
 | Node | Output Schema |
 |------|--------------|
-| `MergeSources` | Union of all joined tables' schemas, plus `__source_table_id: Int8 NOT NULL` |
+| `MergeSources` | Union of all joined tables' schemas, plus `__source_table_id: Int NOT NULL` |
 | `SubqueryFilter` | Identical to outer input (filter, not transform) |
 
 These follow the schema computation rules in `planner-pipeline.md` § 5.4.
@@ -438,7 +438,7 @@ For `MergeSources`, the output entity-key column is always named `entity_id` reg
 **TASK-424 (planner: plan variants for Wave 4):**
 - New `MergeSources { tables, order, table_id_map }` physical node (§ 3.7, § 3.8).
 - `SubqueryFilter { lhs_tuple, cohort: Arc<HashSetCohort>, output_schema }` physical node (§ 4.1).
-- `OperatorSchema` exposes `__source_table_id` as non-nullable `Int8`.
+- `OperatorSchema` exposes `__source_table_id` as non-nullable `Int`.
 - EXPLAIN renders the table-id map alongside the merge node.
 
 **TASK-425 (AST-to-logical lowering, Wave 4):**
@@ -573,7 +573,7 @@ The following spec sections require updates to align with the decisions in this 
 | Section | Change |
 |---------|--------|
 | § 6.9 | Document A8 (alias shape is use-site enforced) and A9 (positional tuple binding) |
-| New section | `__source_table_id: Int8` non-nullable column introduced by `MergeSources` per B7/B8 |
+| New section | `__source_table_id: Int` non-nullable column introduced by `MergeSources` per B7/B8 |
 
 ### 7.3 `planner-pipeline.md` Updates
 
