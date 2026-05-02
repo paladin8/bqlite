@@ -21,11 +21,11 @@ benches/wave5/
 ├── zero_copy_scan.rs                # Zero-copy scan/filter copy budget (CP1)
 ├── stateful_aggregate_fusion.rs     # Stateful → aggregate fusion throughput (CP2)
 ├── morsel_skew.rs                   # Morsel scheduler skew wall-clock tripwire (CP3)
-└── spill_overhead.rs                # Sort spill overhead (CP4)
+├── spill_overhead.rs                # Sort spill overhead (CP4)
+└── cohort_pushdown.rs               # Cohort entity-id pushdown savings (CP5)
 ```
 
-CP5 lands the cohort pushdown bench alongside the CP1–CP4 ones.
-Each follow-up checkpoint adds its own row to the *Coverage matrix*
+Adding a bench means adding a row to both the *Coverage matrix*
 and *Reference-machine targets* tables below.
 
 ## Coverage matrix
@@ -36,6 +36,7 @@ and *Reference-machine targets* tables below.
 | Stateful → aggregate fusion (TASK-520) | `stateful_aggregate_fusion.rs` | `Engine::query` end-to-end on `SESSIONIZE → STATS`; fused vs unfused wall-clock ratio |
 | Morsel scheduler skew (TASK-523/524) | `morsel_skew.rs` | `Engine::query` end-to-end on `STATS COUNT(*) GROUP BY entity_id`; skewed-to-balanced wall-clock ratio |
 | Sort spill overhead (TASK-502/513) | `spill_overhead.rs` | `SortOperator::with_spill` vs `SortOperator::new`; spill-tax wall-clock ratio against an in-memory baseline |
+| Cohort pushdown savings (TASK-522) | `cohort_pushdown.rs` | `SegmentScan::scan` with vs without a `ScanPredicate { conjuncts: [EntityIn(...)] }`; `bytes_scanned` savings ratio |
 
 ## Reference-machine targets
 
@@ -61,6 +62,7 @@ Provenance labels:
 | `wave5/stateful_aggregate_fusion/fusion_speedup_ratio` | ≥ 0.95 | **[floor]** `engine/operator-fusion.md` does not pin a numerical ratio; this is a regression tripwire that catches the fusion pass silently no-op'ing or the inline-accumulator path landing on a slow branch. The 0.95 threshold absorbs CI runner noise around the no-effect point of 1.0. Fused query: `SESSIONIZE → STATS MAX(session_id)`; unfused baseline: `SESSIONIZE → STATS SUM(amount)` |
 | `wave5/morsel_skew/skew_tax_ratio` | ≤ 4.0 | **[floor]** `engine/morsel-scheduler.md` does not pin a numerical ratio. v1's single-task driver should produce roughly identical wall-clock between balanced and skewed inputs (per-entity work is sequential anyway); a >4× skew tax signals a morsel-generation regression. The future per-shard scheduler should *narrow* the tax, not widen it |
 | `wave5/spill_overhead/spill_tax_ratio` | ≤ 3.0 | **[floor]** `engine/spill.md` does not pin a numerical throughput tax (§10.3 covers `try_reserve` semantics, not throughput); this is a regression tripwire. `sort_with_spill_ns / sort_no_spill_ns ≤ 3.0` keeps headroom for the merger phase's startup overhead at small CI sizing while still catching a regression that pushes the spill drain into a slow branch |
+| `wave5/cohort_pushdown/bytes_scanned_savings_ratio` | ≤ 0.5 | **[floor]** `optimizer-direction.md` §7 row 9 makes only a qualitative claim ("a non-trivial fraction of row groups must be skippable"), so this is a regression tripwire. The fixture (single-entity cohort, 100-row row groups) gives the gate its best case — observed ratio ≈ 0.002 in CI mode. A regression that turns the `EntityIn` conjunct into a no-op surfaces as a ratio close to 1.0 |
 
 ### Not covered (intentional)
 
@@ -81,6 +83,17 @@ Provenance labels:
   (TASK-528) owns end-to-end correctness; this suite measures
   per-feature throughput and metric budgets in isolation so the
   numbers are stable and attributable.
+- **`bytes_scanned` parity assertions through `Engine::query`.** The
+  engine bind path (`crates/bqlite-engine/src/bind.rs:1376`)
+  constructs `ScanOperator::with_tombstones` *without* an
+  `attach_metrics` call — so `ExecutionResult.metrics.operator.bytes_scanned`
+  is always zero today. The CP5 cohort-pushdown bench works around
+  this by driving the storage-layer scan directly via
+  `SegmentFileReader::scan` so it can attach `AtomicMetrics` and
+  observe the counter. Once the engine threads its `Metrics` handle
+  into the scan, both the morsel-skew (CP3) and cohort-pushdown
+  (CP5) benches can add `bytes_scanned` parity rows at the engine
+  layer.
 - **Multi-column scan copy-budget assertions.** `zero_copy_scan.rs`
   projects a single column per scenario to isolate the metric.
   Multi-column scan copy budget is exercised end-to-end by Wave 2's
@@ -96,6 +109,7 @@ cargo bench -p bqlite-benches --bench zero_copy_scan
 cargo bench -p bqlite-benches --bench stateful_aggregate_fusion
 cargo bench -p bqlite-benches --bench morsel_skew
 cargo bench -p bqlite-benches --bench spill_overhead
+cargo bench -p bqlite-benches --bench cohort_pushdown
 
 # Reference mode — full-scale fixtures with hard targets. Only
 # meaningful on the pinned reference hardware.
@@ -103,6 +117,7 @@ BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench zero_copy_scan
 BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench stateful_aggregate_fusion
 BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench morsel_skew
 BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench spill_overhead
+BQLITE_BENCH_MODE=reference cargo bench -p bqlite-benches --bench cohort_pushdown
 ```
 
 Each bench also runs under `cargo test --all-targets` /

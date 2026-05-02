@@ -229,3 +229,11 @@ harness = false
 name = "spill_overhead"
 path = "wave5/spill_overhead.rs"
 harness = false
+
+# Wave 5 cohort pushdown savings bench (TASK-526). Compares
+# bytes_scanned between a ScanOperator with an EntityIn conjunct
+# (TASK-522 pushdown) and the same scan without the conjunct.
+[[bench]]
+name = "cohort_pushdown"
+path = "wave5/cohort_pushdown.rs"
+harness = false
