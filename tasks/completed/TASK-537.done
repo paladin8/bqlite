@@ -2,6 +2,7 @@
   "agent_id": "agent-1",
   "task_id": "TASK-537",
   "claimed_at": "2026-05-09T07:25:01Z",
+  "completed_at": "2026-05-09T08:19:58Z",
   "branch": "task/TASK-537",
   "description": "Real worker timing + CPU counter integration (TASK-524 closure)"
 }
