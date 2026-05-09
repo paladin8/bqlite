@@ -522,6 +522,21 @@ impl QueryContext {
         guard.record_worker(&snap);
     }
 
+    /// Record the per-shard morsel counts and add to `morsels_dispatched`
+    /// after a per-shard dispatch returns. The morsel scheduler emits
+    /// exactly one morsel per shard in v1; sub-shard halving will
+    /// expand this to per-`(shard, generator)` totals.
+    pub fn record_morsels_per_shard(&self, counts: &[u64]) {
+        let mut guard = self
+            .worker_aggregate
+            .lock()
+            .expect("query worker_aggregate mutex poisoned");
+        guard.morsels_dispatched = guard
+            .morsels_dispatched
+            .saturating_add(counts.iter().sum::<u64>());
+        guard.record_morsels_per_shard(counts);
+    }
+
     /// Snapshot the per-query metrics: read the shared operator
     /// counters, fold them into the worker aggregate, stamp the
     /// wall-clock duration and the CPU-metrics flag, and return.

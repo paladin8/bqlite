@@ -62,7 +62,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
-use bqlite_core::{BqliteError, OperatorSchema, QueryWarning};
+use bqlite_core::{BqliteError, OperatorSchema, QueryWarning, TimeRange};
 use bqlite_planner::PhysicalPlan;
 use bqlite_storage::Database;
 
@@ -553,41 +553,164 @@ fn run_query_inner(
 
     let schema = physical.output_schema().clone();
 
-    // 3. Bind the plain-data descriptor into an executable operator
-    //    tree. The QueryContext threads through both the memory
-    //    budget (per `docs/design/engine/memory-budget.md`) and the
-    //    warning sink (per `cancellation.md` §7) so adapters that
-    //    publish per-entity diagnostics can attach them to the
-    //    per-query stream.
-    //
-    //    Bind runs on the calling thread because it borrows
-    //    `&mut Database` to register cohorts / pre-load metadata.
-    //    Once bound, the `Box<dyn PhysicalOperator>` owns whatever
-    //    state it needs (segment readers via `Arc<Database>`-internal
-    //    handles), so the operator tree can be moved onto a worker
-    //    thread for the drive step. See `engine/morsel-scheduler.md`
-    //    §5.4: DDL / DELETE / EXPLAIN bypass the worker pool; data-
-    //    plane queries are dispatched through it.
-    let operator = bind_physical(&physical, db, ctx)?;
+    // 3. Classify the dispatch shape (TASK-536). Plans with a top-level
+    //    Aggregate over a per-shard-safe input run via run_per_shard
+    //    with per-shard HashAccumulators merged on the coordinator
+    //    (design §6.4). Pure data-plane plans (Scan / Filter / Project /
+    //    FusedSegment chains; Limit excluded — it needs a coordinator-
+    //    side cap, not a per-shard one) run via run_per_shard with
+    //    whole-tree-per-shard binding and concat outputs. Everything
+    //    else (Sort, MergeSources, SubqueryFilter, SequenceMatch, the
+    //    entity-operator family, Sample, top-level Limit) falls back
+    //    to the single-task path so v1 correctness is never at risk.
+    let shape = classify_dispatch(&physical);
 
-    // 4. Drive the operator on the morsel scheduler's worker pool.
-    //    The submission acquires `query_threads` permits from the
-    //    shared `CoreBudget` (FIFO atomic batch — design §7.1) and
-    //    runs the drive loop on a Rayon worker. v1 dispatches every
-    //    query as one degenerate whole-database task; per-shard
-    //    morsel parallelism lands in follow-on tasks.
-    //
-    //    The "primary error wins" cleanup convention from the prior
-    //    single-threaded driver carries through: `close` runs on
-    //    both happy and sad paths so mmap handles and spill files
-    //    are released promptly. The closure drops the operator tree
-    //    before returning so any adapter clones of the warning sink
-    //    AND of the shared `Arc<dyn Metrics>` are released first —
-    //    matches `cancellation.md` §5.1 leaf-first teardown and
-    //    `execution-model.md` §14.2's "after all morsels complete"
-    //    rule for the metrics aggregate.
+    let dispatch = match shape {
+        DispatchShape::SingleTask => run_single_task(scheduler, db, ctx, &physical)?,
+        DispatchShape::PerShardConcat => run_per_shard_concat(scheduler, db, ctx, &physical)?,
+        DispatchShape::PerShardAggregate => run_per_shard_aggregate(scheduler, db, ctx, &physical)?,
+    };
+
+    // Record one WorkerMetricsSnapshot per worker thread that pulled
+    // at least one morsel. The CPU/idle/busy fields stay zero in this
+    // task — TASK-537 fills them in. For the SingleTask path the
+    // count is 1 (the legacy seed); for the per-shard paths the count
+    // is the number of unique Rayon worker threads that contributed.
+    for _ in 0..dispatch.num_workers {
+        ctx.record_worker_snapshot(WorkerMetricsSnapshot::default());
+    }
+    if !dispatch.morsels_per_shard.is_empty() {
+        ctx.record_morsels_per_shard(&dispatch.morsels_per_shard);
+    }
+
+    let wall_clock_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let metrics = ctx.take_query_metrics(wall_clock_ns);
+
+    Ok(ExecutionResult {
+        schema,
+        rows: dispatch.rows,
+        rows_affected: None,
+        peak_memory_bytes: ctx.peak_memory_bytes(),
+        warnings: ctx.warnings().clone().into_warnings(),
+        metrics,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dispatch classification + per-shard execution helpers (TASK-536)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Plan shapes the engine fans out per shard via
+/// [`MorselScheduler::run_per_shard`]. Shapes outside this set fall
+/// back to the legacy single-task path so v1 correctness never
+/// regresses on plan tree shapes the per-shard model has not yet
+/// been validated against.
+#[derive(Debug, Clone, Copy)]
+enum DispatchShape {
+    /// Per-shard whole-tree dispatch + concat outputs. Safe for
+    /// pure data-plane plans where the result is multiset-equivalent
+    /// across shards (Scan / Filter / Project / FusedSegment).
+    PerShardConcat,
+    /// Per-shard execute-input-of-aggregate + per-shard
+    /// HashAccumulator + cross-shard merge on the coordinator.
+    PerShardAggregate,
+    /// Whole-database single-task dispatch (legacy path).
+    SingleTask,
+}
+
+fn classify_dispatch(plan: &PhysicalPlan) -> DispatchShape {
+    if let PhysicalPlan::Aggregate(agg) = plan {
+        if is_per_shard_safe_input(&agg.input) {
+            return DispatchShape::PerShardAggregate;
+        }
+        return DispatchShape::SingleTask;
+    }
+    if is_per_shard_safe_input(plan) {
+        return DispatchShape::PerShardConcat;
+    }
+    DispatchShape::SingleTask
+}
+
+/// Plans whose row set is the union of per-shard row sets. Stateless
+/// chains (Filter / Project / Limit) are encoded inside `FusedSegment`
+/// in the planner, so this match covers the full Wave 5 stateless
+/// surface. Note that `FusedSegmentStep::Limit` inside the chain
+/// would multiply by populated-shard count if applied per shard;
+/// `is_per_shard_concat_safe` rejects FusedSegment chains that carry
+/// a `Limit` step. Sort / Aggregate / Distinct / MergeSources /
+/// SubqueryFilter / SequenceMatch / Sample / the entity-operator
+/// family change row shape or require cross-shard state and fall back.
+fn is_per_shard_safe_input(plan: &PhysicalPlan) -> bool {
+    use bqlite_planner::PhysicalPlan as P;
+    match plan {
+        P::Scan(_) => true,
+        P::FusedSegment(fs) => {
+            // Reject chains that carry a Limit step — applying the
+            // cap per shard would multiply the result.
+            !chain_has_limit(&fs.steps) && is_per_shard_safe_input(&fs.input)
+        }
+        _ => false,
+    }
+}
+
+fn chain_has_limit(steps: &[bqlite_planner::physical::FusedSegmentStep]) -> bool {
+    use bqlite_planner::physical::FusedSegmentStep;
+    steps
+        .iter()
+        .any(|s| matches!(s, FusedSegmentStep::Limit { .. }))
+}
+
+/// Walk the plan tree to find the underlying Scan's table name, if any.
+/// Used by the per-shard dispatch to enumerate the populated shards
+/// for that table. Returns `None` for plan shapes that don't expose a
+/// single primary table (joins via MergeSources, DDL).
+fn primary_table_name(plan: &PhysicalPlan) -> Option<String> {
+    use bqlite_planner::PhysicalPlan as P;
+    match plan {
+        P::Scan(s) => Some(s.table.clone()),
+        P::FusedSegment(fs) => primary_table_name(&fs.input),
+        P::Aggregate(a) => primary_table_name(&a.input),
+        P::Sort(s) => primary_table_name(&s.input),
+        P::Distinct(d) => primary_table_name(&d.input),
+        _ => None,
+    }
+}
+
+fn primary_table_time_range(plan: &PhysicalPlan) -> Option<TimeRange> {
+    use bqlite_planner::PhysicalPlan as P;
+    match plan {
+        P::Scan(s) => s.reader_range,
+        P::FusedSegment(fs) => primary_table_time_range(&fs.input),
+        P::Aggregate(a) => primary_table_time_range(&a.input),
+        P::Sort(s) => primary_table_time_range(&s.input),
+        P::Distinct(d) => primary_table_time_range(&d.input),
+        _ => None,
+    }
+}
+
+/// Outcome of one of the three dispatch helpers — common shape so
+/// `run_query_inner` can fold the result into `ExecutionResult` and
+/// `QueryMetrics` uniformly.
+struct DispatchOutcome {
+    rows: Vec<RecordBatch>,
+    /// Number of unique worker threads that pulled at least one
+    /// morsel. The single-task path always reports 1 (the legacy
+    /// seed). The per-shard paths report `min(query_threads, num_populated_shards)`.
+    num_workers: usize,
+    /// One entry per populated shard (single-task: empty). v1 emits
+    /// exactly one morsel per shard, so every entry is `1`. Once the
+    /// per-entity-range generator lands these will diverge.
+    morsels_per_shard: Vec<u64>,
+}
+
+fn run_single_task(
+    scheduler: &MorselScheduler,
+    db: &mut Database,
+    ctx: &QueryContext,
+    plan: &PhysicalPlan,
+) -> bqlite_core::Result<DispatchOutcome> {
+    let mut operator = bind_physical(plan, db, ctx)?;
     let rows = scheduler.submit(move || -> bqlite_core::Result<Vec<RecordBatch>> {
-        let mut operator = operator;
         let drive_result = drive_to_completion(operator.as_mut());
         let close_result = operator.close();
         let rows = drive_result?;
@@ -595,25 +718,196 @@ fn run_query_inner(
         drop(operator);
         Ok(rows)
     })?;
-
-    // v1 dispatches one degenerate "whole-database" task per query, so
-    // record exactly one `WorkerMetricsSnapshot::default()` to seed
-    // `num_workers == 1` and give the worker min/max aggregates
-    // concrete (zero) values. The per-shard morsel-parallelism
-    // follow-up will switch to one snapshot per worker. CPU-counter
-    // fields stay zero — `PerfCounters::open_or_disabled` returns
-    // disabled today.
-    ctx.record_worker_snapshot(WorkerMetricsSnapshot::default());
-    let wall_clock_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let metrics = ctx.take_query_metrics(wall_clock_ns);
-
-    Ok(ExecutionResult {
-        schema,
+    Ok(DispatchOutcome {
         rows,
-        rows_affected: None,
-        peak_memory_bytes: ctx.peak_memory_bytes(),
-        warnings: ctx.warnings().clone().into_warnings(),
-        metrics,
+        num_workers: 1,
+        morsels_per_shard: Vec::new(),
+    })
+}
+
+fn run_per_shard_concat(
+    scheduler: &MorselScheduler,
+    db: &mut Database,
+    ctx: &QueryContext,
+    plan: &PhysicalPlan,
+) -> bqlite_core::Result<DispatchOutcome> {
+    let table = match primary_table_name(plan) {
+        Some(t) => t,
+        // Should not happen given classify_dispatch, but if it does
+        // we fall back to single-task rather than panic.
+        None => return run_single_task(scheduler, db, ctx, plan),
+    };
+    let reader_range = primary_table_time_range(plan).unwrap_or_else(TimeRange::unbounded);
+    let snapshots = crate::scheduler::enumerate_shard_snapshots(db, &table, reader_range)?;
+    if snapshots.is_empty() {
+        return run_single_task(scheduler, db, ctx, plan);
+    }
+
+    // Pre-bind one operator tree per shard on the calling thread —
+    // bind borrows `&mut Database` for cohort registration and is
+    // not safe to interleave across worker threads.
+    let mut bound: Vec<(u32, Box<dyn bqlite_operators::PhysicalOperator>)> =
+        Vec::with_capacity(snapshots.len());
+    for snap in &snapshots {
+        let op = crate::bind::bind_physical_for_shard(plan, db, ctx, snap.shard_id)?;
+        bound.push((snap.shard_id, op));
+    }
+    let by_shard: std::sync::Mutex<
+        std::collections::HashMap<u32, Box<dyn bqlite_operators::PhysicalOperator>>,
+    > = std::sync::Mutex::new(bound.into_iter().collect());
+    let collected: std::sync::Mutex<Vec<RecordBatch>> = std::sync::Mutex::new(Vec::new());
+
+    let cancel = ctx.cancellation().clone();
+    let outcome = scheduler.run_per_shard(&snapshots, &cancel, |guard, _ctx_w| {
+        let shard = guard.morsel.shard_id;
+        let mut op = by_shard
+            .lock()
+            .expect("per-shard subplan slot poisoned")
+            .remove(&shard)
+            .ok_or_else(|| BqliteError::Execution(format!("missing subplan for shard {shard}")))?;
+        let drive_result = drive_to_completion(op.as_mut());
+        let close_result = op.close();
+        let rows = drive_result?;
+        close_result?;
+        drop(op);
+        collected.lock().expect("collected poisoned").extend(rows);
+        Ok(())
+    })?;
+
+    let rows = collected.into_inner().expect("collected poisoned");
+    let num_workers = outcome
+        .per_worker
+        .iter()
+        .filter(|c| c.morsels_dispatched > 0)
+        .count()
+        .max(1);
+    Ok(DispatchOutcome {
+        rows,
+        num_workers,
+        morsels_per_shard: vec![1u64; snapshots.len()],
+    })
+}
+
+fn run_per_shard_aggregate(
+    scheduler: &MorselScheduler,
+    db: &mut Database,
+    ctx: &QueryContext,
+    plan: &PhysicalPlan,
+) -> bqlite_core::Result<DispatchOutcome> {
+    use bqlite_operators::aggregate::{evaluate_aggregate_inputs, Accumulator, HashAccumulator};
+    use bqlite_planner::PhysicalPlan as P;
+    let agg = match plan {
+        P::Aggregate(a) => a,
+        _ => unreachable!("classify_dispatch guarantees aggregate root"),
+    };
+    let table = match primary_table_name(&agg.input) {
+        Some(t) => t,
+        None => return run_single_task(scheduler, db, ctx, plan),
+    };
+    let reader_range = primary_table_time_range(&agg.input).unwrap_or_else(TimeRange::unbounded);
+    let snapshots = crate::scheduler::enumerate_shard_snapshots(db, &table, reader_range)?;
+    if snapshots.is_empty() {
+        return run_single_task(scheduler, db, ctx, plan);
+    }
+
+    // Pre-bind the aggregate's INPUT per shard. The aggregate itself
+    // is materialised at the coordinator level via one HashAccumulator
+    // per shard; cross-shard merge runs on the coordinator (design §6.4).
+    let mut bound: Vec<(u32, Box<dyn bqlite_operators::PhysicalOperator>)> =
+        Vec::with_capacity(snapshots.len());
+    for snap in &snapshots {
+        let op = crate::bind::bind_physical_for_shard(&agg.input, db, ctx, snap.shard_id)?;
+        bound.push((snap.shard_id, op));
+    }
+    let by_shard_op: std::sync::Mutex<
+        std::collections::HashMap<u32, Box<dyn bqlite_operators::PhysicalOperator>>,
+    > = std::sync::Mutex::new(bound.into_iter().collect());
+
+    let group_by = agg.group_by.clone();
+    let aggregates = agg.aggregates.clone();
+    let output_schema = agg.output_schema.clone();
+    let max_groups = agg.max_groups;
+
+    let cancel = ctx.cancellation().clone();
+    let outcome = scheduler.run_per_shard(&snapshots, &cancel, |guard, _ctx_w| {
+        let shard = guard.morsel.shard_id;
+        let mut op = by_shard_op
+            .lock()
+            .expect("per-shard subplan poisoned")
+            .remove(&shard)
+            .ok_or_else(|| BqliteError::Execution(format!("missing subplan for shard {shard}")))?;
+        let mut acc = HashAccumulator::from_planner_spec(
+            &aggregates,
+            group_by.len(),
+            output_schema.clone(),
+            max_groups,
+        );
+        op.open()?;
+        loop {
+            // Per-batch cancellation check (design §9.1).
+            if cancel.is_cancelled() {
+                let _ = op.close();
+                return Err(BqliteError::Cancelled);
+            }
+            match op.next_batch()? {
+                Some(batch) => {
+                    let (group_arrays, agg_arrays) =
+                        evaluate_aggregate_inputs(&group_by, &aggregates, &batch)?;
+                    acc.update_evaluated(batch.num_rows(), &group_arrays, &agg_arrays)?;
+                }
+                None => break,
+            }
+        }
+        op.close()?;
+        // Park the per-shard accumulator on the AccumulatorHandle so
+        // the cross-shard merge picks it up.
+        let mut slot =
+            guard
+                .accumulator()
+                .lock_or_poisoned()
+                .map_err(|_| BqliteError::OperatorPanic {
+                    message: "accumulator mutex poisoned by upstream panic".into(),
+                    location: None,
+                })?;
+        *slot = Some(Box::new(acc));
+        Ok(())
+    })?;
+
+    // Cross-shard merge on the coordinator (single-threaded, design §6.4).
+    let mut merged: Option<Box<dyn Accumulator>> = None;
+    for h in &outcome.accumulators {
+        let acc = h
+            .take_accumulator()
+            .expect("shard accumulator parked by worker");
+        match merged.as_mut() {
+            None => merged = Some(acc),
+            Some(m) => m.merge(acc)?,
+        }
+    }
+    // SQL semantics: COUNT(*) on an empty input must emit one row with
+    // zero. The per-shard accumulators all hit zero groups when every
+    // segment is tombstoned, so we mirror HashAggregateOperator's
+    // `ensure_default_group()` call on the merged accumulator before
+    // finish.
+    let rows = match merged {
+        Some(mut m) => {
+            if group_by.is_empty() {
+                m.ensure_default_group_if_ungrouped()?;
+            }
+            vec![m.finish()?]
+        }
+        None => Vec::new(),
+    };
+    let num_workers = outcome
+        .per_worker
+        .iter()
+        .filter(|c| c.morsels_dispatched > 0)
+        .count()
+        .max(1);
+    Ok(DispatchOutcome {
+        rows,
+        num_workers,
+        morsels_per_shard: vec![1u64; snapshots.len()],
     })
 }
 

@@ -444,6 +444,17 @@ pub trait Accumulator: Send {
 
     /// Downcast support for cross-shard merge.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// SQL semantics for ungrouped aggregation: when the input is
+    /// empty, ensure exactly one default-group row is materialised so
+    /// `COUNT(*)` on an empty table returns `0` rather than no rows.
+    /// [`HashAggregateOperator::next_batch`] already calls this on its
+    /// internal accumulator before `finish` (`mod.rs:986`); the engine's
+    /// per-shard dispatch (TASK-536) calls it on the cross-shard
+    /// merged accumulator before `finish`. Default impl: no-op.
+    fn ensure_default_group_if_ungrouped(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -811,6 +822,13 @@ impl Accumulator for HashAccumulator {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn ensure_default_group_if_ungrouped(&mut self) -> Result<()> {
+        if self.group_by_columns.is_empty() && self.num_groups() == 0 {
+            self.ensure_default_group()?;
+        }
+        Ok(())
     }
 }
 
