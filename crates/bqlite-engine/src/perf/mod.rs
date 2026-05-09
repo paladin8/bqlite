@@ -463,25 +463,38 @@ pub fn format_perf_explain(metrics: &QueryMetrics) -> String {
         "  cpu_metrics_enabled        : {}\n",
         metrics.cpu_metrics_enabled
     ));
+    // CPU rows label themselves clearly when the user did not opt
+    // into CPU metrics, or when the kernel refused the syscall (e.g.
+    // CAP_PERFMON missing, paranoid mode, macOS pre-kpc) — printing a
+    // bare zero in those states would be ambiguous with "the workload
+    // genuinely consumed zero cycles". TASK-537 scope (f).
+    let cpu_label = cpu_disabled_label(metrics);
+    let cpu_value = |v: u64| -> String {
+        match cpu_label {
+            Some(label) => label.to_string(),
+            None => v.to_string(),
+        }
+    };
     out.push_str(&format!(
         "  total_cpu_cycles           : {}\n",
-        metrics.total_cpu_cycles
+        cpu_value(metrics.total_cpu_cycles)
     ));
     out.push_str(&format!(
         "  events_processed           : {}\n",
         metrics.events_processed
     ));
-    out.push_str(&format!(
-        "  cycles_per_event           : {}\n",
-        format_ratio(metrics.cycles_per_event())
-    ));
+    let cpe_render = match cpu_label {
+        Some(label) => label.to_string(),
+        None => format_ratio(metrics.cycles_per_event()),
+    };
+    out.push_str(&format!("  cycles_per_event           : {cpe_render}\n",));
     out.push_str(&format!(
         "  branch_misses              : {}\n",
-        metrics.branch_misses
+        cpu_value(metrics.branch_misses)
     ));
     out.push_str(&format!(
         "  llc_misses                 : {}\n",
-        metrics.llc_misses
+        cpu_value(metrics.llc_misses)
     ));
 
     out.push_str("\nSkew\n");
@@ -533,6 +546,25 @@ pub fn format_perf_explain(metrics: &QueryMetrics) -> String {
     ));
 
     out
+}
+
+/// Pick the right "not collected" label for the CPU-row block, or
+/// `None` when real values are available. Returning the label as a
+/// `&'static str` keeps the renderer alloc-free in the happy path.
+///
+/// - `cpu_metrics_enabled == false` → user did not opt in.
+/// - `cpu_metrics_enabled == true` *and* `cpu_counters_available == false`
+///   → user opted in but the platform refused the syscall (Linux
+///   without `CAP_PERFMON`, macOS pre-`kpc`, or any platform without a
+///   perf integration).
+fn cpu_disabled_label(m: &QueryMetrics) -> Option<&'static str> {
+    if !m.cpu_metrics_enabled {
+        return Some("not collected (cpu metrics disabled)");
+    }
+    if !m.cpu_counters_available {
+        return Some("not collected (no CAP_PERFMON)");
+    }
+    None
 }
 
 /// Format an `Option<f64>` ratio with three decimal places, or `—`
@@ -752,6 +784,107 @@ mod tests {
         assert!(out.contains("rows_out                   : 12345"), "{out}");
         // GB/s/core should be ~1.000 for 1 GiB / 1 second / 1 core.
         assert!(out.contains("gb_per_sec_scanned         : 1.000"), "{out}");
+    }
+
+    #[test]
+    fn format_perf_explain_labels_cpu_rows_when_user_did_not_opt_in() {
+        // cpu_metrics_enabled == false: every CPU row carries the
+        // "cpu metrics disabled" label, never a bare zero.
+        let m = QueryMetrics::zero();
+        let out = format_perf_explain(&m);
+        assert!(
+            out.contains("total_cpu_cycles           : not collected (cpu metrics disabled)"),
+            "expected total_cpu_cycles disabled label: {out}"
+        );
+        assert!(
+            out.contains("branch_misses              : not collected (cpu metrics disabled)"),
+            "expected branch_misses disabled label: {out}"
+        );
+        assert!(
+            out.contains("llc_misses                 : not collected (cpu metrics disabled)"),
+            "expected llc_misses disabled label: {out}"
+        );
+        assert!(
+            out.contains("cycles_per_event           : not collected (cpu metrics disabled)"),
+            "expected cycles_per_event disabled label: {out}"
+        );
+    }
+
+    #[test]
+    fn format_perf_explain_labels_cpu_rows_when_kernel_refused() {
+        // cpu_metrics_enabled == true *and* cpu_counters_available == false
+        // → user opted in but kernel refused (e.g. CAP_PERFMON missing).
+        let mut m = QueryMetrics::zero();
+        m.cpu_metrics_enabled = true;
+        m.cpu_counters_available = false;
+        let out = format_perf_explain(&m);
+        assert!(
+            out.contains("branch_misses              : not collected (no CAP_PERFMON)"),
+            "expected CAP_PERFMON label: {out}"
+        );
+        assert!(
+            out.contains("cycles_per_event           : not collected (no CAP_PERFMON)"),
+            "expected CAP_PERFMON label on cycles_per_event: {out}"
+        );
+    }
+
+    #[test]
+    fn format_perf_explain_keeps_em_dash_when_collected_but_no_events() {
+        // Both flags on but events_processed == 0 → cycles_per_event
+        // is mathematically undefined; preserve the em-dash render
+        // rather than fall back to a labelled "not collected" row.
+        // Pins the seam between "counters collected, ratio undefined"
+        // and "counters not collected at all".
+        let mut m = QueryMetrics::zero();
+        m.cpu_metrics_enabled = true;
+        m.cpu_counters_available = true;
+        m.total_cpu_cycles = 1_234;
+        m.events_processed = 0;
+        let out = format_perf_explain(&m);
+        assert!(
+            out.contains("cycles_per_event           : —"),
+            "expected em-dash for undefined cycles_per_event when collected: {out}"
+        );
+        // The concrete cycles total still renders — the em-dash is
+        // limited to the derived ratio.
+        assert!(
+            out.contains("total_cpu_cycles           : 1234"),
+            "concrete cycles count must still render: {out}"
+        );
+    }
+
+    #[test]
+    fn format_perf_explain_renders_real_cpu_values_when_collected() {
+        // cpu_metrics_enabled == true && cpu_counters_available == true
+        // → render real numbers, no label.
+        let mut m = QueryMetrics::zero();
+        m.cpu_metrics_enabled = true;
+        m.cpu_counters_available = true;
+        m.total_cpu_cycles = 1_000_000;
+        m.branch_misses = 42;
+        m.llc_misses = 7;
+        m.events_processed = 1_000;
+        let out = format_perf_explain(&m);
+        assert!(
+            out.contains("total_cpu_cycles           : 1000000"),
+            "expected concrete cycles count: {out}"
+        );
+        assert!(
+            out.contains("branch_misses              : 42"),
+            "expected concrete branch_misses: {out}"
+        );
+        assert!(
+            out.contains("llc_misses                 : 7"),
+            "expected concrete llc_misses: {out}"
+        );
+        assert!(
+            out.contains("cycles_per_event           : 1000.000"),
+            "expected concrete cycles_per_event ratio: {out}"
+        );
+        assert!(
+            !out.contains("not collected"),
+            "happy path must not carry a 'not collected' label: {out}"
+        );
     }
 
     #[test]
