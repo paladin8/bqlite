@@ -332,7 +332,8 @@ mod snapshot_isolation {
     use std::time::Duration;
 
     use bqlite_core::time::TimeRange;
-    use bqlite_engine::{Database, Engine};
+    use bqlite_engine::{Database, Engine, EngineConfig};
+    use bqlite_tests::jsonl;
 
     use super::helpers::scratch_db_root;
 
@@ -551,6 +552,187 @@ mod snapshot_isolation {
 
         let _ = std::fs::remove_dir_all(&path_a);
         let _ = std::fs::remove_dir_all(&path_b);
+    }
+
+    // ─── helpers local to this mod ────────────────────────────────
+
+    /// Create a fresh `purchases` database at `path`, ingest
+    /// `row_count` rows across `entity_count` entities, and return
+    /// the open `Database`.
+    fn setup_purchases_db(
+        path: &std::path::Path,
+        engine: &Engine,
+        row_count: u64,
+        entity_count: u64,
+    ) -> Database {
+        std::fs::create_dir_all(path).unwrap();
+        let mut db = Database::create(path).unwrap();
+        engine
+            .query(jsonl::PURCHASES_CREATE_TABLE, &mut db)
+            .unwrap();
+        let cfg = jsonl::FixtureConfig {
+            row_count,
+            entity_count,
+        };
+        let fixture_path =
+            jsonl::write_fixture_file(&cfg, path, "fixture.jsonl").expect("write fixture");
+        let sql = format!(
+            "INSERT INTO purchases FROM '{}' WITH (format: 'jsonl')",
+            fixture_path.display()
+        );
+        engine.query(&sql, &mut db).unwrap();
+        db
+    }
+
+    /// Spawn a writer thread and a reader thread that race to acquire
+    /// `Arc<Mutex<Database>>`.  Because `Engine::query` holds `&mut
+    /// Database` for its entire duration, the two operations are
+    /// serialized by the mutex — one completes fully before the other
+    /// starts.  The function returns whichever count the reader
+    /// observed.
+    fn run_delete_query_race(db: Arc<Mutex<Database>>, engine: &Engine) -> usize {
+        let db_w = Arc::clone(&db);
+        let eng_w = engine.clone();
+        let writer = thread::spawn(move || {
+            let mut g = db_w.lock().expect("db mutex not poisoned");
+            eng_w
+                .query("DELETE FROM purchases WHERE user_id = 'user_0'", &mut g)
+                .expect("DELETE must succeed");
+        });
+
+        let db_r = Arc::clone(&db);
+        let eng_r = engine.clone();
+        let reader = thread::spawn(move || {
+            let mut g = db_r.lock().expect("db mutex not poisoned");
+            let result = eng_r
+                .query("purchases", &mut g)
+                .expect("SELECT must succeed");
+            super::helpers::count_rows(&result)
+        });
+
+        writer.join().expect("writer thread panicked");
+        reader.join().expect("reader thread panicked")
+    }
+
+    /// DELETE / query ordering correctness on the **same** `Database`
+    /// with `query_threads = 1`.
+    ///
+    /// Two threads race to acquire `Arc<Mutex<Database>>`:
+    ///  - The **writer** deletes `user_0`'s rows.
+    ///  - The **reader** fetches the total row count.
+    ///
+    /// Because `Engine::query` holds `&mut Database` for its entire
+    /// duration, the mutex serializes the two operations — one
+    /// completes before the other starts.  This verifies the ordering
+    /// invariant from `deletes.md §9`: the result is always one of two
+    /// consistent values (pre-delete 50 or post-delete 45), never an
+    /// intermediate count.
+    ///
+    /// `query_threads = 1` routes all morsel work through a single
+    /// Rayon worker, exercising the scheduler under the constraint that
+    /// the cloned `Engine` instances share the same `Arc<MorselScheduler>`.
+    #[test]
+    fn delete_concurrent_with_query_on_same_db() {
+        let path = scratch_db_root("del-conc-1t");
+        let engine = Engine::with_config(EngineConfig {
+            query_threads: Some(1),
+            ..EngineConfig::default()
+        });
+
+        // 50 rows across 10 entities; user_0 owns rows at indices
+        // 0,10,20,30,40 → 5 rows.
+        let db = setup_purchases_db(&path, &engine, 50, 10);
+        let pre_count: usize = 50;
+        let post_count: usize = 45;
+
+        let db = Arc::new(Mutex::new(db));
+        let count = run_delete_query_race(Arc::clone(&db), &engine);
+
+        assert!(
+            count == pre_count || count == post_count,
+            "snapshot-isolation violated (threads=1): \
+             count={count} is neither pre ({pre_count}) nor post ({post_count})"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Same ordering-correctness test as
+    /// `delete_concurrent_with_query_on_same_db` but with
+    /// `query_threads = 4`.
+    ///
+    /// Operations are still mutex-serialized (one runs at a time);
+    /// the higher `query_threads` only affects the Rayon pool size
+    /// for a single query's operator drive, not inter-query
+    /// parallelism.  The test exercises the engine under a different
+    /// scheduler configuration and is a regression guard for when
+    /// TASK-536 lands real per-shard morsel dispatch.
+    #[test]
+    fn delete_concurrent_with_query_on_same_db_threads_4() {
+        let path = scratch_db_root("del-conc-4t");
+        let engine = Engine::with_config(EngineConfig {
+            query_threads: Some(4),
+            ..EngineConfig::default()
+        });
+
+        let db = setup_purchases_db(&path, &engine, 50, 10);
+        let pre_count: usize = 50;
+        let post_count: usize = 45;
+
+        let db = Arc::new(Mutex::new(db));
+        let count = run_delete_query_race(Arc::clone(&db), &engine);
+
+        assert!(
+            count == pre_count || count == post_count,
+            "snapshot-isolation violated (threads=4): \
+             count={count} is neither pre ({pre_count}) nor post ({post_count})"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// 1 000-iteration stability variant. Gated behind `cfg(stress)`
+    /// for nightly CI only — the loop is too slow for `cargo test`.
+    ///
+    /// Each iteration spawns a writer + reader pair that race for
+    /// `Arc<Mutex<Database>>`. The ordering invariant from
+    /// `deletes.md §9` holds throughout: the count must be either
+    /// `pre_count` (50) or `post_count` (45).
+    ///
+    /// **Note on iteration diversity.** After iteration 0 commits a
+    /// delete, `user_0`'s entity tombstone is permanent. In iterations
+    /// 1–999 the writer's DELETE is an idempotent no-op (set-union on
+    /// an already-present entry) and the reader always observes 45.
+    /// The loop's value is stress-testing the absence of panics,
+    /// deadlocks, and mutex poisoning under repeated scheduler
+    /// round-trips — not 1 000 distinct race outcomes.
+    #[test]
+    #[cfg(stress)]
+    fn delete_concurrent_with_query_on_same_db_stress() {
+        const ITERATIONS: usize = 1_000;
+
+        let path = scratch_db_root("del-conc-stress");
+        let engine = Engine::with_config(EngineConfig {
+            query_threads: Some(1),
+            ..EngineConfig::default()
+        });
+
+        let db = setup_purchases_db(&path, &engine, 50, 10);
+        let pre_count: usize = 50;
+        let post_count: usize = 45;
+
+        let db = Arc::new(Mutex::new(db));
+
+        for iter in 0..ITERATIONS {
+            let count = run_delete_query_race(Arc::clone(&db), &engine);
+            assert!(
+                count == pre_count || count == post_count,
+                "iteration {iter}: count={count} outside valid set \
+                 {{pre={pre_count}, post={post_count}}}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 

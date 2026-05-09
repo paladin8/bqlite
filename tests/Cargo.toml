@@ -36,3 +36,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[lints.rust]
+# `#[cfg(stress)]` gates the 1000-iteration nightly stress variants.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(stress)'] }
