@@ -134,7 +134,7 @@ otherwise-stable APIs, not surface removal.
 | bqlite-tests      | 451 (1 ign) |  0 | —  |    — | 0 |
 
 - **Bench harness** compiles cleanly (`cargo bench -p bqlite-benches --no-run` → `Finished bench profile`, 29 bench targets registered in `benches/Cargo.toml`).
-- **Bench CI** (TASK-241) continues to run baseline capture on `main` push and the regression gate on PRs; all 5 new Wave 5 bench groups + 2 Wave 4 follow-ups (`tombstone_scan`, `fused_segment`) are registered alongside Wave 2/3/4 inheritances.
+- **Bench CI** (TASK-241) continues to run baseline capture on `main` push and the regression gate on PRs. All 5 new Wave 5 bench groups (`zero_copy_scan`, `stateful_aggregate_fusion`, `morsel_skew`, `spill_overhead`, `cohort_pushdown`) are now invoked by `.github/workflows/bench.yml` alongside the inherited Wave 2/3 bench list (`scan`, `encoding`, `ingest`, `acceptance`, `matcher`, `aggregate`, `wave3_sort`, `wave3_distinct`, `funnel`, `percentile`). The 2 Wave 4 follow-ups that completed in Wave 5 (`tombstone_scan`, registered as a Wave 4 bench under TASK-534; `fused_segment`, registered as a Wave 2 bench under TASK-519) are present in `benches/Cargo.toml` but not yet wired into the bench.yml invocation list — Wave 4 bench inclusion remains a separate scope-of-work.
 - **Doc build** succeeds with warnings only (`cargo doc --workspace --no-deps` → `Finished dev profile`).
 - **Clippy** clean at `-D warnings` across the workspace (`scripts/local-ci.sh` passing).
 - **Formatting** clean at `cargo fmt --all --check`.
@@ -339,22 +339,69 @@ API surface. No crate is below **C** anywhere.
 
 ## Wave 5 status
 
-**Wave 5 is complete.** All 34 numbered Wave 5 tasks have `.done`
-markers in `tasks/completed/` (TASK-501 through TASK-535, with
-TASK-530 retired before scheduling per the "numbers are never reused"
-rule); the Wave 5 acceptance gate (`tests/wave5_acceptance.rs`)
-passes end-to-end with 9 tests covering the four documented bands —
-multi-shard analytical query under the `MIN_QUERY_BUDGET_BYTES`
-floor, cancellation/timeout cleanup, sort/ingest/cohort spill policy
-with no spill artefacts after return, and fused/zero-copy answer
-equivalence against hand-computed ground truth. Per-crate grades all
-sit at or above **C** on every dimension. One crate slipped one
-Docs sub-grade (bqlite-planner Docs B+ → B), one crate gained an
-Overall sub-grade (bqlite-engine B+ → A-); no crate is below **C**
-anywhere. Bench CI covers all 29 bench groups. No Wave 6 follow-up
-tasks are filed under the *below-C → file a follow-up* rule; the
-rustdoc-warning trajectory is flagged in Finding 1 for Wave 6 to
-absorb. **Wave 6 can begin.**
+All 34 numbered Wave 5 tasks have `.done` markers in
+`tasks/completed/` (TASK-501 through TASK-535, with TASK-530 retired
+before scheduling per the "numbers are never reused" rule); the
+Wave 5 acceptance gate (`tests/wave5_acceptance.rs`) passes end-to-end
+with 9 tests covering the four documented bands — multi-shard
+analytical query under the `MIN_QUERY_BUDGET_BYTES` floor,
+cancellation/timeout cleanup (contract-level only — see open gaps
+below), sort/cohort spill policy with no spill artefacts after
+return, and fused/zero-copy answer equivalence against hand-computed
+ground truth. One crate slipped one Docs sub-grade (bqlite-planner
+Docs B+ → B), one crate gained an Overall sub-grade (bqlite-engine
+B+ → A-).
+
+Bench CI invokes 15 of the 29 wave-scoped bench groups (all 5 Wave 5
+groups plus the inherited Wave 2/3 list); the remaining 14 (Wave 4
+sessionize/attribute/event_select/cohort_join/compaction/sample/
+encoding_matrix/wave4_ingest/pfor and Wave 2 scan_encoded, plus the
+Wave 5 follow-ups `tombstone_scan` and `fused_segment`) are
+registered in `benches/Cargo.toml` and runnable locally but not yet
+in the CI gate's invocation list.
+
+### TASK-599 hard-gate disposition (closure follow-ups filed)
+
+The TASK-599 task definition pins a hard gate: *"Every crate is
+expected to be at least B across all dimensions; anything below B
+ships only with a named owner, a concrete remediation plan, and
+human sign-off before Wave 6 begins."* This section discharges the
+"named owner / remediation plan" half of that bar; **human sign-off
+remains the explicit gate that must clear before Wave 6 starts**.
+
+#### Below-B grade remediation table
+
+| Crate | Below-B cells | Owner | Remediation plan | Sign-off |
+|---|---|---|---|---|
+| `bqlite` | Tests **C**, Docs **C+**, Benchmarks **C** | TASK-544 (audit follow-up) | Re-export crate by design — choose between (a) Tests B / Docs B uplift via doctest-per-re-exported-public-type and `include_str!`-driven crate doc, or (b) explicit accept-with-rationale of the re-export-only model. Benchmarks C is structural (no implementation to bench); covered by TASK-544(d) workspace-bench model decision. | **Pending** |
+| `bqlite-ffi` | Tests **C**, API **C**, Docs **C**, Benchmarks **C** | TASK-544 (audit follow-up) | FFI implementation is Wave 6 scope by design — `TASK-603` (PyO3) and `TASK-604` (C ABI) are the implementation tasks. TASK-544(b) records the explicit deferral; the C grades stay until Wave 6 lands. | **Pending** |
+| `bqlite-core`, `bqlite-ast`, `bqlite-parser`, `bqlite-planner`, `bqlite-engine`, `bqlite-cli` | Benchmarks **C** / **C+** | TASK-544(d) | Per-crate Criterion benches were never expected — transitive coverage flows through `bqlite-benches`. TASK-544(d) decides whether to accept the workspace-bench model with a one-line rationale per crate, or to file individual per-crate bench scaffolds. | **Pending** |
+
+#### Other open Wave 5 closure gaps (closure tasks filed)
+
+Each gap below has a numbered closure task in `TASKS.md` § *Wave 5
+closure follow-ups*. The original Wave 5 task remains `.done` because
+it shipped the documented v1 scope; the follow-up task closes the
+delta to the spec's stated payoff.
+
+| Gap | Cited evidence | Closure task |
+|---|---|---|
+| TASK-523 multi-core dispatch is scaffold-only — engine still dispatches "one degenerate whole-database task per query" | `crates/bqlite-engine/src/query.rs:454-487` | **TASK-536** |
+| TASK-524 worker idle/busy timing is zero; CPU counters are stubbed on every platform | `crates/bqlite-engine/src/perf.rs:21-31, 265-267` | **TASK-537** |
+| TASK-525 + TASK-528 cancellation/timeout coverage is contract-level only because `Engine::query` has no per-query cancel/timeout knob | `tests/wave5_runtime_stress.rs:21-23`, `tests/wave5_acceptance.rs:14-21` | **TASK-538** |
+| TASK-525 + TASK-528 ingest partitioner spill is out-of-scope of both the stress and acceptance suites | `tests/wave5_runtime_stress.rs:28`, `tests/wave5_acceptance.rs:32-34` | **TASK-539** |
+| TASK-525 same-database concurrent DELETE/query under scheduler pressure not covered | `tests/wave5_runtime_stress.rs:434-486` (separate-DB only) | **TASK-540** |
+| Finding 1 rustdoc warning trajectory (33 → 41 → 67 → 94) without a cleanup pass | this file, lines 145-160 | **TASK-542** |
+| 14 wave-scoped Criterion bench groups still not in CI's invocation list | `.github/workflows/bench.yml` (15-of-29) | **TASK-543** |
+
+**Wave 6 readiness.** With the closure follow-ups filed and the
+remediation table populated, the audit now satisfies the
+"named owner + remediation plan" half of the TASK-599 hard gate.
+The remaining gate is **human sign-off** — explicit acknowledgement
+that (a) the listed below-B grades are accepted with their
+remediation plans, and (b) the closure follow-ups can land in Wave 6
+or as Wave 5 patches without blocking Wave 6's interface work. Wave 6
+should not begin until that sign-off is recorded here.
 
 ---
 

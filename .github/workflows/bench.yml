@@ -60,7 +60,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Run Wave 2 + Wave 3 benchmarks
+      - name: Run Wave 2 + Wave 3 + Wave 5 benchmarks
         run: >
           cargo bench -p bqlite-benches
           --bench scan
@@ -73,6 +73,11 @@ jobs:
           --bench wave3_distinct
           --bench funnel
           --bench percentile
+          --bench zero_copy_scan
+          --bench stateful_aggregate_fusion
+          --bench morsel_skew
+          --bench spill_overhead
+          --bench cohort_pushdown
 
       # Upload the entire Criterion output tree so bench-compare.sh can walk
       # it and match estimates.json / sample.json files by relative path.
@@ -118,7 +123,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Run Wave 2 + Wave 3 benchmarks
+      - name: Run Wave 2 + Wave 3 + Wave 5 benchmarks
         run: >
           cargo bench -p bqlite-benches
           --bench scan
@@ -131,6 +136,11 @@ jobs:
           --bench wave3_distinct
           --bench funnel
           --bench percentile
+          --bench zero_copy_scan
+          --bench stateful_aggregate_fusion
+          --bench morsel_skew
+          --bench spill_overhead
+          --bench cohort_pushdown
 
       # Find the most-recent workflow run on main where the bench-baseline job
       # specifically succeeded.  We check the job list for each candidate run
@@ -226,6 +236,11 @@ jobs:
           --bench wave3_distinct
           --bench funnel
           --bench percentile
+          --bench zero_copy_scan
+          --bench stateful_aggregate_fusion
+          --bench morsel_skew
+          --bench spill_overhead
+          --bench cohort_pushdown
 
       - name: Upload reference Criterion output
         uses: actions/upload-artifact@v4
