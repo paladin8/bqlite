@@ -23,7 +23,7 @@ below the table. Grade changes from Wave 4 are annotated with arrows.
 
 | Crate | Tests | API | Docs | Benchmarks | Overall |
 |-------|-------|-----|------|------------|---------|
-| bqlite | **C** · 0 unit, 0 doctest; re-export crate, transitive coverage via re-exported crates | **B-** · re-exports `ast`, `types`, `parser`, `engine`, `BqliteError`, `Result` — complete for Wave 5 | **C+** · crate-level doc with quick-start; 1 rustdoc collision warning persists | **C** · no per-crate benches; workspace harness available | **C+** |
+| bqlite | **B** · 4 doctests (2 in `README.md`, 1 on `BqliteError` re-export, 1 on `Result` re-export); 0 unit tests (re-export crate — appropriate) *(↑ from C — TASK-544 doctest uplift)* | **B-** · re-exports `ast`, `types`, `parser`, `engine`, `BqliteError`, `Result` — complete for Wave 5 | **B** · `include_str!`-driven crate doc with re-export table and compilable usage examples; 1 rustdoc collision warning persists *(↑ from C+ — TASK-544 README uplift)* | **C** · no per-crate benches; workspace harness available; accepted per TASK-544(d) workspace-bench decision | **B** *(↑ from C+)* |
 | bqlite-core | **A** · 331 unit + 3 doctest; adds Wave 5 runtime types — `QueryWarning`/`WarningSeverity`, `MemoryBudget`/`MemoryReservation`/`MemoryTracker`/`SpillNotification`, `CancellationToken`, `TempSpillFile`, `BqliteError::{Timeout, OperatorPanic, WarningsOverflow}` *(↑ from 267)* | **A-** · foundational trait surface + types; Wave 5 additive (memory budget, warning channel, cancellation, spill RAII, structured error variants) preserves backward compat | **B+** · exhaustive module docs with design-doc refs; 8 rustdoc warnings (6 carried + 2 new `try_reserve` / `TombstoneScanWrapper` cross-crate links) *(warnings 6 → 8; grade unchanged)* | **C** · no per-crate benches (appropriate — pure types) | **A-** |
 | bqlite-ast | **A-** · 54 unit across expr/operator/pattern/pipeline/span/statement *(unchanged from Wave 4 — no AST surface changes in Wave 5)* | **A-** · AST node enums for every BQL construct through Wave 4; Wave 5 added no new node variants | **B** · per-module docs on every file; 0 rustdoc warnings | **C** · no per-crate benches | **A-** |
 | bqlite-storage | **A** · 878 unit + workspace encoding/integration property suites *(↑ from 814)* — adds `tombstone_scan`, `encoded_tombstone`, sort spill-run files, partitioner spill, system-column projection paths | **A** · v2 segment format unchanged; Wave 5 adds `EntityIn` cohort-pushdown plumbing into scan, `__seq_id` / `__batch_id` materialization, late-materialization boundary helpers per `zero-copy-scan-filter.md`, `SpillRunFile` writer + sort-merge consumer surface | **B+** · extensive module docs with design-doc §-refs; **35 rustdoc warnings** (32 carried + 3 new private-item links in spill, partitioner, tombstone-with-index) *(warnings 32 → 35; grade unchanged)* | **A** · 9 Wave 4 + Wave 2 storage benches; Wave 4 follow-up `tombstone_scan` (TASK-534) + Wave 5 `zero_copy_scan` + `cohort_pushdown` provide storage-side perf evidence | **A** |
@@ -106,7 +106,7 @@ below the table. Grade changes from Wave 4 are annotated with arrows.
 | `benches/wave5/spill_overhead.rs` | — | **NEW** `SortOperator::with_spill` overhead vs in-memory baseline (TASK-526 CP4) |
 | `benches/wave5/cohort_pushdown.rs` | — | **NEW** Bytes-scanned savings of `EntityIn` pushdown vs probe-only (TASK-526 CP5) |
 
-**Evidence aggregate**: **3,730 passing tests** via `cargo test --workspace --all-targets` (3,265 per-crate library unit + 14 bench-crate unit + 451 workspace integration/property), **4 ignored**, **0 failing tests**. Separately, `cargo test --workspace --doc` adds **5 passing doctests** and **5 ignored doctests**. Of the workspace suite, **213 are property tests** covering 11 encoding codecs (Plain, Dictionary, Delta, DoubleDelta, BitPacking, Constant, RLE, FOR, PFOR, FSST, ALP), PropertyValue coercion, TimeRange algebra, Arrow type mapping, NFA simulator invariants, variable binding semantics, ATTRIBUTE deque and window-boundary rules, and EventSelect candidate-row behavior. **29 Criterion bench groups** now cover Wave 2 (6, including new `fused_segment`), Wave 3 (7), Wave 4 (10, including new `tombstone_scan`), and Wave 5 (5) performance gates plus the Wave 1 smoke bench.
+**Evidence aggregate**: **3,730 passing tests** via `cargo test --workspace --all-targets` (3,265 per-crate library unit + 14 bench-crate unit + 451 workspace integration/property), **4 ignored**, **0 failing tests**. Separately, `cargo test --workspace --doc` adds **9 passing doctests** and **5 ignored doctests** (TASK-544 added 4 `bqlite` doctests: 2 in `README.md`, 1 on `BqliteError`, 1 on `Result`). Of the workspace suite, **213 are property tests** covering 11 encoding codecs (Plain, Dictionary, Delta, DoubleDelta, BitPacking, Constant, RLE, FOR, PFOR, FSST, ALP), PropertyValue coercion, TimeRange algebra, Arrow type mapping, NFA simulator invariants, variable binding semantics, ATTRIBUTE deque and window-boundary rules, and EventSelect candidate-row behavior. **29 Criterion bench groups** now cover Wave 2 (6, including new `fused_segment`), Wave 3 (7), Wave 4 (10, including new `tombstone_scan`), and Wave 5 (5) performance gates plus the Wave 1 smoke bench.
 
 ## Evidence
 
@@ -120,7 +120,7 @@ otherwise-stable APIs, not surface removal.
 
 | Crate | Unit tests | Doctests | LOC (src) | `pub` items | Rustdoc warnings |
 |-------|-----------:|---------:|----------:|------------:|-----------------:|
-| bqlite            |   0 |  0 (1 ign) |     33 |    5 | 1 (output collision) |
+| bqlite            |   0 |  4 (1 ign) |     35 |    5 | 1 (output collision) |
 | bqlite-core       | 331 |  3         | 10,436 |  217 | 8 (intra-doc + new `try_reserve` / `TombstoneScanWrapper`) |
 | bqlite-ast        |  54 |  0         |  2,374 |   66 | 0 |
 | bqlite-storage    | 878 |  0 (1 ign) | 44,556 |  331 | 35 (private-item links across spill / partitioner / tombstone) |
@@ -356,22 +356,36 @@ Bench CI now invokes all 29 wave-scoped bench groups (TASK-543);
 every group registered in `benches/Cargo.toml` is in the CI gate's
 invocation list.
 
+TASK-544 (2026-05-09) uplifted `bqlite` Tests **C → B** and Docs **C+ → B**
+by adding 4 doctests and an `include_str!`-driven crate README, and recorded
+named owners + remediation plans for all remaining below-B cells
+(workspace-bench model for Benchmarks C, Wave 6 deferral for `bqlite-ffi`).
+Remaining below-B cells are `bqlite-ffi` (C across all, Wave 6 scope) and
+the Benchmarks dimension on six crates (workspace-bench model proposed);
+both await human sign-off per the TASK-599 gate before Wave 6 begins.
+
 ### TASK-599 hard-gate disposition (closure follow-ups filed)
 
 The TASK-599 task definition pins a hard gate: *"Every crate is
 expected to be at least B across all dimensions; anything below B
 ships only with a named owner, a concrete remediation plan, and
-human sign-off before Wave 6 begins."* This section discharges the
-"named owner / remediation plan" half of that bar; **human sign-off
-remains the explicit gate that must clear before Wave 6 starts**.
+human sign-off before Wave 6 begins."* TASK-544 (2026-05-09)
+discharges the "named owner + remediation plan" halves: `bqlite`
+Tests and Docs are uplifted to B (no remaining below-B), and every
+remaining below-B cell has a recorded owner and concrete plan in the
+table below. **Human sign-off on the accepted/deferred rows remains
+the explicit gate that must clear before Wave 6 starts.**
 
 #### Below-B grade remediation table
 
-| Crate | Below-B cells | Owner | Remediation plan | Sign-off |
+*Named owner and remediation plan filled by TASK-544 (2026-05-09). Human sign-off on rows marked "Pending human sign-off" is the remaining gate before Wave 6 begins.*
+
+| Crate | Below-B cells | Owner | Decision | Sign-off |
 |---|---|---|---|---|
-| `bqlite` | Tests **C**, Docs **C+**, Benchmarks **C** | TASK-544 (audit follow-up) | Re-export crate by design — choose between (a) Tests B / Docs B uplift via doctest-per-re-exported-public-type and `include_str!`-driven crate doc, or (b) explicit accept-with-rationale of the re-export-only model. Benchmarks C is structural (no implementation to bench); covered by TASK-544(d) workspace-bench model decision. | **Pending** |
-| `bqlite-ffi` | Tests **C**, API **C**, Docs **C**, Benchmarks **C** | TASK-544 (audit follow-up) | FFI implementation is Wave 6 scope by design — `TASK-603` (PyO3) and `TASK-604` (C ABI) are the implementation tasks. TASK-544(b) records the explicit deferral; the C grades stay until Wave 6 lands. | **Pending** |
-| `bqlite-core`, `bqlite-ast`, `bqlite-parser`, `bqlite-planner`, `bqlite-engine`, `bqlite-cli` | Benchmarks **C** / **C+** | TASK-544(d) | Per-crate Criterion benches were never expected — transitive coverage flows through `bqlite-benches`. TASK-544(d) decides whether to accept the workspace-bench model with a one-line rationale per crate, or to file individual per-crate bench scaffolds. | **Pending** |
+| `bqlite` | Tests ~~C~~ → **B**, Docs ~~C+~~ → **B** | TASK-544 | **(a) Uplifted.** Added `#![doc = include_str!("../README.md")]`-driven crate doc + 4 doctests (2 in README, 1 on `BqliteError`, 1 on `Result`). Tests and Docs grades both reach B in this checkpoint. No further remediation required. | **Resolved in TASK-544** |
+| `bqlite` | Benchmarks **C** | TASK-544(d) | **(d) Workspace-bench model proposed.** `bqlite` is a thin re-export crate with zero implementation; per-crate benches would bench nothing meaningful. Transitive coverage flows through `bqlite-benches`. Rationale recorded; no new bench target filed. | **Pending human sign-off** |
+| `bqlite-ffi` | Tests **C**, API **C**, Docs **C**, Benchmarks **C** | TASK-544(b) → Wave 6 (TASK-603, TASK-604) | **(b) Deferral to Wave 6 proposed.** FFI implementation is Wave 6 scope by design. `TASK-603` (PyO3 integration) and `TASK-604` (C ABI surface) are the named remediation tasks. C grades hold until Wave 6 ships. | **Pending human sign-off** |
+| `bqlite-core`, `bqlite-ast`, `bqlite-parser`, `bqlite-planner`, `bqlite-engine`, `bqlite-cli` | Benchmarks **C** / **C+** | TASK-544(d) | **(d) Workspace-bench model proposed for all six crates.** Per-crate Criterion bench targets were never planned for these crates. `bqlite-core` and `bqlite-ast` are pure-types crates with no hot paths; `bqlite-parser` and `bqlite-planner` are compile-time, not hot-path; `bqlite-engine` is covered transitively by workspace acceptance + `morsel_skew` / `spill_overhead`; `bqlite-cli` is a thin frontend. All six crates' perf-critical surfaces are covered by `bqlite-benches` workspace bench groups. No individual per-crate bench scaffolds filed. | **Pending human sign-off** |
 
 #### Other open Wave 5 closure gaps (closure tasks filed)
 
@@ -390,14 +404,21 @@ delta to the spec's stated payoff.
 | Finding 1 rustdoc warning trajectory (33 → 41 → 67 → 94) without a cleanup pass | this file, lines 145-160 | **TASK-542** |
 | 14 wave-scoped Criterion bench groups still not in CI's invocation list | `.github/workflows/bench.yml` (15-of-29) | **TASK-543** ✅ Closed — all 29 groups now in CI |
 
-**Wave 6 readiness.** With the closure follow-ups filed and the
-remediation table populated, the audit now satisfies the
-"named owner + remediation plan" half of the TASK-599 hard gate.
-The remaining gate is **human sign-off** — explicit acknowledgement
-that (a) the listed below-B grades are accepted with their
-remediation plans, and (b) the closure follow-ups can land in Wave 6
-or as Wave 5 patches without blocking Wave 6's interface work. Wave 6
-should not begin until that sign-off is recorded here.
+**Wave 6 readiness.** TASK-544 (2026-05-09) satisfies the "named owner +
+remediation plan" halves of the TASK-599 hard gate:
+
+- `bqlite` Tests and Docs uplifted to **B** — those below-B cells are fully
+  resolved; no sign-off needed for grades that no longer exist.
+- Every remaining below-B cell has a recorded owner and concrete plan in the
+  table above (workspace-bench model for Benchmarks C; Wave 6 deferral for
+  `bqlite-ffi`).
+
+**The TASK-599 human sign-off gate remains open.** The three "Pending human
+sign-off" rows above require explicit human acknowledgement before Wave 6
+begins: (a) the workspace-bench-model acceptance for `bqlite` and the six
+implementation crates' Benchmarks C/C+ grades, and (b) the Wave 6 deferral
+for `bqlite-ffi`. Update the Sign-off column in the table above when that
+acknowledgement is received.
 
 ---
 
