@@ -2,6 +2,7 @@
   "agent_id": "agent-3",
   "task_id": "TASK-538",
   "claimed_at": "2026-05-09T06:26:00Z",
+  "completed_at": "2026-05-09T07:45:22Z",
   "branch": "task/TASK-538",
   "description": "Public cancellation/timeout API + acceptance coverage (TASK-525, TASK-528 closure)"
 }
