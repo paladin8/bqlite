@@ -332,6 +332,99 @@ fn multi_shard_stats_under_floor_budget_matches_hand_computed() {
         result.peak_memory_bytes.is_some(),
         "tracker-backed query must report peak_memory_bytes"
     );
+
+    // Per-shard morsel dispatch (TASK-536) must fan the query out to
+    // multiple Rayon workers and emit at least one morsel per
+    // populated shard. Before TASK-536 the dispatcher seeded
+    // `num_workers == 1` and every `morsels_per_shard_*` field at
+    // zero — the legacy single-task path. With real per-shard
+    // dispatch the metrics carry concrete values.
+    let pop_shards = shards as u64;
+    let resolved_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4) as u64;
+    let expected_workers = resolved_threads.min(pop_shards).max(1);
+    if expected_workers > 1 {
+        // On a multi-core platform with more populated shards than
+        // we risk a 1-core CI runner masking the parallelism — check
+        // num_workers strictly only when the platform can deliver it.
+        assert!(
+            result.metrics.num_workers > 1,
+            "multi-shard query must fan out to >1 worker on multi-core platforms; \
+             got num_workers={}, pop_shards={pop_shards}, resolved_threads={resolved_threads}",
+            result.metrics.num_workers
+        );
+    } else {
+        // On a 1-core runner num_workers may degenerate to 1.
+        assert!(
+            result.metrics.num_workers >= 1,
+            "num_workers must be at least 1; got {}",
+            result.metrics.num_workers
+        );
+    }
+    assert!(
+        result.metrics.morsels_per_shard_min > 0,
+        "every populated shard must produce at least one morsel; got {}",
+        result.metrics.morsels_per_shard_min
+    );
+    assert!(
+        result.metrics.morsels_per_shard_max > 0,
+        "morsels_per_shard_max must be set; got {}",
+        result.metrics.morsels_per_shard_max
+    );
+    assert_eq!(
+        result.metrics.morsels_per_shard_min, result.metrics.morsels_per_shard_max,
+        "v1 dispatch emits exactly one morsel per shard — min == max"
+    );
+    assert_eq!(
+        result.metrics.morsels_dispatched, pop_shards,
+        "morsels_dispatched must equal populated shard count"
+    );
+}
+
+/// Regression: the cross-shard merge of per-shard `HashAccumulator`s
+/// must produce row-for-row equality with the single-threaded baseline
+/// for every v1 aggregate. Drives the same multi-shard fixture through
+/// `query_threads = Some(1)` (which still routes through the per-shard
+/// dispatcher but with one worker) and through the default
+/// `query_threads = None` (multi-worker), then asserts the answer is
+/// identical. Pins TASK-536 plan-revision R3.
+#[test]
+fn per_shard_aggregate_matches_single_thread_baseline() {
+    use bqlite_engine::EngineConfig;
+
+    let (_tmp, mut db, _engine_default) = build_acceptance_db("baseline-cmp");
+
+    // 1-thread baseline: every shard's morsel runs on the same Rayon
+    // worker. The result is the merged per-shard accumulator's
+    // `finish()` output.
+    let cfg_1 = EngineConfig {
+        query_threads: Some(1),
+        ..EngineConfig::default()
+    };
+    let engine_1 = Engine::with_config(cfg_1);
+    let r1 = engine_1
+        .query(
+            "events | STATS rows = COUNT(*) GROUP BY event_type",
+            &mut db,
+        )
+        .expect("1-thread baseline");
+
+    // Multi-thread per-shard dispatch: shards run in parallel; cross-
+    // shard merge on the coordinator.
+    let r_n = Engine::default()
+        .query(
+            "events | STATS rows = COUNT(*) GROUP BY event_type",
+            &mut db,
+        )
+        .expect("multi-thread");
+
+    let by_type_1 = group_by_stringkey_to_i64(&r1, "event_type", "rows");
+    let by_type_n = group_by_stringkey_to_i64(&r_n, "event_type", "rows");
+    assert_eq!(
+        by_type_1, by_type_n,
+        "1-thread and multi-thread dispatch must produce identical aggregate results"
+    );
 }
 
 /// A bare scan over the multi-shard fixture must return exactly
