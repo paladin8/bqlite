@@ -2,6 +2,7 @@
   "agent_id": "agent-2",
   "task_id": "TASK-543",
   "claimed_at": "2026-05-09T06:51:02Z",
+  "completed_at": "2026-05-09T07:15:00Z",
   "branch": "task/TASK-543",
   "description": "Wave 4 + Wave 5 follow-up bench CI integration"
 }
