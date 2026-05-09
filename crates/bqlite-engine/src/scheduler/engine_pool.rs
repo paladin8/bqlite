@@ -152,27 +152,46 @@ impl MorselScheduler {
     /// [`Self::run_degenerate`] (and its successor for true sub-shard
     /// generation) to dispatch through the queue protocol.
     ///
-    /// **Panic propagation.** A panic in `work` propagates back to
-    /// the caller via Rayon's `ThreadPool::scope` panic-resume
-    /// contract: the worker thread catches the panic, re-raises on
-    /// scope exit, and the calling thread observes the panic on the
-    /// `submit` call. The engine's outer `catch_unwind` boundary in
-    /// `Engine::query_with_options` (per `cancellation.md` §4.1)
-    /// converts that re-raised panic into
-    /// [`bqlite_core::BqliteError::OperatorPanic`].
-    pub fn submit<F, R>(&self, work: F) -> R
+    /// **Panic boundary** (`cancellation.md` §4.1). The worker closure
+    /// is wrapped in `catch_unwind`: a panic from `work` is caught at
+    /// the worker boundary and converted to
+    /// [`bqlite_core::BqliteError::OperatorPanic`] — it never escapes
+    /// through Rayon's scope unwind. This is the per-(worker, morsel)
+    /// boundary mandated by §4.1: when TASK-541 introduces per-morsel
+    /// iteration, the boundary migrates inside the morsel loop in the
+    /// same shape. The outer `catch_unwind` in
+    /// `Engine::query_with_options` becomes defense-in-depth for the
+    /// parse / plan / bind path that bypasses the scheduler.
+    pub fn submit<T, F>(&self, work: F) -> bqlite_core::Result<T>
     where
-        F: FnOnce() -> R + Send,
-        R: Send,
+        F: FnOnce() -> bqlite_core::Result<T> + Send,
+        T: Send,
     {
+        use std::panic::catch_unwind;
+
         let _permits = self.core_budget.acquire_n(self.query_threads);
 
-        let result_slot: Mutex<Option<R>> = Mutex::new(None);
+        let result_slot: Mutex<Option<bqlite_core::Result<T>>> = Mutex::new(None);
         let result_ref = &result_slot;
 
         self.pool.scope(|s| {
             s.spawn(move |_| {
-                *result_ref.lock().expect("result slot poisoned") = Some(work());
+                // Catch panic inside the worker so the Rayon scope
+                // does not see an unwinding panic and re-raise on
+                // join. The conversion to OperatorPanic happens here;
+                // peer workers (when TASK-541 lands per-morsel
+                // iteration) observe the failure via the
+                // QueryContext cancel_with_reason path. Currently
+                // single-task — this is forward-compatible.
+                let outcome = catch_unwind(AssertUnwindSafe(work));
+                let mapped = match outcome {
+                    Ok(r) => r,
+                    Err(payload) => Err(bqlite_core::BqliteError::OperatorPanic {
+                        message: panic_message(payload),
+                        location: None,
+                    }),
+                };
+                *result_ref.lock().expect("result slot poisoned") = Some(mapped);
             });
         });
 
@@ -771,6 +790,63 @@ mod tests {
                 "rayon_thread_index missing — was the closure dispatched on a Rayon worker?"
             );
         }
+    }
+
+    #[test]
+    fn submit_returns_worker_result() {
+        // Sanity that the new Result-returning shape round-trips a
+        // success.
+        let cfg = crate::EngineConfig::default();
+        let scheduler = build_from_config(&cfg).expect("scheduler builds");
+        let r: bqlite_core::Result<u32> = scheduler.submit(|| Ok(42));
+        assert_eq!(r.unwrap(), 42);
+        assert_eq!(scheduler.available_permits(), scheduler.query_threads());
+    }
+
+    #[test]
+    fn submit_propagates_worker_error_unchanged() {
+        // A non-panic Err from the closure round-trips unchanged.
+        let cfg = crate::EngineConfig::default();
+        let scheduler = build_from_config(&cfg).expect("scheduler builds");
+        let r: bqlite_core::Result<u32> = scheduler.submit(|| {
+            Err(bqlite_core::BqliteError::Execution(
+                "synthetic error".to_string(),
+            ))
+        });
+        match r {
+            Err(bqlite_core::BqliteError::Execution(msg)) => {
+                assert_eq!(msg, "synthetic error");
+            }
+            other => panic!("expected Execution error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_catches_worker_panic_as_operator_panic() {
+        // A panic from the closure is caught at the worker boundary
+        // and converted to BqliteError::OperatorPanic — it never
+        // re-raises through Rayon's scope unwind. cancellation.md §4.1.
+        let cfg = crate::EngineConfig::default();
+        let scheduler = build_from_config(&cfg).expect("scheduler builds");
+        let result: bqlite_core::Result<()> = scheduler.submit(|| {
+            panic!("synthetic worker panic for test");
+        });
+        match result {
+            Err(bqlite_core::BqliteError::OperatorPanic { message, .. }) => {
+                assert!(
+                    message.contains("synthetic worker panic for test"),
+                    "panic payload should be in OperatorPanic message: {message}"
+                );
+            }
+            other => panic!("expected OperatorPanic, got {other:?}"),
+        }
+        // Permits released cleanly — the worker boundary's catch did
+        // not poison the CoreBudget.
+        assert_eq!(
+            scheduler.available_permits(),
+            scheduler.query_threads(),
+            "permits must be released even after a worker panic"
+        );
     }
 
     #[test]
