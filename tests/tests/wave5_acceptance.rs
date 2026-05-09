@@ -13,12 +13,12 @@
 //!
 //! 2. **Cancellation / timeout cleanup on a long-running query**
 //!    (`engine/cancellation.md` § 5.1 / § 5.2,
-//!    `engine/spill.md` § 8.3). The public `Engine::query` surface does
-//!    not yet expose a per-query cancel/timeout knob, so this band runs
-//!    at the contract level — exactly as `tests/tests/wave5_runtime_stress.rs`
-//!    does — re-pinning the contract here so a future refactor that
-//!    drops the runtime-stress test does not silently lose Wave 5's
-//!    headline cleanup invariant.
+//!    `engine/spill.md` § 8.3). TASK-538 added a public per-query
+//!    cancel handle and timeout knob to `Engine::query_with_options`;
+//!    band 2 drives both through that surface and asserts every exit
+//!    path leaves no spill artefacts behind. The contract-level
+//!    re-pinning (the original Wave 5 entry-time test) lives in
+//!    `tests/tests/wave5_runtime_stress.rs::cancellation_cleanup`.
 //!
 //! 3. **Sort / ingest / cohort spill policy** (`engine/spill.md` § 3 / § 6 / § 8).
 //!    The v1 spill list is short and explicit:
@@ -69,10 +69,7 @@ use std::sync::Arc;
 use arrow::array::{Array, Int64Array, StringArray, StringViewArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use bqlite_core::spill::SpillFs;
-use bqlite_engine::{
-    Database, Engine, ExecutionResult, QueryContext, QueryOptions, MIN_QUERY_BUDGET_BYTES,
-};
+use bqlite_engine::{Database, Engine, ExecutionResult, QueryOptions, MIN_QUERY_BUDGET_BYTES};
 use bqlite_tests::common::TempDb;
 use parquet::arrow::ArrowWriter;
 
@@ -449,71 +446,104 @@ fn multi_shard_scan_returns_full_row_count() {
 // Band 2 — Cancellation / timeout cleanup
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Cancellation propagates through every clone of the per-query
-/// `QueryContext` (`engine/cancellation.md` § 3.1). Re-pinned at the
-/// wave-acceptance level: the suite-level cancellation contract is
-/// also asserted in `tests/tests/wave5_runtime_stress.rs`, but TASK-528
-/// is the wave's headline gate and must encode the contract directly
-/// so a future refactor that drops the runtime-stress test does not
-/// silently lose it.
+/// Public-surface cancellation: a caller-supplied `CancellationToken`
+/// passed via `QueryOptions::cancel` is observed by every operator in
+/// the query. Pre-cancelling it before submission produces
+/// `BqliteError::Cancelled` from the very first yield point.
+/// Public-API equivalent of the runtime-stress contract-level test.
 #[test]
-fn cancellation_propagates_through_context_clones() {
-    let ctx = QueryContext::new(MIN_QUERY_BUDGET_BYTES);
-    let clone_a = ctx.clone();
-    let clone_b = clone_a.clone();
-    assert!(!ctx.cancellation().is_cancelled());
-    assert!(!clone_a.cancellation().is_cancelled());
-    assert!(!clone_b.cancellation().is_cancelled());
-    ctx.cancellation().cancel();
-    assert!(clone_a.cancellation().is_cancelled());
-    assert!(clone_b.cancellation().is_cancelled());
+fn external_cancel_via_query_options_returns_cancelled() {
+    use bqlite_engine::CancellationToken;
+
+    let (_tmp, mut db, engine) = build_acceptance_db("ext-cancel");
+    let token = CancellationToken::new();
+    token.cancel();
+    let opts = QueryOptions {
+        cancel: Some(token),
+        ..QueryOptions::default()
+    };
+    // Use ORDER BY so the SortOperator's pull loop has a yield-point
+    // check before draining the scan — the bare `events` query may
+    // run an empty-shard scan to EOS without observing the flag, but
+    // the sort path is unconditional.
+    match engine.query_with_options("events | ORDER BY ts ASC", &mut db, &opts) {
+        Err(bqlite_engine::ExecutionFailure {
+            error: bqlite_core::BqliteError::Cancelled,
+            ..
+        }) => {}
+        other => panic!("expected Cancelled via public API, got {other:?}"),
+    }
 }
 
-/// Even if an individual `TempSpillFile` guard's `Drop` is suppressed
-/// (simulated here with `mem::forget`), the per-query belt-and-braces
-/// sweep on the last [`QueryContext`] clone reclaims the per-query
-/// subdirectory. Pins `engine/spill.md` § 8.3 — the cleanup contract
-/// the long-running-query cancellation path relies on.
+/// Public-surface timeout: `Duration::ZERO` triggers
+/// `QueryTimer::spawn`'s synchronous-fire branch — the cancel reason
+/// is installed before `run_query_inner` runs, so the result-collection
+/// arm rewrites `Cancelled → Timeout` deterministically. Pins the
+/// contract that the timeout knob discriminates Cancelled from Timeout
+/// on the public surface.
 #[test]
-fn cancellation_cleanup_reclaims_per_query_spill_subdir() {
-    let tmp = TempDb::new();
-    let spill_root = tmp.path().join("spill");
-    let fs = SpillFs::open(spill_root.clone(), tmp.path()).expect("SpillFs::open");
+fn timeout_via_query_options_returns_timeout_error() {
+    let (_tmp, mut db, engine) = build_acceptance_db("timeout");
+    let opts = QueryOptions {
+        timeout: Some(std::time::Duration::ZERO),
+        ..QueryOptions::default()
+    };
+    match engine.query_with_options("events | ORDER BY ts ASC", &mut db, &opts) {
+        Err(bqlite_engine::ExecutionFailure {
+            error: bqlite_core::BqliteError::Timeout { .. },
+            ..
+        }) => {}
+        other => panic!("expected Timeout via public API, got {other:?}"),
+    }
+}
 
-    let ctx = QueryContext::new(MIN_QUERY_BUDGET_BYTES).with_spill_fs(Arc::clone(&fs));
-    let qid = ctx.spill_query_id().expect("query id attached");
+/// After a public-API cancel exits the query, the per-query spill
+/// subdir is reclaimed by `SpillCleanup::Drop`. Re-pins
+/// `engine/spill.md` § 8.3 at the wave-acceptance level — running
+/// through `Engine::query_with_options` rather than constructing a
+/// `QueryContext` directly.
+///
+/// Even a query that never spilled passes the assertion ("the
+/// per-query subdir was never created and the root stayed empty");
+/// the point is that no artefacts persist after a cancel exit.
+#[test]
+fn cancel_exit_leaves_no_spill_artefacts() {
+    use bqlite_engine::CancellationToken;
 
-    // Open and forget a guard — simulates a long-running query whose
-    // cancellation arrives mid-write and whose `TempSpillFile::Drop`
-    // we cannot guarantee fired (`cancellation.md` § 5.2 motivation
-    // for the belt-and-braces sweep).
-    let guard = ctx
-        .open_spill("sort-run")
-        .expect("spill_fs attached")
-        .expect("open_spill must succeed");
-    let leaked = guard.path().to_path_buf();
-    std::mem::forget(guard);
-    assert!(leaked.exists(), "leaked spill file present pre-cancel");
+    let (_tmp, mut db, engine) = build_acceptance_db("cancel-cleanup");
+    let spill_root = db.spill_fs().root().to_path_buf();
 
-    // The contract under test: on the cancellation path, the last-clone
-    // drop of `QueryContext` still reclaims the per-query subdir via
-    // `SpillCleanup::Drop` (`context.rs:226-230`). Cancellation itself
-    // is not what triggers cleanup — the `Drop` impl is unconditional —
-    // but `cancellation.md` § 5.2 motivates the sweep specifically for
-    // the cancel/timeout exit paths, so the cancel signal is set here
-    // to exercise that exit shape.
-    ctx.cancellation().cancel();
-    drop(ctx);
-
-    let qdir = spill_root.join(qid.to_string());
-    assert!(
-        !qdir.exists(),
-        "per-query subdir must be reclaimed after last-clone drop"
-    );
-    assert!(
-        !leaked.exists(),
-        "leaked spill file must be reclaimed by the sweep"
-    );
+    for _ in 0..8 {
+        let token = CancellationToken::new();
+        token.cancel();
+        let opts = QueryOptions {
+            cancel: Some(token),
+            memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES),
+            ..QueryOptions::default()
+        };
+        let result = engine.query_with_options("events | ORDER BY ts ASC", &mut db, &opts);
+        assert!(
+            matches!(
+                &result,
+                Err(bqlite_engine::ExecutionFailure {
+                    error: bqlite_core::BqliteError::Cancelled,
+                    ..
+                })
+            ),
+            "expected Cancelled exit, got {result:?}"
+        );
+        if spill_root.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&spill_root)
+                .expect("read spill root")
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "spill root must be empty after cancel exit, found {} entries",
+                entries.len()
+            );
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
