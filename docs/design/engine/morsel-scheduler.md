@@ -691,6 +691,19 @@ Updates landed in TASK-523's checkpoint (in-tree at the same time as the schedul
 
 `docs/design/operators/aggregate-operator.md` already specifies the `Accumulator::merge` contract and per-shard partial accumulation; no changes needed there.
 
+### 11.2 TASK-536 Reconciliation: Real Per-Shard Dispatch
+
+The TASK-523 scaffold landed the queue, accumulator handle, worker guard, and a `run_degenerate` stub but kept `Engine::query` on a single whole-database task. TASK-536 closes that gap:
+
+- **`MorselScheduler::run_per_shard`** is the multi-morsel dispatch entry point. It pushes one morsel per non-empty `ShardSnapshot` onto the queue, spawns up to `query_threads` Rayon workers, and returns the per-shard `AccumulatorHandle`s plus per-worker scratch contexts (one `PerWorkerCtx` per Rayon thread that pulled at least one morsel). Permits are acquired atomically via `CoreBudget::acquire_n` at the start of the call, identical to `submit`. Each worker wraps its closure in `std::panic::catch_unwind` so a panic in one shard's worker converts to `BqliteError::OperatorPanic` in the first-error slot rather than tearing down the Rayon scope (design §9.2). Workers check the cancellation token at the top of every pull iteration (design §9.1 between-morsels yield point).
+- **Plan classification in `Engine::query`.** A new `classify_dispatch` walks the planner output and routes:
+  - `PhysicalPlan::Aggregate(...)` over a per-shard-safe input → `PerShardAggregate`: bind the aggregate's input per shard, drive each shard's tree, feed batches into a per-shard `HashAccumulator` parked on the `AccumulatorHandle`, pairwise-merge across shards on the coordinator (design §6.4), call `ensure_default_group_if_ungrouped()` then `finish()` to materialise the final batch.
+  - Pure data-plane (`Scan`, `FusedSegment` chain without a `Limit` step) → `PerShardConcat`: bind the whole tree per shard, drive each, concat outputs. The order of shards in the output is multiset-equivalent to the single-task baseline; the result equals the legacy answer up to row order. `Limit` inside the chain forces fallback because applying the cap per-shard would multiply the result by the populated-shard count.
+  - Everything else (`Sort`, `Distinct`, `MergeSources`, `SubqueryFilter`, `SequenceMatch`, the entity-operator family, `Sample`, DDL/DELETE/EXPLAIN) → `SingleTask`: the legacy whole-database path. v1 trades parallelism for correctness on shapes the per-shard model has not yet been validated against; later tasks can lift specific shapes (top-level Sort with k-way merge, Limit re-applied at the coordinator, etc.) into the per-shard set.
+- **Per-worker `WorkerMetricsSnapshot`.** The engine records one default snapshot per unique Rayon worker thread that pulled at least one morsel (`rayon::current_thread_index` dedupe), so `num_workers` reflects actual parallelism on the multi-shard fixture instead of the legacy `1` seed. CPU and wall-time fields stay zero — TASK-537 fills them in.
+- **`bind_physical_for_shard`.** Every leaf `ScanPhysical` opens `Database::segment_reader_for_shard` instead of `segment_reader_for_time_range` when the dispatch sets a shard filter. The `Option<u32> shard_filter` is threaded through every recursive bind call site as a function parameter; adding a new recursive call site forces a compile error if it doesn't thread the filter.
+- **v1 generator scope.** `MorselGenerator::degenerate` still emits exactly one whole-shard morsel per shard (`EntityRange::All`). The §3.4 adaptive halving control loop reading `MorselSizeState::current_target_rows` is wired but not exercised by the v1 dispatch; sub-shard morsel splitting lands in a follow-on task once individual operators learn to take an entity-range parameter.
+
 ---
 
 ## 12. Decision Summary
