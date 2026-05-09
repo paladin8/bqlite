@@ -43,7 +43,9 @@ pub mod shard_plan;
 pub mod worker;
 
 pub use accumulator::{AccumulatorHandle, ShardDoneSignal};
-pub use engine_pool::{build_from_config, BuildError, MorselScheduler};
+pub use engine_pool::{
+    build_from_config, BuildError, MorselScheduler, PerShardOutcome, PerWorkerCtx,
+};
 pub use morsel::{EntityRange, Morsel, MorselGenerator, ShardSnapshot, WindowSegments};
 pub use policy::{MorselSizePolicy, MorselSizeState};
 pub use queue::{MorselQueue, MorselQueueDrained, MorselQueueFull};

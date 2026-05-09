@@ -34,15 +34,36 @@
 //! [`CoreBudget::acquire_n`] contract from CP1 is identical either
 //! way, so the migration is purely additive.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bqlite_core::BqliteError;
+use bqlite_operators::CancellationToken;
 use bqlite_storage::compaction::CoreBudget;
 
 use super::accumulator::AccumulatorHandle;
 use super::morsel::{Morsel, ShardSnapshot};
 use super::queue::MorselQueue;
 use super::worker::{ShardDoneCallback, WorkerMorselGuard};
+
+/// Per-worker scratch carried through one [`MorselScheduler::run_per_shard`]
+/// invocation. The dispatch hands a fresh `&mut PerWorkerCtx` into every
+/// closure invocation on a given worker; the worker increments these
+/// counters as it pulls morsels. After the dispatch returns, the engine
+/// folds one [`crate::perf::WorkerMetricsSnapshot`] per unique worker
+/// thread (identified via [`rayon::current_thread_index`]) into the
+/// query metrics aggregate.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PerWorkerCtx {
+    /// Morsels this worker has pulled in the current dispatch.
+    pub morsels_dispatched: u64,
+    /// Index of this worker in the Rayon pool, captured on the first
+    /// pull. `None` when the closure runs outside a Rayon worker
+    /// (the `pool.scope` invariant rules that out for production
+    /// callers, but tests may construct contexts directly).
+    pub rayon_thread_index: Option<usize>,
+}
 
 /// Engine-level worker pool plus capacity-sharing semaphore.
 pub struct MorselScheduler {
@@ -270,6 +291,211 @@ impl MorselScheduler {
             .expect("result slot poisoned")
             .expect("worker did not write a result")
     }
+
+    /// Multi-morsel dispatch (TASK-536, design §4.1 / §5).
+    ///
+    /// Build one [`super::morsel::MorselGenerator`] per non-empty
+    /// `ShardSnapshot`, push every morsel into a single
+    /// [`MorselQueue`], spawn `min(query_threads, snapshots.len())`
+    /// Rayon workers each pulling morsels until the queue drains, and
+    /// return the per-shard [`AccumulatorHandle`]s for the
+    /// coordinator's cross-shard merge (§6.4).
+    ///
+    /// The closure `work` receives the [`WorkerMorselGuard`] for the
+    /// pulled morsel plus a per-worker `&mut PerWorkerCtx` the engine
+    /// folds into a [`crate::perf::WorkerMetricsSnapshot`]. The first
+    /// `Err` from `work` cancels remaining work via `cancel`; the
+    /// queue is drained without running further closures (guards still
+    /// drop cleanly so outstanding-morsels accounting balances), and
+    /// the first error propagates back to the caller. Subsequent
+    /// errors are dropped — design §9.2 first-error-wins.
+    ///
+    /// **Panic isolation.** Each `work` call is wrapped in
+    /// `catch_unwind` (design §9.2) — a panic in one shard's worker
+    /// does not bring down the Rayon pool. The panic payload is
+    /// converted to `BqliteError::OperatorPanic` and stored in the
+    /// first-error slot; remaining workers observe `cancel` at the
+    /// next morsel pull and unwind cleanly.
+    ///
+    /// **Cancellation.** Workers check `cancel.is_cancelled()` at the
+    /// top of every pull iteration. Per design §9.1 this is the
+    /// "between morsels" yield point; per-batch cancellation is the
+    /// caller's responsibility inside `work`.
+    ///
+    /// **Permits.** `query_threads` permits are acquired from the
+    /// [`CoreBudget`] once at the start of the call and released when
+    /// the dispatch completes — identical to [`Self::submit`]'s
+    /// permit story.
+    ///
+    /// With zero snapshots the method returns `Ok(Vec::new())` without
+    /// touching the worker pool.
+    pub fn run_per_shard<F>(
+        &self,
+        snapshots: &[ShardSnapshot],
+        cancel: &CancellationToken,
+        work: F,
+    ) -> std::result::Result<PerShardOutcome, BqliteError>
+    where
+        F: Fn(&mut WorkerMorselGuard, &mut PerWorkerCtx) -> std::result::Result<(), BqliteError>
+            + Send
+            + Sync,
+    {
+        if snapshots.is_empty() {
+            return Ok(PerShardOutcome::default());
+        }
+        let _permits = self.core_budget.acquire_n(self.query_threads);
+
+        // Per-shard bookkeeping: one AccumulatorHandle + one generator
+        // per shard. The handles are returned to the caller for the
+        // cross-shard merge.
+        let accumulators: Vec<Arc<AccumulatorHandle>> = snapshots
+            .iter()
+            .map(|s| Arc::new(AccumulatorHandle::new(s.shard_id, None)))
+            .collect();
+        let by_shard: std::collections::HashMap<u32, Arc<AccumulatorHandle>> = accumulators
+            .iter()
+            .map(|h| (h.shard_id(), Arc::clone(h)))
+            .collect();
+
+        // Sized to hold every morsel the single-producer enumeration
+        // below pushes plus a small safety margin. v1 generator emits
+        // exactly one morsel per shard; sub-shard halving is not yet
+        // dispatched through this path.
+        let queue = Arc::new(MorselQueue::new(snapshots.len().max(1)));
+
+        for snap in snapshots {
+            let mut gen_ = super::morsel::MorselGenerator::degenerate(snap.clone());
+            while let Some(m) = gen_.take_next() {
+                queue.push(m).expect("queue capacity sized for all morsels");
+            }
+            let total_for_shard = gen_.total_emitted().unwrap_or(0);
+            if let Some(handle) = by_shard.get(&snap.shard_id) {
+                handle.mark_total_emitted(total_for_shard);
+            }
+        }
+        queue.mark_drained();
+
+        let num_workers = self.query_threads.min(snapshots.len()).max(1);
+        let first_error: Mutex<Option<BqliteError>> = Mutex::new(None);
+        let first_error_ref = &first_error;
+        let queue_for_workers = Arc::clone(&queue);
+        let by_shard_for_workers = &by_shard;
+        let work_ref = &work;
+        let cancel_for_workers = cancel.clone();
+        let per_worker_ctxs: Mutex<Vec<PerWorkerCtx>> = Mutex::new(Vec::new());
+        let per_worker_ctxs_ref = &per_worker_ctxs;
+
+        self.pool.scope(|s| {
+            for _ in 0..num_workers {
+                let q = Arc::clone(&queue_for_workers);
+                let cancel_w = cancel_for_workers.clone();
+                s.spawn(move |_| {
+                    let mut ctx = PerWorkerCtx {
+                        rayon_thread_index: rayon::current_thread_index(),
+                        ..PerWorkerCtx::default()
+                    };
+                    loop {
+                        // Cancellation between morsels (design §9.1).
+                        if cancel_w.is_cancelled() {
+                            // Drain the queue with empty guards so
+                            // outstanding-morsels accounting balances.
+                            while let Some(m) = q.pop() {
+                                let acc = by_shard_for_workers
+                                    .get(&m.shard_id)
+                                    .cloned()
+                                    .expect("morsel shard has accumulator");
+                                let on_done: ShardDoneCallback = Arc::new(|_, _| {});
+                                let g = WorkerMorselGuard::new(m, acc, on_done);
+                                drop(g);
+                            }
+                            break;
+                        }
+                        let morsel = match q.pop_or_park(Duration::from_millis(10)) {
+                            Ok(m) => m,
+                            Err(_drained) => break,
+                        };
+                        let shard = morsel.shard_id;
+                        let acc = by_shard_for_workers
+                            .get(&shard)
+                            .cloned()
+                            .expect("morsel shard has accumulator");
+                        let on_done: ShardDoneCallback = Arc::new(|_, _| {});
+                        let mut guard = WorkerMorselGuard::new(morsel, acc, on_done);
+                        ctx.morsels_dispatched = ctx.morsels_dispatched.saturating_add(1);
+                        // Panic isolation per design §9.2: convert
+                        // panic payloads into BqliteError::OperatorPanic
+                        // and propagate via the first-error slot.
+                        let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            work_ref(&mut guard, &mut ctx)
+                        }));
+                        let outcome: std::result::Result<(), BqliteError> = match unwound {
+                            Ok(r) => r,
+                            Err(payload) => Err(BqliteError::OperatorPanic {
+                                message: panic_message(payload),
+                                location: None,
+                            }),
+                        };
+                        // Guard drop runs before we look at the result
+                        // slot — outstanding-morsels accounting must
+                        // balance even on the error path.
+                        drop(guard);
+                        if let Err(e) = outcome {
+                            let mut slot = first_error_ref.lock().expect("first_error poisoned");
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                            cancel_w.cancel();
+                            // Don't break — let the cancel-check at the
+                            // top of the loop drain remaining morsels.
+                        }
+                    }
+                    per_worker_ctxs_ref
+                        .lock()
+                        .expect("per_worker_ctxs poisoned")
+                        .push(ctx);
+                });
+            }
+        });
+
+        if let Some(err) = first_error.into_inner().expect("first_error poisoned") {
+            return Err(err);
+        }
+        let per_worker = per_worker_ctxs
+            .into_inner()
+            .expect("per_worker_ctxs poisoned");
+        Ok(PerShardOutcome {
+            accumulators,
+            per_worker,
+        })
+    }
+}
+
+/// Outcome of a successful [`MorselScheduler::run_per_shard`] dispatch.
+///
+/// Carries both the per-shard [`AccumulatorHandle`]s the coordinator
+/// merges in design §6.4 and the per-worker scratch the engine folds
+/// into the query metrics aggregate (one [`crate::perf::WorkerMetricsSnapshot`]
+/// per Rayon thread that pulled at least one morsel).
+#[derive(Debug, Default)]
+pub struct PerShardOutcome {
+    /// One handle per `ShardSnapshot` that was passed in.
+    pub accumulators: Vec<Arc<AccumulatorHandle>>,
+    /// One context per worker thread that contributed (zero
+    /// contexts for an empty input).
+    pub per_worker: Vec<PerWorkerCtx>,
+}
+
+/// Extract a human-readable message from a `catch_unwind` payload —
+/// matches `query.rs::panic_message` so the conversion is identical
+/// across both the engine-level catch and the per-worker catch.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
 }
 
 /// Errors constructing a [`MorselScheduler`].
@@ -395,6 +621,156 @@ mod tests {
             counter.fetch_add(1, Ordering::Relaxed);
         });
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    // ── run_per_shard (TASK-536) ─────────────────────────────────────
+
+    #[test]
+    fn run_per_shard_dispatches_one_task_per_morsel() {
+        let sched = MorselScheduler::new(4).expect("scheduler builds");
+        let snaps: Vec<ShardSnapshot> = (0..4).map(fake_snapshot).collect();
+        let calls = AtomicU32::new(0);
+        let observed_shards: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+        let cancel = bqlite_operators::CancellationToken::new();
+        let outcome = sched
+            .run_per_shard(&snaps, &cancel, |guard, _ctx| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                observed_shards.lock().unwrap().push(guard.morsel.shard_id);
+                Ok(())
+            })
+            .expect("run_per_shard returns OK");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 4, "one call per shard");
+        let mut got = observed_shards.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![0, 1, 2, 3],
+            "every shard must be processed exactly once"
+        );
+        assert_eq!(outcome.accumulators.len(), 4);
+        for h in &outcome.accumulators {
+            assert!(h.is_done(), "every accumulator must signal done");
+        }
+        // Per-worker contexts populated for every worker that pulled a
+        // morsel; total morsels across all workers equals the input
+        // shard count.
+        let total: u64 = outcome
+            .per_worker
+            .iter()
+            .map(|c| c.morsels_dispatched)
+            .sum();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn run_per_shard_with_zero_shards_returns_empty_outcome() {
+        let sched = MorselScheduler::new(2).expect("scheduler builds");
+        let cancel = bqlite_operators::CancellationToken::new();
+        let outcome = sched
+            .run_per_shard(&[] as &[ShardSnapshot], &cancel, |_, _| {
+                unreachable!("must not be called");
+            })
+            .expect("empty dispatch ok");
+        assert!(outcome.accumulators.is_empty());
+        assert!(outcome.per_worker.is_empty());
+        // Permits are released even on the empty path.
+        assert_eq!(sched.available_permits(), 2);
+    }
+
+    #[test]
+    fn run_per_shard_propagates_first_worker_error() {
+        let sched = MorselScheduler::new(2).expect("scheduler builds");
+        let snaps: Vec<ShardSnapshot> = (0..2).map(fake_snapshot).collect();
+        let cancel = bqlite_operators::CancellationToken::new();
+        let result = sched.run_per_shard(&snaps, &cancel, |guard, _ctx| {
+            if guard.morsel.shard_id == 1 {
+                Err(BqliteError::Execution("boom".into()))
+            } else {
+                Ok(())
+            }
+        });
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, BqliteError::Execution(ref m) if m == "boom"),
+            "{err:?}"
+        );
+        // Cancel was set on first error.
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn run_per_shard_panic_in_worker_surfaces_as_operator_panic() {
+        let sched = MorselScheduler::new(2).expect("scheduler builds");
+        let snaps: Vec<ShardSnapshot> = (0..2).map(fake_snapshot).collect();
+        let cancel = bqlite_operators::CancellationToken::new();
+        let result = sched.run_per_shard(&snaps, &cancel, |guard, _ctx| {
+            if guard.morsel.shard_id == 0 {
+                panic!("synthetic shard-0 panic");
+            }
+            Ok(())
+        });
+        let err = result.unwrap_err();
+        match err {
+            BqliteError::OperatorPanic { message, .. } => {
+                assert!(
+                    message.contains("synthetic shard-0 panic"),
+                    "unexpected panic message: {message}"
+                );
+            }
+            other => panic!("expected OperatorPanic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_per_shard_observes_external_cancellation() {
+        // Pre-cancel the token before dispatch — workers must
+        // observe it at the morsel pull and exit without running
+        // the closure for any shard.
+        let sched = MorselScheduler::new(2).expect("scheduler builds");
+        let snaps: Vec<ShardSnapshot> = (0..3).map(fake_snapshot).collect();
+        let calls = AtomicU32::new(0);
+        let cancel = bqlite_operators::CancellationToken::new();
+        cancel.cancel();
+        let outcome = sched
+            .run_per_shard(&snaps, &cancel, |_g, _ctx| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .expect("pre-cancel does not error");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "no closure must run after pre-cancel"
+        );
+        // Outstanding-morsels accounting balanced — every shard's
+        // accumulator transitioned to done.
+        for h in &outcome.accumulators {
+            assert!(
+                h.is_done(),
+                "accumulator for shard {} not done",
+                h.shard_id()
+            );
+        }
+    }
+
+    #[test]
+    fn run_per_shard_records_rayon_thread_index() {
+        let sched = MorselScheduler::new(2).expect("scheduler builds");
+        let snaps: Vec<ShardSnapshot> = (0..4).map(fake_snapshot).collect();
+        let cancel = bqlite_operators::CancellationToken::new();
+        let outcome = sched
+            .run_per_shard(&snaps, &cancel, |_g, _ctx| Ok(()))
+            .expect("ok");
+        // Every per-worker context was populated by a Rayon worker, so
+        // rayon_thread_index must be Some(_).
+        for c in &outcome.per_worker {
+            assert!(
+                c.rayon_thread_index.is_some(),
+                "rayon_thread_index missing — was the closure dispatched on a Rayon worker?"
+            );
+        }
     }
 
     #[test]
