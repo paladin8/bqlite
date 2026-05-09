@@ -1,6 +1,6 @@
 name: Bench
 
-# Wave 2 benchmark CI job (TASK-241, updated by TASK-246).
+# Wave 2 benchmark CI job (TASK-241, updated by TASK-246, TASK-543).
 #
 # Three jobs:
 #   bench-baseline  — runs on every push to main, captures Criterion
@@ -52,7 +52,7 @@ jobs:
     name: Capture bench baseline
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -60,19 +60,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Run Wave 2 + Wave 3 + Wave 5 benchmarks
+      - name: Run all wave-scoped benchmarks
         run: >
           cargo bench -p bqlite-benches
+          --bench smoke
           --bench scan
+          --bench scan_encoded
           --bench encoding
           --bench ingest
           --bench acceptance
+          --bench fused_segment
           --bench matcher
           --bench aggregate
           --bench wave3_sort
           --bench wave3_distinct
           --bench funnel
           --bench percentile
+          --bench compactstring_eval
+          --bench sessionize
+          --bench attribute
+          --bench event_select
+          --bench pfor
+          --bench encoding_matrix
+          --bench wave4_ingest
+          --bench compaction
+          --bench sample
+          --bench cohort_join
+          --bench tombstone_scan
           --bench zero_copy_scan
           --bench stateful_aggregate_fusion
           --bench morsel_skew
@@ -114,7 +128,7 @@ jobs:
       !github.event.pull_request.draft &&
       !contains(github.event.pull_request.labels.*.name, 'bench-skip')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       actions: read   # query workflow runs and download artifacts cross-run
       contents: read
@@ -123,19 +137,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Run Wave 2 + Wave 3 + Wave 5 benchmarks
+      - name: Run all wave-scoped benchmarks
         run: >
           cargo bench -p bqlite-benches
+          --bench smoke
           --bench scan
+          --bench scan_encoded
           --bench encoding
           --bench ingest
           --bench acceptance
+          --bench fused_segment
           --bench matcher
           --bench aggregate
           --bench wave3_sort
           --bench wave3_distinct
           --bench funnel
           --bench percentile
+          --bench compactstring_eval
+          --bench sessionize
+          --bench attribute
+          --bench event_select
+          --bench pfor
+          --bench encoding_matrix
+          --bench wave4_ingest
+          --bench compaction
+          --bench sample
+          --bench cohort_join
+          --bench tombstone_scan
           --bench zero_copy_scan
           --bench stateful_aggregate_fusion
           --bench morsel_skew
@@ -223,19 +251,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
-      - name: Run reference-mode benchmarks
+      - name: Run all wave-scoped benchmarks (reference mode)
         run: >
           cargo bench -p bqlite-benches
+          --bench smoke
           --bench scan
+          --bench scan_encoded
           --bench encoding
           --bench ingest
           --bench acceptance
+          --bench fused_segment
           --bench matcher
           --bench aggregate
           --bench wave3_sort
           --bench wave3_distinct
           --bench funnel
           --bench percentile
+          --bench compactstring_eval
+          --bench sessionize
+          --bench attribute
+          --bench event_select
+          --bench pfor
+          --bench encoding_matrix
+          --bench wave4_ingest
+          --bench compaction
+          --bench sample
+          --bench cohort_join
+          --bench tombstone_scan
           --bench zero_copy_scan
           --bench stateful_aggregate_fusion
           --bench morsel_skew

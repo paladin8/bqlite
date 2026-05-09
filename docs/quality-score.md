@@ -134,7 +134,7 @@ otherwise-stable APIs, not surface removal.
 | bqlite-tests      | 451 (1 ign) |  0 | —  |    — | 0 |
 
 - **Bench harness** compiles cleanly (`cargo bench -p bqlite-benches --no-run` → `Finished bench profile`, 29 bench targets registered in `benches/Cargo.toml`).
-- **Bench CI** (TASK-241) continues to run baseline capture on `main` push and the regression gate on PRs. All 5 new Wave 5 bench groups (`zero_copy_scan`, `stateful_aggregate_fusion`, `morsel_skew`, `spill_overhead`, `cohort_pushdown`) are now invoked by `.github/workflows/bench.yml` alongside the inherited Wave 2/3 bench list (`scan`, `encoding`, `ingest`, `acceptance`, `matcher`, `aggregate`, `wave3_sort`, `wave3_distinct`, `funnel`, `percentile`). The 2 Wave 4 follow-ups that completed in Wave 5 (`tombstone_scan`, registered as a Wave 4 bench under TASK-534; `fused_segment`, registered as a Wave 2 bench under TASK-519) are present in `benches/Cargo.toml` but not yet wired into the bench.yml invocation list — Wave 4 bench inclusion remains a separate scope-of-work.
+- **Bench CI** (TASK-241, updated by TASK-543) runs baseline capture on `main` push and the regression gate on PRs. All 29 wave-scoped bench groups are now invoked by `.github/workflows/bench.yml`: Wave 1 (`smoke`), Wave 2 (`scan`, `scan_encoded`, `encoding`, `ingest`, `acceptance`, `fused_segment`), Wave 3 (`matcher`, `aggregate`, `wave3_sort`, `wave3_distinct`, `funnel`, `percentile`, `compactstring_eval`), Wave 4 (`sessionize`, `attribute`, `event_select`, `pfor`, `encoding_matrix`, `wave4_ingest`, `compaction`, `sample`, `cohort_join`, `tombstone_scan`), and Wave 5 (`zero_copy_scan`, `stateful_aggregate_fusion`, `morsel_skew`, `spill_overhead`, `cohort_pushdown`). The `bench-compare.sh` 10% × 3-consecutive-sample threshold scales to 29 groups without changes — it walks `*/new/estimates.json` files independently, so adding groups does not affect per-metric logic. Timeout raised from 45 → 90 minutes for `bench-baseline` and `bench-gate` to accommodate the expanded suite.
 - **Doc build** succeeds with warnings only (`cargo doc --workspace --no-deps` → `Finished dev profile`).
 - **Clippy** clean at `-D warnings` across the workspace (`scripts/local-ci.sh` passing).
 - **Formatting** clean at `cargo fmt --all --check`.
@@ -174,8 +174,8 @@ Wave 4 follow-ups that completed in Wave 5: `tombstone_scan`
 (TASK-534, registered as a Wave 4 bench) and `fused_segment`
 (TASK-519, registered as a Wave 2 bench because it exercises the
 filter/project/limit kernels). Combined with prior waves there are
-now **28 wave-scoped Criterion bench groups** (29 including the
-Wave 1 `smoke`) covering every perf-critical path that Wave 5 ships.
+now **29 Criterion bench groups** (including the Wave 1 `smoke`)
+covering every perf-critical path that Wave 5 ships.
 
 Coverage by perf surface:
 
@@ -352,13 +352,9 @@ ground truth. One crate slipped one Docs sub-grade (bqlite-planner
 Docs B+ → B), one crate gained an Overall sub-grade (bqlite-engine
 B+ → A-).
 
-Bench CI invokes 15 of the 29 wave-scoped bench groups (all 5 Wave 5
-groups plus the inherited Wave 2/3 list); the remaining 14 (Wave 4
-sessionize/attribute/event_select/cohort_join/compaction/sample/
-encoding_matrix/wave4_ingest/pfor and Wave 2 scan_encoded, plus the
-Wave 5 follow-ups `tombstone_scan` and `fused_segment`) are
-registered in `benches/Cargo.toml` and runnable locally but not yet
-in the CI gate's invocation list.
+Bench CI now invokes all 29 wave-scoped bench groups (TASK-543);
+every group registered in `benches/Cargo.toml` is in the CI gate's
+invocation list.
 
 ### TASK-599 hard-gate disposition (closure follow-ups filed)
 
@@ -392,7 +388,7 @@ delta to the spec's stated payoff.
 | TASK-525 + TASK-528 ingest partitioner spill is out-of-scope of both the stress and acceptance suites | `tests/wave5_runtime_stress.rs:28`, `tests/wave5_acceptance.rs:32-34` | **TASK-539** |
 | TASK-525 same-database concurrent DELETE/query under scheduler pressure not covered | `tests/wave5_runtime_stress.rs:434-486` (separate-DB only) | **TASK-540** |
 | Finding 1 rustdoc warning trajectory (33 → 41 → 67 → 94) without a cleanup pass | this file, lines 145-160 | **TASK-542** |
-| 14 wave-scoped Criterion bench groups still not in CI's invocation list | `.github/workflows/bench.yml` (15-of-29) | **TASK-543** |
+| 14 wave-scoped Criterion bench groups still not in CI's invocation list | `.github/workflows/bench.yml` (15-of-29) | **TASK-543** ✅ Closed — all 29 groups now in CI |
 
 **Wave 6 readiness.** With the closure follow-ups filed and the
 remediation table populated, the audit now satisfies the
