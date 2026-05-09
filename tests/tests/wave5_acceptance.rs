@@ -29,9 +29,11 @@
 //!      spill. v1 carries no on-disk hash-set. Verified by asserting
 //!      a small-cohort multi-shard query returns the expected row set
 //!      under the floor budget without spilling artefacts.
-//!    - Ingest partitioner spill (TASK-512) is owned by the operator-
-//!      side wiring still landing under the spill design; this gate
-//!      does not yet cover it directly.
+//!    - Ingest partitioner spill (TASK-539) — verified in
+//!      `ingest_spill_produces_correct_queryable_data`: a tight-budget
+//!      partitioner is driven past its memory ceiling, the RAII guards
+//!      remove all `.spill` files on drain, and an analytical query
+//!      over the written segments returns the hand-computed reference.
 //!
 //!    Both sub-bands above also assert "no spill artefacts persist
 //!    after the query returns" (the cleanup contract from § 8.3).
@@ -553,6 +555,104 @@ fn spill_root_is_empty_after_successful_query() {
             "spill_root must be empty after query return: {entries:?}"
         );
     }
+}
+
+/// End-to-end ingest partitioner spill correctness (`engine/spill.md`
+/// § 6.2 / § 8). Drives the partitioner past a tight memory budget so
+/// spill files are created, then verifies:
+///
+/// 1. At least one spill run was produced (the budget was actually hit).
+/// 2. All `.spill` artefacts are removed by the RAII guard after drain
+///    (`spill.md` § 8.1 / § 8.3).
+/// 3. An analytical query over the written segments returns the same
+///    per-event-type counts as the hand-computed reference — no rows
+///    lost or duplicated across the spilled ↔ resident boundary.
+#[test]
+fn ingest_spill_produces_correct_queryable_data() {
+    use bqlite_core::event::{EntityId, Event};
+    use bqlite_core::time::Timestamp;
+    use bqlite_storage::ingest::partitioner::Partitioner;
+    use bqlite_storage::SegmentWriter;
+
+    let tmp = TempDb::new();
+    let mut db = Database::create(tmp.path()).expect("[ingest-spill] Database::create");
+    let engine = Engine::new();
+    engine
+        .query(CREATE_TABLE, &mut db)
+        .expect("[ingest-spill] CREATE TABLE");
+
+    let spill_dir = tmp.path().join("ingest-spill-test");
+    std::fs::create_dir_all(&spill_dir).unwrap();
+
+    let shard_count = db.manifest().shard_count;
+    let batch_id = db
+        .allocate_batch_id("events")
+        .expect("[ingest-spill] allocate_batch_id");
+
+    // A very tight budget forces spill after the first few events.
+    let tight_budget: usize = 2048;
+
+    let mut partitioner =
+        Partitioner::with_spill_dir(shard_count, 30, batch_id, tight_budget, spill_dir.clone())
+            .expect("[ingest-spill] Partitioner::with_spill_dir");
+
+    // Push the same fixture events as the rest of the acceptance suite
+    // so the per-event-type counts are hand-computable.
+    for i in 0..N_ENTITIES {
+        let entity = EntityId::from(entity_id(i));
+        for (k, et) in EVENT_TYPES.iter().enumerate() {
+            let ts = Timestamp::from_nanos(T0 + (k as i64) * S);
+            partitioner
+                .push_event(Event::new(entity.clone(), ts, *et))
+                .expect("[ingest-spill] push_event");
+        }
+    }
+
+    // (1) The tight budget must have triggered at least one spill.
+    let run_count = partitioner.spilled_run_count();
+    assert!(
+        run_count > 0,
+        "tight budget must trigger at least one spill run; got {run_count}"
+    );
+
+    // Drain → write segments.
+    SegmentWriter::new(&mut db)
+        .write_partitioner("events", partitioner)
+        .expect("[ingest-spill] write_partitioner");
+
+    // (2) All spill artefacts removed by the RAII guard on drain.
+    let leftover: Vec<_> = std::fs::read_dir(&spill_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".spill"))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "no .spill artefacts must remain after write_partitioner drain: {leftover:?}"
+    );
+
+    // (3) Analytical query returns the hand-computed reference counts.
+    let stats = engine
+        .query(
+            "events | STATS rows = COUNT(*) GROUP BY event_type",
+            &mut db,
+        )
+        .expect("[ingest-spill] STATS query");
+    let by_type = group_by_stringkey_to_i64(&stats, "event_type", "rows");
+    assert_eq!(
+        by_type,
+        expected_per_event_type_counts(),
+        "per-event-type COUNT after spill must match the hand-computed reference"
+    );
+
+    let scan = engine
+        .query("events", &mut db)
+        .expect("[ingest-spill] full scan");
+    assert_eq!(
+        count_rows(&scan),
+        total_fixture_rows(),
+        "full scan after spill must return every fixture row"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

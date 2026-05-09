@@ -25,7 +25,7 @@
 //!   `DEFAULT_MAX_GROUPS = 1_000_000` is hardcoded in the planner;
 //!   suite-level coverage is non-additive against the operator-level
 //!   tests in `crates/bqlite-operators/src/aggregate/mod.rs::tests`.
-//! - **Ingest partitioner spill** — TASK-512 not yet landed.
+//! - **Ingest partitioner spill** — covered in `spill_fallback::ingest_partitioner_spill`.
 //! - **Per-`(worker, morsel)` `catch_unwind`** — TASK-541 follow-on.
 
 use std::path::PathBuf;
@@ -764,5 +764,117 @@ mod spill_fallback {
         let b: Arc<SpillFs> = Arc::clone(db.spill_fs());
         assert!(Arc::ptr_eq(&a, &b), "spill_fs handle is shared");
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Drives the ingest partitioner past its memory budget so spill
+    /// files are created, verifies that `drain_sorted` merges them in
+    /// `(entity_id, ts)` order across the spilled-vs-resident boundary,
+    /// and confirms no spill artefacts persist after drain completes.
+    ///
+    /// Pins `docs/design/engine/spill.md` § 6.2 / § 8 at the suite
+    /// level (TASK-539 closure). The full end-to-end correctness check
+    /// — spill → `write_partitioner` → analytical query — lives in
+    /// `wave5_acceptance.rs::ingest_spill_produces_correct_queryable_data`.
+    #[test]
+    fn ingest_partitioner_spill() {
+        use bqlite_core::event::{EntityId, Event};
+        use bqlite_core::time::Timestamp;
+        use bqlite_storage::ingest::partitioner::Partitioner;
+
+        let db_root = scratch_db_root("ingest-partitioner-spill");
+        std::fs::create_dir_all(&db_root).unwrap();
+        let spill_dir = db_root.join("spill");
+        std::fs::create_dir_all(&spill_dir).unwrap();
+
+        // Anchor timestamp inside a single 30-day window so all events
+        // land in one bucket per shard (deterministic multi-shard spread).
+        // Same T0 as the Wave 5 fixture so the shard distribution matches.
+        const T0: i64 = 1_700_000_000_000_000_000;
+        const S: i64 = 1_000_000_000; // 1 second in nanoseconds
+
+        // 2 KiB budget forces spill after the first ~17-20 events for
+        // minimal-property events (each Event is ~100-120 bytes per
+        // `estimated_event_size`). Enough to exercise multiple spill
+        // cycles without making the test slow.
+        let tight_budget = 2048_usize;
+
+        // 200 events across 50 entities in scrambled insertion order
+        // so the merge has real cross-entity interleaving to handle.
+        // Outer loop = event index so events for the same entity arrive
+        // separated by events for other entities.
+        let n_entities = 50_usize;
+        let events_per_entity = 4_usize;
+        let mut all_events: Vec<Event> = Vec::with_capacity(n_entities * events_per_entity);
+        for ev_idx in 0..events_per_entity {
+            for e_id in 0..n_entities {
+                let entity = EntityId::from(format!("user_{e_id:04}"));
+                let ts = Timestamp::from_nanos(T0 + (ev_idx as i64) * S);
+                all_events.push(Event::new(entity, ts, "click"));
+            }
+        }
+
+        // Reference: unlimited-budget no-spill drain.
+        let mut ref_p = Partitioner::new(32, 30, 1, usize::MAX).unwrap();
+        for e in &all_events {
+            ref_p.push_event(e.clone()).unwrap();
+        }
+        let reference: Vec<_> = ref_p.drain_sorted().collect();
+
+        // Spilling path: tight budget forces multiple spill cycles.
+        let mut p =
+            Partitioner::with_spill_dir(32, 30, 1, tight_budget, spill_dir.clone()).unwrap();
+        for e in &all_events {
+            p.push_event(e.clone()).unwrap();
+        }
+        assert!(
+            p.spilled_run_count() > 0,
+            "tight budget must trigger at least one spill; got runs={}",
+            p.spilled_run_count()
+        );
+
+        let actual: Vec<_> = p.drain_sorted().collect();
+
+        // (a) Ordering: every bucket must be sorted by (entity_id, ts)
+        //     across the spilled-vs-resident boundary.
+        for (key, events) in &actual {
+            for w in events.windows(2) {
+                let a = (&w[0].entity, &w[0].timestamp);
+                let b = (&w[1].entity, &w[1].timestamp);
+                assert!(
+                    a <= b,
+                    "bucket {key:?}: (entity_id, ts) ordering violated \
+                     after spill+merge (spill.md §6.2)"
+                );
+            }
+        }
+
+        // (b) Content: spill+merge must produce the same output as the
+        //     unlimited-budget no-spill drain on identical input.
+        assert_eq!(
+            actual.len(),
+            reference.len(),
+            "bucket count must match across spill and no-spill drain"
+        );
+        for ((ka, va), (kb, vb)) in actual.iter().zip(reference.iter()) {
+            assert_eq!(ka, kb, "bucket keys diverged after spill+merge");
+            assert_eq!(
+                va, vb,
+                "events diverged for bucket {ka:?} after spill+merge"
+            );
+        }
+
+        // (c) Cleanup: drain removes all spill artefacts via
+        //     `SpillRunFile` RAII (spill.md §8.1 / §8.3).
+        let leftover: Vec<_> = std::fs::read_dir(&spill_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".spill"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no spill artefacts must remain after drain; found {leftover:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&db_root);
     }
 }
