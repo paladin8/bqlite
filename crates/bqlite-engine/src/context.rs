@@ -26,6 +26,7 @@
 //! TASK-510 stops at making the context available so those tasks have a
 //! single seam to wire against.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bqlite_core::metrics::{AtomicMetrics, Metrics};
@@ -63,6 +64,50 @@ pub const DEFAULT_INGEST_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// query cannot make forward progress on small / medium hosts. See
 /// design doc § 8.2 for the derivation.
 pub const MIN_QUERY_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CancelReason — first-fire attribution for cooperative cancel paths.
+// (engine/cancellation.md §3.1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Why a query was cancelled. Set exactly once per [`QueryContext`] via
+/// the first-fire CAS on [`QueryContext::cancel_with_reason`]; subsequent
+/// fires lose the race and are silently dropped. Read at result
+/// collection in `Engine::query_with_options` to discriminate
+/// `BqliteError::Cancelled` from `BqliteError::Timeout`.
+///
+/// `LimitHit` is included for completeness with the design doc — the
+/// `LimitOperator` calls `cancel_with_reason(LimitHit)` to short-circuit
+/// once it has produced the requested rows. Per cancellation.md §3.1
+/// case 4, the driver maps `LimitHit` to `Ok(...)` at result collection
+/// (the in-flight rows were already collected before the token fired).
+/// TASK-538 records the variant but does not yet rewire `LimitOperator`
+/// to use `cancel_with_reason` — the existing operator calls
+/// `cancellation().cancel()` directly, and the driver's "no reason"
+/// path still produces the right answer because the rows are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CancelReason {
+    /// No cancellation has fired.
+    None = 0,
+    /// Caller-initiated cancel via `QueryOptions::cancel`.
+    Cancelled = 1,
+    /// Per-query timeout timer fired.
+    Timeout = 2,
+    /// `LimitOperator` short-circuited after producing the requested rows.
+    LimitHit = 3,
+}
+
+impl CancelReason {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => CancelReason::Cancelled,
+            2 => CancelReason::Timeout,
+            3 => CancelReason::LimitHit,
+            _ => CancelReason::None,
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EngineConfig
@@ -124,9 +169,16 @@ impl EngineConfig {
 
 /// Per-submission overrides for a single `Engine::query` call.
 ///
-/// `Default` produces an empty option set (all `None`), so existing
-/// callers that pass nothing still get the engine-level defaults.
-#[derive(Debug, Clone, Copy, Default)]
+/// `Default` produces an empty option set (all `None` / `false`), so
+/// existing callers that pass nothing still get the engine-level
+/// defaults. Constructed with struct update syntax
+/// (`..QueryOptions::default()`) so additive field changes do not
+/// break existing call sites.
+///
+/// `Copy` was previously implemented but is no longer because
+/// [`bqlite_operators::CancellationToken`] (an `Arc<AtomicBool>`
+/// under the hood) is not `Copy`. The struct remains `Clone`.
+#[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
     /// Override the per-query memory budget. Validated against
     /// [`MIN_QUERY_BUDGET_BYTES`] at submission time.
@@ -141,6 +193,26 @@ pub struct QueryOptions {
     /// distinguish "CPU counters were sampled but were zero" from
     /// "CPU counters were never enabled".
     pub collect_cpu_metrics: bool,
+    /// External cancellation handle. When `Some`, the token is
+    /// installed as the per-query [`bqlite_operators::CancellationToken`]
+    /// — operators see the same flag the caller set. When `None`, the
+    /// engine constructs a fresh token (the original Wave 1 default).
+    /// Per `cancellation.md` §3.1 source 1 (caller-initiated cancel).
+    pub cancel: Option<bqlite_operators::CancellationToken>,
+    /// Per-query timeout. When `Some(d)`, the engine spawns a timer
+    /// thread that fires `cancel_with_reason(Timeout)` after `d`
+    /// elapses; the driver maps the resulting `BqliteError::Cancelled`
+    /// to `BqliteError::Timeout { elapsed_ms }` at result collection.
+    /// Per `cancellation.md` §3.1 source 2 (query timeout).
+    ///
+    /// Latency target: the timer signal is observed at the next yield
+    /// point — batch / sub-batch / morsel boundary — per
+    /// `cancellation.md` §3.2.
+    ///
+    /// `Some(Duration::ZERO)` is a deterministic-fire shorthand: the
+    /// timer fires synchronously at spawn time, before any operator
+    /// runs. Useful for tests and for callers that want to fail fast.
+    pub timeout: Option<std::time::Duration>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +277,11 @@ pub struct QueryContext {
     /// single-threaded driver records exactly one snapshot today; the
     /// morsel-scheduler follow-up will record one per worker.
     worker_aggregate: Arc<Mutex<QueryMetrics>>,
+    /// First-fire reason for the cooperative cancel path
+    /// (`engine/cancellation.md` §3.1). Stored as a `u8` because
+    /// `AtomicEnum` is not in std; values map through
+    /// [`CancelReason::from_u8`].
+    cancel_reason: Arc<AtomicU8>,
     /// Whether CPU-cost sampling is opted in for this query
     /// (`PerfCounters::open_or_disabled` returns enabled only when
     /// this flag is set and the platform supports it). Default
@@ -233,6 +310,7 @@ impl std::fmt::Debug for QueryContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryContext")
             .field("cancelled", &self.cancellation.is_cancelled())
+            .field("cancel_reason", &self.cancel_reason())
             .field("memory_used_bytes", &self.memory.used_bytes())
             .field("memory_budget_bytes", &self.memory.budget_bytes())
             .field("has_tracker", &self.tracker.is_some())
@@ -256,6 +334,33 @@ impl QueryContext {
             _cleanup: None,
             metrics: Arc::new(AtomicMetrics::new()),
             worker_aggregate: Arc::new(Mutex::new(QueryMetrics::zero())),
+            cancel_reason: Arc::new(AtomicU8::new(CancelReason::None as u8)),
+            collect_cpu_metrics: false,
+        }
+    }
+
+    /// Build a tracker-backed context whose cancellation flag is
+    /// driven by an externally-supplied [`CancellationToken`]. The
+    /// caller retains a clone of the same token and observes any
+    /// internal cancel signal (timeout fire, panic peer-shutdown) by
+    /// reading it.
+    ///
+    /// This is a constructor (not a builder) so the token is in place
+    /// before any clone of `self` can be made — no observer ever sees
+    /// the about-to-be-replaced default token.
+    pub fn new_with_external_cancellation(budget_bytes: u64, token: CancellationToken) -> Self {
+        let tracker = MemoryTracker::new(budget_bytes);
+        Self {
+            cancellation: token,
+            memory: tracker.clone(),
+            tracker: Some(tracker),
+            warnings: crate::warning_sink::WarningSink::new(),
+            spill_fs: None,
+            spill_query_id: None,
+            _cleanup: None,
+            metrics: Arc::new(AtomicMetrics::new()),
+            worker_aggregate: Arc::new(Mutex::new(QueryMetrics::zero())),
+            cancel_reason: Arc::new(AtomicU8::new(CancelReason::None as u8)),
             collect_cpu_metrics: false,
         }
     }
@@ -274,6 +379,7 @@ impl QueryContext {
             _cleanup: None,
             metrics: Arc::new(AtomicMetrics::new()),
             worker_aggregate: Arc::new(Mutex::new(QueryMetrics::zero())),
+            cancel_reason: Arc::new(AtomicU8::new(CancelReason::None as u8)),
             collect_cpu_metrics: false,
         }
     }
@@ -300,6 +406,39 @@ impl QueryContext {
     /// Cancellation token shared across every operator in this query.
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
+    }
+
+    /// Read the current first-fire cancel reason. `None` until any
+    /// cooperative source CAS-installs a reason via
+    /// [`Self::cancel_with_reason`].
+    pub fn cancel_reason(&self) -> CancelReason {
+        CancelReason::from_u8(self.cancel_reason.load(Ordering::Acquire))
+    }
+
+    /// Mark the query cancelled with a structured reason. CAS-installs
+    /// `reason` from `None`; second fires lose the race and are
+    /// silently dropped. After the CAS (won or lost) the cancellation
+    /// token is set so operators stop at their next yield point.
+    ///
+    /// `reason` must not be [`CancelReason::None`] — that variant
+    /// represents the "no cancellation fired" sentinel and installing
+    /// it would defeat the first-fire rule. Callers that want to flip
+    /// the cancellation token without recording a reason should use
+    /// `cancellation().cancel()` directly (the external-cancel path
+    /// in `Engine::query_with_options` does exactly this).
+    pub fn cancel_with_reason(&self, reason: CancelReason) {
+        debug_assert_ne!(
+            reason as u8,
+            CancelReason::None as u8,
+            "cancel_with_reason must record a real reason"
+        );
+        let _ = self.cancel_reason.compare_exchange(
+            CancelReason::None as u8,
+            reason as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.cancellation.cancel();
     }
 
     /// Memory budget for this query. Operators that allocate dynamically
@@ -621,6 +760,78 @@ mod tests {
         let ctx = QueryContext::unbounded().collect_cpu_metrics(true);
         let snap = ctx.take_query_metrics(0);
         assert!(snap.cpu_metrics_enabled);
+    }
+
+    // ── CancelReason + external cancellation (TASK-538) ────────────
+
+    #[test]
+    fn cancel_reason_default_is_none() {
+        let ctx = QueryContext::new(MIN_QUERY_BUDGET_BYTES);
+        assert_eq!(ctx.cancel_reason(), CancelReason::None);
+        assert!(!ctx.cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn cancel_with_reason_installs_first_fire_only() {
+        let ctx = QueryContext::new(MIN_QUERY_BUDGET_BYTES);
+        ctx.cancel_with_reason(CancelReason::Timeout);
+        assert_eq!(ctx.cancel_reason(), CancelReason::Timeout);
+        assert!(ctx.cancellation().is_cancelled());
+        // Second fire is silently dropped — Timeout wins because it
+        // was first. The cancellation flag stays set across the
+        // losing fire (pin this behaviorally so a refactor that
+        // moves `self.cancellation.cancel()` inside the CAS Ok arm
+        // fails loudly).
+        ctx.cancel_with_reason(CancelReason::Cancelled);
+        assert_eq!(ctx.cancel_reason(), CancelReason::Timeout);
+        assert!(ctx.cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn cancel_with_reason_propagates_through_clones() {
+        let ctx = QueryContext::new(MIN_QUERY_BUDGET_BYTES);
+        let clone = ctx.clone();
+        ctx.cancel_with_reason(CancelReason::Cancelled);
+        assert_eq!(clone.cancel_reason(), CancelReason::Cancelled);
+        assert!(clone.cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn external_cancellation_token_is_observed_by_context() {
+        let external = CancellationToken::new();
+        let ctx =
+            QueryContext::new_with_external_cancellation(MIN_QUERY_BUDGET_BYTES, external.clone());
+        assert!(!ctx.cancellation().is_cancelled());
+        external.cancel();
+        assert!(
+            ctx.cancellation().is_cancelled(),
+            "cancel on the externally-supplied token must be observed by the context"
+        );
+        // The external-cancel path does not pre-install a reason; the
+        // engine driver records it at the boundary because the
+        // user-supplied token has no `cancel_with_reason` API.
+        assert_eq!(ctx.cancel_reason(), CancelReason::None);
+    }
+
+    #[test]
+    fn query_options_default_includes_cancel_and_timeout_as_none() {
+        let opts = QueryOptions::default();
+        assert!(opts.cancel.is_none());
+        assert!(opts.timeout.is_none());
+    }
+
+    #[test]
+    fn query_options_with_cancel_clones_token() {
+        let token = CancellationToken::new();
+        let opts = QueryOptions {
+            cancel: Some(token.clone()),
+            ..QueryOptions::default()
+        };
+        let cloned = opts.clone();
+        // Mutating through one observable handle must reach the other —
+        // they are clones of the same `Arc<AtomicBool>`.
+        token.cancel();
+        assert!(cloned.cancel.as_ref().unwrap().is_cancelled());
     }
 
     #[test]

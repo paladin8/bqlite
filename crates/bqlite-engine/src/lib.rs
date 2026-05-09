@@ -63,8 +63,9 @@ pub mod scheduler;
 pub mod warning_sink;
 
 pub use bind::bind_physical;
+pub use bqlite_operators::CancellationToken;
 pub use context::{
-    EngineConfig, QueryContext, QueryOptions, DEFAULT_COMPACTION_BUDGET_BYTES,
+    CancelReason, EngineConfig, QueryContext, QueryOptions, DEFAULT_COMPACTION_BUDGET_BYTES,
     DEFAULT_INGEST_BUDGET_BYTES, DEFAULT_QUERY_BUDGET_BYTES, MIN_QUERY_BUDGET_BYTES,
 };
 pub use perf::{format_perf_explain, PerfCounters, QueryMetrics, WorkerMetricsSnapshot};
