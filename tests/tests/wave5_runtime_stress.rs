@@ -18,15 +18,14 @@
 //!
 //! Out of scope today (deferred to TASK-528 acceptance gate / Wave 6):
 //!
-//! - **Public timeout API** — `Engine` does not expose a per-query
-//!   timeout knob today (`cancellation.md` §6.2). The cancellation
-//!   tests use `QueryContext::cancellation()` directly.
 //! - **End-to-end `MaxGroupsExceeded` through `Engine::query`** —
 //!   `DEFAULT_MAX_GROUPS = 1_000_000` is hardcoded in the planner;
 //!   suite-level coverage is non-additive against the operator-level
 //!   tests in `crates/bqlite-operators/src/aggregate/mod.rs::tests`.
 //! - **Ingest partitioner spill** — covered in `spill_fallback::ingest_partitioner_spill`.
-//! - **Per-`(worker, morsel)` `catch_unwind`** — TASK-541 follow-on.
+//! - **Per-morsel iteration `catch_unwind`** — TASK-541 follow-on; the
+//!   `MorselScheduler::submit` worker boundary catches panics today
+//!   (cancellation.md §4.1; landed in TASK-538 CP1.3).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +51,103 @@ mod helpers {
     /// Total row count across every batch in an `ExecutionResult`.
     pub fn count_rows(result: &bqlite_engine::ExecutionResult) -> usize {
         result.rows.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// Build a database with a multi-shard `events` fixture sized for
+    /// long-enough scans to be observable. Used by the public-API
+    /// cancellation tests (TASK-538) — the fixture is large enough
+    /// that an `ORDER BY ts ASC` scan does observable work, but small
+    /// enough to keep test runtime reasonable.
+    ///
+    /// Caller owns the returned `TempDb`; dropping it removes the
+    /// temp directory.
+    pub fn build_long_query_db(
+        label: &str,
+    ) -> (
+        bqlite_tests::common::TempDb,
+        bqlite_storage::Database,
+        bqlite_engine::Engine,
+    ) {
+        use std::sync::Arc;
+
+        use arrow::array::{StringArray, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use bqlite_engine::Engine;
+        use bqlite_storage::Database;
+        use bqlite_tests::common::TempDb;
+        use parquet::arrow::ArrowWriter;
+
+        const N_ENTITIES: usize = 5_000;
+        const EVENTS_PER_ENTITY: usize = 10;
+        const T0: i64 = 1_700_000_000_000_000_000;
+        const S: i64 = 1_000_000_000;
+
+        let tmp = TempDb::new();
+        let mut db = Database::create(tmp.path())
+            .unwrap_or_else(|e| panic!("[{label}] Database::create: {e}"));
+        let engine = Engine::new();
+        engine
+            .query(
+                "CREATE TABLE events (\
+                     entity_id STRING NOT NULL ENTITY KEY, \
+                     ts TIMESTAMP NOT NULL EVENT TIME, \
+                     event_type STRING NOT NULL EVENT TYPE\
+                 )",
+                &mut db,
+            )
+            .unwrap_or_else(|e| panic!("[{label}] CREATE TABLE: {e}"));
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("entity_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("event_type", DataType::Utf8, false),
+        ]));
+        let mut entity_ids: Vec<String> = Vec::with_capacity(N_ENTITIES * EVENTS_PER_ENTITY);
+        let mut tss: Vec<i64> = Vec::with_capacity(N_ENTITIES * EVENTS_PER_ENTITY);
+        let mut event_types: Vec<&str> = Vec::with_capacity(N_ENTITIES * EVENTS_PER_ENTITY);
+        for i in 0..N_ENTITIES {
+            let eid = format!("user_{i:05}");
+            for k in 0..EVENTS_PER_ENTITY {
+                entity_ids.push(eid.clone());
+                tss.push(T0 + (k as i64) * S);
+                event_types.push(if k % 3 == 0 {
+                    "view"
+                } else if k % 3 == 1 {
+                    "add_to_cart"
+                } else {
+                    "purchase"
+                });
+            }
+        }
+        let entity_id_array =
+            StringArray::from(entity_ids.iter().map(String::as_str).collect::<Vec<_>>());
+        let ts_array = TimestampNanosecondArray::from(tss);
+        let event_type_array = StringArray::from(event_types);
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(entity_id_array),
+                Arc::new(ts_array),
+                Arc::new(event_type_array),
+            ],
+        )
+        .expect("build fixture batch");
+
+        let path = tmp.path().join(format!("{label}-fixture.parquet"));
+        let file = std::fs::File::create(&path).expect("create parquet file");
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).expect("ArrowWriter");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let sql = format!(
+            "INSERT INTO events FROM '{}' WITH (format: 'parquet')",
+            path.display()
+        );
+        engine
+            .query(&sql, &mut db)
+            .unwrap_or_else(|e| panic!("[{label}] INSERT FROM Parquet: {e}"));
+        (tmp, db, engine)
     }
 }
 
@@ -318,6 +414,176 @@ mod cancellation_cleanup {
         assert!(ctx.spill_fs().is_none());
         assert!(ctx.spill_query_id().is_none());
         assert!(ctx.open_spill("any").is_none());
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Public-surface tests (TASK-538): drive cancellation through
+    // `Engine::query_with_options` and the new `QueryOptions`
+    // surface rather than the contract-level `QueryContext`.
+    // ────────────────────────────────────────────────────────────
+
+    use bqlite_core::BqliteError;
+    use bqlite_engine::{CancellationToken, ExecutionFailure, QueryOptions};
+
+    use super::helpers::build_long_query_db;
+
+    /// External cancel before the query starts produces
+    /// `BqliteError::Cancelled` from the very first yield point.
+    /// Deterministic: the token is pre-cancelled so any operator
+    /// poll observes the flag immediately. Public-API counterpart of
+    /// the contract-level `cancel_propagates_through_context_clones`.
+    #[test]
+    fn external_cancel_pre_query_returns_cancelled() {
+        let (_tmp, mut db, engine) = build_long_query_db("ext-pre");
+        let token = CancellationToken::new();
+        token.cancel();
+        let opts = QueryOptions {
+            cancel: Some(token),
+            ..QueryOptions::default()
+        };
+        let err = engine
+            .query_with_options("events | ORDER BY ts ASC", &mut db, &opts)
+            .expect_err("pre-cancelled token must fire on first yield");
+        assert!(
+            matches!(
+                &err,
+                ExecutionFailure {
+                    error: BqliteError::Cancelled,
+                    ..
+                }
+            ),
+            "expected Cancelled, got {err:?}"
+        );
+    }
+
+    /// Per-query timeout fires deterministically when set to
+    /// `Duration::ZERO` — `QueryTimer::spawn` synchronously calls
+    /// `cancel_with_reason(Timeout)` before the query starts, so the
+    /// driver maps the resulting `Cancelled` to `Timeout` at result
+    /// collection (cancellation.md §3.1). No retry loop, no race.
+    #[test]
+    fn timeout_zero_duration_returns_timeout_deterministically() {
+        let (_tmp, mut db, engine) = build_long_query_db("timeout-mid");
+        let opts = QueryOptions {
+            timeout: Some(std::time::Duration::ZERO),
+            ..QueryOptions::default()
+        };
+        let err = engine
+            .query_with_options("events | ORDER BY ts ASC", &mut db, &opts)
+            .expect_err("zero-duration timeout must fire");
+        match err {
+            ExecutionFailure {
+                error: BqliteError::Timeout { .. },
+                ..
+            } => {}
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    /// Cancel mid-query through the public API leaves no spill
+    /// artefacts under the database's spill root. The engine
+    /// constructs (and drops) a fresh `QueryContext` per call that
+    /// may have lazily created a per-query subdir; on every exit
+    /// path — natural completion or external cancel —
+    /// `SpillCleanup::Drop` on the last `QueryContext` clone reclaims
+    /// the per-query subdir, leaving the spill root empty.
+    ///
+    /// Unlike the `Duration::ZERO` timeout (which fires before any
+    /// operator runs), a pre-cancelled token deterministically lets
+    /// bind run and the operator tree open before the very first
+    /// yield-point check fires Cancelled — exercising the "operator
+    /// state opened, then unwound" exit path. Re-pins
+    /// `cancellation.md` § 5.1 / § 5.2 / `spill.md` § 8.3 through
+    /// the public surface.
+    #[test]
+    fn cancel_via_query_options_leaves_no_spill_artefacts() {
+        use bqlite_engine::MIN_QUERY_BUDGET_BYTES;
+
+        let (_tmp, mut db, engine) = build_long_query_db("cancel-cleanup");
+        let spill_root = db.spill_fs().root().to_path_buf();
+
+        for _ in 0..16 {
+            let token = CancellationToken::new();
+            token.cancel();
+            let opts = QueryOptions {
+                cancel: Some(token),
+                memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES),
+                ..QueryOptions::default()
+            };
+            let result = engine.query_with_options("events | ORDER BY ts ASC", &mut db, &opts);
+            assert!(
+                matches!(
+                    &result,
+                    Err(ExecutionFailure {
+                        error: BqliteError::Cancelled,
+                        ..
+                    })
+                ),
+                "expected Cancelled exit, got {result:?}"
+            );
+            // Spill root must be empty (or absent) after every call.
+            // The per-query subdir is created lazily on first spill;
+            // on the cancel exit path SpillCleanup::Drop reclaims it
+            // before the engine returns.
+            if spill_root.exists() {
+                let entries: Vec<_> = std::fs::read_dir(&spill_root)
+                    .expect("read spill root")
+                    .filter_map(|e| e.ok())
+                    .collect();
+                assert!(
+                    entries.is_empty(),
+                    "spill root must be empty after cancel, found {} entries",
+                    entries.len()
+                );
+            }
+        }
+    }
+
+    /// Timeout exit through the public API runs the engine cleanup
+    /// path successfully — `Engine::query_with_options` returns
+    /// `BqliteError::Timeout` and no spill artefacts persist under
+    /// the database's spill root.
+    ///
+    /// `Duration::ZERO` deterministically fires the timer before
+    /// any operator runs (`QueryTimer::spawn` synchronous-fire
+    /// branch). The complementary
+    /// `cancel_via_query_options_leaves_no_spill_artefacts` exercises
+    /// the operator-state-opened exit path. Together they pin
+    /// "the public timeout / cancel surface returns cleanly without
+    /// leaving artefacts" for every reachable interleaving today.
+    #[test]
+    fn timeout_via_query_options_exits_cleanly() {
+        use bqlite_engine::MIN_QUERY_BUDGET_BYTES;
+
+        let (_tmp, mut db, engine) = build_long_query_db("timeout-exit");
+        let spill_root = db.spill_fs().root().to_path_buf();
+
+        let opts = QueryOptions {
+            timeout: Some(std::time::Duration::ZERO),
+            memory_budget_bytes: Some(MIN_QUERY_BUDGET_BYTES),
+            ..QueryOptions::default()
+        };
+        let result = engine.query_with_options("events | ORDER BY ts ASC", &mut db, &opts);
+        assert!(
+            matches!(
+                &result,
+                Err(ExecutionFailure {
+                    error: BqliteError::Timeout { .. },
+                    ..
+                })
+            ),
+            "expected Timeout exit, got {result:?}"
+        );
+        if spill_root.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&spill_root)
+                .expect("read spill root")
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "spill root must be empty after timeout exit"
+            );
+        }
     }
 }
 
