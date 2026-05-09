@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-2",
+  "task_id": "TASK-540",
+  "claimed_at": "2026-05-09T06:26:08Z",
+  "branch": "task/TASK-540",
+  "description": "Same-database concurrent DELETE/query stress (TASK-525 closure)"
+}
