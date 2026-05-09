@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-1",
+  "task_id": "TASK-536",
+  "claimed_at": "2026-05-09T06:25:58Z",
+  "branch": "task/TASK-536",
+  "description": "Real per-shard morsel dispatch (TASK-523 closure)"
+}
