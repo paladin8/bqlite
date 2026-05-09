@@ -35,7 +35,7 @@
 //! > two row groups. Entities larger than `ROW_GROUP_SIZE_DEFAULT`
 //! > occupy consecutive row groups within a segment.
 //!
-//! [`plan_row_groups`] implements this rule. It walks the input
+//! `plan_row_groups` implements this rule. It walks the input
 //! starting from the row-group target size (default 65,536), and:
 //!
 //! - When the natural cut at `target_size` lands on an entity
@@ -63,7 +63,7 @@
 //! region) and the per-row-group params shrink to a 5-byte
 //! `dict_id (u32 LE) + code_bit_width (u8)` header.
 //!
-//! [`hoist_dictionary_chunk`] performs the conversion: it parses the
+//! `hoist_dictionary_chunk` performs the conversion: it parses the
 //! 6-byte trait-level header (`type_tag, code_bit_width, cardinality`)
 //! and the variable-length dictionary block that follows it, registers
 //! the dictionary as a [`PreparedDictionary`] in the segment-level
@@ -79,8 +79,8 @@
 //!
 //! The orchestration logic is split into pure functions that the
 //! tests below exercise without touching the filesystem
-//! ([`plan_row_groups`], [`events_to_record_batch`],
-//! [`hoist_dictionary_chunk`]). The end-to-end path is covered by
+//! (`plan_row_groups`, `events_to_record_batch`,
+//! `hoist_dictionary_chunk`). The end-to-end path is covered by
 //! tests that build a real [`Database`], call [`SegmentWriter::write_bucket`],
 //! and re-read the resulting segment through
 //! [`crate::segment::reader::SegmentFileReader`] to assert the row

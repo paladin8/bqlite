@@ -18,7 +18,7 @@
 //!   (TASK-238).
 //!
 //! The function returns `()` on success (INSERT produces no result
-//! rows); the caller wraps it in an empty [`ResultOperator`].
+//! rows); the caller wraps it in an empty `ResultOperator`.
 
 use std::path::{Path, PathBuf};
 

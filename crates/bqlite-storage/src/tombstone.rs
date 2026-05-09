@@ -155,7 +155,7 @@ impl TombstoneFile {
     ///
     /// Computed once per scan and reused across batches by the scan
     /// wrappers via [`TombstoneFilter::filter_batch_with_index`] /
-    /// [`TombstoneFilter::apply_entity_deletes_with_index`]; the inline
+    /// `TombstoneFilter::apply_entity_deletes_with_index`; the inline
     /// path through [`TombstoneFilter::filter_batch`] would otherwise
     /// rebuild it on every batch (see deletes.md §7 per-batch hot path).
     pub fn entity_delete_index(&self) -> EntityDeleteIndex {

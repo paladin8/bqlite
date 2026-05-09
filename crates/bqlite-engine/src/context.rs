@@ -233,7 +233,7 @@ pub struct QueryOptions {
 ///
 /// ## Spill cleanup
 ///
-/// When the *last* clone drops, the inner [`SpillCleanup`] guard runs
+/// When the *last* clone drops, the inner `SpillCleanup` guard runs
 /// `SpillFs::cleanup_query(qid)` so any spill files that survived
 /// their owning [`TempSpillFile`] guard's `Drop` (e.g. an `EBUSY` we
 /// did not log) are reclaimed. This is the belt-and-braces sweep

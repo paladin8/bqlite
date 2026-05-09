@@ -59,7 +59,7 @@ const SMALL_IN_THRESHOLD: usize = 8;
 /// Run the stateless-filter conjunct-ordering pass over a
 /// [`PhysicalPlan`] tree. Returns a new tree with every fused-segment
 /// `Filter` step's `And`-rooted predicate reordered by the rank table
-/// in [`rank`].
+/// in `rank`.
 pub fn order_stateless_filters(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
         PhysicalPlan::FusedSegment(seg) => {

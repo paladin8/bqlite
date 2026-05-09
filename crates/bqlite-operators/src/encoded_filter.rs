@@ -16,7 +16,7 @@
 //!
 //! The remaining kernels (Dict eq/IN, plain-fixed range, bool eq, null
 //! checks on non-constant columns) land alongside the real
-//! [`ScanOperator`] integration in CP7. The trait defined here is the
+//! `ScanOperator` integration in CP7. The trait defined here is the
 //! binding contract those kernels will also implement.
 //!
 //! # Non-goals for CP3

@@ -6,7 +6,7 @@
 //! 1. Open a CSV file and read its header to discover source column
 //!    names.
 //! 2. Apply the column mapping from the planner's
-//!    [`InsertFromDescriptor`] to resolve each source column to its
+//!    `InsertFromDescriptor` to resolve each source column to its
 //!    target column in the [`TableSchema`].
 //! 3. For each CSV row, parse and coerce field values into
 //!    [`PropertyValue`]s matching the target column types, populate

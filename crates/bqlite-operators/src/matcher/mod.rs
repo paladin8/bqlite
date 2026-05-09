@@ -342,7 +342,7 @@ impl SequenceMatchOperator {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Per-entity mutable state. Variant selected at plan time based on
-/// [`PatternClass`] and demand (match-operator.md §4.1).
+/// `PatternClass` and demand (match-operator.md §4.1).
 pub enum SequenceMatchState {
     /// Step counter fast path for linear patterns.
     /// Boxed because `StepCounterState` (~496 bytes) is significantly

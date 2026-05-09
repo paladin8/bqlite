@@ -143,7 +143,7 @@ pub fn surviving_row_groups(
 /// This is the performance-critical pruning entry point used by
 /// `SegmentFileScan::next_row_group` (TASK-247). For every conjunct
 /// in the predicate, it finds the matching column's
-/// [`ColumnChunkMeta`] by name (using the write-time schema to map
+/// `ColumnChunkMeta` by name (using the write-time schema to map
 /// `column_ordinal` → name), constructs an ephemeral [`ZoneMap`] on
 /// the stack, and calls `accepts_zone`. A conjunct whose column is
 /// absent from the row-group's metadata is conservatively accepted

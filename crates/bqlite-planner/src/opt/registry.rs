@@ -1,14 +1,14 @@
 //! Optimizer rule registry and pipeline driver (TASK-521).
 //!
 //! Replaces the bespoke sequence of pass-function calls in
-//! [`crate::finalize_physical`] with a uniform rule trait, a registry
+//! `crate::finalize_physical` with a uniform rule trait, a registry
 //! of rule implementations, and a driver that runs them in registration
 //! order, recording each rule's outcome into a [`RuleTrace`] for EXPLAIN
 //! visibility.
 //!
 //! The framework is the merge-first scaffold for Wave 5 rule work. The
 //! v1 ruleset (`OptimizerPipeline::v1`) wraps the existing physical
-//! passes — [`fuse_match_aggregate`](crate::opt::fuse_match_aggregate),
+//! passes — [`fuse_match_aggregate`](fn@crate::opt::fuse_match_aggregate),
 //! [`pushdown_sample`](crate::opt::sample_pushdown), and
 //! [`pushdown_predicates`](crate::opt::pushdown), and
 //! [`prune_columns`](crate::opt::prune) — plus two stub rules for

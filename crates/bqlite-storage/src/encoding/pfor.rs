@@ -41,7 +41,7 @@
 //! # Null handling
 //!
 //! Same as FOR: the writer strips nulls before encoding; passing a
-//! nullable array is a contract violation caught by [`super::require_dense`].
+//! nullable array is a contract violation caught by `super::require_dense`.
 //!
 //! # Edge cases
 //!

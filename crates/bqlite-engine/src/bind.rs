@@ -47,14 +47,14 @@
 //!
 //! - **`Sessionize`**, **`EventSelect`**, **`Attribute`**: each implements
 //!   [`EntityOperator`] and is wrapped by a generic
-//!   [`EntityOperatorAdapter`] that detects entity boundaries and drives
+//!   `EntityOperatorAdapter` that detects entity boundaries and drives
 //!   the per-entity `create_state` → `process_sub_batch*` → `finish_entity`
 //!   protocol. Wave 4 operators do not support fused aggregates; the
 //!   `fused_aggregate` field is asserted `None` by each operator constructor.
 //! - **`Sample`** (fallback): when the optimizer's sample-pushdown pass
 //!   cannot push SAMPLE into the scan layer (because a stateful operator
 //!   sits between SAMPLE and the scan), the bind step materializes a
-//!   [`SampleFilterOperator`] that applies the xxHash64 entity-level filter
+//!   `SampleFilterOperator` that applies the xxHash64 entity-level filter
 //!   above the stateful stage.
 //! - **`MergeSources`**: materializes a `MergeSourcesOperator` that
 //!   performs an N-ary k-way merge over one `ScanOperator` per joined
@@ -896,7 +896,7 @@ fn fill_entity_id(batch: RecordBatch, entity: &EntityId) -> Result<RecordBatch> 
 ///
 /// Each descriptor arm is responsible for wiring in runtime handles
 /// (`Database` for segment readers, the shared
-/// [`CancellationToken`], later the memory budget and metrics sink).
+/// `CancellationToken`, later the memory budget and metrics sink).
 /// The returned operator is ready to drive with `open → next_batch* →
 /// close` per the [`PhysicalOperator`] lifecycle contract.
 ///
@@ -909,7 +909,7 @@ fn fill_entity_id(batch: RecordBatch, entity: &EntityId) -> Result<RecordBatch> 
 ///
 /// `Aggregate`, `Sort`, `Distinct` — bind the child and construct the
 /// corresponding stateless operator. `SequenceMatch` — bind the child
-/// and wrap in a [`SequenceMatchAdapter`] that drives the per-entity
+/// and wrap in a `SequenceMatchAdapter` that drives the per-entity
 /// `EntityOperator` protocol.
 ///
 /// ## DDL descriptors

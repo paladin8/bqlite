@@ -206,7 +206,7 @@ impl ExecutionResult {
 /// `docs/design/engine/memory-budget.md` § 2.2) used to size each
 /// query's [`QueryContext`], plus an [`Arc<MorselScheduler>`] that
 /// dispatches data-plane queries onto a Rayon worker pool guarded
-/// by a [`CoreBudget`] semaphore (engine/morsel-scheduler.md §5).
+/// by a `CoreBudget` semaphore (engine/morsel-scheduler.md §5).
 /// `Engine::new()` and `Engine::default()` remain interchangeable
 /// for hosts that want the documented Wave 5 defaults.
 #[derive(Debug, Clone)]

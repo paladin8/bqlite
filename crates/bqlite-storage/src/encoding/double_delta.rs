@@ -38,7 +38,7 @@
 //!
 //! DoubleDelta operates on dense arrays — the writer strips nulls into a
 //! separate bitmap before handing values to the encoding layer. A nullable
-//! input is a contract violation caught by [`super::require_dense`].
+//! input is a contract violation caught by `super::require_dense`.
 //!
 //! # Edge cases
 //!

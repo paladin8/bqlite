@@ -43,7 +43,7 @@
 //! # Selector guards (Wave 4)
 //!
 //! The per-codec guards from `advanced-encodings.md` §§3.7, 5.7, 6.7,
-//! 7.7, 8.7 live in [`candidate_passes_guard`]. The only hard guard
+//! 7.7, 8.7 live in `candidate_passes_guard`. The only hard guard
 //! we apply is RLE's §3.7 run-length check, which rejects runs ≤ 2
 //! cheaply before calling [`Rle::estimate_size`]. The remaining
 //! codecs' `estimate_size` implementations already reflect their
@@ -139,7 +139,7 @@ impl SelectedEncoding {
 /// `array` must be **dense** — the selector only operates on the
 /// non-null values; null handling is the writer orchestration's job
 /// per the [`Encoding`] trait contract. A nullable input is rejected
-/// with [`BqliteError::Execution`] before any encoding work happens.
+/// with `BqliteError::Execution` before any encoding work happens.
 ///
 /// Returns a [`SelectedEncoding`] carrying the encoded chunk, the
 /// compression decision, and the on-disk payload bytes ready for

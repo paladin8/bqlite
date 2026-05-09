@@ -44,7 +44,7 @@
 //! Plain encodes only non-null values; the null bitmap is a separate
 //! prefix of the column chunk emitted by the writer. Every method on
 //! [`Plain`] treats a nullable input as a contract violation — see
-//! [`super::require_dense`] and the module-level docs on
+//! `super::require_dense` and the module-level docs on
 //! [`super::Encoding`].
 
 use arrow::array::{

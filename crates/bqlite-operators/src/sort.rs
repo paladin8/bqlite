@@ -37,7 +37,7 @@
 //! Each accumulated batch's Arrow array bytes are reserved against the
 //! per-query [`MemoryBudget`] (TASK-513 CP2a). If a [`SpillFs`] handle
 //! is wired in (production callers thread one through; tests may pass
-//! `None`) the operator registers a [`SortSpillHandler`] with the
+//! `None`) the operator registers a `SortSpillHandler` with the
 //! budget. On `try_reserve` overshoot the handler sorts the in-memory
 //! buffer, writes one Arrow IPC stream-format run to disk, drops the
 //! reservations the run held, and returns the freed reservation bytes
@@ -99,7 +99,7 @@ pub struct SortOperator {
     /// on pressure.
     budget: Arc<dyn MemoryBudget>,
     schema: OperatorSchema,
-    /// Spill state shared with the [`SortSpillHandler`]. The operator
+    /// Spill state shared with the `SortSpillHandler`. The operator
     /// holds the writer side; the handler owns a clone of the same
     /// `Arc` so it can drain the buffer when the budget asks. The
     /// operator never holds this lock across `try_reserve`, so the
@@ -122,7 +122,7 @@ struct BufferedBatch {
 }
 
 /// Spill-related state shared between the operator and the
-/// [`SortSpillHandler`]. Held behind `Arc<Mutex<…>>` so the handler
+/// `SortSpillHandler`. Held behind `Arc<Mutex<…>>` so the handler
 /// can mutate it from inside the budget's `on_pressure` callback.
 struct SortSpillState {
     /// In-memory accumulation buffer. Drained on spill or merge.
@@ -191,7 +191,7 @@ impl SortOperator {
     /// - `cancel` — shared cancellation flag.
     /// - `budget` — per-query [`MemoryBudget`].
     /// - `spill_fs` / `spill_qid` — paired; both `Some` enables spill.
-    ///   The operator registers a [`SortSpillHandler`] with `budget`
+    ///   The operator registers a `SortSpillHandler` with `budget`
     ///   so `try_reserve` overshoot drains the buffer to disk.
     pub fn with_spill(
         child: Box<dyn PhysicalOperator>,

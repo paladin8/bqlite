@@ -6,7 +6,7 @@
 //! 1. Open a `.parquet` file and read it into Arrow [`RecordBatch`]es
 //!    via the `parquet` crate's Arrow integration.
 //! 2. Apply the column mapping from the planner's
-//!    [`InsertFromDescriptor`] to resolve each Parquet field name to its
+//!    `InsertFromDescriptor` to resolve each Parquet field name to its
 //!    target column in the [`TableSchema`].
 //! 3. Apply width-consolidation: any integer width collapses to `i64`
 //!    (BQL `Int`), any float width collapses to `f64` (BQL `Float`),

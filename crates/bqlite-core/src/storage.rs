@@ -28,7 +28,7 @@
 //!    exposes per-column min/max metadata for pruning.
 //! 5. **Predicate pushdown** — an optional `Arc<dyn Predicate>` the
 //!    reader may consult for zone-map filtering. The real predicate
-//!    IR is a Wave 2 [DESIGN] task; [`Predicate`] here is a narrow
+//!    IR is a Wave 2 DESIGN task; [`Predicate`] here is a narrow
 //!    one-method hook that extension is additive on.
 //!
 //! ## v0 scope exclusions
@@ -107,14 +107,14 @@ pub struct SegmentHandle {
     pub schema_version: u32,
     /// First `__seq_id` in this segment (`SegmentMeta::seq_id_range.0`).
     /// Row at segment-relative offset `n` has `__seq_id = seq_id_first + n`.
-    /// Carried here so [`bqlite_storage::TombstoneScanWrapper`] can
+    /// Carried here so `bqlite_storage::TombstoneScanWrapper` can
     /// synthesise per-row `__seq_id` values when the scan projection omits
     /// the system column but tombstone filtering still needs it.
     /// `0` is the safe default for callers that do not populate system-column
     /// metadata (e.g. unit-test stub readers).
     pub seq_id_first: u64,
     /// Ingest batch that produced this segment (`SegmentMeta::batch_id`).
-    /// Used by [`bqlite_storage::TombstoneScanWrapper`] to apply batch-level
+    /// Used by `bqlite_storage::TombstoneScanWrapper` to apply batch-level
     /// tombstones when `__batch_id` is absent from the scan output.
     /// `0` is the safe default for callers that do not populate this field.
     pub batch_id: u64,
@@ -878,7 +878,7 @@ pub trait SegmentScan: Send {
     fn next_row_group(&mut self) -> Result<Option<RecordBatch>>;
 
     /// Yield the next row-group as an encoded-preserving
-    /// [`EncodedBatch`], or `Ok(None)` when the segment is exhausted.
+    /// `EncodedBatch`, or `Ok(None)` when the segment is exhausted.
     ///
     /// This is the encoded-path read hook described in
     /// `docs/design/storage/zero-copy-scan-filter.md` and
@@ -891,7 +891,7 @@ pub trait SegmentScan: Send {
     ///
     /// The default delegates to [`SegmentScan::next_row_group`] and
     /// wraps each resulting Arrow column into
-    /// [`EncodedColumn::Materialized`]. This means every existing
+    /// `EncodedColumn::Materialized`. This means every existing
     /// `SegmentScan` implementor works on the encoded-path surface
     /// with no behavior change — they just stay on the materialized
     /// fallback until they override this method with a real encoded
@@ -928,7 +928,7 @@ pub trait SegmentScan: Send {
         }
     }
 
-    /// Attach a copy-budget [`Metrics`] handle.
+    /// Attach a copy-budget `Metrics` handle.
     ///
     /// Implementations that record the
     /// `docs/design/storage/zero-copy-scan-filter.md` §3 counters

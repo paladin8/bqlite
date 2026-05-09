@@ -80,7 +80,7 @@
 //!
 //! FSST operates on dense arrays — the writer strips nulls into a
 //! separate bitmap before encoding. A nullable input is a contract
-//! violation caught by [`super::require_dense`].
+//! violation caught by `super::require_dense`.
 //!
 //! # Edge cases
 //!
@@ -181,7 +181,7 @@ impl Encoding for Fsst {
 /// the first byte of the blob. When the encoder took the small-input
 /// passthrough path the blob still carries this count so decoders can
 /// reconstruct the table; TASK-419 uses this value to populate the
-/// `symbol_count` field of a segment-level [`FsstSymbolTableRef`].
+/// `symbol_count` field of a segment-level `FsstSymbolTableRef`.
 ///
 /// bqlite's on-disk segment format is little-endian throughout (see
 /// `segment-format-v1.md` §4), so the header is read with

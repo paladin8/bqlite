@@ -889,7 +889,7 @@ impl HashAggregateOperator {
     ///
     /// - `child`: the upstream operator to drain.
     /// - `aggregates`: compiled aggregate expressions (function + arg +
-    ///   output name) from [`AggregatePhysical`].
+    ///   output name) from `AggregatePhysical`.
     /// - `group_by`: compiled group-by key expressions paired with
     ///   their output column names.
     /// - `max_groups`: hard cap on group cardinality. When exceeded,

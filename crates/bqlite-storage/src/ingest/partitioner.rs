@@ -195,7 +195,7 @@ pub type BucketKey = (u32, u16);
 /// # Memory model
 ///
 /// The buffer is tracked as a per-bucket running sum of per-event
-/// heap-size estimates (see [`estimated_event_size`]); the
+/// heap-size estimates (see `estimated_event_size`); the
 /// partitioner-wide [`Partitioner::buffered_bytes`] is the sum
 /// across buckets. The estimate is deliberately cheap and
 /// monotonic: it will under-count some exotic `PropertyValue`
@@ -318,7 +318,7 @@ impl Partitioner {
     /// directory's lifetime (creation up-front, removal on every
     /// exit path) per `docs/design/engine/spill.md` § 8.3. The
     /// partitioner only owns the individual files via the
-    /// [`SpillRunFile`] RAII guard.
+    /// `SpillRunFile` RAII guard.
     ///
     /// Same validation rules as [`Partitioner::new`].
     pub fn with_spill_dir(

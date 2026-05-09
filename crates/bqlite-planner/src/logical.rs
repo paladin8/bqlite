@@ -692,7 +692,7 @@ pub enum DeleteFilter {
 /// Decomposed cheap-class DELETE predicate.
 ///
 /// Same-granularity terms are collapsed (multiple time-range
-/// comparisons → one [`TimeRangeDelete`] with both bounds; multiple
+/// comparisons → one `TimeRangeDelete` with both bounds; multiple
 /// entity equalities / IN-lists → one deduplicated `entity_keys` vec).
 /// Cross-granularity is rejected at the classifier with the SS3.2
 /// exception: entity equality / IN combined with `__seq_id` or
@@ -728,7 +728,7 @@ pub struct CheapDeleteSpec {
     pub time_range: Option<TimeRangeSpec>,
 }
 
-/// Plain-data view of a [`bqlite_storage::TimeRangeDelete`] held in
+/// Plain-data view of a `bqlite_storage::TimeRangeDelete` held in
 /// the planner.
 ///
 /// The planner cannot import `bqlite-storage` (it sits below in the

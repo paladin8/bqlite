@@ -242,7 +242,7 @@ impl BenchResultCollector {
 
     /// Record a result. If in reference mode and a target is set, the
     /// target is checked immediately and the violation is recorded (but
-    /// enforcement is deferred to [`finish`]).
+    /// enforcement is deferred to `finish`).
     pub fn record(&mut self, name: &str, value: f64, unit: &str, target: Option<BenchTarget>) {
         let direction_str = target.map(|t| match t.direction {
             TargetDirection::AtMost => "at_most",

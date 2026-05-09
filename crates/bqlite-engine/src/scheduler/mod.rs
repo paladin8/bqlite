@@ -17,7 +17,7 @@
 //! - [`queue`] — [`MorselQueue`], the lock-free MPMC fronted by a
 //!   condvar pair for producer/consumer wakeups (design §4.1).
 //! - [`accumulator`] — [`AccumulatorHandle`], the per-shard
-//!   [`Mutex<Box<dyn Accumulator>>`] wrapper plus shard-done signaling
+//!   `Mutex<Box<dyn Accumulator>>` wrapper plus shard-done signaling
 //!   (design §6.2 / §4.3).
 //! - [`worker`] — [`WorkerContext`] and [`WorkerMorselGuard`] with the
 //!   §4.3 RAII drop hook.

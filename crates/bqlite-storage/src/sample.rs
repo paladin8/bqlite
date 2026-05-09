@@ -351,7 +351,7 @@ impl Predicate for SampleFilter {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Conjunctive predicate that combines an arbitrary
-/// [`Predicate`] (typically a [`crate::segment::…`] scan predicate
+/// [`Predicate`] (typically a `crate::segment::…` scan predicate
 /// built from `CompiledExpr` pushdown) with a [`SampleFilter`].
 ///
 /// The scan operator builds one of these when a query carries both a

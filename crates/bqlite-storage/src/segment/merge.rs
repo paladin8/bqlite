@@ -67,7 +67,7 @@
 //! scan opened through
 //! [`crate::segment::reader::SegmentFileReader::open`] has already
 //! issued a `POSIX_FADV_SEQUENTIAL` hint at open time via
-//! [`crate::segment::advise::advise_sequential`], so the merged
+//! `crate::segment::advise::advise_sequential`, so the merged
 //! stream inherits sequential-scan readahead from each leaf
 //! without needing any hint of its own. `WillNeed` for the next
 //! row group and the compaction-specific hint pair are deferred

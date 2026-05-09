@@ -31,6 +31,8 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Build
         run: cargo build --all-targets
+      - name: Rustdoc warnings
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       - name: Test
         run: cargo test --all-targets
       - name: Agent script tests

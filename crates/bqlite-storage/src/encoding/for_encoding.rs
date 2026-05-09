@@ -42,7 +42,7 @@
 //! # Null handling
 //!
 //! FOR operates on dense arrays — the writer strips nulls before encoding.
-//! A nullable input is a contract violation caught by [`super::require_dense`].
+//! A nullable input is a contract violation caught by `super::require_dense`.
 //!
 //! # Edge cases
 //!

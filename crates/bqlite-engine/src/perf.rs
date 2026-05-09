@@ -114,7 +114,7 @@ pub struct QueryMetrics {
     pub branch_misses: u64,
     /// Last-level cache miss count.
     pub llc_misses: u64,
-    /// Total CPU cycles. Denominator for [`cycles_per_event`].
+    /// Total CPU cycles. Denominator for `cycles_per_event`.
     pub total_cpu_cycles: u64,
     /// Events processed across all workers — numerator for derived
     /// throughput metrics.

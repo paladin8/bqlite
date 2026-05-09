@@ -18,7 +18,7 @@
 //!   a line/column pair and a hand-tuned suggestion string so callers
 //!   can render a caret with the `§27.1` common-error heuristics.
 //!
-//! Internal modules ([`lex`], [`parser`], [`error`]) are kept
+//! Internal modules (`lex`, `parser`, `error`) are kept
 //! crate-private; only `parse` and `ParseError` are exported from this
 //! crate. This matches the Wave 1 stub's public surface so the engine
 //! integration (see `crates/bqlite-engine/src/query.rs`) keeps working

@@ -18,19 +18,19 @@
 //!
 //! | Helper | Module | Task |
 //! |--------|--------|------|
-//! | FUNNEL desugaring | [`desugar_funnel`] | TASK-319 |
+//! | FUNNEL desugaring | [`mod@desugar_funnel`] | TASK-319 |
 //!
 //! ## Wave 3 passes
 //!
 //! | Pass | Module | Task |
 //! |------|--------|------|
-//! | Match-aggregate fusion | [`fuse_match_aggregate`] | TASK-320 |
+//! | Match-aggregate fusion | [`mod@fuse_match_aggregate`] | TASK-320 |
 //!
 //! ## Wave 4 lowering helpers
 //!
 //! | Helper | Module | Task |
 //! |--------|--------|------|
-//! | RETENTION desugaring | [`desugar_retention`] | TASK-426 |
+//! | RETENTION desugaring | [`mod@desugar_retention`] | TASK-426 |
 //!
 //! ## Wave 4 passes
 //!
@@ -45,14 +45,14 @@
 //! | [`registry`] | `OptimizerRule` trait, `OptimizerPipeline` driver, `RuleTrace` for EXPLAIN | TASK-521 |
 //! | [`rules`] | Pass 6.5 / Pass 7 stub rules (TASK-527 fills in the bodies) | TASK-521 / TASK-527 |
 //! | [`filter_order`] | Pass 9 — stateless filter conjunct ordering inside fused segment | TASK-527 |
-//! | [`coalesce_scan_predicates`] | Pass 10 — scan-pushdown filter coalescing | TASK-527 |
+//! | [`mod@coalesce_scan_predicates`] | Pass 10 — scan-pushdown filter coalescing | TASK-527 |
 //!
 //! The Wave 0 / Wave 2 / Wave 3 / Wave 4 passes above are wrapped as
-//! [`OptimizerRule`](registry::OptimizerRule) implementations in
+//! [`registry::OptimizerRule`] implementations in
 //! [`registry`] and registered into the canonical pipeline via
 //! [`OptimizerPipeline::v1`](registry::OptimizerPipeline::v1). The
 //! pipeline driver runs them in registration order and records the
-//! per-rule outcome into [`RuleTrace`](registry::RuleTrace) for
+//! per-rule outcome into [`registry::RuleTrace`] for
 //! EXPLAIN visibility per `optimizer-direction.md` §8.2.
 
 pub mod coalesce_scan_predicates;

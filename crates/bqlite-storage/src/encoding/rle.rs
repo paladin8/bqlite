@@ -37,7 +37,7 @@
 //!
 //! RLE operates on dense arrays — the writer strips nulls into a separate
 //! bitmap before encoding. A nullable input is a contract violation caught
-//! by [`super::require_dense`].
+//! by `super::require_dense`.
 //!
 //! # Edge cases
 //!

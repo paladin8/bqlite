@@ -41,7 +41,7 @@
 //!   Writing them is a copy into the footer.
 //!
 //! Any invariant the input is expected to satisfy is checked by
-//! [`validate_request`] up front and surfaced as
+//! `validate_request` up front and surfaced as
 //! [`BqliteError::Execution`] — the writer never panics on bad input.
 //!
 //! # What the writer enforces on its own

@@ -7,11 +7,11 @@
 //! (`bqlite-ffi`), and eventually the top-level `bqlite` re-export —
 //! goes through. Internally it ties together:
 //!
-//! - [`bqlite_parser`](bqlite_parser) — BQL text → AST
-//! - [`bqlite_planner`](bqlite_planner) — AST → plain-data `PhysicalPlan`
-//! - [`bqlite_operators`](bqlite_operators) — concrete `PhysicalOperator`
+//! - [`bqlite_parser`] — BQL text → AST
+//! - [`bqlite_planner`] — AST → plain-data `PhysicalPlan`
+//! - [`bqlite_operators`] — concrete `PhysicalOperator`
 //!   implementations bound from the descriptor tree
-//! - [`bqlite_storage`](bqlite_storage) — the `Database` handle that
+//! - [`bqlite_storage`] — the `Database` handle that
 //!   supplies the catalog and `SegmentReader`s
 //!
 //! The crate-boundary change that adds `bqlite-parser` as a dependency

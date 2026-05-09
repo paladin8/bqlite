@@ -182,7 +182,7 @@ pub enum CompiledNode {
     },
 
     /// Implicit coercion inserted by the type checker (Int → Float).
-    /// Lowered to the same Arrow cast kernel as [`Cast`] but kept
+    /// Lowered to the same Arrow cast kernel as `Cast` but kept
     /// structurally distinct so optimizer rewrites can elide
     /// implicit coercions while preserving explicit ones.
     ImplicitCoerce {

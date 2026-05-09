@@ -32,7 +32,7 @@
 //! Stateless work (filter, project, limit) is implemented as a chain
 //! of [`StatelessKernel`]s ([`FilterKernel`], [`ProjectKernel`], plus
 //! the in-driver `LIMIT` step) driven by [`FusedStatelessSegment`].
-//! See [`docs/design/engine/operator-fusion.md`] for the full
+//! See `docs/design/engine/operator-fusion.md` for the full
 //! contract.
 
 pub mod aggregate;

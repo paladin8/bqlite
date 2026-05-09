@@ -144,7 +144,7 @@ otherwise-stable APIs, not surface removal.
 
 ## Findings
 
-### 1 — Rustdoc warnings grew from 67 to 94 (+27 new; trajectory Wave 2: 33 → Wave 3: 41 → Wave 4: 67 → Wave 5: 94)
+### 1 — Rustdoc warnings grew from 67 to 94 (+27 new; trajectory Wave 2: 33 → Wave 3: 41 → Wave 4: 67 → Wave 5: 94) — resolved by TASK-542
 
 Warnings by crate:
 
@@ -159,11 +159,13 @@ Warnings by crate:
 
 Impact: rendered docs build fine, but the trajectory (33 → 41 → 67 → 94) continues to drift wrong. The Wave 4 audit warned this would happen if Wave 5 added another ~25 warnings without a cleanup pass — that prediction held. The bqlite-planner Docs grade slipped one sub-grade (B+ → B) at the Wave 4 audit's stated threshold; bqlite-operators stays at B+ but a Wave 6 cleanup pass that swaps private-item links for plain back-ticks and re-aliases the `coalesce_scan_predicates` / `fuse_match_aggregate` function/module collisions would reverse the drift cheaply. **Not filed as a follow-up task** under the *below-C → file a follow-up* rule because the Docs dimension still sits at **B** or above for every affected crate; flagged explicitly so Wave 6 can absorb the cleanup. If Wave 6 adds another ~25 warnings without a cleanup pass, bqlite-storage Docs will drop below B+ and bqlite-engine Docs will likely follow.
 
+**TASK-542 resolution (Wave 6):** All 93 doc-comment warnings fixed — private-item links converted to plain backticks, `coalesce_scan_predicates` / `fuse_match_aggregate` / `desugar_funnel` / `desugar_retention` function/module collisions resolved with `mod@` disambiguation, redundant explicit link targets simplified. `cargo doc --workspace --no-deps` now emits 1 warning (the persistent bqlite/bqlite-cli filename collision per Cargo bug #6313, not a doc-comment issue). CI gate added to `scripts/local-ci.sh` and `.github/workflows/ci.yml` via `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`. Trajectory reset: Wave 6 baseline = 1.
+
 ### 2 — `bqlite` top-level re-export collision persists
 
 Same as Wave 1/2/3/4 Findings. `cargo doc --workspace --no-deps` emits
 `warning: output filename collision at target/doc/bqlite/index.html`.
-Same disposition — noted, not filed.
+This is a Cargo-level warning caused by the `bqlite` binary (in `bqlite-cli`) and the `bqlite` library sharing the same output filename — a known Cargo bug (#6313). `#[doc(no_inline)]` was added to the crate-level re-exports in `crates/bqlite/src/lib.rs` (TASK-542) but does not suppress this cargo-level warning (which is distinct from rustdoc-level warnings). The `RUSTDOCFLAGS="-D warnings"` CI gate introduced by TASK-542 does not fail on this warning because it is emitted by cargo, not rustdoc. Disposition: **expected and documented**; the CI gate treats it as the Wave 6 baseline (1 warning).
 
 ### 3 — Benchmark coverage expanded with 5 Wave 5 groups + 2 Wave 4 follow-ups
 

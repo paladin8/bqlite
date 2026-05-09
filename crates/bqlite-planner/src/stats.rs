@@ -66,13 +66,13 @@ pub struct PlannerStats {
     pub entity_presence_indexed: HashMap<(String, String), bool>,
 
     /// §4.5 — exact cohort sizes after materialization. Empty during
-    /// phase 5.1; populated exactly once by [`bind_cohorts`] before the
+    /// phase 5.1; populated exactly once by `bind_cohorts` before the
     /// post-cohort rule pass runs. Reading this map before binding is a
     /// programmer error and panics in debug builds (see
     /// [`PlannerStatsView::cohort_size`]).
     pub cohort_size: HashMap<CohortId, u64>,
 
-    /// True after [`bind_cohorts`] has been called. Used by
+    /// True after `bind_cohorts` has been called. Used by
     /// [`PlannerStatsView`] to enforce the snapshot discipline in
     /// `optimizer-direction.md` §6.2.
     cohorts_bound: bool,
@@ -86,7 +86,7 @@ impl PlannerStats {
         Self::default()
     }
 
-    /// Returns true if [`bind_cohorts`] has been called on this
+    /// Returns true if `bind_cohorts` has been called on this
     /// snapshot.
     pub fn cohorts_bound(&self) -> bool {
         self.cohorts_bound

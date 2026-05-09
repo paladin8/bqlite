@@ -1,8 +1,12 @@
 #![doc = include_str!("../README.md")]
 
+#[doc(no_inline)]
 pub use bqlite_ast as ast;
+#[doc(no_inline)]
 pub use bqlite_core as types;
+#[doc(no_inline)]
 pub use bqlite_engine as engine;
+#[doc(no_inline)]
 pub use bqlite_parser as parser;
 
 /// The unified error type returned by all fallible bqlite APIs.

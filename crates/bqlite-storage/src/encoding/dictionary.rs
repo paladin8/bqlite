@@ -74,7 +74,7 @@
 //! Dictionary operates on dense arrays — the writer strips nulls into
 //! a separate bitmap before handing values to the encoding layer. A
 //! nullable input is a contract violation, caught by
-//! [`super::require_dense`].
+//! `super::require_dense`.
 //!
 //! # Edge cases
 //!
@@ -498,7 +498,7 @@ fn code_bit_width_for(cardinality: usize) -> Result<u8> {
 }
 
 /// Exact payload byte count for a bit-packed code stream: the smallest
-/// multiple of [`SIMD_LANE_BYTES`] that holds `row_count` codes at
+/// multiple of `SIMD_LANE_BYTES` that holds `row_count` codes at
 /// `bit_width` bits per code.
 pub fn payload_byte_count(row_count: usize, bit_width: u8) -> usize {
     let unpadded_bits = (bit_width as usize) * row_count;
@@ -548,7 +548,7 @@ fn pack_codes(codes: &[u32], bit_width: u8, row_count: usize) -> Result<Vec<u8>>
     Ok(out)
 }
 
-/// Inverse of [`pack_codes`]: reconstruct a `Vec<u32>` of length
+/// Inverse of `pack_codes`: reconstruct a `Vec<u32>` of length
 /// `row_count` from a bit-packed code stream.
 pub fn unpack_codes(payload: &[u8], row_count: usize, bit_width: u8) -> Result<Vec<u32>> {
     if !(1..=MAX_CODE_BIT_WIDTH).contains(&bit_width) {

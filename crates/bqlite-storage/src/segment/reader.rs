@@ -158,7 +158,7 @@ impl SegmentFileReader {
     ///
     /// Before the read, the opener issues a sequential-scan
     /// access-pattern hint to the kernel via
-    /// [`crate::segment::advise::advise_sequential`] — Wave 2 only
+    /// `crate::segment::advise::advise_sequential` — Wave 2 only
     /// scans segments front-to-back, so `POSIX_FADV_SEQUENTIAL`
     /// is the single hint that actually matches every call path
     /// (see `docs/design/storage-format.md` §8.2 and TASK-243).
@@ -173,7 +173,7 @@ impl SegmentFileReader {
     ///
     /// Like [`Self::open`] but accepts an `Arc<TableSchema>` to avoid
     /// cloning the schema for every segment. Used by
-    /// [`ManifestSegmentReader`] (TASK-247) which shares one Arc
+    /// `ManifestSegmentReader` (TASK-247) which shares one Arc
     /// across all segments in a table.
     pub fn open_shared<P: AsRef<Path>>(path: P, current_schema: Arc<TableSchema>) -> Result<Self> {
         // Path comes from the manifest (trusted internal state), not user input.
@@ -404,7 +404,7 @@ impl std::fmt::Debug for SegmentFileReader {
 ///
 /// Clones the reader's `Arc<[u8]>`, `Arc<SegmentFooter>`, and
 /// `Arc<[DictionaryValues]>`. A `SegmentFileScan` is therefore cheap
-/// to create — the only per-scan allocations are the [`ScanPlan`]
+/// to create — the only per-scan allocations are the `ScanPlan`
 /// and the predicate pointer.
 pub struct SegmentFileScan {
     bytes: Arc<[u8]>,

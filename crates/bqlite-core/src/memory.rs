@@ -116,7 +116,7 @@ pub trait SpillNotification: Send + Sync {
 /// Byte-accounting interface shared by all bqlite operators.
 ///
 /// Every operator that allocates memory proportional to data size should
-/// call [`try_reserve`] before the allocation and hold the returned
+/// call `try_reserve` before the allocation and hold the returned
 /// [`MemoryReservation`] for the lifetime of the allocation. Releasing
 /// the reservation (by dropping it) returns the bytes to the budget.
 ///
@@ -142,7 +142,7 @@ pub trait MemoryBudget: Send + Sync {
     /// Register a spill handler that the budget may call when under pressure.
     ///
     /// A budget may hold multiple handlers. They are called in registration
-    /// order when [`try_reserve`] cannot be satisfied. The real invocation
+    /// order when `try_reserve` cannot be satisfied. The real invocation
     /// protocol is defined in Wave 5.
     fn register_spill_handler(&self, handler: Arc<dyn SpillNotification>);
 

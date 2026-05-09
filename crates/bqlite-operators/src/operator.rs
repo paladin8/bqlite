@@ -15,7 +15,7 @@
 //!   waves.
 //!
 //! Both traits rely on [`OperatorSchema`] from `bqlite-core` for schema
-//! propagation and on [`BqliteError`] for error reporting.
+//! propagation and on `BqliteError` for error reporting.
 //!
 //! ## Cancellation
 //!

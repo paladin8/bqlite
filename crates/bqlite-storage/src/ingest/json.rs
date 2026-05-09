@@ -24,7 +24,7 @@
 //!    preserves the value for a target column such as
 //!    `properties MAP(STRING)` and prevents silent data loss.
 //! 4. Apply the column mapping from the planner's
-//!    [`InsertFromDescriptor`] to resolve each source key to its target
+//!    `InsertFromDescriptor` to resolve each source key to its target
 //!    column in the [`TableSchema`].
 //! 5. For each row, coerce JSON values to [`PropertyValue`]s matching
 //!    the target column types, populate the entity id / timestamp /

@@ -137,7 +137,7 @@ pub fn materialize_selected_with_metrics(
 ///    no metric increment.
 /// 2. `selection: Some(sv)` with `sv.len() == batch.num_rows()` —
 ///    every row is live (the all-pass shape per §3.3.1). Soundness:
-///    [`SelectionVector`] is sorted-ascending and unique, so
+///    `SelectionVector` is sorted-ascending and unique, so
 ///    `len() == num_rows()` ⇒ `sv == 0..num_rows()`. Return the inner
 ///    batch; no copy, no metric increment.
 /// 3. `selection: Some(sv)` with `sv.len() < batch.num_rows()` —

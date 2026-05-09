@@ -32,7 +32,7 @@
 //! category and the offending construct / span so downstream tooling
 //! can match on the message text until the typed error variant lands.
 //! Every error produced here passes through the small
-//! [`type_error`] helper so the "category:" prefix is stable.
+//! `type_error` helper so the "category:" prefix is stable.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -310,7 +310,7 @@ impl TypedExpr {
     /// filter predicates, project items, and insert-body expressions.
     /// Every `bqlite_ast::Expr` variant either lowers to a
     /// `TypedExprKind` per design doc §4.2 or returns a structured
-    /// `BqliteError::Plan` error categorized by [`type_error`].
+    /// `BqliteError::Plan` error categorized by `type_error`.
     pub fn from_ast(
         expr: &Spanned<Expr>,
         schema: &OperatorSchema,

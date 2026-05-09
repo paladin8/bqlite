@@ -3,7 +3,7 @@
 //! [`Database::create`] initializes a fresh database directory with
 //! an empty manifest and exclusive lock. [`Database::open`] opens an
 //! existing database, validating its manifest and acquiring the lock.
-//! These replace the Wave 1 [`Database::open_or_create`] (deprecated)
+//! These replace the Wave 1 `Database::open_or_create` (deprecated)
 //! to align with `query-language.md` §29 ("Database init | CLI-only
 //! (`bqlite init`)").
 //!
@@ -351,7 +351,7 @@ impl Database {
     /// Per-database spill filesystem helper.
     ///
     /// Cloned via [`Arc::clone`] into every operator that may spill —
-    /// in v1, [`bqlite_operators::SortOperator`] (TASK-513) and the
+    /// in v1, `bqlite_operators::SortOperator` (TASK-513) and the
     /// ingest partitioner (TASK-512). The handle is invalidated when
     /// the [`Database`] is dropped; callers that need to outlive the
     /// database must clone the [`Arc`].
@@ -837,7 +837,7 @@ impl Database {
     /// background scheduler (CP5) acquires the semaphore via its own
     /// path and does not call this method.
     ///
-    /// Returns a list of every successful [`CompactionOutcome`].
+    /// Returns a list of every successful `CompactionOutcome`.
     /// Surfaces the first compaction failure; outcomes that succeeded
     /// before the failure stay durable.
     pub fn compact_now(

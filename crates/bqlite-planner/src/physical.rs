@@ -68,7 +68,7 @@ use crate::logical::{EventSelectKind, InsertLogicalBody, LogicalPlan, ProjectIte
 /// its input in cache-friendly tiles so the predicate evaluation stays
 /// L1/L2-resident. 2,048 rows is the §3.6 default; it is clamped to
 /// [`MIN_FILTER_TILE_SIZE`] / [`MAX_FILTER_TILE_SIZE`] by
-/// [`clamp_filter_tile_size`].
+/// `clamp_filter_tile_size`.
 pub const DEFAULT_FILTER_TILE_SIZE: usize = 2_048;
 
 /// Minimum legal tile size for [`FusedSegmentStep::Filter::tile_size`].
@@ -192,7 +192,7 @@ pub enum PhysicalPlan {
     /// `DELETE FROM <table> WHERE <pred> [ALLOW SCAN]`. Wave 4
     /// (TASK-453).
     ///
-    /// Carries the same classified [`DeleteFilter`] the logical plan
+    /// Carries the same classified `DeleteFilter` the logical plan
     /// produced — the engine consumes the variant directly without
     /// re-walking the AST. See `docs/design/storage/deletes.md` §3 / §4
     /// for the cheap-class taxonomy and the `ALLOW SCAN` opt-in.
@@ -308,7 +308,7 @@ pub struct ScanPhysical {
 ///
 /// Mirrors the `(fraction, seed)` pair on [`SamplePhysical`] so the
 /// engine bind step can materialize a
-/// [`bqlite_storage::SampleFilter`] without looking up the original
+/// `bqlite_storage::SampleFilter` without looking up the original
 /// `SamplePhysical` descriptor — the pass elides it from the plan
 /// whenever the push succeeds.
 #[derive(Debug, Clone, PartialEq)]
@@ -368,7 +368,7 @@ pub struct FusedSegmentPhysical {
 ///
 /// Mirrors the `KernelStep` runtime enum in `bqlite-operators`. Filter
 /// carries a `tile_size` already clamped to the legal window via
-/// [`clamp_filter_tile_size`]. Project carries a list of expressions
+/// `clamp_filter_tile_size`. Project carries a list of expressions
 /// pre-built into [`ProjectPhysicalItem`] form. Limit carries the row
 /// budget; the segment driver owns the running counter.
 #[derive(Debug, Clone, PartialEq)]
@@ -675,7 +675,7 @@ pub struct SessionizePhysical {
     /// operator's native session-row schema (`input ∪ {session_id,
     /// session_duration}`). When `fused_aggregate` is `Some`, the fusion
     /// pass replaces this with the aggregate's output schema and stashes
-    /// the original native schema in [`pre_fusion_output_schema`] so the
+    /// the original native schema in `pre_fusion_output_schema` so the
     /// runtime operator can still construct per-entity batches.
     pub output_schema: OperatorSchema,
     /// Native operator-output schema preserved across fusion. `None`
@@ -747,7 +747,7 @@ pub struct EventSelectPhysical {
     /// Output schema. Native single-row-per-entity schema when not fused;
     /// aggregate output schema when `fused_aggregate.is_some()`. The
     /// pre-fusion native schema is preserved in
-    /// [`pre_fusion_output_schema`].
+    /// `pre_fusion_output_schema`.
     pub output_schema: OperatorSchema,
     /// Native (pre-fusion) output schema preserved across fusion. See
     /// `SessionizePhysical::pre_fusion_output_schema`.
@@ -809,7 +809,7 @@ pub struct AttributePhysical {
     pub input: Box<PhysicalPlan>,
     /// Output schema. Native flat-row schema when not fused; aggregate
     /// schema when `fused_aggregate.is_some()`. Pre-fusion native schema
-    /// preserved in [`pre_fusion_output_schema`].
+    /// preserved in `pre_fusion_output_schema`.
     pub output_schema: OperatorSchema,
     /// Native (pre-fusion) output schema preserved across fusion. See
     /// `SessionizePhysical::pre_fusion_output_schema`.

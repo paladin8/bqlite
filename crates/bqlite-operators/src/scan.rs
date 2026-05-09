@@ -543,7 +543,7 @@ impl ScanOperator {
     }
 
     /// Attach an entity-level SAMPLE filter pushed down from the
-    /// physical plan's [`ScanPhysical::sample`] field (TASK-430).
+    /// physical plan's `ScanPhysical::sample` field (TASK-430).
     ///
     /// Must be called before [`ScanOperator::open`]. The filter is
     /// evaluated on every materialized batch via a boolean mask over
@@ -570,7 +570,7 @@ impl ScanOperator {
     /// Multiple calls accumulate. Conjuncts produced by this path
     /// participate in zone-map row-group acceptance exactly like the
     /// `CompiledExpr`-derived ones, but they have no row-level
-    /// post-filter step — the [`SubqueryFilterOperator`] above this
+    /// post-filter step — the `SubqueryFilterOperator` above this
     /// scan is the row-level source of truth for cohort membership.
     pub fn with_extra_conjuncts(&mut self, extra: Vec<ScanConjunct>) -> &mut Self {
         self.extra_conjuncts.extend(extra);

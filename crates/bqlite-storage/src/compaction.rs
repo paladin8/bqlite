@@ -346,7 +346,7 @@ pub struct CompactionOutcome {
 /// Picks every segment currently in `(table, window_id, shard_id)`,
 /// k-way merges them in `(entity_id, ts)` order, re-encodes through
 /// the latest selector, publishes the replacement via the
-/// [`Database::replace_segments`] atomic primitive, and deletes the
+/// `Database::replace_segments` atomic primitive, and deletes the
 /// superseded segment files.
 ///
 /// **Pre-condition:** at least two input segments must be present.
