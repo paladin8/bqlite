@@ -522,18 +522,29 @@ impl QueryContext {
         guard.record_worker(&snap);
     }
 
-    /// Record the per-shard morsel counts and add to `morsels_dispatched`
-    /// after a per-shard dispatch returns. The morsel scheduler emits
-    /// exactly one morsel per shard in v1; sub-shard halving will
-    /// expand this to per-`(shard, generator)` totals.
+    /// Record that at least one worker in this query successfully
+    /// opened a real `PerfCounters` group. Used by the per-shard
+    /// dispatch to surface kernel-refused (`CAP_PERFMON` missing) vs.
+    /// kernel-honoured to the CLI render path.
+    pub fn set_cpu_counters_available(&self) {
+        let mut guard = self
+            .worker_aggregate
+            .lock()
+            .expect("query worker_aggregate mutex poisoned");
+        guard.cpu_counters_available = true;
+    }
+
+    /// Record the per-shard morsel counts after a per-shard dispatch
+    /// returns. Sets only `morsels_per_shard_min` / `_max`; the
+    /// `morsels_dispatched` total is now summed from each worker's
+    /// `WorkerMetricsSnapshot::morsels_dispatched` field via
+    /// `record_worker_snapshot` (TASK-537), so this method must not
+    /// also add the per-shard counts or the total double-counts.
     pub fn record_morsels_per_shard(&self, counts: &[u64]) {
         let mut guard = self
             .worker_aggregate
             .lock()
             .expect("query worker_aggregate mutex poisoned");
-        guard.morsels_dispatched = guard
-            .morsels_dispatched
-            .saturating_add(counts.iter().sum::<u64>());
         guard.record_morsels_per_shard(counts);
     }
 

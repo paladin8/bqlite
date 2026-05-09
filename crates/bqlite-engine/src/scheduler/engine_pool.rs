@@ -54,7 +54,13 @@ use super::worker::{ShardDoneCallback, WorkerMorselGuard};
 /// folds one [`crate::perf::WorkerMetricsSnapshot`] per unique worker
 /// thread (identified via [`rayon::current_thread_index`]) into the
 /// query metrics aggregate.
-#[derive(Debug, Default, Clone, Copy)]
+///
+/// `PerWorkerCtx` is `Clone` (not `Copy`) because TASK-537 added the
+/// per-morsel `processed_events` vector — sized at most by the morsel
+/// count for this worker (≤ shard count today; sub-shard halving will
+/// raise the ceiling). Construction sites use struct-update syntax:
+/// `PerWorkerCtx { rayon_thread_index, ..PerWorkerCtx::default() }`.
+#[derive(Debug, Default, Clone)]
 pub struct PerWorkerCtx {
     /// Morsels this worker has pulled in the current dispatch.
     pub morsels_dispatched: u64,
@@ -63,6 +69,32 @@ pub struct PerWorkerCtx {
     /// (the `pool.scope` invariant rules that out for production
     /// callers, but tests may construct contexts directly).
     pub rayon_thread_index: Option<usize>,
+    /// Wall-time the worker spent actively executing morsels — sum of
+    /// `Instant::now()` deltas between morsel pull and morsel guard
+    /// drop, recorded by the worker driver loop. TASK-537.
+    pub worker_busy_ns: u64,
+    /// Wall-time the worker spent waiting on its morsel queue —
+    /// `pop_or_park` elapsed time per pull, summed across all pulls
+    /// for this dispatch. Includes pulls that returned `Drained`. TASK-537.
+    pub worker_idle_ns: u64,
+    /// Per-morsel processed-event counts. The closure body pushes the
+    /// row count it processed for the morsel after running its body.
+    /// Folded into `entity_event_skew_p99` (p99 - p50 spread) at
+    /// dispatch finalize per TASK-537 scope (b). The design doc names
+    /// this metric as a per-entity sample, but TASK-537 explicitly
+    /// scopes v1 to per-morsel counts as a proxy until the
+    /// `EntityOperatorAdapter::finish_entity` hook lands.
+    pub processed_events_per_morsel: Vec<u64>,
+    /// Sum of CPU cycles read from this worker's `PerfCounters` during
+    /// the dispatch — zero when CPU metrics collection is off or the
+    /// platform integration is the disabled stub. TASK-537.
+    pub total_cpu_cycles: u64,
+    /// Sum of branch-prediction misses read from this worker's
+    /// `PerfCounters` during the dispatch.
+    pub branch_misses: u64,
+    /// Sum of last-level cache misses read from this worker's
+    /// `PerfCounters` during the dispatch.
+    pub llc_misses: u64,
 }
 
 /// Engine-level worker pool plus capacity-sharing semaphore.
@@ -352,6 +384,7 @@ impl MorselScheduler {
         &self,
         snapshots: &[ShardSnapshot],
         cancel: &CancellationToken,
+        collect_cpu_metrics: bool,
         work: F,
     ) -> std::result::Result<PerShardOutcome, BqliteError>
     where
@@ -403,6 +436,11 @@ impl MorselScheduler {
         let cancel_for_workers = cancel.clone();
         let per_worker_ctxs: Mutex<Vec<PerWorkerCtx>> = Mutex::new(Vec::new());
         let per_worker_ctxs_ref = &per_worker_ctxs;
+        // Whether *any* worker successfully opened a real perf-counter
+        // group. Folded into `PerShardOutcome::cpu_counters_available`
+        // for the CLI render path (TASK-537 CP3).
+        let cpu_counters_available: Mutex<bool> = Mutex::new(false);
+        let cpu_counters_available_ref = &cpu_counters_available;
 
         self.pool.scope(|s| {
             for _ in 0..num_workers {
@@ -413,6 +451,21 @@ impl MorselScheduler {
                         rayon_thread_index: rayon::current_thread_index(),
                         ..PerWorkerCtx::default()
                     };
+                    // Open one perf-counter group per worker thread.
+                    // Disabled when the engine did not opt into CPU
+                    // metrics, on platforms without an integration, or
+                    // when the kernel refuses (`CAP_PERFMON` missing).
+                    // TASK-537 scope (c) / (d).
+                    let mut perf = if collect_cpu_metrics {
+                        crate::perf::PerfCounters::open_or_disabled()
+                    } else {
+                        crate::perf::PerfCounters::disabled()
+                    };
+                    if perf.is_enabled() {
+                        *cpu_counters_available_ref
+                            .lock()
+                            .expect("cpu_counters_available poisoned") = true;
+                    }
                     loop {
                         // Cancellation between morsels (design §9.1).
                         if cancel_w.is_cancelled() {
@@ -429,9 +482,22 @@ impl MorselScheduler {
                             }
                             break;
                         }
+                        // Idle sample: time spent inside `pop_or_park`.
+                        // Includes pulls that hand back `Drained` so a
+                        // worker that fails to find work does not make
+                        // its idle row look artificially zero.
+                        let pre_pull = std::time::Instant::now();
                         let morsel = match q.pop_or_park(Duration::from_millis(10)) {
-                            Ok(m) => m,
-                            Err(_drained) => break,
+                            Ok(m) => {
+                                ctx.worker_idle_ns =
+                                    ctx.worker_idle_ns.saturating_add(elapsed_ns(pre_pull));
+                                m
+                            }
+                            Err(_drained) => {
+                                ctx.worker_idle_ns =
+                                    ctx.worker_idle_ns.saturating_add(elapsed_ns(pre_pull));
+                                break;
+                            }
                         };
                         let shard = morsel.shard_id;
                         let acc = by_shard_for_workers
@@ -441,6 +507,16 @@ impl MorselScheduler {
                         let on_done: ShardDoneCallback = Arc::new(|_, _| {});
                         let mut guard = WorkerMorselGuard::new(morsel, acc, on_done);
                         ctx.morsels_dispatched = ctx.morsels_dispatched.saturating_add(1);
+                        // Busy sample: wall time from morsel pull to
+                        // guard drop, per design §8.3 (one Instant
+                        // pair per morsel).
+                        let pre_busy = std::time::Instant::now();
+                        let perf_pre = perf.snapshot_counters();
+                        // Snapshot the events vec length so we can
+                        // detect whether the closure pushed an entry —
+                        // a closure that errors out before recording
+                        // its row count gets a 0-sample.
+                        let events_before = ctx.processed_events_per_morsel.len();
                         // Panic isolation per design §9.2: convert
                         // panic payloads into BqliteError::OperatorPanic
                         // and propagate via the first-error slot.
@@ -454,10 +530,25 @@ impl MorselScheduler {
                                 location: None,
                             }),
                         };
+                        if ctx.processed_events_per_morsel.len() == events_before {
+                            // Closure did not record an event count
+                            // (error path or omitted call). Push 0 so
+                            // the per-morsel sample count matches
+                            // `morsels_dispatched`.
+                            ctx.processed_events_per_morsel.push(0);
+                        }
                         // Guard drop runs before we look at the result
                         // slot — outstanding-morsels accounting must
                         // balance even on the error path.
                         drop(guard);
+                        let perf_delta = perf.delta_since(perf_pre);
+                        ctx.total_cpu_cycles =
+                            ctx.total_cpu_cycles.saturating_add(perf_delta.cpu_cycles);
+                        ctx.branch_misses =
+                            ctx.branch_misses.saturating_add(perf_delta.branch_misses);
+                        ctx.llc_misses = ctx.llc_misses.saturating_add(perf_delta.llc_misses);
+                        ctx.worker_busy_ns =
+                            ctx.worker_busy_ns.saturating_add(elapsed_ns(pre_busy));
                         if let Err(e) = outcome {
                             let mut slot = first_error_ref.lock().expect("first_error poisoned");
                             if slot.is_none() {
@@ -482,9 +573,13 @@ impl MorselScheduler {
         let per_worker = per_worker_ctxs
             .into_inner()
             .expect("per_worker_ctxs poisoned");
+        let cpu_counters_available = cpu_counters_available
+            .into_inner()
+            .expect("cpu_counters_available poisoned");
         Ok(PerShardOutcome {
             accumulators,
             per_worker,
+            cpu_counters_available,
         })
     }
 }
@@ -502,6 +597,19 @@ pub struct PerShardOutcome {
     /// One context per worker thread that contributed (zero
     /// contexts for an empty input).
     pub per_worker: Vec<PerWorkerCtx>,
+    /// `true` iff at least one worker successfully opened a real
+    /// `PerfCounters` group (i.e. the kernel honoured the
+    /// `perf_event_open` syscall). Disambiguates "user opted in but
+    /// kernel refused" from "user did not opt in" for the
+    /// `--explain-perf` CLI rendering. See TASK-537 scope (f).
+    pub cpu_counters_available: bool,
+}
+
+/// Convert an `Instant`'s elapsed time to a saturating `u64` of
+/// nanoseconds. Used by the worker driver loop to record per-morsel
+/// busy / idle samples without panicking on the (impossible) overflow.
+fn elapsed_ns(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Extract a human-readable message from a `catch_unwind` payload —
@@ -653,7 +761,7 @@ mod tests {
 
         let cancel = bqlite_operators::CancellationToken::new();
         let outcome = sched
-            .run_per_shard(&snaps, &cancel, |guard, _ctx| {
+            .run_per_shard(&snaps, &cancel, false, |guard, _ctx| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 observed_shards.lock().unwrap().push(guard.morsel.shard_id);
                 Ok(())
@@ -688,7 +796,7 @@ mod tests {
         let sched = MorselScheduler::new(2).expect("scheduler builds");
         let cancel = bqlite_operators::CancellationToken::new();
         let outcome = sched
-            .run_per_shard(&[] as &[ShardSnapshot], &cancel, |_, _| {
+            .run_per_shard(&[] as &[ShardSnapshot], &cancel, false, |_, _| {
                 unreachable!("must not be called");
             })
             .expect("empty dispatch ok");
@@ -703,7 +811,7 @@ mod tests {
         let sched = MorselScheduler::new(2).expect("scheduler builds");
         let snaps: Vec<ShardSnapshot> = (0..2).map(fake_snapshot).collect();
         let cancel = bqlite_operators::CancellationToken::new();
-        let result = sched.run_per_shard(&snaps, &cancel, |guard, _ctx| {
+        let result = sched.run_per_shard(&snaps, &cancel, false, |guard, _ctx| {
             if guard.morsel.shard_id == 1 {
                 Err(BqliteError::Execution("boom".into()))
             } else {
@@ -724,7 +832,7 @@ mod tests {
         let sched = MorselScheduler::new(2).expect("scheduler builds");
         let snaps: Vec<ShardSnapshot> = (0..2).map(fake_snapshot).collect();
         let cancel = bqlite_operators::CancellationToken::new();
-        let result = sched.run_per_shard(&snaps, &cancel, |guard, _ctx| {
+        let result = sched.run_per_shard(&snaps, &cancel, false, |guard, _ctx| {
             if guard.morsel.shard_id == 0 {
                 panic!("synthetic shard-0 panic");
             }
@@ -753,7 +861,7 @@ mod tests {
         let cancel = bqlite_operators::CancellationToken::new();
         cancel.cancel();
         let outcome = sched
-            .run_per_shard(&snaps, &cancel, |_g, _ctx| {
+            .run_per_shard(&snaps, &cancel, false, |_g, _ctx| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             })
@@ -775,12 +883,42 @@ mod tests {
     }
 
     #[test]
+    fn run_per_shard_records_per_morsel_timing() {
+        // The worker driver loop instrumentation must populate
+        // `worker_busy_ns` to a non-zero value when the closure body
+        // takes measurable wall-clock time. TASK-537.
+        let sched = MorselScheduler::new(2).expect("scheduler builds");
+        let snaps: Vec<ShardSnapshot> = (0..2).map(fake_snapshot).collect();
+        let cancel = bqlite_operators::CancellationToken::new();
+        let outcome = sched
+            .run_per_shard(&snaps, &cancel, false, |_g, ctx_w| {
+                std::thread::sleep(Duration::from_millis(5));
+                ctx_w.processed_events_per_morsel.push(42);
+                Ok(())
+            })
+            .expect("ok");
+        let total_busy_ns: u64 = outcome.per_worker.iter().map(|c| c.worker_busy_ns).sum();
+        assert!(
+            total_busy_ns > 1_000_000,
+            "worker_busy_ns must be ≥ 1ms after a 5ms sleep per morsel; got {total_busy_ns} ns"
+        );
+        // Per-morsel events vec sized to one entry per morsel pulled.
+        for c in &outcome.per_worker {
+            assert_eq!(
+                c.processed_events_per_morsel.len() as u64,
+                c.morsels_dispatched,
+                "every morsel must record an events sample"
+            );
+        }
+    }
+
+    #[test]
     fn run_per_shard_records_rayon_thread_index() {
         let sched = MorselScheduler::new(2).expect("scheduler builds");
         let snaps: Vec<ShardSnapshot> = (0..4).map(fake_snapshot).collect();
         let cancel = bqlite_operators::CancellationToken::new();
         let outcome = sched
-            .run_per_shard(&snaps, &cancel, |_g, _ctx| Ok(()))
+            .run_per_shard(&snaps, &cancel, false, |_g, _ctx| Ok(()))
             .expect("ok");
         // Every per-worker context was populated by a Rayon worker, so
         // rayon_thread_index must be Some(_).

@@ -551,6 +551,12 @@ Other rows (rows_scanned, bytes_scanned, segments_pruned, etc.) are owned by the
 
 `worker_idle_ns_*` and `entity_event_skew_p99` use `sketches-ddsketch` (CLAUDE.md dependency conventions §1) for constant-memory percentiles. One sketch per worker for `worker_idle_ns`; one per worker for `entity_event_skew`. Sketches merge across workers at query finalization (constant-time merge).
 
+**TASK-537 v1 simplifications.** Until sub-shard morsel halving raises the per-worker sample count into the hundreds, the engine collapses both DDSketch-based metrics into simpler shapes that produce comparable signal at zero new dependency cost:
+
+- `worker_idle_ns_p50` / `_p99` are derived from the per-worker idle-time *totals* (one `u64` per worker) via the running min/max protocol in `QueryMetrics::record_worker` — `worker_idle_ns_p50` is the cross-worker minimum, `worker_idle_ns_p99` is the cross-worker maximum. With ≤ `num_cores` samples per query the running min/max is the right approximation; switch to DDSketch when the per-worker pull count grows past one digit.
+- `entity_event_skew_p99` is reported at the worker as the p99-vs-p50 spread of *per-morsel processed-event counts*, not per-entity event counts. The per-entity sample lands when `EntityOperatorAdapter` exposes a `finish_entity` metrics hook; until then the per-morsel proxy carries the same "this worker saw a hot tail" signal at much lower wiring cost.
+- `total_cpu_cycles` / `branch_misses` / `llc_misses` come from `perf_event_open` on Linux when the kernel honours the syscall (i.e. `CAP_PERFMON` is granted or `/proc/sys/kernel/perf_event_paranoid` permits it). On macOS and on a Linux box where the syscall is refused, the counters report zero and the CLI labels the rows as `not collected (no CAP_PERFMON)`.
+
 ### 8.3 Collection Protocol
 
 - **Per-batch counters** (rows_scanned, bytes_scanned, etc.) are local `u64` increments inside the worker — no atomics, no contention. Owned by operators, not this document.

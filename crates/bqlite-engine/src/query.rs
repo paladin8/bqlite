@@ -571,13 +571,23 @@ fn run_query_inner(
         DispatchShape::PerShardAggregate => run_per_shard_aggregate(scheduler, db, ctx, &physical)?,
     };
 
-    // Record one WorkerMetricsSnapshot per worker thread that pulled
-    // at least one morsel. The CPU/idle/busy fields stay zero in this
-    // task — TASK-537 fills them in. For the SingleTask path the
-    // count is 1 (the legacy seed); for the per-shard paths the count
-    // is the number of unique Rayon worker threads that contributed.
-    for _ in 0..dispatch.num_workers {
-        ctx.record_worker_snapshot(WorkerMetricsSnapshot::default());
+    // Record one WorkerMetricsSnapshot per worker that pulled at
+    // least one morsel. Per-shard dispatch paths produce real
+    // observations (per-morsel busy/idle deltas, CPU counter deltas);
+    // the single-task path has no per-worker timing and falls back to
+    // the legacy default-seed snapshot so `num_workers == 1` is still
+    // reflected in `QueryMetrics`. TASK-537.
+    if dispatch.worker_snapshots.is_empty() {
+        for _ in 0..dispatch.num_workers {
+            ctx.record_worker_snapshot(WorkerMetricsSnapshot::default());
+        }
+    } else {
+        for snap in &dispatch.worker_snapshots {
+            ctx.record_worker_snapshot(*snap);
+        }
+    }
+    if dispatch.cpu_counters_available {
+        ctx.set_cpu_counters_available();
     }
     if !dispatch.morsels_per_shard.is_empty() {
         ctx.record_morsels_per_shard(&dispatch.morsels_per_shard);
@@ -701,6 +711,19 @@ struct DispatchOutcome {
     /// exactly one morsel per shard, so every entry is `1`. Once the
     /// per-entity-range generator lands these will diverge.
     morsels_per_shard: Vec<u64>,
+    /// One snapshot per worker that pulled at least one morsel —
+    /// real values from the per-shard dispatch, empty for the single-
+    /// task path (the legacy default-seed survives there because the
+    /// single-task driver has no per-worker observations to record).
+    /// TASK-537.
+    worker_snapshots: Vec<WorkerMetricsSnapshot>,
+    /// `true` iff the per-shard dispatch successfully opened at least
+    /// one perf-event group. Threaded through to
+    /// `QueryMetrics::cpu_counters_available` so the CLI can label the
+    /// CPU rows when the kernel refused to honour
+    /// `perf_event_open`. Always `false` for the single-task path
+    /// (no perf-counter open ever happens there).
+    cpu_counters_available: bool,
 }
 
 fn run_single_task(
@@ -722,6 +745,11 @@ fn run_single_task(
         rows,
         num_workers: 1,
         morsels_per_shard: Vec::new(),
+        // Single-task driver has no per-morsel timing — the legacy
+        // default-seed snapshot is recorded by `run_query_inner` so
+        // `num_workers == 1` is reflected in `QueryMetrics`.
+        worker_snapshots: Vec::new(),
+        cpu_counters_available: false,
     })
 }
 
@@ -758,7 +786,8 @@ fn run_per_shard_concat(
     let collected: std::sync::Mutex<Vec<RecordBatch>> = std::sync::Mutex::new(Vec::new());
 
     let cancel = ctx.cancellation().clone();
-    let outcome = scheduler.run_per_shard(&snapshots, &cancel, |guard, _ctx_w| {
+    let collect_cpu = ctx.cpu_metrics_enabled();
+    let outcome = scheduler.run_per_shard(&snapshots, &cancel, collect_cpu, |guard, ctx_w| {
         let shard = guard.morsel.shard_id;
         let mut op = by_shard
             .lock()
@@ -770,6 +799,14 @@ fn run_per_shard_concat(
         let rows = drive_result?;
         close_result?;
         drop(op);
+        // Per-morsel processed-event count: total rows materialised by
+        // this morsel's pipeline. Folded into `entity_event_skew_p99`
+        // by the post-dispatch reducer (TASK-537 scope (b)).
+        let events: u64 = rows
+            .iter()
+            .map(|b| u64::try_from(b.num_rows()).unwrap_or(u64::MAX))
+            .sum();
+        ctx_w.processed_events_per_morsel.push(events);
         collected.lock().expect("collected poisoned").extend(rows);
         Ok(())
     })?;
@@ -790,10 +827,13 @@ fn run_per_shard_concat(
         .filter(|c| c.morsels_dispatched > 0)
         .count()
         .max(1);
+    let worker_snapshots = build_worker_snapshots(&outcome.per_worker, ctx.cpu_metrics_enabled());
     Ok(DispatchOutcome {
         rows,
         num_workers,
         morsels_per_shard: vec![1u64; snapshots.len()],
+        worker_snapshots,
+        cpu_counters_available: outcome.cpu_counters_available,
     })
 }
 
@@ -838,7 +878,8 @@ fn run_per_shard_aggregate(
     let max_groups = agg.max_groups;
 
     let cancel = ctx.cancellation().clone();
-    let outcome = scheduler.run_per_shard(&snapshots, &cancel, |guard, _ctx_w| {
+    let collect_cpu = ctx.cpu_metrics_enabled();
+    let outcome = scheduler.run_per_shard(&snapshots, &cancel, collect_cpu, |guard, ctx_w| {
         let shard = guard.morsel.shard_id;
         let mut op = by_shard_op
             .lock()
@@ -852,6 +893,7 @@ fn run_per_shard_aggregate(
             max_groups,
         );
         op.open()?;
+        let mut events: u64 = 0;
         loop {
             // Per-batch cancellation check (design §9.1).
             if cancel.is_cancelled() {
@@ -860,6 +902,8 @@ fn run_per_shard_aggregate(
             }
             match op.next_batch()? {
                 Some(batch) => {
+                    events =
+                        events.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
                     let (group_arrays, agg_arrays) =
                         evaluate_aggregate_inputs(&group_by, &aggregates, &batch)?;
                     acc.update_evaluated(batch.num_rows(), &group_arrays, &agg_arrays)?;
@@ -879,6 +923,10 @@ fn run_per_shard_aggregate(
                     location: None,
                 })?;
         *slot = Some(Box::new(acc));
+        // Drop the slot before recording the event count so the
+        // worker's hold on the accumulator mutex is short.
+        drop(slot);
+        ctx_w.processed_events_per_morsel.push(events);
         Ok(())
     })?;
 
@@ -921,11 +969,70 @@ fn run_per_shard_aggregate(
         .filter(|c| c.morsels_dispatched > 0)
         .count()
         .max(1);
+    let worker_snapshots = build_worker_snapshots(&outcome.per_worker, ctx.cpu_metrics_enabled());
     Ok(DispatchOutcome {
         rows,
         num_workers,
         morsels_per_shard: vec![1u64; snapshots.len()],
+        worker_snapshots,
+        cpu_counters_available: outcome.cpu_counters_available,
     })
+}
+
+/// Build one [`WorkerMetricsSnapshot`] per worker that pulled at least
+/// one morsel. Folded into the per-query aggregate by the caller.
+///
+/// `entity_event_skew_p99` is the per-worker p99-vs-p50 spread of
+/// per-morsel processed-event counts (TASK-537 scope (b)). For workers
+/// with fewer than two samples the spread is zero.
+fn build_worker_snapshots(
+    per_worker: &[crate::scheduler::PerWorkerCtx],
+    cpu_metrics_enabled: bool,
+) -> Vec<WorkerMetricsSnapshot> {
+    per_worker
+        .iter()
+        .filter(|c| c.morsels_dispatched > 0)
+        .map(|c| {
+            let skew = percentile_spread(&c.processed_events_per_morsel);
+            WorkerMetricsSnapshot {
+                worker_idle_ns: c.worker_idle_ns,
+                worker_busy_ns: c.worker_busy_ns,
+                entity_event_skew_p99: skew,
+                morsels_dispatched: c.morsels_dispatched,
+                branch_misses: if cpu_metrics_enabled {
+                    c.branch_misses
+                } else {
+                    0
+                },
+                llc_misses: if cpu_metrics_enabled { c.llc_misses } else { 0 },
+                total_cpu_cycles: if cpu_metrics_enabled {
+                    c.total_cpu_cycles
+                } else {
+                    0
+                },
+                events_processed: c.processed_events_per_morsel.iter().sum(),
+            }
+        })
+        .collect()
+}
+
+/// p99 minus p50 of `samples`, saturating to zero when fewer than two
+/// samples or when p50 ≥ p99 (degenerate case for a single distinct
+/// value). Sort-and-pick is fine — v1 morsel count per worker is small
+/// (≤ shard count today, max ~32). Once sub-shard halving raises the
+/// per-worker sample count into the hundreds, swap to DDSketch.
+fn percentile_spread(samples: &[u64]) -> u64 {
+    if samples.len() < 2 {
+        return 0;
+    }
+    let mut sorted: Vec<u64> = samples.to_vec();
+    sorted.sort_unstable();
+    let p50 = sorted[sorted.len() / 2];
+    // p99 index — saturating to len-1 for small sample sets.
+    let p99_idx = ((sorted.len() as f64) * 0.99).ceil() as usize;
+    let p99_idx = p99_idx.saturating_sub(1).min(sorted.len() - 1);
+    let p99 = sorted[p99_idx];
+    p99.saturating_sub(p50)
 }
 
 /// Extract a human-readable message from a `catch_unwind` payload.
@@ -973,6 +1080,75 @@ mod tests {
 
     use super::*;
     use crate::context::MIN_QUERY_BUDGET_BYTES;
+
+    // ── Percentile spread helper (TASK-537) ───────────────────────────
+
+    #[test]
+    fn percentile_spread_empty_and_single_sample_are_zero() {
+        assert_eq!(percentile_spread(&[]), 0);
+        assert_eq!(percentile_spread(&[42]), 0);
+    }
+
+    #[test]
+    fn percentile_spread_uniform_samples_yield_zero() {
+        // p50 == p99 when every sample is equal — the spread is zero.
+        assert_eq!(percentile_spread(&[100; 10]), 0);
+    }
+
+    #[test]
+    fn percentile_spread_skewed_samples_carry_signal() {
+        // Nine small samples + one huge — the p99 picks up the tail.
+        let samples = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1_000];
+        let spread = percentile_spread(&samples);
+        assert!(spread > 0, "skewed input must surface a non-zero spread");
+    }
+
+    #[test]
+    fn build_worker_snapshots_drops_idle_workers_and_records_timing() {
+        use crate::scheduler::PerWorkerCtx;
+        let workers = vec![
+            PerWorkerCtx {
+                morsels_dispatched: 3,
+                worker_busy_ns: 1_000_000,
+                worker_idle_ns: 500,
+                processed_events_per_morsel: vec![10, 20, 30],
+                total_cpu_cycles: 9_999,
+                ..PerWorkerCtx::default()
+            },
+            PerWorkerCtx {
+                // Idle worker that pulled nothing — must be filtered out.
+                morsels_dispatched: 0,
+                ..PerWorkerCtx::default()
+            },
+        ];
+        let snaps = build_worker_snapshots(&workers, false);
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].morsels_dispatched, 3);
+        assert_eq!(snaps[0].worker_busy_ns, 1_000_000);
+        assert_eq!(snaps[0].worker_idle_ns, 500);
+        assert_eq!(snaps[0].events_processed, 60);
+        // CPU collection off — counters zeroed even though the worker
+        // populated the field (defense-in-depth: callers must not see
+        // stale counter values when collection was not opted into).
+        assert_eq!(snaps[0].total_cpu_cycles, 0);
+    }
+
+    #[test]
+    fn build_worker_snapshots_passes_through_cpu_counters_when_enabled() {
+        use crate::scheduler::PerWorkerCtx;
+        let workers = vec![PerWorkerCtx {
+            morsels_dispatched: 1,
+            total_cpu_cycles: 100,
+            branch_misses: 5,
+            llc_misses: 2,
+            processed_events_per_morsel: vec![1],
+            ..PerWorkerCtx::default()
+        }];
+        let snaps = build_worker_snapshots(&workers, true);
+        assert_eq!(snaps[0].total_cpu_cycles, 100);
+        assert_eq!(snaps[0].branch_misses, 5);
+        assert_eq!(snaps[0].llc_misses, 2);
+    }
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 

@@ -6,7 +6,7 @@
 //! (operator-tree counters via [`MetricsSnapshot`], plus engine-side
 //! rows: worker spread, morsels dispatched, optional CPU counters).
 //!
-//! ## Wave 5 scope (TASK-524)
+//! ## Wave 5 scope (TASK-524 / TASK-537)
 //!
 //! Wave 5 ships:
 //!
@@ -15,29 +15,32 @@
 //!   selection-vector counters). These flow through
 //!   [`QueryMetrics::operator`].
 //! - `spill_bytes_written` — populated by the
-//!   [`bqlite_core::spill::TempSpillFile`] drop hook landed in CP1
-//!   when the engine attaches a metrics handle to the spill guard
-//!   (CP3).
-//! - Morsel / skew / worker rows — present as fields, all-zero today.
-//!   They become non-zero once the morsel scheduler (TASK-523
-//!   follow-up) records per-worker snapshots through
-//!   [`crate::context::QueryContext::record_worker_snapshot`]. This
-//!   matches `execution-model.md` §14.1: "Metrics that depend on a
-//!   feature not yet shipped report zero until the feature lands."
-//! - CPU-cost rows — present as fields, all-zero unless
-//!   `QueryContext::collect_cpu_metrics(true)` is set *and* the
-//!   platform integration plugs in real counters. The Wave 5 surface
-//!   lands the seam ([`PerfCounters::open_or_disabled`]); the
-//!   concrete `perf_event_open` / `kpc` integration is a follow-up.
+//!   [`bqlite_core::spill::TempSpillFile`] drop hook (TASK-524 CP1).
+//! - Morsel / skew / worker rows — populated by the per-shard dispatch
+//!   path through [`crate::context::QueryContext::record_worker_snapshot`].
+//!   `worker_idle_ns_*` and `worker_busy_ns_*` carry per-worker
+//!   `Instant::now()` deltas; `entity_event_skew_p99` is the per-worker
+//!   p99-vs-p50 spread of per-morsel processed-event counts. TASK-537
+//!   landed the worker-driver instrumentation that makes these non-zero.
+//! - CPU-cost rows — populated by [`PerfCounters`] when the engine has
+//!   opted into CPU sampling (`QueryOptions::collect_cpu_metrics`) and
+//!   the platform integration is available. On Linux this is a real
+//!   `perf_event_open` group covering `PERF_COUNT_HW_CPU_CYCLES`,
+//!   `PERF_COUNT_HW_BRANCH_MISSES`, and the LL-cache miss event;
+//!   permission failure (`CAP_PERFMON` not granted, paranoid mode)
+//!   degrades to the disabled stub. macOS / other platforms keep the
+//!   disabled stub pending the v2 `kpc` integration.
 //!
 //! ## Surface
 //!
 //! - [`QueryMetrics`] — flat aggregate. Attached to
-//!   [`crate::ExecutionResult`] in CP3.
+//!   [`crate::ExecutionResult`].
 //! - [`WorkerMetricsSnapshot`] — what a single worker contributes; the
-//!   morsel scheduler will hand one of these per worker to
+//!   per-shard dispatch hands one of these per worker to
 //!   [`QueryMetrics::record_worker`].
-//! - [`PerfCounters`] — per-worker CPU counter handle. Stub today.
+//! - [`PerfCounters`] — per-worker CPU counter handle. Real perf-event
+//!   group on Linux when permitted; disabled stub on macOS, on Linux
+//!   without `CAP_PERFMON`, and whenever CPU collection is off.
 //! - [`format_perf_explain`] — render the aggregate as a labelled
 //!   multi-section text block for `bqlite query --explain-perf`.
 
@@ -139,6 +142,15 @@ pub struct QueryMetrics {
     /// `true` only when [`crate::QueryContext::collect_cpu_metrics`]
     /// returned a context with the flag set.
     pub cpu_metrics_enabled: bool,
+    /// Whether at least one worker successfully opened a real
+    /// `perf_event_open` group during this query. `false` when
+    /// [`Self::cpu_metrics_enabled`] is also `false` (collection was
+    /// off) *or* when collection was on but the kernel refused (e.g.
+    /// `CAP_PERFMON` not granted, paranoid mode).
+    /// `format_perf_explain` reads this to decide whether the CPU
+    /// rows render as zeros, "not collected (cpu metrics disabled)",
+    /// or "not collected (no CAP_PERFMON)". TASK-537 scope (f).
+    pub cpu_counters_available: bool,
 }
 
 impl QueryMetrics {
@@ -243,51 +255,139 @@ impl QueryMetrics {
 // PerfCounters
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-worker CPU counter handle. Wave 5 surface; concrete platform
-/// integration (Linux `perf_event_open`, macOS `kpc`) is a follow-up
-/// to TASK-524.
+/// Per-worker CPU counter handle. Wave 5 surface plus TASK-537 Linux
+/// integration; macOS `kpc` is a v2 follow-on.
 ///
 /// The seam exists so the morsel scheduler can call
 /// [`PerfCounters::open_or_disabled`] in a worker's `WorkerContext`
 /// constructor without conditional compilation in the scheduler
-/// itself. Today every platform returns the disabled variant; counter
-/// reads are no-ops.
-#[derive(Debug, Default)]
+/// itself. Linux opens a real `perf_event_open` group when the engine
+/// has opted into CPU-cost metrics and the kernel honours the syscall;
+/// macOS and other platforms return the disabled variant.
+#[derive(Debug)]
 pub struct PerfCounters {
-    enabled: bool,
+    inner: PerfCountersInner,
+}
+
+#[derive(Debug)]
+enum PerfCountersInner {
+    Disabled,
+    #[cfg(target_os = "linux")]
+    Linux(linux_perf::LinuxPerfCounters),
+}
+
+/// Snapshot of the three CPU counter values at a single read. Workers
+/// take one of these before a morsel runs and another after; the
+/// difference is the morsel's CPU cost. Zero on disabled handles —
+/// callers compute deltas blindly so the disabled path is a no-op.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PerfCounterSnapshot {
+    pub cpu_cycles: u64,
+    pub branch_misses: u64,
+    pub llc_misses: u64,
+}
+
+impl PerfCounterSnapshot {
+    /// Saturating per-counter difference. Used by the worker driver
+    /// loop to attribute CPU cost to the morsel just executed.
+    ///
+    /// The kernel guarantees the grouped read on a pinned worker
+    /// thread returns monotonically non-decreasing values for the
+    /// underlying hardware counters; `saturating_sub` is defensive in
+    /// case the kernel ever returns a glitched lower value (rare; we
+    /// would rather see zero than wrap to `u64::MAX`).
+    pub fn delta(&self, prev: &PerfCounterSnapshot) -> PerfCounterSnapshot {
+        PerfCounterSnapshot {
+            cpu_cycles: self.cpu_cycles.saturating_sub(prev.cpu_cycles),
+            branch_misses: self.branch_misses.saturating_sub(prev.branch_misses),
+            llc_misses: self.llc_misses.saturating_sub(prev.llc_misses),
+        }
+    }
 }
 
 impl PerfCounters {
     /// Open a perf-event group for the current worker, or return a
-    /// disabled placeholder when the platform / build does not
-    /// support it or when the engine has not opted into CPU-cost
-    /// metrics. Today every platform returns disabled.
+    /// disabled placeholder. On Linux this issues `perf_event_open` for
+    /// `PERF_COUNT_HW_CPU_CYCLES`, `PERF_COUNT_HW_BRANCH_MISSES`, and
+    /// `PERF_COUNT_HW_CACHE_LL` (last-level cache misses); on
+    /// permission failure (`CAP_PERFMON` not granted, paranoid mode,
+    /// kernel-not-built-with-perf) the handle silently degrades to
+    /// disabled. macOS and other platforms always return disabled
+    /// pending the v2 `kpc` integration (TASK-537 scope (d)).
     pub fn open_or_disabled() -> Self {
-        Self { enabled: false }
+        #[cfg(target_os = "linux")]
+        {
+            match linux_perf::LinuxPerfCounters::open() {
+                Some(handle) => {
+                    return Self {
+                        inner: PerfCountersInner::Linux(handle),
+                    }
+                }
+                None => {
+                    // Graceful disable — no panic, no log spam. The
+                    // CLI surfaces this as
+                    // "branch_misses: not collected (no CAP_PERFMON)"
+                    // when CPU collection was opted into.
+                }
+            }
+        }
+        Self::disabled()
     }
 
     /// Construct an explicit disabled handle. Used by code paths that
-    /// know they will not be sampling.
+    /// know they will not be sampling (CPU collection opt-out).
     pub fn disabled() -> Self {
-        Self { enabled: false }
+        Self {
+            inner: PerfCountersInner::Disabled,
+        }
     }
 
     /// Whether this handle is connected to a real counter source.
     pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
-    /// Read the underlying counters into `out`. No-op when disabled —
-    /// the snapshot's `branch_misses` / `llc_misses` /
-    /// `total_cpu_cycles` fields stay at their pre-call value.
-    pub fn read_into(&self, _out: &mut WorkerMetricsSnapshot) {
-        if !self.enabled {
-            // Platform integration lands later; today this is a
-            // deliberate no-op so callers can issue the read
-            // unconditionally on every morsel boundary.
+        match &self.inner {
+            PerfCountersInner::Disabled => false,
+            #[cfg(target_os = "linux")]
+            PerfCountersInner::Linux(_) => true,
         }
     }
+
+    /// Read the underlying counters into a snapshot. Disabled handles
+    /// return zeroes so that `delta_since(prev) == 0` and callers can
+    /// fold the result blindly.
+    pub fn snapshot_counters(&mut self) -> PerfCounterSnapshot {
+        match &mut self.inner {
+            PerfCountersInner::Disabled => PerfCounterSnapshot::default(),
+            #[cfg(target_os = "linux")]
+            PerfCountersInner::Linux(h) => h.read().unwrap_or_default(),
+        }
+    }
+
+    /// Compute the per-morsel delta from a prior snapshot to *now*.
+    /// Convenience for the worker driver loop — equivalent to
+    /// `snapshot_counters().delta(prev)`.
+    pub fn delta_since(&mut self, prev: PerfCounterSnapshot) -> PerfCounterSnapshot {
+        self.snapshot_counters().delta(&prev)
+    }
+
+    /// Read the underlying counters into `out` — kept for the legacy
+    /// CP-3 wiring shape. Sums into existing fields so callers that
+    /// loop over morsels don't need to clear `out`.
+    pub fn read_into(&mut self, out: &mut WorkerMetricsSnapshot) {
+        let snap = self.snapshot_counters();
+        out.total_cpu_cycles = out.total_cpu_cycles.saturating_add(snap.cpu_cycles);
+        out.branch_misses = out.branch_misses.saturating_add(snap.branch_misses);
+        out.llc_misses = out.llc_misses.saturating_add(snap.llc_misses);
+    }
 }
+
+impl Default for PerfCounters {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_perf;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Rendering
@@ -593,14 +693,18 @@ mod tests {
     // ── PerfCounters ─────────────────────────────────────────────────
 
     #[test]
-    fn perf_counters_open_returns_disabled_today() {
+    fn perf_counters_open_does_not_panic() {
+        // On Linux with `CAP_PERFMON` the call may succeed; on a CI
+        // container without the capability it returns disabled. Both
+        // are valid — the contract is that the call never panics.
         let p = PerfCounters::open_or_disabled();
-        assert!(!p.is_enabled());
+        // Disabled or enabled — both are fine.
+        let _ = p.is_enabled();
     }
 
     #[test]
     fn perf_counters_read_into_disabled_is_noop() {
-        let p = PerfCounters::disabled();
+        let mut p = PerfCounters::disabled();
         let mut snap = WorkerMetricsSnapshot {
             branch_misses: 99,
             llc_misses: 7,
@@ -608,7 +712,8 @@ mod tests {
             ..Default::default()
         };
         p.read_into(&mut snap);
-        // Disabled handle leaves the snapshot untouched.
+        // Disabled handle adds zero to every field — the snapshot
+        // stays at its pre-call value.
         assert_eq!(snap.branch_misses, 99);
         assert_eq!(snap.llc_misses, 7);
         assert_eq!(snap.total_cpu_cycles, 42);
