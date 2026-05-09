@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-542",
+  "claimed_at": "2026-05-09T06:47:05Z",
+  "branch": "task/TASK-542",
+  "description": "Rustdoc warning cleanup pass"
+}
