@@ -435,6 +435,44 @@ impl Database {
             table_name: table_name.to_string(),
             schema: Arc::new(entry.schema.clone()),
             windows,
+            shard_filter: None,
+        }))
+    }
+
+    /// Open a manifest-backed segment reader restricted to a single shard.
+    ///
+    /// Iteration order is unchanged from the unfiltered reader (window-major,
+    /// insertion order within the shard). Every segment whose
+    /// `shard_id != shard` is filtered out at enumeration time. Used by the
+    /// engine's per-shard morsel dispatch (TASK-536) so each shard's worker
+    /// binds a fresh operator tree against this reader and drives it
+    /// independently of the other shards'.
+    ///
+    /// Returns `BqliteError::Plan` if `table_name` is unknown.
+    pub fn segment_reader_for_shard(
+        &self,
+        table_name: &str,
+        shard: u32,
+        time_range: TimeRange,
+    ) -> Result<Box<dyn SegmentReader>> {
+        let entry = self
+            .manifest
+            .tables
+            .get(table_name)
+            .ok_or_else(|| bqlite_core::catalog::unknown_table_error(table_name))?;
+
+        let windows = if time_range == TimeRange::unbounded() {
+            entry.windows.clone()
+        } else {
+            filter_windows_by_time_range(&entry.windows, time_range)
+        };
+
+        Ok(Box::new(ManifestSegmentReader {
+            root: self.root.clone(),
+            table_name: table_name.to_string(),
+            schema: Arc::new(entry.schema.clone()),
+            windows,
+            shard_filter: Some(shard),
         }))
     }
 
@@ -1074,6 +1112,10 @@ struct ManifestSegmentReader {
     /// (columns, entity-key name, timestamp name) per segment.
     schema: Arc<TableSchema>,
     windows: Vec<WindowManifest>,
+    /// `Some(shard)` restricts `segments()` to the given shard
+    /// (TASK-536 per-shard morsel dispatch); `None` enumerates every
+    /// live segment (the historical contract).
+    shard_filter: Option<u32>,
 }
 
 impl SegmentReader for ManifestSegmentReader {
@@ -1082,11 +1124,13 @@ impl SegmentReader for ManifestSegmentReader {
     }
 
     fn segments(&self) -> Box<dyn Iterator<Item = Result<SegmentHandle>> + Send + '_> {
-        let iter = self.windows.iter().flat_map(|win| {
+        let target = self.shard_filter;
+        let iter = self.windows.iter().flat_map(move |win| {
             let window_id = win.window_id;
             win.shards
                 .iter()
                 .enumerate()
+                .filter(move |(shard_idx, _)| target.is_none_or(|s| *shard_idx as u32 == s))
                 .flat_map(move |(shard_idx, segs)| {
                     let shard_id = shard_idx as u32;
                     segs.iter().map(move |seg| {
@@ -1804,6 +1848,121 @@ mod tests {
                 .expect("should have a row group");
             assert_eq!(batch.num_rows(), 1);
         }
+    }
+
+    // ── segment_reader_for_shard (TASK-536) ─────────────────────────────────
+
+    #[test]
+    fn segment_reader_for_shard_filters_to_one_shard() {
+        let scratch = Scratch::new("seg-reader-shard-filter");
+        let mut db = create_db_with_writer_schema(scratch.path());
+
+        let events1 = vec![test_event("alice", 1_000, "click")];
+        let events2 = vec![test_event("bob", 2_000, "view")];
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        {
+            let mut writer = SegmentWriter::new(&mut db);
+            writer
+                .write_bucket("events", 0, 0, batch_id, &events1)
+                .expect("shard 0");
+            writer
+                .write_bucket("events", 0, 1, batch_id, &events2)
+                .expect("shard 1");
+        }
+
+        // Restrict the reader to shard 0; only that shard's segments
+        // must surface.
+        let scoped = db
+            .segment_reader_for_shard("events", 0, TimeRange::unbounded())
+            .expect("scoped reader");
+        let handles: Vec<_> = scoped.segments().collect::<Result<Vec<_>>>().unwrap();
+        assert!(
+            !handles.is_empty(),
+            "shard 0 must have at least one segment"
+        );
+        assert!(
+            handles.iter().all(|h| h.shard_id == 0),
+            "scoped reader yielded foreign shards: {:?}",
+            handles.iter().map(|h| h.shard_id).collect::<Vec<_>>()
+        );
+
+        // Same for shard 1.
+        let scoped1 = db
+            .segment_reader_for_shard("events", 1, TimeRange::unbounded())
+            .expect("scoped reader shard 1");
+        let handles1: Vec<_> = scoped1.segments().collect::<Result<Vec<_>>>().unwrap();
+        assert!(handles1.iter().all(|h| h.shard_id == 1));
+        assert_eq!(handles1.len(), 1, "shard 1 has exactly one segment");
+    }
+
+    #[test]
+    fn segment_reader_for_shard_unbounded_matches_base_per_shard() {
+        let scratch = Scratch::new("seg-reader-shard-base");
+        let mut db = create_db_with_writer_schema(scratch.path());
+
+        let events_a = vec![test_event("alice", 1_000, "click")];
+        let events_b = vec![test_event("bob", 2_000, "view")];
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        {
+            let mut writer = SegmentWriter::new(&mut db);
+            writer
+                .write_bucket("events", 0, 0, batch_id, &events_a)
+                .expect("shard 0");
+            writer
+                .write_bucket("events", 0, 2, batch_id, &events_b)
+                .expect("shard 2");
+        }
+
+        // For each populated shard, the scoped reader must yield
+        // exactly the same segment ids the base reader yielded for
+        // that shard.
+        let base = db.segment_reader("events").expect("base reader");
+        let mut by_shard: std::collections::BTreeMap<u32, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for h in base.segments() {
+            let h = h.unwrap();
+            by_shard.entry(h.shard_id).or_default().push(h.segment_id);
+        }
+        for (shard, expected_segments) in &by_shard {
+            let scoped = db
+                .segment_reader_for_shard("events", *shard, TimeRange::unbounded())
+                .unwrap();
+            let mut observed: Vec<u64> = scoped.segments().map(|h| h.unwrap().segment_id).collect();
+            observed.sort();
+            let mut expected = expected_segments.clone();
+            expected.sort();
+            assert_eq!(observed, expected, "shard {shard} segments must match base");
+        }
+    }
+
+    #[test]
+    fn segment_reader_for_shard_unknown_table_errors() {
+        let scratch = Scratch::new("seg-reader-shard-unknown");
+        let db = Database::create(scratch.path()).unwrap();
+        let err = match db.segment_reader_for_shard("nope", 0, TimeRange::unbounded()) {
+            Ok(_) => panic!("unknown table must error"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, BqliteError::Plan(_)), "{err:?}");
+    }
+
+    #[test]
+    fn segment_reader_for_shard_empty_for_unpopulated_shard() {
+        let scratch = Scratch::new("seg-reader-shard-empty");
+        let mut db = create_db_with_writer_schema(scratch.path());
+        let events = vec![test_event("alice", 1_000, "click")];
+        let batch_id = db.allocate_batch_id("events").unwrap();
+        {
+            let mut writer = SegmentWriter::new(&mut db);
+            writer
+                .write_bucket("events", 0, 0, batch_id, &events)
+                .expect("shard 0");
+        }
+        // Shard 5 has no segments — scoped reader yields zero handles.
+        let scoped = db
+            .segment_reader_for_shard("events", 5, TimeRange::unbounded())
+            .unwrap();
+        assert_eq!(scoped.segments().count(), 0);
     }
 
     #[test]
