@@ -2,6 +2,7 @@
   "agent_id": "agent-4",
   "task_id": "TASK-542",
   "claimed_at": "2026-05-09T06:47:05Z",
+  "completed_at": "2026-05-09T07:30:00Z",
   "branch": "task/TASK-542",
   "description": "Rustdoc warning cleanup pass"
 }
