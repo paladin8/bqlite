@@ -517,6 +517,48 @@ impl HashAccumulator {
         &self.output_schema
     }
 
+    /// Build an accumulator with the same internal column-name and
+    /// type wiring [`HashAggregateOperator::new`] uses, derived from
+    /// the planner-level `(aggregates, group_by, output_schema, max_groups)`
+    /// tuple. The engine's per-shard morsel dispatch (TASK-536)
+    /// constructs one of these per shard and feeds in row batches
+    /// directly via [`Self::update_evaluated`] (paired with
+    /// [`evaluate_aggregate_inputs`]); the cross-shard merge runs on
+    /// the coordinator via [`Accumulator::merge`].
+    ///
+    /// Keeping the constructor here (rather than duplicating the
+    /// `__grp_{i}` / `__agg_{i}` setup in the engine) means the
+    /// internal column names are owned by exactly one place. If they
+    /// ever change, [`HashAggregateOperator::new`] and the engine's
+    /// per-shard accumulator stay in lockstep automatically.
+    pub fn from_planner_spec(
+        aggregates: &[CompiledAgg],
+        group_by_len: usize,
+        output_schema: OperatorSchema,
+        max_groups: usize,
+    ) -> Self {
+        let functions: Vec<AggFunction> = aggregates.iter().map(|a| a.function).collect();
+        let input_types: Vec<Option<BqlType>> = aggregates
+            .iter()
+            .map(|a| a.arg.as_ref().map(|expr| expr.result_type.clone()))
+            .collect();
+        let group_by_col_names: Vec<String> =
+            (0..group_by_len).map(|i| format!("__grp_{i}")).collect();
+        let agg_arg_col_names: Vec<Option<String>> = aggregates
+            .iter()
+            .enumerate()
+            .map(|(i, agg)| agg.arg.as_ref().map(|_| format!("__agg_{i}")))
+            .collect();
+        Self::new(
+            functions,
+            input_types,
+            output_schema,
+            group_by_col_names,
+            agg_arg_col_names,
+            max_groups,
+        )
+    }
+
     /// Returns the number of distinct groups currently tracked.
     pub fn num_groups(&self) -> usize {
         self.groups.len()
@@ -843,29 +885,10 @@ impl HashAggregateOperator {
         max_groups: usize,
         output_schema: OperatorSchema,
     ) -> Self {
-        let functions: Vec<AggFunction> = aggregates.iter().map(|a| a.function).collect();
-        let input_types: Vec<Option<BqlType>> = aggregates
-            .iter()
-            .map(|a| a.arg.as_ref().map(|expr| expr.result_type.clone()))
-            .collect();
-
-        // Internal column names used to bridge CompiledExpr evaluation
-        // with HashAccumulator::update_batch. These names are never
-        // visible outside this operator.
-        let group_by_col_names: Vec<String> =
-            (0..group_by.len()).map(|i| format!("__grp_{i}")).collect();
-        let agg_arg_col_names: Vec<Option<String>> = aggregates
-            .iter()
-            .enumerate()
-            .map(|(i, agg)| agg.arg.as_ref().map(|_| format!("__agg_{i}")))
-            .collect();
-
-        let accumulator = HashAccumulator::new(
-            functions,
-            input_types,
+        let accumulator = HashAccumulator::from_planner_spec(
+            &aggregates,
+            group_by.len(),
             output_schema.clone(),
-            group_by_col_names,
-            agg_arg_col_names,
             max_groups,
         );
 
@@ -909,6 +932,35 @@ impl HashAggregateOperator {
         self.accumulator
             .update_evaluated(num_rows, &group_arrays, &agg_arrays)
     }
+}
+
+/// Evaluate the group-by and aggregate-argument expressions against
+/// `batch`, returning the parallel arrays [`HashAccumulator::update_evaluated`]
+/// consumes. Public so the engine's per-shard morsel dispatch
+/// (TASK-536) can drive a per-shard accumulator without instantiating
+/// a full [`HashAggregateOperator`] per shard. The expressions are
+/// the same compiled forms `HashAggregateOperator::new` already
+/// stores; sharing this helper guarantees identical evaluation
+/// semantics on both paths.
+pub fn evaluate_aggregate_inputs(
+    group_by: &[(CompiledExpr, String)],
+    aggregates: &[CompiledAgg],
+    batch: &RecordBatch,
+) -> Result<(Vec<ArrayRef>, Vec<Option<ArrayRef>>)> {
+    let group_arrays: Vec<ArrayRef> = group_by
+        .iter()
+        .map(|(expr, _)| eval::evaluate(expr, batch))
+        .collect::<Result<Vec<_>>>()?;
+    let agg_arrays: Vec<Option<ArrayRef>> = aggregates
+        .iter()
+        .map(|agg| {
+            agg.arg
+                .as_ref()
+                .map(|arg| eval::evaluate(arg, batch))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((group_arrays, agg_arrays))
 }
 
 impl PhysicalOperator for HashAggregateOperator {
