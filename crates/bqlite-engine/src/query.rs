@@ -774,6 +774,15 @@ fn run_per_shard_concat(
         Ok(())
     })?;
 
+    // The scheduler's between-morsels cancellation check drains the
+    // queue silently and returns Ok — so a pre-cancelled query reaches
+    // here with no rows collected and no error from the dispatch.
+    // Honour cancellation.md §3.1 step 2 ("reason is Cancelled →
+    // BqliteError::Cancelled") at the dispatch boundary.
+    if ctx.cancellation().is_cancelled() {
+        return Err(BqliteError::Cancelled);
+    }
+
     let rows = collected.into_inner().expect("collected poisoned");
     let num_workers = outcome
         .per_worker
@@ -872,6 +881,14 @@ fn run_per_shard_aggregate(
         *slot = Some(Box::new(acc));
         Ok(())
     })?;
+
+    // Honour cancellation.md §3.1 step 2 at the dispatch boundary.
+    // The scheduler's between-morsels cancel check drains the queue
+    // and returns Ok; without this guard the cross-shard merge would
+    // emit a partial (or empty) result instead of `Err(Cancelled)`.
+    if ctx.cancellation().is_cancelled() {
+        return Err(BqliteError::Cancelled);
+    }
 
     // Cross-shard merge on the coordinator (single-threaded, design §6.4).
     let mut merged: Option<Box<dyn Accumulator>> = None;

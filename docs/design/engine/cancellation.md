@@ -75,7 +75,7 @@ unified by the same `CancellationToken` so operators only ever observe
 
 | Source | Mechanism | Maps to terminal error |
 |---|---|---|
-| Caller-initiated cancel | Caller invokes `QueryHandle::cancel()` (TASK-541); engine calls `token.cancel()` | `BqliteError::Cancelled` |
+| Caller-initiated cancel | Caller passes a `CancellationToken` via `QueryOptions::cancel` (TASK-538) and invokes `token.cancel()`; the richer `QueryHandle::cancel()` lands with TASK-541 | `BqliteError::Cancelled` |
 | Query timeout | Engine's per-query timer fires after `QueryContext::timeout`; sets a `timed_out` flag *before* `token.cancel()` | `BqliteError::Timeout { elapsed_ms }` |
 | LIMIT short-circuit | The `LimitOperator` calls `token.cancel()` once it has produced the requested rows | `Ok` — propagates up as success once the in-flight `next_batch()` returns |
 | Worker panic | A worker's `catch_unwind` boundary (see §4) calls `token.cancel()` so peer workers stop quickly | `BqliteError::OperatorPanic { message, location }` |
@@ -253,7 +253,9 @@ masking it.
 ```rust
 pub enum BqliteError {
     // ... existing variants ...
-    /// The query was cancelled by the caller via QueryHandle::cancel().
+    /// The query was cancelled by the caller via `QueryOptions::cancel`'s
+    /// `CancellationToken` (TASK-538) — or, eventually, via the richer
+    /// `QueryHandle::cancel()` handle that lands with TASK-541.
     Cancelled,
     /// The query exceeded its configured timeout. Carries the elapsed
     /// time in milliseconds for diagnostics.
@@ -470,6 +472,16 @@ query stop?" answers "the timer expired" *or* "I asked for it to stop"
 then panics during teardown surfaces the *panic*, not the timeout —
 panics are bugs and must be visible.
 
+TASK-538 lands the public surface for this protocol:
+`QueryOptions { cancel: Option<CancellationToken>, timeout: Option<Duration> }`
+on `Engine::query_with_options`. The timeout timer is a per-query
+thread that CAS-installs `CancelReason::Timeout` after the duration
+(or synchronously, when `Duration::ZERO` is passed); the driver maps
+the resulting `BqliteError::Cancelled` to
+`BqliteError::Timeout { elapsed_ms }` at result collection. See §3.1
+for first-fire precedence and §4.1 for the per-worker `catch_unwind`
+boundary inside `MorselScheduler::submit`.
+
 ## 7. Warning protocol
 
 ### 7.1 The `QueryWarning` enum
@@ -652,7 +664,8 @@ mapping:
 | TASK-512 (ingest spill) | §5.2, §5.3 | Uses `TempSpillFile` for partitioner spill; honours the per-query subdirectory layout and the startup orphan sweep. |
 | TASK-513 (sort spill) | §3.2 exception, §5.2, §5.3 | Sort spill writer polls cancellation between row-groups; spill runs use `TempSpillFile`; merge pass reads through OS cache. |
 | TASK-514 (cohort spill / fail) | §5.1 | Cohort materialization either spills (using §5.3 layout) or fails fast with `BqliteError::MemoryBudgetExceeded`; either way honours the cleanup ordering. |
-| TASK-541 (morsel scheduler) | §3.1, §3.2, §4 | Implements per-query timeout timer, the morsel-boundary panic catch, the peer-worker shutdown via `token.cancel()`, and the `CancelReason` CAS. |
+| TASK-538 (public cancel/timeout API) | §3.1, §3.2, §4.1, §6.2 | Adds `QueryOptions { cancel, timeout }` on `Engine::query_with_options`, the `CancelReason` CAS slot on `QueryContext`, the per-query timeout timer (synchronous fire on `Duration::ZERO`; `park_timeout` idle wait), the `Cancelled → Timeout { elapsed_ms }` discrimination at result collection, and the per-worker `catch_unwind` boundary inside `MorselScheduler::submit`. The outer `catch_unwind` in `Engine::query_with_options` becomes defense-in-depth for the parse / plan / bind path. |
+| TASK-541 (morsel scheduler) | §3.1, §3.2, §4 | Implements per-morsel iteration `catch_unwind` (the worker-entry boundary already lands in TASK-538), the peer-worker shutdown via `token.cancel()` once true per-shard dispatch is in flight, and the `panic_payload` slot on `QueryContext`. |
 
 TASK-505 itself ships only this design note — no code change. The
 implementation tasks above are gated on this doc landing on `main`.

@@ -462,11 +462,7 @@ fn external_cancel_via_query_options_returns_cancelled() {
         cancel: Some(token),
         ..QueryOptions::default()
     };
-    // Use ORDER BY so the SortOperator's pull loop has a yield-point
-    // check before draining the scan — the bare `events` query may
-    // run an empty-shard scan to EOS without observing the flag, but
-    // the sort path is unconditional.
-    match engine.query_with_options("events | ORDER BY ts ASC", &mut db, &opts) {
+    match engine.query_with_options("events", &mut db, &opts) {
         Err(bqlite_engine::ExecutionFailure {
             error: bqlite_core::BqliteError::Cancelled,
             ..

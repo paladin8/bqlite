@@ -538,9 +538,10 @@ pub struct EngineConfig {
 
 ### 8.2 Per-query override
 
-A future `QueryOptions` struct (TASK-510) will accept
-`memory_budget_bytes: Option<u64>`. When set, it replaces the
-engine-level default for that query only. Validation:
+The `QueryOptions` struct (scaffolded in TASK-510, public surface
+extended in TASK-538) accepts `memory_budget_bytes: Option<u64>`.
+When set, it replaces the engine-level default for that query only.
+Validation:
 
 - **Floor.** A query budget below `MIN_QUERY_BUDGET_BYTES = 512 MiB`
   is rejected at submission time. This is enough to hold the
