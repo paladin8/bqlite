@@ -67,7 +67,9 @@ use bqlite_planner::PhysicalPlan;
 use bqlite_storage::Database;
 
 use crate::bind::bind_physical;
-use crate::context::{resolve_query_budget, EngineConfig, QueryContext, QueryOptions};
+use crate::context::{
+    resolve_query_budget, CancelReason, EngineConfig, QueryContext, QueryOptions,
+};
 use crate::perf::{QueryMetrics, WorkerMetricsSnapshot};
 use crate::scheduler::MorselScheduler;
 
@@ -316,9 +318,29 @@ impl Engine {
             Ok(b) => b,
             Err(e) => return Err(ExecutionFailure::from(e)),
         };
-        let ctx = QueryContext::new(budget_bytes)
-            .with_spill_fs(db.spill_fs().clone())
-            .collect_cpu_metrics(options.collect_cpu_metrics);
+        // Install the caller-supplied cancellation token at construction
+        // time (constructor — not builder — so no observer sees the
+        // about-to-be-replaced default token). See cancellation.md §3.1.
+        let ctx = match options.cancel.clone() {
+            Some(token) => QueryContext::new_with_external_cancellation(budget_bytes, token),
+            None => QueryContext::new(budget_bytes),
+        }
+        .with_spill_fs(db.spill_fs().clone())
+        .collect_cpu_metrics(options.collect_cpu_metrics);
+
+        // Spawn the per-query timeout timer. The timer holds a clone
+        // of the context (cheap — every field is Arc) and self-exits
+        // when the driver flips its `completed` flag at return.
+        // `Duration::ZERO` is a deterministic-fire shorthand: the
+        // cancel reason is installed synchronously here, before
+        // `run_query_inner` runs. cancellation.md §3.1 source 2.
+        let _timer = options.timeout.map(|d| QueryTimer::spawn(ctx.clone(), d));
+
+        // Wall-clock for the `Cancelled → Timeout` rewrite below. The
+        // engine-level stamp covers parse + plan + bind + drive, so
+        // `elapsed_ms` reports the user-visible duration of the
+        // `Engine::query_with_options` call.
+        let started_at = std::time::Instant::now();
 
         // `AssertUnwindSafe` is required because `&mut Database` is
         // not `UnwindSafe` by default. This is sound here per
@@ -329,10 +351,13 @@ impl Engine {
         // `WarningSink` it carries is `Send + Sync`, so observing
         // it across the unwind boundary is fine.
         //
-        // The driver catches its own panic so a panic in any operator
-        // surfaces as `BqliteError::OperatorPanic` rather than
-        // aborting the process. TASK-541 generalizes this to
-        // per-worker `catch_unwind` boundaries.
+        // Panic boundary. After CP1.3 (TASK-538), `MorselScheduler::submit`
+        // catches worker panics at the worker boundary and surfaces
+        // them as `BqliteError::OperatorPanic`; this outer boundary
+        // becomes defense-in-depth covering the parse/plan/bind path
+        // and (until TASK-541) the in-thread DDL / DELETE / EXPLAIN
+        // path that bypasses the scheduler. Until CP1.3 lands, the
+        // outer boundary is the primary catch site for every panic.
         //
         // `run_query_inner` itself decides whether to dispatch the
         // operator-tree drive through the morsel scheduler (data-plane
@@ -351,15 +376,30 @@ impl Engine {
             // idempotent (mem::take), so reading it on the failure
             // paths below sees the already-drained buffer.
             Ok(Ok(result)) => Ok(result),
-            // Cooperative failure: pull the partial warnings the
-            // operators recorded before the error fired.
-            Ok(Err(error)) => Err(ExecutionFailure {
-                error,
-                warnings: ctx.warnings().clone().into_warnings(),
-            }),
+            // Cooperative failure. Pull the partial warnings the
+            // operators recorded before the error fired, then map a
+            // `Cancelled` whose first-fire reason is `Timeout` to the
+            // typed `Timeout` variant per cancellation.md §3.1.
+            Ok(Err(error)) => {
+                let warnings = ctx.warnings().clone().into_warnings();
+                let mapped = match (error, ctx.cancel_reason()) {
+                    (BqliteError::Cancelled, CancelReason::Timeout) => {
+                        let elapsed_ms =
+                            u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        BqliteError::Timeout { elapsed_ms }
+                    }
+                    (other, _) => other,
+                };
+                Err(ExecutionFailure {
+                    error: mapped,
+                    warnings,
+                })
+            }
             // Worker panic: surface as `OperatorPanic`. `location` is
             // always `None` until TASK-541 installs the project-local
-            // panic hook, per `cancellation.md` §4.1.
+            // panic hook, per `cancellation.md` §4.1. Panic always
+            // wins over timeout (cancellation.md §3.1 panic-precedence
+            // rule).
             Err(payload) => {
                 let message = panic_message(payload);
                 Err(ExecutionFailure {
@@ -370,6 +410,85 @@ impl Engine {
                     warnings: ctx.warnings().clone().into_warnings(),
                 })
             }
+        }
+    }
+}
+
+/// RAII handle for the per-query timeout timer.
+///
+/// Owns a one-shot "completed" flag the driver flips before returning,
+/// plus the timer thread's join handle. Drop unparks the thread (so
+/// it sees the flag immediately) and joins it. Idle wait uses
+/// [`std::thread::park_timeout`] rather than `sleep` so the timer
+/// wakes instantly on natural completion — no slice-boundary tax.
+///
+/// `Duration::ZERO` is a special case: the timer fires synchronously
+/// at spawn time and no thread is created. This makes timeout-fired
+/// tests deterministic without race-tolerant retries.
+struct QueryTimer {
+    completed: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl QueryTimer {
+    /// Spawn a timer that calls `ctx.cancel_with_reason(Timeout)` after
+    /// `duration`, unless the driver flips `completed` first.
+    ///
+    /// `Duration::ZERO` is handled synchronously (no thread spawn);
+    /// the cancel fires before this function returns.
+    fn spawn(ctx: QueryContext, duration: std::time::Duration) -> Self {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if duration.is_zero() {
+            // Synchronous fire: deterministic for tests, zero-thread
+            // overhead in any other zero-deadline path.
+            ctx.cancel_with_reason(CancelReason::Timeout);
+            completed.store(true, std::sync::atomic::Ordering::Release);
+            return Self {
+                completed,
+                handle: None,
+            };
+        }
+        let completed_inner = Arc::clone(&completed);
+        let handle = std::thread::Builder::new()
+            .name("bqlite-query-timeout".to_string())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                loop {
+                    if completed_inner.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    let remaining = duration.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    // park_timeout returns either when the timer
+                    // expires or when Drop calls unpark(). Either
+                    // way the next loop iteration re-checks the
+                    // completed flag and the elapsed budget.
+                    std::thread::park_timeout(remaining);
+                }
+                if !completed_inner.load(std::sync::atomic::Ordering::Acquire) {
+                    ctx.cancel_with_reason(CancelReason::Timeout);
+                }
+            })
+            .expect("spawn timeout timer");
+        Self {
+            completed,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for QueryTimer {
+    fn drop(&mut self) {
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            // Wake the parked timer thread so it observes the flag
+            // immediately rather than waiting out its remaining
+            // park_timeout window. join() then returns promptly.
+            h.thread().unpark();
+            let _ = h.join();
         }
     }
 }
@@ -827,6 +946,114 @@ mod tests {
                 );
             }
             other => panic!("expected Execution error, got {other:?}"),
+        }
+    }
+
+    // ── Public cancel / timeout surface (TASK-538) ──────────────────
+
+    #[test]
+    fn external_cancel_before_query_returns_cancelled() {
+        use crate::CancellationToken;
+        let scratch = Scratch::new("ext-cancel-pre");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let token = CancellationToken::new();
+        token.cancel(); // Pre-cancel: the very first yield-point should fire.
+        let opts = QueryOptions {
+            cancel: Some(token),
+            ..QueryOptions::default()
+        };
+        let err = engine
+            .query_with_options("events", &mut db, &opts)
+            .expect_err("pre-cancelled query must surface BqliteError::Cancelled");
+        assert!(
+            matches!(
+                &err,
+                ExecutionFailure {
+                    error: BqliteError::Cancelled,
+                    ..
+                }
+            ),
+            "expected Cancelled, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_zero_fires_synchronously_returns_timeout_error() {
+        // Duration::ZERO triggers the synchronous-fire branch in
+        // QueryTimer::spawn — the cancel reason is installed before
+        // run_query_inner is called, so the very first yield point
+        // observes Cancelled, and the result-collection arm maps it
+        // to BqliteError::Timeout via cancel_reason() == Timeout.
+        // Deterministic — no retry loop.
+        let scratch = Scratch::new("timeout-zero");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let opts = QueryOptions {
+            timeout: Some(std::time::Duration::ZERO),
+            ..QueryOptions::default()
+        };
+        let err = engine
+            .query_with_options("events", &mut db, &opts)
+            .expect_err("zero-duration timeout must fire deterministically");
+        match err {
+            ExecutionFailure {
+                error: BqliteError::Timeout { elapsed_ms },
+                ..
+            } => {
+                assert!(
+                    elapsed_ms < 60_000,
+                    "elapsed_ms must be reasonable, got {elapsed_ms}"
+                );
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_timeout_no_cancel_runs_normally() {
+        // A query without cancel/timeout completes successfully and
+        // the timer is never spawned — sanity check that the timer
+        // code is gated on `Some(timeout)`.
+        let scratch = Scratch::new("no-timeout");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let opts = QueryOptions::default();
+        let result = engine
+            .query_with_options("events", &mut db, &opts)
+            .expect("default opts must succeed");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn shared_cancel_token_observed_by_subsequent_queries() {
+        // The same `CancellationToken` is reusable across queries —
+        // pre-cancelling it cancels any future query that opts in.
+        use crate::CancellationToken;
+        let scratch = Scratch::new("shared-cancel");
+        let mut db = create_db_with_events(scratch.path());
+        let engine = Engine::new();
+        let token = CancellationToken::new();
+        token.cancel();
+
+        for label in ["first", "second"] {
+            let opts = QueryOptions {
+                cancel: Some(token.clone()),
+                ..QueryOptions::default()
+            };
+            let err = engine
+                .query_with_options("events", &mut db, &opts)
+                .expect_err("pre-cancelled token must cancel every query that opts in");
+            assert!(
+                matches!(
+                    &err,
+                    ExecutionFailure {
+                        error: BqliteError::Cancelled,
+                        ..
+                    }
+                ),
+                "{label}: expected Cancelled, got {err:?}"
+            );
         }
     }
 
