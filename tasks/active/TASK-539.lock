@@ -1,0 +1,7 @@
+{
+  "agent_id": "agent-4",
+  "task_id": "TASK-539",
+  "claimed_at": "2026-05-09T06:26:04Z",
+  "branch": "task/TASK-539",
+  "description": "Ingest partitioner spill stress + acceptance coverage (TASK-525, TASK-528 closure)"
+}
