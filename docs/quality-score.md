@@ -343,15 +343,18 @@ API surface. No crate is below **C** anywhere.
 
 All 34 numbered Wave 5 tasks have `.done` markers in
 `tasks/completed/` (TASK-501 through TASK-535, with TASK-530 retired
-before scheduling per the "numbers are never reused" rule); the
-Wave 5 acceptance gate (`tests/wave5_acceptance.rs`) passes end-to-end
-with 9 tests covering the four documented bands — multi-shard
-analytical query under the `MIN_QUERY_BUDGET_BYTES` floor,
-cancellation/timeout cleanup (contract-level only — see open gaps
-below), sort/cohort spill policy with no spill artefacts after
-return, and fused/zero-copy answer equivalence against hand-computed
-ground truth. One crate slipped one Docs sub-grade (bqlite-planner
-Docs B+ → B), one crate gained an Overall sub-grade (bqlite-engine
+before scheduling per the "numbers are never reused" rule), and all
+8 Wave 5 closure follow-ups landed between 2026-05-08 and 2026-05-09
+(TASK-536 through TASK-540, TASK-542 through TASK-544; TASK-541
+remains reserved per `engine/cancellation.md` §8). The Wave 5
+acceptance gate (`tests/wave5_acceptance.rs`) passes end-to-end with
+9 tests covering the four documented bands — multi-shard analytical
+query under the `MIN_QUERY_BUDGET_BYTES` floor, cancellation/timeout
+through the public `Engine::query_with_options` API, sort / cohort /
+ingest-partitioner spill policy with no spill artefacts after return,
+and fused/zero-copy answer equivalence against hand-computed ground
+truth. One crate slipped one Docs sub-grade (bqlite-planner Docs
+B+ → B), one crate gained an Overall sub-grade (bqlite-engine
 B+ → A-).
 
 Bench CI now invokes all 29 wave-scoped bench groups (TASK-543);
@@ -396,14 +399,22 @@ closure follow-ups*. The original Wave 5 task remains `.done` because
 it shipped the documented v1 scope; the follow-up task closes the
 delta to the spec's stated payoff.
 
+All seven gaps have been closed by the Wave 5 closure follow-ups
+landed between 2026-05-08 and 2026-05-09. The TASK-536 wording was
+also reconciled with `morsel-scheduler.md` §11.2 / §13.3 on
+2026-05-09 — the original closure-task spec asked for sub-shard
+`(shard, entity-range)` halving, but the design doc lists that as
+v1-out-of-scope (§13.3 open decision #3); TASK-545 now carries that
+work as a Wave 5+ follow-on that does not block Wave 6.
+
 | Gap | Cited evidence | Closure task |
 |---|---|---|
-| TASK-523 multi-core dispatch is scaffold-only — engine still dispatches "one degenerate whole-database task per query" | `crates/bqlite-engine/src/query.rs:454-487` | **TASK-536** |
-| TASK-524 worker idle/busy timing is zero; CPU counters are stubbed on every platform | `crates/bqlite-engine/src/perf.rs:21-31, 265-267` | **TASK-537** |
-| TASK-525 + TASK-528 cancellation/timeout coverage is contract-level only because `Engine::query` has no per-query cancel/timeout knob | `tests/wave5_runtime_stress.rs:21-23`, `tests/wave5_acceptance.rs:14-21` | **TASK-538** |
-| TASK-525 + TASK-528 ingest partitioner spill is out-of-scope of both the stress and acceptance suites | `tests/wave5_runtime_stress.rs:28`, `tests/wave5_acceptance.rs:32-34` | **TASK-539** |
-| TASK-525 same-database concurrent DELETE/query under scheduler pressure not covered | `tests/wave5_runtime_stress.rs:434-486` (separate-DB only) | **TASK-540** |
-| Finding 1 rustdoc warning trajectory (33 → 41 → 67 → 94) without a cleanup pass | this file, lines 145-160 | **TASK-542** |
+| TASK-523 multi-core dispatch is scaffold-only — engine still dispatches "one degenerate whole-database task per query" | `crates/bqlite-engine/src/query.rs:454-487` | **TASK-536** ✅ Closed — real per-shard fan-out via `MorselScheduler::run_per_shard` (commits d6848a4 / b50d7d3 / c32a8d2 / 4042516 / 3f47f73 / ffe7c32 / 46d04bc); sub-shard halving deferred to **TASK-545** per `morsel-scheduler.md` §11.2 / §13.3 |
+| TASK-524 worker idle/busy timing is zero; CPU counters are stubbed on every platform | `crates/bqlite-engine/src/perf.rs:21-31, 265-267` | **TASK-537** ✅ Closed — real `Instant::now()` deltas + Linux `perf_event_open`; bench upgraded to assert real metric values |
+| TASK-525 + TASK-528 cancellation/timeout coverage is contract-level only because `Engine::query` has no per-query cancel/timeout knob | `tests/wave5_runtime_stress.rs:21-23`, `tests/wave5_acceptance.rs:14-21` | **TASK-538** ✅ Closed — `Engine::query_with_options` + `QueryOptions { cancel, timeout, … }`; band 2 + stress now drive cancel/timeout through the public API |
+| TASK-525 + TASK-528 ingest partitioner spill is out-of-scope of both the stress and acceptance suites | `tests/wave5_runtime_stress.rs:28`, `tests/wave5_acceptance.rs:32-34` | **TASK-539** ✅ Closed — `ingest_partitioner_spill` stress test + acceptance band 3 leg |
+| TASK-525 same-database concurrent DELETE/query under scheduler pressure not covered | `tests/wave5_runtime_stress.rs:434-486` (separate-DB only) | **TASK-540** ✅ Closed — same-DB tests in 1-thread + 4-thread + `cfg(stress)` 1000-iter variants |
+| Finding 1 rustdoc warning trajectory (33 → 41 → 67 → 94) without a cleanup pass | this file, lines 145-160 | **TASK-542** ✅ Closed — 94 → 1 warnings; `RUSTDOCFLAGS=-D warnings` CI gate |
 | 14 wave-scoped Criterion bench groups still not in CI's invocation list | `.github/workflows/bench.yml` (15-of-29) | **TASK-543** ✅ Closed — all 29 groups now in CI |
 
 **Wave 6 readiness.** TASK-544 (2026-05-09) satisfies the "named owner +
