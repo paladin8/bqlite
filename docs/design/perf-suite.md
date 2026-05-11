@@ -239,13 +239,15 @@ pub fn criterion_for_scale(scale: BenchScale) -> Criterion {
         BenchScale::Small  => Criterion::default().sample_size(50).warm_up(1s).measure(3s),
         BenchScale::Medium => Criterion::default().sample_size(20).warm_up(3s).measure(10s),
         BenchScale::Large  => Criterion::default().sample_size(10).warm_up(5s).measure(30s),
-        BenchScale::XLarge => Criterion::default().sample_size(5).warm_up(10s).measure(60s),
+        BenchScale::XLarge => Criterion::default().sample_size(10).warm_up(10s).measure(60s),
     }
 }
 ```
 
-XLarge runs the full bench suite in approximately
-**`(60s measure + 10s warm-up + 5 samples × per-bench overhead) × ~50 benches`**
+Criterion 0.5 enforces `sample_size >= 10` (panics otherwise), so `XLarge`
+runs the same 10-sample floor as `Large` but with longer per-sample
+measurement. XLarge runs the full bench suite in approximately
+**`(60s measure + 10s warm-up + 10 samples × per-bench overhead) × ~50 benches`**
 — budget several hours.
 
 ## 4. Workflow

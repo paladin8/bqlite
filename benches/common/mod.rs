@@ -264,7 +264,7 @@ pub fn criterion_for_scale(scale: BenchScale) -> Criterion {
             .warm_up_time(Duration::from_secs(5))
             .measurement_time(Duration::from_secs(30)),
         BenchScale::XLarge => Criterion::default()
-            .sample_size(10)
+            .sample_size(10) // Criterion-enforced minimum
             .warm_up_time(Duration::from_secs(10))
             .measurement_time(Duration::from_secs(60)),
     }
@@ -857,7 +857,14 @@ pub const STREAMING_DEFAULT_SEED: u64 = 0xBEACA15E;
 /// Default chunk size in events. At ~150 B/event this is ~150 MiB per
 /// chunk, comfortably below per-process memory budgets at every scale.
 pub const STREAMING_DEFAULT_CHUNK: usize = 1_000_000;
-/// Default Zipf-like skew exponent. Higher = more concentrated.
+/// Default Zipf-like skew exponent. Higher = more concentrated head.
+///
+/// With `alpha = 1.0` (true Zipf) and 10K entities the top 1% own
+/// roughly half of all events; with 1M entities the top 1% own about
+/// 30% — a realistic behavioural-workload shape. Higher values
+/// (e.g. 1.5) over-concentrate the head to the point a single entity
+/// owns tens of percent of all events, which inflates fixture build
+/// memory and dominates bench results with one hot entity.
 pub const STREAMING_DEFAULT_SKEW: f64 = 1.0;
 
 /// Configuration for [`StreamingEventGenerator`]. Defaults derive from
@@ -930,7 +937,9 @@ impl StreamingEventGenerator {
     where
         F: FnMut(&[Event]),
     {
-        let labels = event_type_labels();
+        let labels: Vec<String> = (0..self.cfg.event_type_count.max(1))
+            .map(|i| format!("event_{i}"))
+            .collect();
         let mut buf: Vec<Event> = Vec::with_capacity(self.cfg.chunk_size);
         let base_ns: i64 = 1_735_689_600_000_000_000; // 2025-01-01T00:00:00Z
         let step_ns: i64 = 60_000_000_000; // 1 minute per event
@@ -988,10 +997,12 @@ impl StreamingEventGenerator {
 ///
 /// Entity at index `i` (0-based) receives `floor(N * w_i / W)` events
 /// where `w_i = 1 / (i + 1)^alpha`. Rounding shortfall is added to
-/// entity 0 so the total matches `total` exactly. With `alpha = 1.5`
-/// and 10K entities the top 1% own roughly a third of events; with
-/// `alpha = 1.0` (true Zipf) the head is heavier still. `alpha = 0`
-/// degenerates to uniform.
+/// entity 0 so the total matches `total` exactly. Higher `alpha`
+/// concentrates more events on the lowest-index entities; with
+/// `alpha = 1.0` (true Zipf) and 10K entities the top 1% own roughly
+/// half of all events. `alpha = 1.5` is *more* concentrated still and
+/// pushes a single entity past 30% of events at moderate entity counts.
+/// `alpha = 0` degenerates to uniform.
 fn zipf_event_allocation(total: u64, entity_count: u64, alpha: f64) -> Vec<u64> {
     if entity_count == 0 || total == 0 {
         return Vec::new();
@@ -1048,6 +1059,7 @@ pub struct FixtureManifest {
 /// See `docs/design/perf-suite.md` §3.3.
 pub struct PersistentFixture {
     pub root: PathBuf,
+    pub db_path: PathBuf,
     pub manifest: FixtureManifest,
 }
 
@@ -1159,6 +1171,7 @@ impl PersistentFixture {
 
         Self {
             root: fixture_root,
+            db_path,
             manifest,
         }
     }
@@ -1166,11 +1179,7 @@ impl PersistentFixture {
     /// Path to the materialized `Database` directory. Open with
     /// [`bqlite_storage::Database::open`].
     pub fn db_path(&self) -> &Path {
-        // The db lives at `<root>/db/`.
-        // Returning a sub-path requires storing it; recompute on demand.
-        // SAFETY: root is initialized at construction; child path is a
-        // stable string literal.
-        static_db_path_for(&self.root)
+        &self.db_path
     }
 
     /// Convenience: open the database. Bench files should typically
@@ -1178,30 +1187,6 @@ impl PersistentFixture {
     pub fn open_db(&self) -> bqlite_storage::Database {
         bqlite_storage::Database::open(self.db_path()).expect("open fixture database")
     }
-}
-
-fn static_db_path_for(root: &Path) -> &Path {
-    // `Path::new` is zero-cost on str, but we need to extend `root`.
-    // Use a thread-local cache so the returned reference stays valid
-    // for the lifetime of the fixture.
-    //
-    // Simpler approach: store the joined path in PersistentFixture.
-    // But we want db_path() to return &Path, so cache it in a static
-    // map keyed by root. For bench usage there's typically one
-    // fixture per process, so a small LRU isn't required.
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, &'static Path>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("fixture db_path cache poisoned");
-    if let Some(p) = guard.get(root) {
-        return p;
-    }
-    let owned: PathBuf = root.join("db");
-    let leaked: &'static Path = Box::leak(owned.into_boxed_path());
-    guard.insert(root.to_path_buf(), leaked);
-    leaked
 }
 
 fn resolve_fixture_cache_dir() -> PathBuf {
@@ -1247,11 +1232,13 @@ fn load_existing_fixture(
     if now.saturating_sub(manifest.built_at_secs) > PersistentFixture::MAX_AGE_SECS {
         return None;
     }
+    let root = manifest_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
     Some(PersistentFixture {
-        root: manifest_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(".")),
+        db_path: root.join("db"),
+        root,
         manifest,
     })
 }
@@ -1740,6 +1727,41 @@ mod tests {
         assert_eq!(again.manifest.built_at_secs, fixture.manifest.built_at_secs);
 
         std::env::remove_var("BQLITE_BENCH_CACHE_DIR");
+    }
+
+    #[test]
+    fn streaming_generator_honors_event_type_count() {
+        for k in [1usize, 3, 20, 50] {
+            let cfg = StreamingConfig {
+                total_events: 500,
+                entity_count: 25,
+                event_type_count: k,
+                entity_skew: 1.0,
+                seed: 0,
+                chunk_size: 128,
+            };
+            let gen = StreamingEventGenerator::with_config(cfg);
+            let mut seen = std::collections::BTreeSet::new();
+            gen.for_each_chunk(|chunk| {
+                for ev in chunk {
+                    seen.insert(ev.event_type.clone());
+                }
+            });
+            assert!(
+                seen.len() <= k,
+                "event_type_count={k} but observed {} distinct types: {seen:?}",
+                seen.len()
+            );
+            // For sufficient rows we should hit every label.
+            if 500 >= k * 4 {
+                assert_eq!(
+                    seen.len(),
+                    k,
+                    "expected all {k} labels to appear, got {}",
+                    seen.len()
+                );
+            }
+        }
     }
 
     #[test]
