@@ -25,6 +25,7 @@ arrow = { workspace = true }
 criterion = { workspace = true }
 parquet = { workspace = true }
 pprof = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 compact_str = { workspace = true }
 fsst = { workspace = true }

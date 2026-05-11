@@ -420,6 +420,7 @@ dependencies = [
  "fsst",
  "parquet",
  "pprof",
+ "serde",
  "serde_json",
 ]
 

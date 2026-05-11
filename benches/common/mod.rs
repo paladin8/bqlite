@@ -139,6 +139,80 @@ impl BenchSizing {
     }
 }
 
+// ── Bench scale (TASK-546) ──────────────────────────────────────────────────
+
+/// Headline-throughput dataset size selector for the `bench-perf` suite.
+///
+/// Orthogonal to [`BenchMode`]: `Mode` controls hard-target enforcement;
+/// `BenchScale` controls fixture size. The same bench file runs at any
+/// scale.
+///
+/// See `docs/design/perf-suite.md` §3.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchScale {
+    /// 1M rows. Sub-second iteration; validates wiring.
+    Small,
+    /// 100M rows. Wave 5 reference-mode acceptance gate.
+    Medium,
+    /// 1B rows. Stress.
+    Large,
+    /// 10B rows. Headline production run.
+    XLarge,
+}
+
+impl BenchScale {
+    /// Read the scale from `BQLITE_BENCH_SCALE`. Defaults to `Small`.
+    pub fn from_env() -> Self {
+        match std::env::var("BQLITE_BENCH_SCALE").as_deref() {
+            Ok("small") | Err(_) => BenchScale::Small,
+            Ok("medium") => BenchScale::Medium,
+            Ok("large") => BenchScale::Large,
+            Ok("xlarge") => BenchScale::XLarge,
+            Ok(other) => {
+                eprintln!(
+                    "WARNING: unknown BQLITE_BENCH_SCALE={other:?}, \
+                     expected \"small\" / \"medium\" / \"large\" / \"xlarge\". \
+                     Falling back to small."
+                );
+                BenchScale::Small
+            }
+        }
+    }
+
+    /// Total number of events the scale's fixture contains.
+    pub fn rows(self) -> u64 {
+        match self {
+            BenchScale::Small => 1_000_000,
+            BenchScale::Medium => 100_000_000,
+            BenchScale::Large => 1_000_000_000,
+            BenchScale::XLarge => 10_000_000_000,
+        }
+    }
+
+    /// Distinct entity-id count: scales sub-linearly with rows so that
+    /// average events-per-entity grows with scale (matches real-world
+    /// workloads where bigger datasets cover longer histories per
+    /// entity rather than only adding new entities).
+    pub fn entity_count(self) -> u64 {
+        match self {
+            BenchScale::Small => 10_000,
+            BenchScale::Medium => 100_000,
+            BenchScale::Large => 1_000_000,
+            BenchScale::XLarge => 10_000_000,
+        }
+    }
+
+    /// Short, lower-case label used in cache paths and report tables.
+    pub fn label(self) -> &'static str {
+        match self {
+            BenchScale::Small => "small",
+            BenchScale::Medium => "medium",
+            BenchScale::Large => "large",
+            BenchScale::XLarge => "xlarge",
+        }
+    }
+}
+
 // ── Criterion configuration ─────────────────────────────────────────────────
 
 /// Standard Criterion config for Wave 2 benches: reduced sample size
@@ -165,6 +239,34 @@ pub fn criterion_for_mode(mode: BenchMode) -> Criterion {
     match mode {
         BenchMode::Ci => wave2_criterion(),
         BenchMode::Reference => reference_criterion(),
+    }
+}
+
+/// Criterion configuration scaled to fixture size for the `bench-perf`
+/// suite. Larger fixtures get fewer samples but much longer measurement
+/// time, on the assumption that variance per sample is small at scale
+/// but per-iteration cost is large.
+///
+/// See `docs/design/perf-suite.md` §3.6.
+pub fn criterion_for_scale(scale: BenchScale) -> Criterion {
+    use std::time::Duration;
+    match scale {
+        BenchScale::Small => Criterion::default()
+            .sample_size(50)
+            .warm_up_time(Duration::from_secs(1))
+            .measurement_time(Duration::from_secs(3)),
+        BenchScale::Medium => Criterion::default()
+            .sample_size(20)
+            .warm_up_time(Duration::from_secs(3))
+            .measurement_time(Duration::from_secs(10)),
+        BenchScale::Large => Criterion::default()
+            .sample_size(10)
+            .warm_up_time(Duration::from_secs(5))
+            .measurement_time(Duration::from_secs(30)),
+        BenchScale::XLarge => Criterion::default()
+            .sample_size(10)
+            .warm_up_time(Duration::from_secs(10))
+            .measurement_time(Duration::from_secs(60)),
     }
 }
 
@@ -747,6 +849,483 @@ pub fn compute_event_bytes(events: &[Event]) -> u64 {
         .sum()
 }
 
+// ── Streaming event generator (TASK-546) ────────────────────────────────────
+
+/// Default seed for [`StreamingEventGenerator`]. Recorded in the
+/// `bench-perf` report's methodology section so runs are reproducible.
+pub const STREAMING_DEFAULT_SEED: u64 = 0xBEACA15E;
+/// Default chunk size in events. At ~150 B/event this is ~150 MiB per
+/// chunk, comfortably below per-process memory budgets at every scale.
+pub const STREAMING_DEFAULT_CHUNK: usize = 1_000_000;
+/// Default Zipf-like skew exponent. Higher = more concentrated.
+pub const STREAMING_DEFAULT_SKEW: f64 = 1.0;
+
+/// Configuration for [`StreamingEventGenerator`]. Defaults derive from
+/// the chosen [`BenchScale`].
+#[derive(Debug, Clone)]
+pub struct StreamingConfig {
+    pub total_events: u64,
+    pub entity_count: u64,
+    pub event_type_count: usize,
+    pub entity_skew: f64,
+    pub seed: u64,
+    pub chunk_size: usize,
+}
+
+impl StreamingConfig {
+    pub fn for_scale(scale: BenchScale) -> Self {
+        Self {
+            total_events: scale.rows(),
+            entity_count: scale.entity_count(),
+            event_type_count: REF_EVENT_TYPE_COUNT,
+            entity_skew: STREAMING_DEFAULT_SKEW,
+            seed: STREAMING_DEFAULT_SEED,
+            chunk_size: STREAMING_DEFAULT_CHUNK,
+        }
+    }
+}
+
+/// Streaming, deterministic event generator with power-law entity
+/// skew. Yields events in fixed-size chunks via a callback so total
+/// memory stays bounded regardless of fixture size.
+///
+/// Output ordering: entities are emitted in monotonically-increasing
+/// entity-id-string order; within each entity timestamps are monotonic.
+/// This matches the partitioner's expectation.
+///
+/// See `docs/design/perf-suite.md` §3.2.
+pub struct StreamingEventGenerator {
+    cfg: StreamingConfig,
+    per_entity_counts: Vec<u64>,
+}
+
+impl StreamingEventGenerator {
+    pub fn for_scale(scale: BenchScale) -> Self {
+        Self::with_config(StreamingConfig::for_scale(scale))
+    }
+
+    pub fn with_config(cfg: StreamingConfig) -> Self {
+        let per_entity_counts =
+            zipf_event_allocation(cfg.total_events, cfg.entity_count, cfg.entity_skew);
+        Self {
+            cfg,
+            per_entity_counts,
+        }
+    }
+
+    pub fn config(&self) -> &StreamingConfig {
+        &self.cfg
+    }
+
+    /// Exact total event count this generator will yield. Equal to
+    /// `cfg.total_events` modulo rounding from the allocation step.
+    pub fn total_events(&self) -> u64 {
+        self.per_entity_counts.iter().sum()
+    }
+
+    /// Walk the entire fixture, invoking `f` on each chunk of at most
+    /// `cfg.chunk_size` events. The slice passed to `f` is reused
+    /// across calls — copy out what you need before returning.
+    pub fn for_each_chunk<F>(&self, mut f: F)
+    where
+        F: FnMut(&[Event]),
+    {
+        let labels = event_type_labels();
+        let mut buf: Vec<Event> = Vec::with_capacity(self.cfg.chunk_size);
+        let base_ns: i64 = 1_735_689_600_000_000_000; // 2025-01-01T00:00:00Z
+        let step_ns: i64 = 60_000_000_000; // 1 minute per event
+
+        for (entity_idx, &count) in self.per_entity_counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let entity = EntityId::String(format!("user_{entity_idx:08}"));
+            let entity_offset_ns =
+                splitmix64(self.cfg.seed.wrapping_add(entity_idx as u64)) as i64 % step_ns;
+
+            for ev_idx in 0..count {
+                let ts =
+                    Timestamp::from_nanos(base_ns + entity_offset_ns + (ev_idx as i64) * step_ns);
+                let event_type =
+                    labels[((entity_idx as u64 + ev_idx) as usize) % labels.len()].clone();
+                let amount = ((ev_idx as i64) % 5000) + 1;
+                let price = 9.99 + ((ev_idx % 1024) as f64) * 0.01;
+                let category = format!("cat_{}", ev_idx % 16);
+                let quantity = (ev_idx as i64 % 10) + 1;
+                let discount = if ev_idx % 3 == 0 { 0.1 } else { 0.0 };
+                let region = format!("region_{}", entity_idx % 8);
+                let flag = ev_idx % 2 == 0;
+
+                buf.push(Event::with_properties(
+                    entity.clone(),
+                    ts,
+                    event_type,
+                    vec![
+                        ("amount".into(), PropertyValue::Int(amount)),
+                        ("price".into(), PropertyValue::Float(price)),
+                        ("category".into(), PropertyValue::String(category)),
+                        ("quantity".into(), PropertyValue::Int(quantity)),
+                        ("discount".into(), PropertyValue::Float(discount)),
+                        ("region".into(), PropertyValue::String(region)),
+                        ("flag".into(), PropertyValue::Bool(flag)),
+                    ],
+                ));
+
+                if buf.len() >= self.cfg.chunk_size {
+                    f(&buf);
+                    buf.clear();
+                }
+            }
+        }
+
+        if !buf.is_empty() {
+            f(&buf);
+        }
+    }
+}
+
+/// Zipf-like event-count allocation across entities.
+///
+/// Entity at index `i` (0-based) receives `floor(N * w_i / W)` events
+/// where `w_i = 1 / (i + 1)^alpha`. Rounding shortfall is added to
+/// entity 0 so the total matches `total` exactly. With `alpha = 1.5`
+/// and 10K entities the top 1% own roughly a third of events; with
+/// `alpha = 1.0` (true Zipf) the head is heavier still. `alpha = 0`
+/// degenerates to uniform.
+fn zipf_event_allocation(total: u64, entity_count: u64, alpha: f64) -> Vec<u64> {
+    if entity_count == 0 || total == 0 {
+        return Vec::new();
+    }
+    let n = entity_count as usize;
+    let mut weights: Vec<f64> = (0..n).map(|i| 1.0 / ((i + 1) as f64).powf(alpha)).collect();
+    let total_weight: f64 = weights.iter().sum();
+    for w in &mut weights {
+        *w /= total_weight;
+    }
+    let mut counts: Vec<u64> = weights
+        .iter()
+        .map(|w| ((*w) * (total as f64)).floor() as u64)
+        .collect();
+    let assigned: u64 = counts.iter().sum();
+    let mut leftover = total.saturating_sub(assigned);
+    // Distribute the remainder to the heaviest entities so the head
+    // stays heavy even after rounding.
+    let mut i = 0usize;
+    while leftover > 0 && i < counts.len() {
+        counts[i] += 1;
+        leftover -= 1;
+        i += 1;
+    }
+    counts
+}
+
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
+}
+
+// ── Persistent fixture cache (TASK-546) ─────────────────────────────────────
+
+/// Manifest written next to each cached fixture database. Stored as
+/// pretty JSON for easy human inspection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FixtureManifest {
+    pub scale: String,
+    pub seed: u64,
+    pub schema_version: u32,
+    pub rows: u64,
+    pub bytes_logical: u64,
+    /// Wall-clock build time in seconds since the UNIX epoch.
+    pub built_at_secs: u64,
+}
+
+/// A fully-built `Database` materialized on disk and reusable across
+/// bench iterations and runs. Keyed by `(scale, seed, schema_version)`.
+///
+/// See `docs/design/perf-suite.md` §3.3.
+pub struct PersistentFixture {
+    pub root: PathBuf,
+    pub manifest: FixtureManifest,
+}
+
+impl PersistentFixture {
+    /// Bump whenever the streaming generator's event shape or the
+    /// fixture's table schema changes — forces existing caches to
+    /// rebuild.
+    pub const SCHEMA_VERSION: u32 = 1;
+    pub const DEFAULT_TABLE: &'static str = "purchases";
+    /// Maximum age, in seconds, before a cached fixture is rebuilt
+    /// (90 days). Generator changes are caught by `SCHEMA_VERSION`;
+    /// this guard catches subtler bit-rot (filesystem corruption,
+    /// retroactive Database format changes).
+    pub const MAX_AGE_SECS: u64 = 90 * 24 * 60 * 60;
+    /// Shard count for fixture databases.
+    pub const SHARD_COUNT: u16 = 32;
+    /// Partitioner buffer budget during fixture build. The spill
+    /// directory beneath the fixture root absorbs the rest.
+    pub const PARTITIONER_BUDGET_BYTES: usize = 1 << 30; // 1 GiB
+
+    /// Open the cached fixture for `scale` with the default seed, or
+    /// build it if absent / stale. Panics on build failure — bench
+    /// harnesses cannot recover from a fixture that won't materialize.
+    pub fn load_or_build(scale: BenchScale) -> Self {
+        Self::load_or_build_with(scale, STREAMING_DEFAULT_SEED)
+    }
+
+    pub fn load_or_build_with(scale: BenchScale, seed: u64) -> Self {
+        let cache_dir = resolve_fixture_cache_dir();
+        let fixture_root = cache_dir.join(format!(
+            "fixture-{}-seed{:#018x}-v{}",
+            scale.label(),
+            seed,
+            Self::SCHEMA_VERSION,
+        ));
+        let manifest_path = fixture_root.join("manifest.json");
+        let db_path = fixture_root.join("db");
+
+        let force_rebuild = matches!(
+            std::env::var("BQLITE_BENCH_REGEN").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+
+        if !force_rebuild {
+            if let Some(existing) =
+                load_existing_fixture(&manifest_path, &db_path, scale, seed, Self::SCHEMA_VERSION)
+            {
+                eprintln!(
+                    "  [fixture] reusing cached fixture at {} ({} rows, {} bytes_logical)",
+                    fixture_root.display(),
+                    existing.manifest.rows,
+                    existing.manifest.bytes_logical,
+                );
+                return existing;
+            }
+        }
+
+        if fixture_root.exists() {
+            eprintln!(
+                "  [fixture] removing stale fixture at {}",
+                fixture_root.display()
+            );
+            let _ = std::fs::remove_dir_all(&fixture_root);
+        }
+        std::fs::create_dir_all(&fixture_root).expect("create fixture root");
+
+        eprintln!(
+            "  [fixture] building scale={} seed={:#018x} rows={} entities={} at {}",
+            scale.label(),
+            seed,
+            scale.rows(),
+            scale.entity_count(),
+            fixture_root.display(),
+        );
+
+        let cfg = StreamingConfig {
+            total_events: scale.rows(),
+            entity_count: scale.entity_count(),
+            event_type_count: REF_EVENT_TYPE_COUNT,
+            entity_skew: STREAMING_DEFAULT_SKEW,
+            seed,
+            chunk_size: STREAMING_DEFAULT_CHUNK,
+        };
+        let generator = StreamingEventGenerator::with_config(cfg);
+
+        let start = std::time::Instant::now();
+        let (rows, bytes_logical) = build_fixture_database(&db_path, &generator);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "  [fixture] built {} rows ({:.2} GiB logical) in {:.1}s ({:.2}M rows/s)",
+            rows,
+            (bytes_logical as f64) / (1u64 << 30) as f64,
+            elapsed.as_secs_f64(),
+            (rows as f64) / elapsed.as_secs_f64() / 1_000_000.0,
+        );
+
+        let manifest = FixtureManifest {
+            scale: scale.label().to_string(),
+            seed,
+            schema_version: Self::SCHEMA_VERSION,
+            rows,
+            bytes_logical,
+            built_at_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        write_manifest_atomic(&manifest_path, &manifest);
+
+        Self {
+            root: fixture_root,
+            manifest,
+        }
+    }
+
+    /// Path to the materialized `Database` directory. Open with
+    /// [`bqlite_storage::Database::open`].
+    pub fn db_path(&self) -> &Path {
+        // The db lives at `<root>/db/`.
+        // Returning a sub-path requires storing it; recompute on demand.
+        // SAFETY: root is initialized at construction; child path is a
+        // stable string literal.
+        static_db_path_for(&self.root)
+    }
+
+    /// Convenience: open the database. Bench files should typically
+    /// open once and reuse the handle across iterations.
+    pub fn open_db(&self) -> bqlite_storage::Database {
+        bqlite_storage::Database::open(self.db_path()).expect("open fixture database")
+    }
+}
+
+fn static_db_path_for(root: &Path) -> &Path {
+    // `Path::new` is zero-cost on str, but we need to extend `root`.
+    // Use a thread-local cache so the returned reference stays valid
+    // for the lifetime of the fixture.
+    //
+    // Simpler approach: store the joined path in PersistentFixture.
+    // But we want db_path() to return &Path, so cache it in a static
+    // map keyed by root. For bench usage there's typically one
+    // fixture per process, so a small LRU isn't required.
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, &'static Path>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().expect("fixture db_path cache poisoned");
+    if let Some(p) = guard.get(root) {
+        return p;
+    }
+    let owned: PathBuf = root.join("db");
+    let leaked: &'static Path = Box::leak(owned.into_boxed_path());
+    guard.insert(root.to_path_buf(), leaked);
+    leaked
+}
+
+fn resolve_fixture_cache_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("BQLITE_BENCH_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            std::env::var("CARGO_MANIFEST_DIR").map(|m| {
+                PathBuf::from(m)
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join("target")
+            })
+        })
+        .unwrap_or_else(|_| PathBuf::from("target"));
+    target_dir.join("bench-fixtures")
+}
+
+fn load_existing_fixture(
+    manifest_path: &Path,
+    db_path: &Path,
+    scale: BenchScale,
+    seed: u64,
+    schema_version: u32,
+) -> Option<PersistentFixture> {
+    let raw = std::fs::read_to_string(manifest_path).ok()?;
+    let manifest: FixtureManifest = serde_json::from_str(&raw).ok()?;
+    if manifest.scale != scale.label()
+        || manifest.seed != seed
+        || manifest.schema_version != schema_version
+    {
+        return None;
+    }
+    if !db_path.is_dir() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(manifest.built_at_secs) > PersistentFixture::MAX_AGE_SECS {
+        return None;
+    }
+    Some(PersistentFixture {
+        root: manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+        manifest,
+    })
+}
+
+fn write_manifest_atomic(path: &Path, manifest: &FixtureManifest) {
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(manifest).expect("serialize manifest");
+    let mut f = std::fs::File::create(&tmp).expect("create manifest tmp");
+    f.write_all(json.as_bytes()).expect("write manifest tmp");
+    f.sync_all().expect("sync manifest tmp");
+    std::fs::rename(&tmp, path).expect("rename manifest");
+}
+
+fn build_fixture_database(db_path: &Path, generator: &StreamingEventGenerator) -> (u64, u64) {
+    use bqlite_storage::ingest::partitioner::Partitioner;
+    use bqlite_storage::writer::SegmentWriter;
+
+    std::fs::create_dir_all(db_path).expect("create fixture db dir");
+    let schema = purchases_schema();
+    let mut db = bqlite_storage::Database::create_with_shards(db_path, PersistentFixture::SHARD_COUNT)
+        .expect("create fixture db");
+    db.create_table(PersistentFixture::DEFAULT_TABLE.to_string(), schema)
+        .expect("create fixture table");
+
+    let batch_id = db
+        .allocate_batch_id(PersistentFixture::DEFAULT_TABLE)
+        .expect("allocate batch id");
+    let spill_dir = db_path.parent().unwrap_or(db_path).join("ingest-spill");
+    std::fs::create_dir_all(&spill_dir).expect("create ingest spill dir");
+
+    let mut partitioner = Partitioner::with_spill_dir(
+        PersistentFixture::SHARD_COUNT,
+        30,
+        batch_id,
+        PersistentFixture::PARTITIONER_BUDGET_BYTES,
+        spill_dir.clone(),
+    )
+    .expect("partitioner init");
+
+    let mut rows: u64 = 0;
+    let mut bytes_logical: u64 = 0;
+    let mut last_logged_rows: u64 = 0;
+    let target = generator.cfg.total_events;
+    let log_every = (target / 20).max(1_000_000);
+    generator.for_each_chunk(|chunk| {
+        bytes_logical += compute_event_bytes(chunk);
+        for event in chunk {
+            partitioner
+                .push_event(event.clone())
+                .expect("partitioner push_event");
+            rows += 1;
+        }
+        if rows.saturating_sub(last_logged_rows) >= log_every {
+            eprintln!(
+                "  [fixture] ingest progress: {rows} / {target} rows ({:.1}%)",
+                (rows as f64) / (target as f64) * 100.0
+            );
+            last_logged_rows = rows;
+        }
+    });
+
+    let mut writer = SegmentWriter::new(&mut db);
+    let _metas = writer
+        .write_partitioner(PersistentFixture::DEFAULT_TABLE, partitioner)
+        .expect("write_partitioner");
+
+    // Best-effort cleanup of any leftover spill files. The Partitioner
+    // is consumed; remaining files (if any) are spill scratch we
+    // created.
+    let _ = std::fs::remove_dir_all(&spill_dir);
+
+    (rows, bytes_logical)
+}
+
 // ── Database setup helpers ───────────────────────────────────────────────────
 
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1028,5 +1607,156 @@ mod tests {
             Some(BenchTarget::at_least(100.0)),
         );
         c.finish();
+    }
+
+    // ── BenchScale tests (TASK-546) ────────────────────────────────────────
+
+    #[test]
+    fn bench_scale_rows_grow_monotonically() {
+        assert!(BenchScale::Small.rows() < BenchScale::Medium.rows());
+        assert!(BenchScale::Medium.rows() < BenchScale::Large.rows());
+        assert!(BenchScale::Large.rows() < BenchScale::XLarge.rows());
+    }
+
+    #[test]
+    fn bench_scale_labels_round_trip() {
+        for scale in [
+            BenchScale::Small,
+            BenchScale::Medium,
+            BenchScale::Large,
+            BenchScale::XLarge,
+        ] {
+            assert!(!scale.label().is_empty());
+            assert!(scale.rows() > 0);
+            assert!(scale.entity_count() > 0);
+        }
+    }
+
+    // ── Streaming generator tests (TASK-546) ──────────────────────────────
+
+    #[test]
+    fn zipf_allocation_sums_to_total() {
+        let counts = zipf_event_allocation(1_000, 100, 1.5);
+        let sum: u64 = counts.iter().sum();
+        assert_eq!(sum, 1_000);
+    }
+
+    #[test]
+    fn zipf_allocation_is_monotonically_non_increasing() {
+        // Higher-rank entities should not receive more events than
+        // lower-rank ones when alpha > 0.
+        let counts = zipf_event_allocation(100_000, 1_000, 1.0);
+        for w in counts.windows(2) {
+            assert!(
+                w[0] >= w[1],
+                "non-monotone: counts[i]={}, counts[i+1]={}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn zipf_uniform_when_alpha_zero() {
+        let counts = zipf_event_allocation(100, 10, 0.0);
+        // With alpha=0 every entity gets weight 1, so counts differ by
+        // at most 1 (rounding remainder distributed to the head).
+        let max = *counts.iter().max().unwrap();
+        let min = *counts.iter().min().unwrap();
+        assert!(max - min <= 1, "uniform should differ by ≤ 1: {counts:?}");
+    }
+
+    #[test]
+    fn streaming_generator_yields_total_events() {
+        let cfg = StreamingConfig {
+            total_events: 1_000,
+            entity_count: 100,
+            event_type_count: REF_EVENT_TYPE_COUNT,
+            entity_skew: 1.0,
+            seed: 42,
+            chunk_size: 128,
+        };
+        let gen = StreamingEventGenerator::with_config(cfg);
+        let mut total = 0u64;
+        gen.for_each_chunk(|chunk| total += chunk.len() as u64);
+        assert_eq!(total, gen.total_events());
+        assert_eq!(total, 1_000);
+    }
+
+    #[test]
+    fn streaming_generator_yields_sorted_chunks() {
+        let cfg = StreamingConfig {
+            total_events: 5_000,
+            entity_count: 200,
+            event_type_count: REF_EVENT_TYPE_COUNT,
+            entity_skew: 1.5,
+            seed: 7,
+            chunk_size: 256,
+        };
+        let gen = StreamingEventGenerator::with_config(cfg);
+        let mut last: Option<(EntityId, Timestamp)> = None;
+        gen.for_each_chunk(|chunk| {
+            for ev in chunk {
+                let key = (ev.entity.clone(), ev.timestamp);
+                if let Some(prev) = &last {
+                    assert!(
+                        prev <= &key,
+                        "events not sorted: {:?} > {:?}",
+                        prev,
+                        key,
+                    );
+                }
+                last = Some(key);
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "builds a 100K-event database; run with --ignored"]
+    fn fixture_load_or_build_round_trip() {
+        // Use a temp dir so we don't leave artefacts in target/.
+        let tmp = ScratchDir::new("fixture-smoke");
+        std::fs::create_dir_all(tmp.path()).expect("create tmp");
+        std::env::set_var("BQLITE_BENCH_CACHE_DIR", tmp.path());
+
+        // Override scale to a CI-friendly size by going through the
+        // config directly. We don't expose a public Small-override on
+        // PersistentFixture, so the test uses BenchScale::Small (1M
+        // rows) — this is still a few-second build.
+        let fixture = PersistentFixture::load_or_build(BenchScale::Small);
+        assert_eq!(fixture.manifest.scale, "small");
+        assert_eq!(fixture.manifest.seed, STREAMING_DEFAULT_SEED);
+        assert_eq!(fixture.manifest.schema_version, PersistentFixture::SCHEMA_VERSION);
+        assert_eq!(fixture.manifest.rows, BenchScale::Small.rows());
+        assert!(fixture.manifest.bytes_logical > 0);
+        assert!(fixture.db_path().is_dir());
+        // segment files must have been written.
+        let segs = find_segment_files(fixture.db_path());
+        assert!(!segs.is_empty(), "fixture build wrote no segments");
+
+        // Second load_or_build for the same scale must reuse the cache
+        // without rebuilding.
+        let again = PersistentFixture::load_or_build(BenchScale::Small);
+        assert_eq!(again.manifest.built_at_secs, fixture.manifest.built_at_secs);
+
+        std::env::remove_var("BQLITE_BENCH_CACHE_DIR");
+    }
+
+    #[test]
+    fn streaming_generator_has_seven_properties_per_event() {
+        let cfg = StreamingConfig {
+            total_events: 100,
+            entity_count: 5,
+            event_type_count: REF_EVENT_TYPE_COUNT,
+            entity_skew: 1.0,
+            seed: 1,
+            chunk_size: 64,
+        };
+        let gen = StreamingEventGenerator::with_config(cfg);
+        gen.for_each_chunk(|chunk| {
+            for ev in chunk {
+                assert_eq!(ev.properties.len(), 7);
+            }
+        });
     }
 }
