@@ -238,3 +238,55 @@ harness = false
 name = "cohort_pushdown"
 path = "wave5/cohort_pushdown.rs"
 harness = false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# `bench-perf` headline-throughput suite (TASK-546). Sized by
+# BQLITE_BENCH_SCALE (small=1M / medium=100M / large=1B / xlarge=10B);
+# fixtures are materialised once per (scale, seed, schema_version) and
+# cached under $BQLITE_BENCH_CACHE_DIR. See `docs/design/perf-suite.md`.
+[[bench]]
+name = "perf_scan_selectivity"
+path = "perf/scan_selectivity.rs"
+harness = false
+
+[[bench]]
+name = "perf_aggregation_cardinality"
+path = "perf/aggregation_cardinality.rs"
+harness = false
+
+[[bench]]
+name = "perf_funnel_depth"
+path = "perf/funnel_depth.rs"
+harness = false
+
+[[bench]]
+name = "perf_sort_topk"
+path = "perf/sort_topk.rs"
+harness = false
+
+[[bench]]
+name = "perf_ingest_throughput"
+path = "perf/ingest_throughput.rs"
+harness = false
+
+[[bench]]
+name = "perf_mc_scaling"
+path = "perf/mc_scaling.rs"
+harness = false
+
+[[bench]]
+name = "perf_concurrent_queries"
+path = "perf/concurrent_queries.rs"
+harness = false
+
+[[bench]]
+name = "perf_memory_pressure"
+path = "perf/memory_pressure.rs"
+harness = false
+
+# TASK-546 Phase 3 — collects per-bench JSON from
+# `target/bench-results.json` and writes the consolidated markdown
+# report to `docs/perf/wave5-results.md`.
+[[bin]]
+name = "perf_report"
+path = "src/bin/perf_report.rs"
