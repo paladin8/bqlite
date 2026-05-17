@@ -462,14 +462,18 @@ fn create_table_then_empty_scan() {
         .iter()
         .map(|c| c.name.as_str())
         .collect();
-    // Table columns + system columns (__seq_id, __batch_id).
+    // Post-optimizer schema reflects the runtime-emitted columns: the
+    // declared columns the scan actually decodes, in table-schema
+    // order. `__seq_id`/`__batch_id` are absent because no downstream
+    // operator demands them — the column-index remap pass aligns
+    // `output_schema` with what the runtime scan emits.
     assert!(names.contains(&"user_id"));
     assert!(names.contains(&"ts"));
     assert!(names.contains(&"event_type"));
     assert!(names.contains(&"amount"));
     assert!(names.contains(&"category"));
-    assert!(names.contains(&"__seq_id"));
-    assert!(names.contains(&"__batch_id"));
+    assert!(!names.contains(&"__seq_id"));
+    assert!(!names.contains(&"__batch_id"));
 }
 
 /// INSERT VALUES round-trip — insert a small batch and verify the

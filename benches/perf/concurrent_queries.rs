@@ -28,12 +28,11 @@ use bqlite_benches::common::*;
 use bqlite_engine::{Database, Engine};
 use criterion::{black_box, Criterion, Throughput};
 
-// NOTE: original sweep spec used `GROUP BY category` (a property
-// column) — currently blocked by the same planner-pruning bug
-// documented in the `aggregation_cardinality` bench. `event_type` is
-// the role-column substitute that keeps a similar group cardinality
-// (20 groups) without triggering the bug.
-const QUERY: &str = "purchases | STATS n = COUNT(*) GROUP BY event_type";
+// `STATS COUNT(*) GROUP BY category` per `perf-suite.md` §3.4. Yields
+// ~16 groups from the generator's `category` distribution; the path
+// through the property column exercises the post-prune column-index
+// remap pass (`opt::remap`).
+const QUERY: &str = "purchases | STATS n = COUNT(*) GROUP BY category";
 
 struct ConcurrencyPoint {
     label: &'static str,

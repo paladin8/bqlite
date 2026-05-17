@@ -222,7 +222,7 @@ mod tests {
         catalog::unknown_table_error,
         property::BqlType,
         schema::{ColumnDef, TableSchema},
-        BqliteError, OperatorSchema,
+        BqliteError,
     };
 
     use super::*;
@@ -309,21 +309,33 @@ mod tests {
             .iter()
             .map(|c| c.name.as_str())
             .collect();
-        assert_eq!(
-            col_names,
-            vec!["entity_id", "ts", "event_type", "__seq_id", "__batch_id"]
-        );
+        // The post-optimizer `output_schema` reflects what the runtime
+        // scan actually emits: declared columns demanded by downstream
+        // ops, in table-schema order. `__seq_id`/`__batch_id` are
+        // omitted because no downstream operator demands them — the
+        // pruner drops them from `projected_columns` and the runtime's
+        // `build_output_schema` only emits system columns when they're
+        // explicitly named.
+        assert_eq!(col_names, vec!["entity_id", "ts", "event_type"]);
     }
 
     #[test]
-    fn physical_output_schema_matches_logical_output_schema() {
-        // Lowering is one-to-one so both sides report the same schema.
+    fn physical_output_schema_matches_runtime_emit() {
+        // The post-optimizer schema must match what the runtime scan
+        // actually produces. For a bare pipeline with no downstream
+        // demand for system columns the runtime emits the declared
+        // block only — see the comment in `plans_known_table_to_scan_physical`.
         let catalog = InMemoryCatalog::default().with(events_schema());
         let stmt = Statement::Query(bare_pipeline("events"));
 
         let physical = plan(stmt, &catalog, 0).unwrap();
-        let expected = OperatorSchema::from_table(&events_schema());
-        assert_eq!(physical.output_schema(), &expected);
+        let names: Vec<&str> = physical
+            .output_schema()
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["entity_id", "ts", "event_type"]);
     }
 
     #[test]
@@ -583,11 +595,12 @@ mod tests {
     // ── TASK-521: optimizer pipeline + rule trace ───────────────────
 
     #[test]
-    fn plan_with_trace_returns_eight_v1_rule_entries() {
-        // The Wave 5 pipeline registers exactly eight rules per
+    fn plan_with_trace_returns_nine_v1_rule_entries() {
+        // The Wave 5 pipeline registers nine rules per
         // `optimizer-direction.md` §9 (Passes 6, 6.5, 7, 9, 10 plus the
-        // Wave 0/2/4 wrappers); the trace surfaces every one regardless
-        // of whether the rule modified the plan.
+        // Wave 0/2/4 wrappers and the post-prune column-index remap);
+        // the trace surfaces every one regardless of whether the rule
+        // modified the plan.
         let catalog = InMemoryCatalog::default().with(events_schema());
         let stmt = Statement::Query(bare_pipeline("events"));
         let (_plan, trace) = plan_with_trace(stmt, &catalog, 0).unwrap();
@@ -599,6 +612,7 @@ mod tests {
                 "sample_pushdown",
                 "predicate_pushdown",
                 "projection_pruning",
+                "column_index_remap",
                 "tier3_predicate_shape",
                 "match_anchor_presence",
                 "stateless_filter_order",

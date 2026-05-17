@@ -8,13 +8,13 @@ Best throughput observed across the run, per bench group. Higher is better; cell
 
 | Bench | small |
 |---|---|
-| Scan (peak rows/s) | 47.65 M/s |
-| Aggregation (peak rows/s) | 30.75 M/s |
-| Funnel (peak rows/s) | 1.03 M/s |
-| Sort top-k (peak rows/s) | 128.95 K/s |
-| Ingest JSONL (peak rows/s) | 318.89 K/s |
-| MC-scaling (peak rows/s) | 5.43 M/s |
-| Concurrent (peak queries/s) | 40.0/s |
+| Scan (peak rows/s) | 95.49 M/s |
+| Aggregation (peak rows/s) | 44.52 M/s |
+| Funnel (peak rows/s) | 1.02 M/s |
+| Sort top-k (peak rows/s) | 85.75 K/s |
+| Ingest JSONL (peak rows/s) | 320.64 K/s |
+| MC-scaling (peak rows/s) | 23.50 M/s |
+| Concurrent (peak queries/s) | 39.3/s |
 
 ## Methodology
 
@@ -51,20 +51,22 @@ Five selectivity targets driven through `purchases | where amount <= K`. `matche
 
 | Point | small rows/s | small GB/s | small ratio |
 |---|---|---|---|
-| `sel_0.001` | 35.00 M/s | 4.53 GB/s | 0.050 |
-| `sel_0.01` | 37.74 M/s | 4.88 GB/s | 0.267 |
-| `sel_0.1` | 33.67 M/s | 4.35 GB/s | 0.531 |
-| `sel_0.5` | 41.99 M/s | 5.43 GB/s | 0.808 |
-| `sel_1.0` | 47.65 M/s | 6.16 GB/s | 1.000 |
+| `sel_0.001` | 79.04 M/s | 10.22 GB/s | 0.050 |
+| `sel_0.01` | 88.53 M/s | 11.45 GB/s | 0.267 |
+| `sel_0.1` | 75.53 M/s | 9.77 GB/s | 0.531 |
+| `sel_0.5` | 95.49 M/s | 12.35 GB/s | 0.808 |
+| `sel_1.0` | 53.82 M/s | 6.96 GB/s | 1.000 |
 
 ## Aggregation
 
-`COUNT(*) GROUP BY <key>` across group-key shapes. Property-column GROUP BY points (`category`, `quantity`, composite) are currently blocked by a column-pruning planner bug — see the bench docstring.
+`COUNT(*) GROUP BY <key>` across group-key shapes covering low / mid / composite / high group-cardinalities per `docs/design/perf-suite.md` §3.4.
 
 | Point | small rows/s | small GB/s | small groups |
 |---|---|---|---|
-| `high_card_user_id` | 30.14 M/s | 3.90 GB/s | 10.0 K |
-| `mid_card_event_type` | 30.75 M/s | 3.98 GB/s | 20 |
+| `composite_category_region` | 25.77 M/s | 3.33 GB/s | 128 |
+| `high_card_user_id` | 34.18 M/s | 4.42 GB/s | 10.0 K |
+| `low_card_quantity` | 44.52 M/s | 5.76 GB/s | 10 |
+| `mid_card_event_type` | 36.79 M/s | 4.76 GB/s | 20 |
 
 ## Funnel / sequence
 
@@ -73,8 +75,8 @@ Five selectivity targets driven through `purchases | where amount <= K`. `matche
 | Point | small rows/s | small GB/s | small matches |
 |---|---|---|---|
 | `depth_10` | 1.01 M/s | 0.13 GB/s | 5.8 K |
-| `depth_2` | 999.87 K/s | 0.13 GB/s | 8.2 K |
-| `depth_5` | 1.03 M/s | 0.13 GB/s | 7.4 K |
+| `depth_2` | 984.46 K/s | 0.13 GB/s | 8.2 K |
+| `depth_5` | 1.02 M/s | 0.13 GB/s | 7.4 K |
 
 ## Sort / top-k
 
@@ -82,8 +84,9 @@ Five selectivity targets driven through `purchases | where amount <= K`. `matche
 
 | Point | small probe | small rows/s | small peak mem |
 |---|---|---|---|
-| `topk_1k` | 7.75 s | 128.95 K/s | 2.39 GiB |
-| `topk_1m` | 14.02 s | 71.35 K/s | 2.39 GiB |
+| `full_sort` | 11.66 s | 85.75 K/s | 2.39 GiB |
+| `topk_1k` | 18.18 s | 55.00 K/s | 2.39 GiB |
+| `topk_1m` | 24.08 s | 41.54 K/s | 2.39 GiB |
 
 ## Ingest
 
@@ -91,31 +94,31 @@ End-to-end ingest throughput for the three supported input shapes. `file_mb_per_
 
 | Point | small rows/s | small file | small events |
 |---|---|---|---|
-| `insert_values` | 121.40 K/s | — | 16.1 MB/s |
-| `jsonl` | 241.87 K/s | 42.1 MB/s | 32.0 MB/s |
-| `parquet` | 318.89 K/s | 5.3 MB/s | 42.2 MB/s |
+| `insert_values` | 98.52 K/s | — | 13.0 MB/s |
+| `jsonl` | 245.77 K/s | 42.8 MB/s | 32.5 MB/s |
+| `parquet` | 320.64 K/s | 5.3 MB/s | 42.4 MB/s |
 
 ## Multi-core scaling
 
-`purchases | STATS COUNT(*) GROUP BY user_id, event_type` driven at `query_threads = 1 / 2 / 4 / 8 / auto`. Speedup is relative to the 1-thread probe of the same bench run (so a non-zero figure even at `threads_1` reflects measurement noise vs. the warm-up probe).
+`purchases | STATS COUNT(*) GROUP BY category, region` driven at `query_threads = 1 / 2 / 4 / 8 / auto`. Speedup is relative to the 1-thread probe of the same bench run (so a non-zero figure even at `threads_1` reflects measurement noise vs. the warm-up probe).
 
 | Point | small threads | small rows/s | small speedup |
 |---|---|---|---|
-| `threads_1` | 1 | 2.51 M/s | 1.00× |
-| `threads_2` | 2 | 3.71 M/s | 1.48× |
-| `threads_4` | 4 | 4.83 M/s | 1.93× |
-| `threads_8` | 8 | 5.43 M/s | 2.17× |
-| `threads_auto` | 12 | 5.04 M/s | 2.01× |
+| `threads_1` | 1 | 4.46 M/s | 1.03× |
+| `threads_2` | 2 | 8.85 M/s | 2.04× |
+| `threads_4` | 4 | 16.92 M/s | 3.90× |
+| `threads_8` | 8 | 20.62 M/s | 4.75× |
+| `threads_auto` | 12 | 23.50 M/s | 5.41× |
 
 ## Concurrent queries
 
-1 / 4 / 16 client threads submit `purchases | STATS COUNT(*) GROUP BY event_type` against a shared `Arc<Mutex<Database>>` (`Database::open` holds a per-directory exclusive lock, so submissions serialize at the mutex). Per-query parallelism within the engine is unchanged — the bench varies only the submitter count.
+1 / 4 / 16 client threads submit `purchases | STATS COUNT(*) GROUP BY category` against a shared `Arc<Mutex<Database>>` (`Database::open` holds a per-directory exclusive lock, so submissions serialize at the mutex). Per-query parallelism within the engine is unchanged — the bench varies only the submitter count.
 
 | Point | small queries/s | small per-thread | small rows/s |
 |---|---|---|---|
-| `clients_1` | 35.1 | 28.5 ms | 35.06 M/s |
-| `clients_16` | 37.2 | 430.4 ms | 37.18 M/s |
-| `clients_4` | 40.0 | 99.9 ms | 40.02 M/s |
+| `clients_1` | 39.3 | 25.5 ms | 39.28 M/s |
+| `clients_16` | 35.7 | 448.0 ms | 35.72 M/s |
+| `clients_4` | 35.9 | 111.4 ms | 35.90 M/s |
 
 ## Memory pressure
 
@@ -123,10 +126,10 @@ Same two queries (`sort_full`, `agg_high_card`) submitted at three `QueryOptions
 
 | Point | small status | small probe | small peak mem | small rows/s |
 |---|---|---|---|---|
-| `agg_high_card/budget_1gb` | ok | 32.0 ms | 0 MiB | 31.20 M/s |
-| `agg_high_card/budget_3gb` | ok | 25.4 ms | 0 MiB | 39.34 M/s |
-| `agg_high_card/budget_512mb` | ok | 30.2 ms | 0 MiB | 33.14 M/s |
+| `agg_high_card/budget_1gb` | ok | 39.0 ms | 0 MiB | 25.67 M/s |
+| `agg_high_card/budget_3gb` | ok | 41.8 ms | 0 MiB | 23.91 M/s |
+| `agg_high_card/budget_512mb` | ok | 40.0 ms | 0 MiB | 24.99 M/s |
 | `sort_full/budget_1gb` | fail | — | — | — |
-| `sort_full/budget_3gb` | ok | 10.72 s | 2.39 GiB | 93.29 K/s |
+| `sort_full/budget_3gb` | ok | 20.88 s | 2.39 GiB | 47.89 K/s |
 | `sort_full/budget_512mb` | fail | — | — | — |
 

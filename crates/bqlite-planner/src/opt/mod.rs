@@ -63,6 +63,7 @@ pub mod fuse_match_aggregate;
 pub mod prune;
 pub mod pushdown;
 pub mod registry;
+pub mod remap;
 pub mod rules;
 pub mod sample_pushdown;
 
@@ -74,9 +75,11 @@ pub use fuse_match_aggregate::fuse_match_aggregate;
 pub use prune::prune_columns;
 pub use pushdown::pushdown_predicates;
 pub use registry::{
-    FuseMatchAggregateRule, OptimizerPipeline, OptimizerRule, PredicatePushdownRule,
-    ProjectionPruningRule, RuleContext, RulePhase, RuleTrace, RuleTraceEntry, RuleTraceOutcome,
-    SamplePushdownRule, ScanPredicateCoalesceRule, StatelessFilterOrderingRule,
+    ColumnIndexRemapRule, FuseMatchAggregateRule, OptimizerPipeline, OptimizerRule,
+    PredicatePushdownRule, ProjectionPruningRule, RuleContext, RulePhase, RuleTrace,
+    RuleTraceEntry, RuleTraceOutcome, SamplePushdownRule, ScanPredicateCoalesceRule,
+    StatelessFilterOrderingRule,
 };
+pub use remap::remap_column_indices;
 pub use rules::{MatchAnchorPresenceRule, Tier3PredicateShapeRule};
 pub use sample_pushdown::pushdown_sample;

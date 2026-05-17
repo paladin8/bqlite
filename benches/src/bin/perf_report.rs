@@ -352,8 +352,7 @@ fn render_scan_filter(db: &Db, scales: &[String], out: &mut String) {
 
 fn render_aggregation(db: &Db, scales: &[String], out: &mut String) {
     out.push_str("## Aggregation\n\n");
-    out.push_str("`COUNT(*) GROUP BY <key>` across group-key shapes. ");
-    out.push_str("Property-column GROUP BY points (`category`, `quantity`, composite) are currently blocked by a column-pruning planner bug — see the bench docstring.\n\n");
+    out.push_str("`COUNT(*) GROUP BY <key>` across group-key shapes covering low / mid / composite / high group-cardinalities per `docs/design/perf-suite.md` §3.4.\n\n");
     render_per_point_table(
         db,
         "aggregation_cardinality",
@@ -422,7 +421,7 @@ fn render_ingest(db: &Db, scales: &[String], out: &mut String) {
 
 fn render_mc_scaling(db: &Db, scales: &[String], out: &mut String) {
     out.push_str("## Multi-core scaling\n\n");
-    out.push_str("`purchases | STATS COUNT(*) GROUP BY user_id, event_type` driven at `query_threads = 1 / 2 / 4 / 8 / auto`. ");
+    out.push_str("`purchases | STATS COUNT(*) GROUP BY category, region` driven at `query_threads = 1 / 2 / 4 / 8 / auto`. ");
     out.push_str("Speedup is relative to the 1-thread probe of the same bench run (so a non-zero figure even at `threads_1` reflects measurement noise vs. the warm-up probe).\n\n");
     render_per_point_table(
         db,
@@ -439,7 +438,7 @@ fn render_mc_scaling(db: &Db, scales: &[String], out: &mut String) {
 
 fn render_concurrent(db: &Db, scales: &[String], out: &mut String) {
     out.push_str("## Concurrent queries\n\n");
-    out.push_str("1 / 4 / 16 client threads submit `purchases | STATS COUNT(*) GROUP BY event_type` against a shared `Arc<Mutex<Database>>` (`Database::open` holds a per-directory exclusive lock, so submissions serialize at the mutex). Per-query parallelism within the engine is unchanged — the bench varies only the submitter count.\n\n");
+    out.push_str("1 / 4 / 16 client threads submit `purchases | STATS COUNT(*) GROUP BY category` against a shared `Arc<Mutex<Database>>` (`Database::open` holds a per-directory exclusive lock, so submissions serialize at the mutex). Per-query parallelism within the engine is unchanged — the bench varies only the submitter count.\n\n");
     render_per_point_table(
         db,
         "concurrent_queries",

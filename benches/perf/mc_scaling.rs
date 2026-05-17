@@ -25,15 +25,11 @@ use bqlite_benches::common::*;
 use bqlite_engine::{Database, Engine, EngineConfig};
 use criterion::{black_box, Criterion, Throughput};
 
-// NOTE: the design-doc sweep originally specified `GROUP BY category,
-// region`, which exercises the multi-key composite path. That query
-// currently surfaces a planner-pruning bug (column-resolve mismatch
-// when STATS references property columns); see the
-// `aggregation_cardinality` bench docstring for the full trace.
-// `GROUP BY user_id, event_type` is the closest workload still
-// supported — composite key, 20 × entity_count groups, but uses only
-// role columns and avoids the pruning bug.
-const QUERY: &str = "purchases | STATS n = COUNT(*) GROUP BY user_id, event_type";
+// Composite GROUP BY over two property columns per `perf-suite.md`
+// §3.4. Produces ~128 groups from the generator's
+// `category` × `region` distribution and exercises the multi-key path
+// of the hash aggregate.
+const QUERY: &str = "purchases | STATS n = COUNT(*) GROUP BY category, region";
 
 struct ThreadPoint {
     label: &'static str,

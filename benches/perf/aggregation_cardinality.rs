@@ -2,30 +2,18 @@
 //! (TASK-546).
 //!
 //! Reads the persistent `purchases` fixture and runs
-//! `purchases | STATS n = COUNT(*) GROUP BY <key>` for two group-key
-//! shapes (`docs/design/perf-suite.md` §3.4):
+//! `purchases | STATS n = COUNT(*) GROUP BY <key>` for four group-key
+//! shapes spanning the cardinality space from `docs/design/perf-suite.md`
+//! §3.4:
 //!
+//! - `low_card_quantity` — ~10 distinct values, property-column key.
 //! - `mid_card_event_type` — 20 distinct values from the generator's
 //!   `event_type` profile.
+//! - `composite_category_region` — composite key over two property
+//!   columns (~128 groups).
 //! - `high_card_user_id` — one group per entity. Scales with
 //!   `BenchScale::entity_count`: 10K at Small, 100K Medium, 1M Large,
 //!   10M XLarge.
-//!
-//! The design-doc sweep originally called for low-card (`quantity`,
-//! 10 groups) and composite (`category, region`, 128 groups) points
-//! too. Both are skipped here because aggregation that references a
-//! *property* column — either as the GROUP BY key or via
-//! `SUM`/`AVG`/etc — surfaces a planner bug today:
-//!
-//!     Execution error: column `quantity` has index 6 but
-//!     batch only has 3 columns
-//!
-//! The column-pruning rule in `opt::prune` reduces the scan to the
-//! role-column subset (entity_id, ts, event_type) for STATS, but the
-//! HashAggregateOperator still resolves property columns by full-
-//! schema index. Filed separately; once fixed, restore
-//! `low_card_quantity` (`GROUP BY quantity`) and
-//! `composite_category_region` (`GROUP BY category, region`).
 //!
 //! The 100M-group point from the design doc remains omitted: the
 //! generator's natural cardinalities top out at the entity count
@@ -46,8 +34,16 @@ struct GroupPoint {
 
 const POINTS: &[GroupPoint] = &[
     GroupPoint {
+        label: "low_card_quantity",
+        group_by: "quantity",
+    },
+    GroupPoint {
         label: "mid_card_event_type",
         group_by: "event_type",
+    },
+    GroupPoint {
+        label: "composite_category_region",
+        group_by: "category, region",
     },
     GroupPoint {
         label: "high_card_user_id",

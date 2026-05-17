@@ -1208,19 +1208,18 @@ mod tests {
 
         assert!(result.is_empty(), "fresh database has no events");
         assert_eq!(result.row_count(), 0);
-        // Schema must reflect the bootstrap events table plus the
-        // `__seq_id` / `__batch_id` system columns from
-        // `OperatorSchema::from_table`.
+        // Schema reflects the declared columns the runtime scan
+        // actually emits. `__seq_id`/`__batch_id` are omitted because
+        // no downstream operator demands them — the column-index remap
+        // pass aligns the planner's `output_schema` with what the
+        // runtime emits at execution time.
         let names: Vec<&str> = result
             .schema
             .columns()
             .iter()
             .map(|c| c.name.as_str())
             .collect();
-        assert_eq!(
-            names,
-            vec!["entity_id", "ts", "event_type", "__seq_id", "__batch_id"]
-        );
+        assert_eq!(names, vec!["entity_id", "ts", "event_type"]);
     }
 
     #[test]

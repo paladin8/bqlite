@@ -1357,7 +1357,12 @@ mod tests {
     fn create_initializes_empty_spill_root() {
         let scratch = Scratch::new("spill-create");
         let db = Database::create(scratch.path()).expect("create");
-        assert_eq!(db.spill_root(), scratch.path().join(SPILL_DIR_NAME));
+        // `Database::create` canonicalizes its root (resolving e.g.
+        // `/var` → `/private/var` on macOS). The test's `scratch.path()`
+        // is the raw `temp_dir()` form, so canonicalize it through the
+        // now-existing directory before comparing.
+        let expected_root = scratch.path().canonicalize().expect("canonicalize scratch");
+        assert_eq!(db.spill_root(), expected_root.join(SPILL_DIR_NAME));
         assert!(db.spill_root().is_dir(), "spill root must exist");
         let entries: Vec<_> = fs::read_dir(db.spill_root())
             .expect("read spill root")
@@ -1377,7 +1382,12 @@ mod tests {
         {
             let _db = Database::create(scratch.path()).expect("create");
         }
-        let spill_root = scratch.path().join(SPILL_DIR_NAME);
+        // `Database::open` canonicalizes its root, so the test must
+        // anchor its expectations on the canonicalized form too —
+        // otherwise macOS's `/var` → `/private/var` symlink breaks the
+        // `PathBuf` equality below.
+        let canonical_root = scratch.path().canonicalize().expect("canonicalize scratch");
+        let spill_root = canonical_root.join(SPILL_DIR_NAME);
         let stale_query_dir = spill_root.join("ingest-stale-uuid");
         fs::create_dir_all(&stale_query_dir).unwrap();
         fs::write(

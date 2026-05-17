@@ -45,7 +45,7 @@
 use crate::opt::{
     coalesce_scan_predicates::coalesce_scan_predicates, filter_order::order_stateless_filters,
     fuse_match_aggregate::fuse_match_aggregate, prune::prune_columns,
-    pushdown::pushdown_predicates, sample_pushdown::pushdown_sample,
+    pushdown::pushdown_predicates, remap::remap_column_indices, sample_pushdown::pushdown_sample,
 };
 use crate::physical::PhysicalPlan;
 use crate::stats::{PlannerStats, PlannerStatsView, StatsBudget};
@@ -220,6 +220,7 @@ impl OptimizerPipeline {
             .with(Box::new(SamplePushdownRule))
             .with(Box::new(PredicatePushdownRule))
             .with(Box::new(ProjectionPruningRule))
+            .with(Box::new(ColumnIndexRemapRule))
             .with(Box::new(crate::opt::rules::Tier3PredicateShapeRule))
             .with(Box::new(crate::opt::rules::MatchAnchorPresenceRule))
             .with(Box::new(StatelessFilterOrderingRule))
@@ -380,6 +381,31 @@ impl OptimizerRule for ProjectionPruningRule {
     }
     fn apply(&self, plan: PhysicalPlan, _ctx: &mut RuleContext<'_>) -> PhysicalPlan {
         prune_columns(plan)
+    }
+}
+
+/// Wraps [`remap_column_indices`]. Must run immediately after
+/// [`ProjectionPruningRule`] so every downstream rule sees
+/// `CompiledExpr::Column { index, .. }` ordinals that match the
+/// runtime batches the pruned scan will actually emit. The runtime
+/// emits the scan's projected columns in table-schema order; this
+/// pass realigns every reachable expression's column indices to that
+/// ordering and updates `output_schema` on every operator the pruner
+/// touched.
+pub struct ColumnIndexRemapRule;
+
+impl OptimizerRule for ColumnIndexRemapRule {
+    fn id(&self) -> &'static str {
+        "column_index_remap"
+    }
+    fn phase(&self) -> RulePhase {
+        RulePhase::PlanTime
+    }
+    fn budget(&self) -> StatsBudget {
+        StatsBudget::none()
+    }
+    fn apply(&self, plan: PhysicalPlan, _ctx: &mut RuleContext<'_>) -> PhysicalPlan {
+        remap_column_indices(plan)
     }
 }
 
@@ -614,9 +640,9 @@ mod tests {
     }
 
     #[test]
-    fn v1_registers_eight_rules_in_documented_order() {
+    fn v1_registers_nine_rules_in_documented_order() {
         let pipeline = OptimizerPipeline::v1();
-        assert_eq!(pipeline.rule_count(), 8);
+        assert_eq!(pipeline.rule_count(), 9);
         let stats = PlannerStats::empty();
         let mut trace = RuleTrace::default();
         let _ = pipeline.run_plan_time(dummy_scan(), &stats, &mut trace);
@@ -628,6 +654,7 @@ mod tests {
                 "sample_pushdown",
                 "predicate_pushdown",
                 "projection_pruning",
+                "column_index_remap",
                 "tier3_predicate_shape",
                 "match_anchor_presence",
                 "stateless_filter_order",
@@ -657,6 +684,7 @@ mod tests {
                 ("sample_pushdown", RuleTraceOutcome::Applied),
                 ("predicate_pushdown", RuleTraceOutcome::Applied),
                 ("projection_pruning", RuleTraceOutcome::Applied),
+                ("column_index_remap", RuleTraceOutcome::Applied),
                 (
                     "tier3_predicate_shape",
                     RuleTraceOutcome::Skipped("no value-set indexes registered")

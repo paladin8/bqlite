@@ -10,14 +10,10 @@
 //! K values land in the *order* low → high, not at fixed percentile
 //! targets.
 //!
-//! NOTE: an earlier shape of this bench appended `| select user_id,
-//! amount` to the pipeline, which surfaced an engine bug —
-//! `column `amount` has index 3 but batch only has 3 columns` —
-//! when the projection prune dropped `amount` from the scanned batch
-//! while the pushed-down filter still referenced it by full-schema
-//! index. The bench drops the explicit SELECT until that bug is
-//! tracked separately; the rows/s + GB/s axes are dominated by the
-//! scan + filter cost and are unaffected.
+//! The pipeline appends `| select user_id, amount` so the bench
+//! measures filter + project end-to-end (the prior workaround that
+//! dropped the SELECT existed only while the column-index remap pass
+//! was missing — see `opt::remap`).
 //!
 //! See `docs/design/perf-suite.md` §3.4. The bench is intentionally
 //! report-only (TASK-546 §2 "out of scope" — no CI gating); per-scale
@@ -82,7 +78,7 @@ fn bench_scan_selectivity(
 
     for point in POINTS {
         let sql = format!(
-            "{} | where amount <= {}",
+            "{} | where amount <= {} | select user_id, amount",
             PersistentFixture::DEFAULT_TABLE,
             point.amount_threshold,
         );
