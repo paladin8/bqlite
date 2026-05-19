@@ -32,8 +32,7 @@ use bqlite_core::encoded::{EncodedBatch, RowSelection, StitchedBatch, StitchedRo
 use bqlite_core::metrics::Metrics;
 use bqlite_core::{BqlType, BqliteError, Result};
 use bqlite_storage::{
-    materialize_encoded_column, materialize_encoded_column_selected,
-    materialize_encoded_column_selected_with_options,
+    materialize_encoded_column, materialize_encoded_column_selected_with_options,
 };
 
 use crate::filtered_batch::FilteredBatch;
@@ -313,11 +312,19 @@ pub fn materialize_stitched(
     materialize_stitched_inner(stitched, types, schema, false)
 }
 
-/// Dict-aware variant of [`materialize_stitched`]. The single-source
-/// arm honours dict push-through; the cross-source `Runs` and
-/// `Indices` arms force `prefer_dict_string == false` because their
-/// concat/take steps require homogeneous physical types and per-segment
-/// dictionaries are not unified.
+/// Dict-aware variant of [`materialize_stitched`]. All three arms
+/// honour dict push-through:
+///
+/// - **SingleSource** — delegates straight to
+///   [`materialize_selected_inner`] with `prefer_dict_string=true`.
+/// - **Runs** — materialises each per-source slice as Dict<UInt8,
+///   Utf8View> when its segment encoding allows, then unifies the
+///   per-segment dictionaries at concat time. Chunks that exceed the
+///   u8 keyspace after unification, or columns whose chunks are mixed
+///   Dict + StringView, fall back to a value-type cast + standard
+///   `arrow::compute::concat`.
+/// - **Indices** — same unification at concat time after `take` from
+///   each Dict-encoded source.
 pub fn materialize_stitched_dict_pushthrough(
     stitched: &StitchedBatch,
     types: &[BqlType],
@@ -351,8 +358,14 @@ fn materialize_stitched_inner(
             materialize_selected_inner(src, selection.as_ref(), types, schema, None, prefer_dict_string)
         }
         StitchedRows::Runs(runs) => {
-            let arrays = materialize_stitched_runs(&stitched.sources, runs, types)?;
-            let batch = RecordBatch::try_new(schema, arrays).map_err(|e| {
+            let arrays =
+                materialize_stitched_runs(&stitched.sources, runs, types, prefer_dict_string)?;
+            let effective_schema = if prefer_dict_string {
+                schema_matching_arrays(&schema, &arrays)?
+            } else {
+                schema
+            };
+            let batch = RecordBatch::try_new(effective_schema, arrays).map_err(|e| {
                 BqliteError::Execution(format!(
                     "materialize_stitched: record-batch build failed: {e}"
                 ))
@@ -360,8 +373,14 @@ fn materialize_stitched_inner(
             Ok(FilteredBatch::dense(batch))
         }
         StitchedRows::Indices(refs) => {
-            let arrays = materialize_stitched_indices(&stitched.sources, refs, types)?;
-            let batch = RecordBatch::try_new(schema, arrays).map_err(|e| {
+            let arrays =
+                materialize_stitched_indices(&stitched.sources, refs, types, prefer_dict_string)?;
+            let effective_schema = if prefer_dict_string {
+                schema_matching_arrays(&schema, &arrays)?
+            } else {
+                schema
+            };
+            let batch = RecordBatch::try_new(effective_schema, arrays).map_err(|e| {
                 BqliteError::Execution(format!(
                     "materialize_stitched: record-batch build failed: {e}"
                 ))
@@ -375,6 +394,7 @@ fn materialize_stitched_runs(
     sources: &[EncodedBatch],
     runs: &[bqlite_core::encoded::SourceRun],
     types: &[BqlType],
+    prefer_dict_string: bool,
 ) -> Result<Vec<ArrayRef>> {
     let mut out: Vec<Vec<ArrayRef>> = (0..types.len()).map(|_| Vec::new()).collect();
     for run in runs {
@@ -396,7 +416,12 @@ fn materialize_stitched_runs(
             len: run.len,
         }]);
         for (col_idx, (col, ty)) in src.columns.iter().zip(types.iter()).enumerate() {
-            let arr = materialize_encoded_column_selected(col, ty, Some(&sel))?;
+            let arr = materialize_encoded_column_selected_with_options(
+                col,
+                ty,
+                Some(&sel),
+                prefer_dict_string,
+            )?;
             out[col_idx].push(arr);
         }
     }
@@ -407,6 +432,7 @@ fn materialize_stitched_indices(
     sources: &[EncodedBatch],
     refs: &[bqlite_core::encoded::RowRef],
     types: &[BqlType],
+    prefer_dict_string: bool,
 ) -> Result<Vec<ArrayRef>> {
     // Decode every referenced source once, then `take` per index.
     //
@@ -433,7 +459,25 @@ fn materialize_stitched_indices(
         }
         let mut arrs = Vec::with_capacity(types.len());
         for (col, ty) in src.columns.iter().zip(types.iter()) {
-            arrs.push(materialize_encoded_column(col, ty)?);
+            // Build a full-range selection so the per-encoding
+            // materialiser stays on the selection-aware fast path —
+            // that's the only path that respects `prefer_dict_string`.
+            // The cost is one selection-vector walk per source, which
+            // is amortised over every index that targets this source.
+            let arr = if prefer_dict_string {
+                let rows = match col {
+                    bqlite_core::encoded::EncodedColumn::Materialized { rows, .. } => *rows,
+                    bqlite_core::encoded::EncodedColumn::Encoded { rows, .. } => *rows,
+                };
+                let full = RowSelection::from_runs(vec![bqlite_core::encoded::RowRun {
+                    start: 0,
+                    len: rows,
+                }]);
+                materialize_encoded_column_selected_with_options(col, ty, Some(&full), true)?
+            } else {
+                materialize_encoded_column(col, ty)?
+            };
+            arrs.push(arr);
         }
         dense_sources[idx] = Some(arrs);
     }
@@ -471,7 +515,45 @@ fn concat_chunks(mut chunks: Vec<Vec<ArrayRef>>) -> Result<Vec<ArrayRef>> {
                 "materialize_stitched: column has no chunks to concatenate".into(),
             ));
         }
-        let refs: Vec<&dyn arrow::array::Array> = col_chunks
+        // Three-way dispatch:
+        //   1. No Dict chunks at all → plain concat (the original path,
+        //      kept zero-overhead so non-string columns regress 0%).
+        //   2. All chunks are Dict<UInt8, Utf8View> → try to unify their
+        //      per-segment dictionaries and emit a single
+        //      Dict<UInt8, Utf8View>; only falls through to plain concat
+        //      if the union overflows the u8 keyspace.
+        //   3. Mixed Dict + non-Dict → cast Dict chunks to value type
+        //      and concat as a homogeneous non-Dict array.
+        let any_dict = col_chunks
+            .iter()
+            .any(|a| matches!(a.data_type(), arrow::datatypes::DataType::Dictionary(_, _)));
+        if !any_dict {
+            let refs: Vec<&dyn arrow::array::Array> = col_chunks
+                .iter()
+                .map(|a| a.as_ref() as &dyn arrow::array::Array)
+                .collect();
+            let concatenated = compute::concat(&refs).map_err(|e| {
+                BqliteError::Execution(format!(
+                    "materialize_stitched: arrow::compute::concat failed: {e}"
+                ))
+            })?;
+            out.push(concatenated);
+            continue;
+        }
+        if col_chunks
+            .iter()
+            .all(|a| is_dict_uint8_utf8view(a.data_type()))
+        {
+            if let Some(unified) = try_unify_dict_uint8_utf8view(col_chunks)? {
+                out.push(unified);
+                continue;
+            }
+        }
+        let normalized: Vec<ArrayRef> = col_chunks
+            .iter()
+            .map(normalize_dict_to_values)
+            .collect::<Result<Vec<_>>>()?;
+        let refs: Vec<&dyn arrow::array::Array> = normalized
             .iter()
             .map(|a| a.as_ref() as &dyn arrow::array::Array)
             .collect();
@@ -483,6 +565,137 @@ fn concat_chunks(mut chunks: Vec<Vec<ArrayRef>>) -> Result<Vec<ArrayRef>> {
         out.push(concatenated);
     }
     Ok(out)
+}
+
+fn is_dict_uint8_utf8view(dt: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Dictionary(k, v)
+            if matches!(k.as_ref(), DataType::UInt8)
+                && matches!(v.as_ref(), DataType::Utf8View)
+    )
+}
+
+/// Decay a `Dict<_, Utf8View>` array to its value type for the
+/// fallback concat path. Non-dict arrays pass through unchanged.
+fn normalize_dict_to_values(a: &ArrayRef) -> Result<ArrayRef> {
+    use arrow::datatypes::DataType;
+    if let DataType::Dictionary(_, value_ty) = a.data_type() {
+        compute::cast(a.as_ref(), value_ty.as_ref()).map_err(|e| {
+            BqliteError::Execution(format!(
+                "materialize_stitched: cast Dict->values failed: {e}"
+            ))
+        })
+    } else {
+        Ok(a.clone())
+    }
+}
+
+/// Build a single `Dict<UInt8, Utf8View>` array that covers every
+/// chunk by unifying their value tables.
+///
+/// Returns `Ok(None)` (caller falls back to cast+concat) when the
+/// union of value strings exceeds the u8 keyspace (256 entries).
+/// Storage-side dict materialisers append no nulls to the value
+/// region — nulls live in the key bitmap — so this helper treats
+/// dict values as a flat set of non-null `&str`s.
+fn try_unify_dict_uint8_utf8view(chunks: &[ArrayRef]) -> Result<Option<ArrayRef>> {
+    use ::arrow::array::{
+        builder::UInt8Builder, Array, DictionaryArray, StringViewArray, StringViewBuilder,
+    };
+    use ::arrow::datatypes::UInt8Type;
+    use std::collections::HashMap;
+
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut value_to_code: HashMap<String, u8> = HashMap::new();
+    let mut unified_values: Vec<String> = Vec::new();
+    // Per-chunk remap from local code -> unified code.
+    let mut remaps: Vec<Vec<u8>> = Vec::with_capacity(chunks.len());
+    let mut total_keys: usize = 0;
+
+    for chunk in chunks {
+        total_keys += chunk.len();
+        let dict = chunk
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .ok_or_else(|| {
+                BqliteError::Execution(
+                    "materialize_stitched: dict downcast failed (UInt8)".into(),
+                )
+            })?;
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .ok_or_else(|| {
+                BqliteError::Execution(
+                    "materialize_stitched: dict values downcast failed (Utf8View)".into(),
+                )
+            })?;
+        let mut remap: Vec<u8> = Vec::with_capacity(values.len());
+        for i in 0..values.len() {
+            let s = if values.is_null(i) { "" } else { values.value(i) };
+            let code = match value_to_code.get(s) {
+                Some(&c) => c,
+                None => {
+                    if unified_values.len() >= 256 {
+                        return Ok(None);
+                    }
+                    let c = unified_values.len() as u8;
+                    unified_values.push(s.to_owned());
+                    value_to_code.insert(s.to_owned(), c);
+                    c
+                }
+            };
+            remap.push(code);
+        }
+        remaps.push(remap);
+    }
+
+    let mut value_builder = StringViewBuilder::with_capacity(unified_values.len());
+    for s in &unified_values {
+        value_builder.append_value(s);
+    }
+    let unified_values_arr = value_builder.finish();
+
+    let mut key_builder = UInt8Builder::with_capacity(total_keys);
+    for (chunk, remap) in chunks.iter().zip(remaps.iter()) {
+        let dict = chunk
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .unwrap();
+        let keys = dict.keys();
+        let raw: &[u8] = keys.values();
+        match keys.nulls() {
+            None => {
+                for &code in raw {
+                    key_builder.append_value(remap[code as usize]);
+                }
+            }
+            Some(nulls) => {
+                for (row, &code) in raw.iter().enumerate() {
+                    if nulls.is_null(row) {
+                        key_builder.append_null();
+                    } else {
+                        key_builder.append_value(remap[code as usize]);
+                    }
+                }
+            }
+        }
+    }
+    let unified_keys = key_builder.finish();
+
+    let unified = DictionaryArray::<UInt8Type>::try_new(unified_keys, Arc::new(unified_values_arr))
+        .map_err(|e| {
+            BqliteError::Execution(format!(
+                "materialize_stitched: unified DictionaryArray::try_new failed: {e}"
+            ))
+        })?;
+    Ok(Some(Arc::new(unified)))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -847,5 +1060,127 @@ mod tests {
         let fb = materialize_selected(&batch, Some(&sel), &[BqlType::Int], i64_schema()).unwrap();
         assert_eq!(fb.batch.num_rows(), 0);
         assert!(fb.is_dense());
+    }
+
+    // ── Dict<UInt8, Utf8View> unification at concat time ──────────────
+
+    fn dict_chunk(values: &[&str], keys: &[Option<u8>]) -> ArrayRef {
+        use ::arrow::array::{
+            builder::UInt8Builder, DictionaryArray, StringViewBuilder,
+        };
+        use ::arrow::datatypes::UInt8Type;
+        let mut vb = StringViewBuilder::with_capacity(values.len());
+        for v in values {
+            vb.append_value(v);
+        }
+        let values_arr = vb.finish();
+        let mut kb = UInt8Builder::with_capacity(keys.len());
+        for k in keys {
+            match k {
+                Some(c) => kb.append_value(*c),
+                None => kb.append_null(),
+            }
+        }
+        let keys_arr = kb.finish();
+        Arc::new(
+            DictionaryArray::<UInt8Type>::try_new(keys_arr, Arc::new(values_arr)).unwrap(),
+        )
+    }
+
+    #[test]
+    fn unify_dict_uint8_utf8view_concats_disjoint_dicts() {
+        // Two chunks with disjoint dict values that fit in u8.
+        // Chunk A: dict=["x","y"], keys=[0,1,0]
+        // Chunk B: dict=["y","z"], keys=[1,0]
+        // Unified: dict=["x","y","z"], keys=[0,1,0, 2,1]
+        let chunks = vec![
+            dict_chunk(&["x", "y"], &[Some(0), Some(1), Some(0)]),
+            dict_chunk(&["y", "z"], &[Some(1), Some(0)]),
+        ];
+        let unified = super::try_unify_dict_uint8_utf8view(&chunks).unwrap().unwrap();
+        let dict = unified
+            .as_any()
+            .downcast_ref::<::arrow::array::DictionaryArray<::arrow::datatypes::UInt8Type>>()
+            .unwrap();
+        assert_eq!(dict.keys().len(), 5);
+        let vals = dict
+            .values()
+            .as_any()
+            .downcast_ref::<::arrow::array::StringViewArray>()
+            .unwrap();
+        // Codes must resolve to the right strings.
+        let resolved: Vec<&str> = (0..dict.keys().len())
+            .map(|i| vals.value(dict.keys().value(i) as usize))
+            .collect();
+        assert_eq!(resolved, vec!["x", "y", "x", "z", "y"]);
+    }
+
+    #[test]
+    fn unify_dict_uint8_utf8view_preserves_null_keys() {
+        // Chunk with one null key. Output must keep the null at that
+        // logical position.
+        let chunks = vec![
+            dict_chunk(&["a", "b"], &[Some(0), None, Some(1)]),
+            dict_chunk(&["b"], &[Some(0)]),
+        ];
+        let unified = super::try_unify_dict_uint8_utf8view(&chunks).unwrap().unwrap();
+        let dict = unified
+            .as_any()
+            .downcast_ref::<::arrow::array::DictionaryArray<::arrow::datatypes::UInt8Type>>()
+            .unwrap();
+        assert_eq!(dict.keys().len(), 4);
+        assert!(!dict.keys().is_null(0));
+        assert!(dict.keys().is_null(1));
+        assert!(!dict.keys().is_null(2));
+        assert!(!dict.keys().is_null(3));
+    }
+
+    #[test]
+    fn unify_dict_uint8_utf8view_returns_none_on_u8_overflow() {
+        // Build a chunk with 200 distinct strings, plus a second chunk
+        // with 100 more disjoint strings. Union = 300, exceeds u8.
+        let a_vals: Vec<String> = (0..200).map(|i| format!("a{i}")).collect();
+        let b_vals: Vec<String> = (0..100).map(|i| format!("b{i}")).collect();
+        let a_refs: Vec<&str> = a_vals.iter().map(|s| s.as_str()).collect();
+        let b_refs: Vec<&str> = b_vals.iter().map(|s| s.as_str()).collect();
+        let a_keys: Vec<Option<u8>> = (0..200).map(|i| Some(i as u8)).collect();
+        let b_keys: Vec<Option<u8>> = (0..100).map(|i| Some(i as u8)).collect();
+        let chunks = vec![dict_chunk(&a_refs, &a_keys), dict_chunk(&b_refs, &b_keys)];
+        let unified = super::try_unify_dict_uint8_utf8view(&chunks).unwrap();
+        assert!(unified.is_none(), "u8 overflow must fall back");
+    }
+
+    #[test]
+    fn concat_chunks_dict_path_emits_single_dict_when_all_dict() {
+        let chunks = vec![vec![
+            dict_chunk(&["foo", "bar"], &[Some(0), Some(1)]),
+            dict_chunk(&["bar", "baz"], &[Some(0), Some(1)]),
+        ]];
+        let out = super::concat_chunks(chunks).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(super::is_dict_uint8_utf8view(out[0].data_type()));
+        assert_eq!(out[0].len(), 4);
+    }
+
+    #[test]
+    fn concat_chunks_falls_back_to_stringview_on_mixed_shapes() {
+        use ::arrow::array::{StringViewArray, StringViewBuilder};
+        let mut vb = StringViewBuilder::with_capacity(2);
+        vb.append_value("x");
+        vb.append_value("z");
+        let sv: ArrayRef = Arc::new(vb.finish());
+        let chunks = vec![vec![dict_chunk(&["a", "b"], &[Some(0), Some(1)]), sv]];
+        let out = super::concat_chunks(chunks).unwrap();
+        assert_eq!(out.len(), 1);
+        // Mixed Dict + StringView → cast to value type, concat as StringView.
+        let strs = out[0]
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("fallback emits StringViewArray");
+        assert_eq!(strs.len(), 4);
+        assert_eq!(strs.value(0), "a");
+        assert_eq!(strs.value(1), "b");
+        assert_eq!(strs.value(2), "x");
+        assert_eq!(strs.value(3), "z");
     }
 }
