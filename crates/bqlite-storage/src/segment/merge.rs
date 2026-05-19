@@ -1112,9 +1112,19 @@ impl EncodedKWayMergeScan {
 
     /// Decode only the sort-key columns of `batch` into dense Arrow
     /// arrays and bundle them with a walker over `selection`.
+    ///
+    /// After decoding the sort-key arrays, this swaps the
+    /// `EncodedColumn::Encoded` entries for `entity_key_col` and
+    /// `ts_col` into `EncodedColumn::Materialized` variants holding
+    /// the already-decoded arrays. The downstream
+    /// `materialize_stitched` call then takes the cheap
+    /// `(EncodedColumn::Materialized, Some(sel))` path
+    /// (`compute::take`) instead of re-decoding the FoR/Plain payload
+    /// a second time. The encoded forms are Arc-backed so the swap
+    /// just drops one refcount.
     fn load_batch(
         &self,
-        batch: EncodedBatch,
+        mut batch: EncodedBatch,
         selection: RowSelection,
     ) -> Result<LoadedEncodedBatch> {
         if batch.columns.len() != self.schema.fields().len() {
@@ -1127,6 +1137,15 @@ impl EncodedKWayMergeScan {
         let entity_arr =
             materialize_encoded_column(&batch.columns[self.entity_key_col], &self.entity_bql)?;
         let ts_arr = materialize_encoded_column(&batch.columns[self.ts_col], &self.ts_bql)?;
+        let rows = batch.row_count;
+        batch.columns[self.entity_key_col] = bqlite_core::encoded::EncodedColumn::Materialized {
+            array: entity_arr.clone(),
+            rows,
+        };
+        batch.columns[self.ts_col] = bqlite_core::encoded::EncodedColumn::Materialized {
+            array: ts_arr.clone(),
+            rows,
+        };
         // Defend against sources that hand back decoded arrays whose
         // DataType disagrees with the merge schema — otherwise
         // `EntityKeyValue::extract` / `extract_ts_nanos` would panic on
