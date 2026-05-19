@@ -228,6 +228,10 @@ fn decode_impl(
     let mut values: Vec<i64> = Vec::with_capacity(row_count);
     let mut payload_cursor = 0usize;
 
+    // Cache BitPacker4x across blocks — `new()` runs CPU feature detection.
+    let bitpacker = BitPacker4x::new();
+    let mut block_u32 = [0u32; BLOCK_SIZE];
+
     for block_idx in 0..block_count {
         let block_start = block_idx * BLOCK_SIZE;
         let block_len = (row_count - block_start).min(BLOCK_SIZE);
@@ -268,10 +272,28 @@ fn decode_impl(
         let packed = &payload[payload_cursor..payload_cursor + packed_len];
         payload_cursor += packed_len;
 
-        let offsets = unpack_block_offsets(packed, block_len, bit_width);
-        for offset in offsets {
-            // Use i128 arithmetic to avoid overflow when block_min is near i64::MIN.
-            values.push(((block_min as i128) + (offset as i128)) as i64);
+        // Hot path: full 128-value block with bit_width ≤ 32. Decompress
+        // directly into a stack buffer and reconstitute via `wrapping_add`
+        // — equivalent to the i128 cast for in-range values (offset fits in
+        // u32, block_min + offset is a valid i64 by construction), but skips
+        // both the per-block `Vec<u64>` allocation and the i128 arithmetic.
+        if block_len == BLOCK_SIZE && bit_width <= BITPACKER4X_MAX_BIT_WIDTH {
+            let block_bytes = bitpacker4x_block_bytes(bit_width);
+            bitpacker.decompress(&packed[..block_bytes], &mut block_u32, bit_width);
+            for &offset in &block_u32 {
+                values.push(block_min.wrapping_add(offset as i64));
+            }
+        } else {
+            // Scalar fallback for short final blocks or bit_width > 32.
+            // `wrapping_add` works for the full range because offset is
+            // computed as (value as i128 - block_min as i128) as u64 at
+            // encode time, so the round-trip in two's-complement always
+            // recovers the original i64.
+            let width = bit_width as usize;
+            for i in 0..block_len {
+                let offset = read_bits(packed, i * width, width);
+                values.push(block_min.wrapping_add(offset as i64));
+            }
         }
     }
 
@@ -432,34 +454,6 @@ fn pack_block_offsets(block: &[i64], block_min: i64, bit_width: u8) -> Vec<u8> {
         write_bits(&mut bytes, i * width, width, offset);
     }
     bytes
-}
-
-/// Unpack `block_len` bit-packed offsets out of `bytes` at `bit_width` bits each.
-///
-/// Fast path: full 128-value blocks with `bit_width ≤ 32` use `BitPacker4x`.
-/// Scalar path: short final blocks and `bit_width > 32`.
-fn unpack_block_offsets(bytes: &[u8], block_len: usize, bit_width: u8) -> Vec<u64> {
-    let mut offsets = Vec::with_capacity(block_len);
-    if block_len == 0 {
-        return offsets;
-    }
-    let width = bit_width as usize;
-
-    // Fast path: full 128-value block with bit_width ≤ 32 → BitPacker4x.
-    if block_len == BLOCK_SIZE && bit_width <= BITPACKER4X_MAX_BIT_WIDTH {
-        let bitpacker = BitPacker4x::new();
-        let block_bytes = bitpacker4x_block_bytes(bit_width);
-        let mut block_u32 = [0u32; BLOCK_SIZE];
-        bitpacker.decompress(&bytes[..block_bytes], &mut block_u32, bit_width);
-        offsets.extend(block_u32.iter().copied().map(u64::from));
-        return offsets;
-    }
-
-    // Scalar path: short block or bit_width > 32.
-    for i in 0..block_len {
-        offsets.push(read_bits(bytes, i * width, width));
-    }
-    offsets
 }
 
 /// Write `width` bits of `value` at bit offset `start` into `out`,
