@@ -1061,9 +1061,69 @@ fn drive_to_completion(
     operator.open()?;
     let mut rows = Vec::new();
     while let Some(batch) = operator.next_batch()? {
-        rows.push(batch);
+        rows.push(canonicalize_for_output(batch)?);
     }
     Ok(rows)
+}
+
+/// Canonicalize a result batch for the user-facing contract.
+///
+/// Dict push-through (TASK-536 family) lets the scan emit
+/// `DictionaryArray<UInt8, Utf8View>` for low-cardinality string
+/// columns. Downstream operators handle that natively, but the
+/// engine's public output contract is plain `Utf8View` — Python
+/// bindings, CLI, and the acceptance tests downcast directly. This
+/// helper casts every `Dictionary(_, Utf8View)` column back to
+/// `Utf8View`, leaving other columns untouched.
+///
+/// Cost-neutral relative to the pre-push-through behaviour: scan used
+/// to materialise the dictionary at the boundary, so paying for the
+/// cast here just moves the same work past the operator chain (which
+/// may have skipped it entirely for aggregate queries because
+/// `HashAccumulator` already outputs `Utf8View`).
+fn canonicalize_for_output(batch: RecordBatch) -> bqlite_core::Result<RecordBatch> {
+    use ::arrow::datatypes::DataType;
+    let schema = batch.schema();
+    let mut needs_rewrite = false;
+    for col in batch.columns() {
+        if matches!(col.data_type(), DataType::Dictionary(_, _)) {
+            needs_rewrite = true;
+            break;
+        }
+    }
+    if !needs_rewrite {
+        return Ok(batch);
+    }
+    let mut new_cols: Vec<::arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut new_fields: Vec<::arrow::datatypes::Field> = Vec::with_capacity(batch.num_columns());
+    for (col, field) in batch.columns().iter().zip(schema.fields().iter()) {
+        match col.data_type() {
+            DataType::Dictionary(_, value_ty) => {
+                let target = value_ty.as_ref().clone();
+                let cast = ::arrow::compute::cast(col.as_ref(), &target).map_err(|e| {
+                    bqlite_core::BqliteError::Execution(format!(
+                        "canonicalize_for_output: cast Dict→{target:?} failed for column {}: {e}",
+                        field.name()
+                    ))
+                })?;
+                new_cols.push(cast);
+                new_fields.push(field.as_ref().clone().with_data_type(target));
+            }
+            _ => {
+                new_cols.push(col.clone());
+                new_fields.push(field.as_ref().clone());
+            }
+        }
+    }
+    let new_schema = std::sync::Arc::new(::arrow::datatypes::Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, new_cols).map_err(|e| {
+        bqlite_core::BqliteError::Execution(format!(
+            "canonicalize_for_output: record-batch rebuild failed: {e}"
+        ))
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

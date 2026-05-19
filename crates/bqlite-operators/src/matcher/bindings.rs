@@ -237,6 +237,14 @@ fn extract_binding_value(array: &dyn Array, row: usize) -> Option<BindingValue> 
     if let Some(arr) = array.as_any().downcast_ref::<StringViewArray>() {
         return Some(BindingValue::String(CompactString::from(arr.value(row))));
     }
+    // Dict<UInt8, Utf8View> — the low-card scan-output layout. Use the
+    // shared `StringColumnView` resolver so the row→&str dispatch
+    // matches every other consumer of the layout.
+    if let Some(view) = crate::string_column::StringColumnView::resolve(array) {
+        if let crate::string_column::StringColumnView::Dict { .. } = view {
+            return Some(BindingValue::String(CompactString::from(view.value(row))));
+        }
+    }
     if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
         return Some(BindingValue::Int(arr.value(row)));
     }

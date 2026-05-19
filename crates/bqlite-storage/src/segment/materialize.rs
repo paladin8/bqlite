@@ -25,11 +25,11 @@
 use std::sync::Arc;
 
 use ::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringViewArray, StringViewBuilder,
-    TimestampNanosecondArray, UInt32Array,
+    Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, StringViewArray,
+    StringViewBuilder, TimestampNanosecondArray, UInt32Array, UInt8Builder,
 };
 use ::arrow::compute;
-use ::arrow::datatypes::TimeUnit;
+use ::arrow::datatypes::{TimeUnit, UInt8Type};
 
 use bqlite_core::encoded::{EncodedBatch, EncodedColumn, EncodedKind, RowSelection};
 use bqlite_core::scalar::ScalarValue;
@@ -67,6 +67,27 @@ pub fn materialize_encoded_column_selected(
     ty: &BqlType,
     selection: Option<&RowSelection>,
 ) -> Result<ArrayRef> {
+    materialize_encoded_column_selected_with_options(col, ty, selection, false)
+}
+
+/// Variant of [`materialize_encoded_column_selected`] that opts a column
+/// into the Dict<UInt8> push-through fast path.
+///
+/// When `prefer_dict_string == true` and the column is a Dictionary-encoded
+/// `BqlType::String` whose `code_bit_width <= 8`, the materialized output is
+/// a `DictionaryArray<UInt8, Utf8View>` instead of a fully-expanded
+/// `StringViewArray`. All other encodings, types, and code widths fall back
+/// to the existing materialized shape.
+///
+/// Callers that go through a cross-source `concat` / `take` /
+/// `interleave` must pass `false` because per-segment dictionaries differ
+/// — see `materialize_stitched`'s Runs/Indices arms.
+pub fn materialize_encoded_column_selected_with_options(
+    col: &EncodedColumn,
+    ty: &BqlType,
+    selection: Option<&RowSelection>,
+    prefer_dict_string: bool,
+) -> Result<ArrayRef> {
     match (col, selection) {
         (EncodedColumn::Materialized { array, .. }, None) => Ok(array.clone()),
         (EncodedColumn::Materialized { array, .. }, Some(sel)) => take_selected(array, sel),
@@ -74,7 +95,14 @@ pub fn materialize_encoded_column_selected(
             materialize_encoded_kind(chunk, kind, *rows as usize, ty)
         }
         (EncodedColumn::Encoded { chunk, kind, rows }, Some(sel)) => {
-            materialize_encoded_kind_selected(chunk, kind, *rows as usize, ty, sel)
+            materialize_encoded_kind_selected(
+                chunk,
+                kind,
+                *rows as usize,
+                ty,
+                sel,
+                prefer_dict_string,
+            )
         }
     }
 }
@@ -159,6 +187,7 @@ fn materialize_encoded_kind_selected(
     rows: usize,
     ty: &BqlType,
     selection: &RowSelection,
+    prefer_dict_string: bool,
 ) -> Result<ArrayRef> {
     match kind {
         EncodedKind::Constant { value } => {
@@ -169,7 +198,20 @@ fn materialize_encoded_kind_selected(
         }
         EncodedKind::Rle => materialize_rle_selected(chunk, ty, rows, selection),
         EncodedKind::Dictionary { values } => {
-            materialize_dictionary_selected(chunk, values.as_ref(), ty, rows, selection)
+            // Dict<UInt8> push-through fast path: when the caller opts
+            // in AND the chunk's code width fits in a byte AND the
+            // logical type is String, hand back a `DictionaryArray`
+            // sized to `selection.len()` instead of materialising every
+            // row to a `StringViewArray`. Operators handle both shapes.
+            let prefer = prefer_dict_string
+                && matches!(ty, BqlType::String)
+                && chunk.params.len() == 5
+                && chunk.params[4] <= 8;
+            if prefer {
+                materialize_dictionary_selected_as_dict(chunk, values.as_ref(), rows, selection)
+            } else {
+                materialize_dictionary_selected(chunk, values.as_ref(), ty, rows, selection)
+            }
         }
         other => Err(BqliteError::Execution(format!(
             "materialize: EncodedKind::{other:?} has no selection-aware materializer; \
@@ -700,13 +742,123 @@ fn materialize_dictionary_selected(
     }
 }
 
-/// Type-dispatched "pick rows from a dense Arrow array via
-/// `walk_selection_with_nulls`" helper used by `materialize_plain_selected`
-/// and `materialize_rle_selected`. `dense` has length `non_null_count`
-/// and contains the values the encoder physically stored — i.e. only
-/// non-null rows. The output is sized to `selection.len()` and its null
-/// buffer reflects the chunk's bitmap at the selected logical
+/// Materialise a `Dictionary`-encoded String chunk to a
+/// `DictionaryArray<UInt8, Utf8View>` instead of a fully-expanded
+/// `StringViewArray`.
+///
+/// Requires `chunk.params[4] (code_bit_width) <= 8` so per-row codes
+/// fit in a `u8`. Callers should fall back to
+/// [`materialize_dictionary_selected`] when the bit width exceeds 8.
+///
+/// The output dictionary value array contains every entry from the
+/// chunk's value region (no pruning by selection); only the keys are
+/// narrowed to `selection.len()`. Keeping the full value table avoids
+/// re-mapping codes and matches the size profile of segment-side
+/// dictionaries (typically ≤ 256 unique strings).
+///
+/// Wired into the scan boundary via
+/// [`materialize_encoded_column_selected_with_options`] when callers
+/// opt into the Dict<UInt8> push-through. The operator-side boundary
+/// builds a per-batch Arrow schema from the actual emitted arrays so
+/// the `RecordBatch::try_new` strict type check stays consistent even
+/// when consecutive row-groups disagree on physical String shape.
+pub(crate) fn materialize_dictionary_selected_as_dict(
+    chunk: &bqlite_core::encoded::PinnedChunk,
+    values: &[u8],
+    rows: usize,
+    selection: &RowSelection,
+) -> Result<ArrayRef> {
+    if chunk.params.len() != 5 {
+        return Err(BqliteError::Execution(format!(
+            "materialize_dictionary_selected_as_dict: chunk params expected 5 bytes, got {}",
+            chunk.params.len()
+        )));
+    }
+    let code_bit_width = chunk.params[4];
+    if code_bit_width > 8 {
+        return Err(BqliteError::Execution(format!(
+            "materialize_dictionary_selected_as_dict: code_bit_width {code_bit_width} exceeds u8"
+        )));
+    }
+    let non_null_count = match chunk.nulls.as_deref() {
+        None => rows,
+        Some(b) => super::reader::count_set_bits_pub(b, rows),
+    };
+    let codes =
+        crate::encoding::dictionary::unpack_codes(&chunk.payload, non_null_count, code_bit_width)?;
+
+    // Decode the dict-values region into a StringViewArray.
+    let mut dict_builder = StringViewBuilder::with_capacity(16);
+    let mut off = 0usize;
+    while off < values.len() {
+        if off + 4 > values.len() {
+            return Err(BqliteError::Execution(
+                "materialize_dictionary_selected_as_dict: value region truncated at length prefix"
+                    .into(),
+            ));
+        }
+        let len = u32::from_le_bytes(values[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        if off + len > values.len() {
+            return Err(BqliteError::Execution(
+                "materialize_dictionary_selected_as_dict: value region truncated at value".into(),
+            ));
+        }
+        let s = std::str::from_utf8(&values[off..off + len]).map_err(|e| {
+            BqliteError::Execution(format!(
+                "materialize_dictionary_selected_as_dict: value not valid UTF-8: {e}"
+            ))
+        })?;
+        off += len;
+        dict_builder.append_value(s);
+    }
+    let dict_values = dict_builder.finish();
+    let dict_cardinality = dict_values.len();
+
+    let mut key_builder = UInt8Builder::with_capacity(selection.len());
+    walk_selection_with_nulls(chunk.nulls.as_deref(), rows, selection, |_, src| {
+        match src {
+            None => key_builder.append_null(),
+            Some(rank) => {
+                let code = *codes.get(rank).ok_or_else(|| {
+                    BqliteError::Execution(format!(
+                        "materialize_dictionary_selected_as_dict: rank {rank} out of bounds"
+                    ))
+                })? as usize;
+                if code >= dict_cardinality {
+                    return Err(BqliteError::Execution(format!(
+                        "materialize_dictionary_selected_as_dict: code {code} out of bounds (cardinality {dict_cardinality})"
+                    )));
+                }
+                key_builder.append_value(code as u8);
+            }
+        }
+        Ok(())
+    })?;
+    let keys = key_builder.finish();
+
+    let dict = DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(dict_values)).map_err(|e| {
+        BqliteError::Execution(format!(
+            "materialize_dictionary_selected_as_dict: DictionaryArray::try_new failed: {e}"
+        ))
+    })?;
+    Ok(Arc::new(dict))
+}
+
+/// Type-dispatched "pick rows from a dense Arrow array" helper used by
+/// `materialize_plain_selected` and `materialize_rle_selected`.
+///
+/// `dense` has length `non_null_count` (the values the encoder
+/// physically stored). The output is sized to `selection.len()` and its
+/// null buffer reflects the chunk's bitmap at the selected logical
 /// positions only.
+///
+/// The function specializes on `null_bitmap == None` to skip building a
+/// `NullBuffer` entirely (left at `None` on the output array) and to
+/// bulk-copy whole runs via `extend_from_slice` / `append_packed_range`
+/// instead of walking row-by-row through a callback. Both shapes
+/// matter: the no-null fast path is hit on every scan that doesn't run
+/// into actual nulls, which is the common case for these benchmarks.
 fn select_with_nulls(
     dense: &ArrayRef,
     ty: &BqlType,
@@ -722,33 +874,15 @@ fn select_with_nulls(
                 .ok_or_else(|| {
                     BqliteError::Execution("select_with_nulls: expected BooleanArray".into())
                 })?;
-            let mut values = Vec::with_capacity(selection.len());
-            let null_buffer =
-                walk_selection_with_nulls(null_bitmap, rows, selection, |_, source| {
-                    match source {
-                        None => values.push(false),
-                        Some(rank) => values.push(src.value(rank)),
-                    }
-                    Ok(())
-                })?;
-            let bb = ::arrow::buffer::BooleanBuffer::from_iter(values);
-            Ok(Arc::new(BooleanArray::new(bb, Some(null_buffer))))
+            select_bool(src.values(), null_bitmap, rows, selection)
         }
         BqlType::Int => {
             let src = dense.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                 BqliteError::Execution("select_with_nulls: expected Int64Array".into())
             })?;
-            let src_values = src.values();
-            let mut out = Vec::with_capacity(selection.len());
-            let null_buffer =
-                walk_selection_with_nulls(null_bitmap, rows, selection, |_, source| {
-                    match source {
-                        None => out.push(0),
-                        Some(rank) => out.push(src_values[rank]),
-                    }
-                    Ok(())
-                })?;
-            Ok(Arc::new(Int64Array::new(out.into(), Some(null_buffer))))
+            let (values, null_buffer) =
+                select_primitive::<i64>(src.values(), null_bitmap, rows, selection)?;
+            Ok(Arc::new(Int64Array::new(values.into(), null_buffer)))
         }
         BqlType::Float => {
             let src = dense
@@ -757,17 +891,9 @@ fn select_with_nulls(
                 .ok_or_else(|| {
                     BqliteError::Execution("select_with_nulls: expected Float64Array".into())
                 })?;
-            let src_values = src.values();
-            let mut out = Vec::with_capacity(selection.len());
-            let null_buffer =
-                walk_selection_with_nulls(null_bitmap, rows, selection, |_, source| {
-                    match source {
-                        None => out.push(0.0),
-                        Some(rank) => out.push(src_values[rank]),
-                    }
-                    Ok(())
-                })?;
-            Ok(Arc::new(Float64Array::new(out.into(), Some(null_buffer))))
+            let (values, null_buffer) =
+                select_primitive::<f64>(src.values(), null_bitmap, rows, selection)?;
+            Ok(Arc::new(Float64Array::new(values.into(), null_buffer)))
         }
         BqlType::Timestamp => {
             let src = dense
@@ -778,18 +904,10 @@ fn select_with_nulls(
                         "select_with_nulls: expected TimestampNanosecondArray".into(),
                     )
                 })?;
-            let src_values = src.values();
-            let mut out = Vec::with_capacity(selection.len());
-            let null_buffer =
-                walk_selection_with_nulls(null_bitmap, rows, selection, |_, source| {
-                    match source {
-                        None => out.push(0),
-                        Some(rank) => out.push(src_values[rank]),
-                    }
-                    Ok(())
-                })?;
+            let (values, null_buffer) =
+                select_primitive::<i64>(src.values(), null_bitmap, rows, selection)?;
             Ok(Arc::new(
-                TimestampNanosecondArray::new(out.into(), Some(null_buffer)).with_timezone("UTC"),
+                TimestampNanosecondArray::new(values.into(), null_buffer).with_timezone("UTC"),
             ))
         }
         BqlType::String => {
@@ -799,20 +917,332 @@ fn select_with_nulls(
                 .ok_or_else(|| {
                     BqliteError::Execution("select_with_nulls: expected StringViewArray".into())
                 })?;
-            let mut builder = StringViewBuilder::with_capacity(selection.len());
-            walk_selection_with_nulls(null_bitmap, rows, selection, |_, source| {
-                match source {
-                    None => builder.append_null(),
-                    Some(rank) => builder.append_value(src.value(rank)),
-                }
-                Ok(())
-            })?;
-            Ok(Arc::new(builder.finish()))
+            select_string(src, null_bitmap, rows, selection)
         }
         BqlType::List(_) | BqlType::Map(_) => Err(BqliteError::Execution(format!(
             "select_with_nulls: nested type {ty:?} is not supported on the encoded selection path"
         ))),
     }
+}
+
+/// Generic primitive row picker for `Int`, `Float`, and `Timestamp`.
+///
+/// `src` is indexed two different ways depending on `null_bitmap`:
+/// - `None`: `src.len() == rows` and is indexed directly by logical row,
+///   so whole runs can be `extend_from_slice`-ed.
+/// - `Some(bitmap)`: `src.len() == non_null_count` and is indexed by
+///   rank into the non-null sequence; a rank walk over the bitmap maps
+///   selected logical rows to ranks.
+///
+/// Returns the dense output buffer plus an `Option<NullBuffer>` that the
+/// caller hands to the Arrow array constructor. When there are no
+/// nulls, the buffer is `None` and the output array carries no null
+/// buffer at all — Arrow validity checks then take the cheap "no
+/// nulls" branch.
+fn select_primitive<T: Copy + Default>(
+    src: &[T],
+    null_bitmap: Option<&[u8]>,
+    rows: usize,
+    selection: &RowSelection,
+) -> Result<(Vec<T>, Option<::arrow::buffer::NullBuffer>)> {
+    let sel_len = selection.len();
+    match null_bitmap {
+        None => {
+            let mut out: Vec<T> = Vec::with_capacity(sel_len);
+            match selection {
+                RowSelection::Runs(runs) => {
+                    for run in runs {
+                        let start = run.start as usize;
+                        let end = run.end() as usize;
+                        if end > rows {
+                            return Err(BqliteError::Execution(format!(
+                                "select_primitive: run end {end} out of range (rows = {rows})"
+                            )));
+                        }
+                        out.extend_from_slice(&src[start..end]);
+                    }
+                }
+                RowSelection::Indices(sv) => {
+                    for &row in sv.as_slice() {
+                        let r = row as usize;
+                        if r >= rows {
+                            return Err(BqliteError::Execution(format!(
+                                "select_primitive: row {r} out of range (rows = {rows})"
+                            )));
+                        }
+                        out.push(src[r]);
+                    }
+                }
+            }
+            Ok((out, None))
+        }
+        Some(bitmap) => {
+            let mut out: Vec<T> = Vec::with_capacity(sel_len);
+            let mut nulls_bb = ::arrow::array::builder::BooleanBufferBuilder::new(sel_len);
+            let mut last_walked = 0usize;
+            let mut running_rank = 0usize;
+            match selection {
+                RowSelection::Runs(runs) => {
+                    for run in runs {
+                        for row in run.start..run.end() {
+                            let r = row as usize;
+                            if r >= rows {
+                                return Err(BqliteError::Execution(format!(
+                                    "select_primitive: row {r} out of range (rows = {rows})"
+                                )));
+                            }
+                            while last_walked < r {
+                                if bitmap_is_set(bitmap, last_walked) {
+                                    running_rank += 1;
+                                }
+                                last_walked += 1;
+                            }
+                            if bitmap_is_set(bitmap, r) {
+                                out.push(src[running_rank]);
+                                nulls_bb.append(true);
+                            } else {
+                                out.push(T::default());
+                                nulls_bb.append(false);
+                            }
+                        }
+                    }
+                }
+                RowSelection::Indices(sv) => {
+                    for &row in sv.as_slice() {
+                        let r = row as usize;
+                        if r >= rows {
+                            return Err(BqliteError::Execution(format!(
+                                "select_primitive: row {r} out of range (rows = {rows})"
+                            )));
+                        }
+                        while last_walked < r {
+                            if bitmap_is_set(bitmap, last_walked) {
+                                running_rank += 1;
+                            }
+                            last_walked += 1;
+                        }
+                        if bitmap_is_set(bitmap, r) {
+                            out.push(src[running_rank]);
+                            nulls_bb.append(true);
+                        } else {
+                            out.push(T::default());
+                            nulls_bb.append(false);
+                        }
+                    }
+                }
+            }
+            Ok((
+                out,
+                Some(::arrow::buffer::NullBuffer::new(nulls_bb.finish())),
+            ))
+        }
+    }
+}
+
+/// Bool specialization. Mirrors `select_primitive` but emits bits
+/// directly into a `BooleanBufferBuilder` — no `Vec<bool>` intermediate
+/// and no `BooleanBuffer::from_iter::<bool>` per-bit copy. The no-null
+/// + Runs path bulk-appends bit runs via `append_packed_range`.
+fn select_bool(
+    src_bb: &::arrow::buffer::BooleanBuffer,
+    null_bitmap: Option<&[u8]>,
+    rows: usize,
+    selection: &RowSelection,
+) -> Result<ArrayRef> {
+    let sel_len = selection.len();
+    match null_bitmap {
+        None => {
+            let mut out_bb = ::arrow::array::builder::BooleanBufferBuilder::new(sel_len);
+            let src_offset = src_bb.offset();
+            let src_bytes = src_bb.values();
+            match selection {
+                RowSelection::Runs(runs) => {
+                    for run in runs {
+                        let start = run.start as usize;
+                        let end = run.end() as usize;
+                        if end > rows {
+                            return Err(BqliteError::Execution(format!(
+                                "select_bool: run end {end} out of range (rows = {rows})"
+                            )));
+                        }
+                        out_bb.append_packed_range(
+                            src_offset + start..src_offset + end,
+                            src_bytes,
+                        );
+                    }
+                }
+                RowSelection::Indices(sv) => {
+                    for &row in sv.as_slice() {
+                        let r = row as usize;
+                        if r >= rows {
+                            return Err(BqliteError::Execution(format!(
+                                "select_bool: row {r} out of range (rows = {rows})"
+                            )));
+                        }
+                        out_bb.append(src_bb.value(r));
+                    }
+                }
+            }
+            Ok(Arc::new(BooleanArray::new(out_bb.finish(), None)))
+        }
+        Some(bitmap) => {
+            let mut out_bb = ::arrow::array::builder::BooleanBufferBuilder::new(sel_len);
+            let mut nulls_bb = ::arrow::array::builder::BooleanBufferBuilder::new(sel_len);
+            let mut last_walked = 0usize;
+            let mut running_rank = 0usize;
+            let emit = |r: usize,
+                            out_bb: &mut ::arrow::array::builder::BooleanBufferBuilder,
+                            nulls_bb: &mut ::arrow::array::builder::BooleanBufferBuilder,
+                            last_walked: &mut usize,
+                            running_rank: &mut usize|
+             -> Result<()> {
+                if r >= rows {
+                    return Err(BqliteError::Execution(format!(
+                        "select_bool: row {r} out of range (rows = {rows})"
+                    )));
+                }
+                while *last_walked < r {
+                    if bitmap_is_set(bitmap, *last_walked) {
+                        *running_rank += 1;
+                    }
+                    *last_walked += 1;
+                }
+                if bitmap_is_set(bitmap, r) {
+                    out_bb.append(src_bb.value(*running_rank));
+                    nulls_bb.append(true);
+                } else {
+                    out_bb.append(false);
+                    nulls_bb.append(false);
+                }
+                Ok(())
+            };
+            match selection {
+                RowSelection::Runs(runs) => {
+                    for run in runs {
+                        for row in run.start..run.end() {
+                            emit(
+                                row as usize,
+                                &mut out_bb,
+                                &mut nulls_bb,
+                                &mut last_walked,
+                                &mut running_rank,
+                            )?;
+                        }
+                    }
+                }
+                RowSelection::Indices(sv) => {
+                    for &row in sv.as_slice() {
+                        emit(
+                            row as usize,
+                            &mut out_bb,
+                            &mut nulls_bb,
+                            &mut last_walked,
+                            &mut running_rank,
+                        )?;
+                    }
+                }
+            }
+            Ok(Arc::new(BooleanArray::new(
+                out_bb.finish(),
+                Some(::arrow::buffer::NullBuffer::new(nulls_bb.finish())),
+            )))
+        }
+    }
+}
+
+/// String specialization. Pre-sizes `StringViewBuilder` and walks rows
+/// inline rather than through a callback. The no-null path skips
+/// building a null buffer entirely (the builder leaves validity at
+/// "all valid" when `append_null` is never called).
+fn select_string(
+    src: &StringViewArray,
+    null_bitmap: Option<&[u8]>,
+    rows: usize,
+    selection: &RowSelection,
+) -> Result<ArrayRef> {
+    let sel_len = selection.len();
+    let mut builder = StringViewBuilder::with_capacity(sel_len);
+    match null_bitmap {
+        None => match selection {
+            RowSelection::Runs(runs) => {
+                for run in runs {
+                    let start = run.start as usize;
+                    let end = run.end() as usize;
+                    if end > rows {
+                        return Err(BqliteError::Execution(format!(
+                            "select_string: run end {end} out of range (rows = {rows})"
+                        )));
+                    }
+                    for r in start..end {
+                        builder.append_value(src.value(r));
+                    }
+                }
+            }
+            RowSelection::Indices(sv) => {
+                for &row in sv.as_slice() {
+                    let r = row as usize;
+                    if r >= rows {
+                        return Err(BqliteError::Execution(format!(
+                            "select_string: row {r} out of range (rows = {rows})"
+                        )));
+                    }
+                    builder.append_value(src.value(r));
+                }
+            }
+        },
+        Some(bitmap) => {
+            let mut last_walked = 0usize;
+            let mut running_rank = 0usize;
+            let emit = |r: usize,
+                            builder: &mut StringViewBuilder,
+                            last_walked: &mut usize,
+                            running_rank: &mut usize|
+             -> Result<()> {
+                if r >= rows {
+                    return Err(BqliteError::Execution(format!(
+                        "select_string: row {r} out of range (rows = {rows})"
+                    )));
+                }
+                while *last_walked < r {
+                    if bitmap_is_set(bitmap, *last_walked) {
+                        *running_rank += 1;
+                    }
+                    *last_walked += 1;
+                }
+                if bitmap_is_set(bitmap, r) {
+                    builder.append_value(src.value(*running_rank));
+                } else {
+                    builder.append_null();
+                }
+                Ok(())
+            };
+            match selection {
+                RowSelection::Runs(runs) => {
+                    for run in runs {
+                        for row in run.start..run.end() {
+                            emit(
+                                row as usize,
+                                &mut builder,
+                                &mut last_walked,
+                                &mut running_rank,
+                            )?;
+                        }
+                    }
+                }
+                RowSelection::Indices(sv) => {
+                    for &row in sv.as_slice() {
+                        emit(
+                            row as usize,
+                            &mut builder,
+                            &mut last_walked,
+                            &mut running_rank,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
 }
 
 fn apply_null_bitmap(
@@ -1176,6 +1606,117 @@ mod tests {
         let sel = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1, 5]));
         let err = materialize_encoded_column_selected(&col, &BqlType::Int, Some(&sel))
             .expect_err("row 5 exceeds logical row count 3");
+        assert!(matches!(err, BqliteError::Execution(_)));
+    }
+
+    /// Build a dict-encoded String chunk + its inline values region for
+    /// `materialize_dictionary_selected_as_dict` tests.
+    fn dict_string_chunk(
+        rows_values: &[&str],
+        valid: Option<&[bool]>,
+    ) -> (PinnedChunk, Vec<u8>, u32) {
+        let mut distinct: Vec<&str> = rows_values.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let cardinality = distinct.len();
+        let bit_width: u8 = if cardinality <= 1 {
+            1
+        } else {
+            let max_code = (cardinality - 1) as u32;
+            (32 - max_code.leading_zeros()) as u8
+        };
+        // Non-null rows' codes only (encoder stores `non_null_count` codes).
+        let codes: Vec<u32> = rows_values
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| valid.is_none_or(|v| v[*i]))
+            .map(|(_, s)| distinct.binary_search(s).unwrap() as u32)
+            .collect();
+        let payload =
+            crate::encoding::dictionary::pack_codes(&codes, bit_width, codes.len()).unwrap();
+
+        // Inline values region: `len u32 LE + bytes` per dict entry.
+        let mut values: Vec<u8> = Vec::new();
+        for s in &distinct {
+            values.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            values.extend_from_slice(s.as_bytes());
+        }
+
+        // 5-byte params block: dict_id u32 LE (0) + code_bit_width u8.
+        let mut params = vec![0u8; 4];
+        params.push(bit_width);
+
+        let nulls = valid.map(|v| arc_bytes(make_null_bitmap(v)));
+        let chunk = PinnedChunk {
+            payload: arc_bytes(payload),
+            nulls,
+            params: arc_bytes(params),
+        };
+        (chunk, values, rows_values.len() as u32)
+    }
+
+    #[test]
+    fn dict_materialize_as_dict_round_trips_low_card() {
+        // 3 distinct values → 2 bits per code, fits in u8.
+        let row_values = ["us", "uk", "us", "ca", "us", "uk"];
+        let (chunk, values, rows) = dict_string_chunk(&row_values, None);
+        let sel = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 2, 3, 5]));
+        let out = materialize_dictionary_selected_as_dict(&chunk, &values, rows as usize, &sel)
+            .expect("materialize_dictionary_selected_as_dict succeeds");
+        let dict = out
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .expect("output is DictionaryArray<UInt8Type>");
+        let dict_values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("dict values are StringViewArray");
+        assert_eq!(dict.len(), 4);
+        let resolve = |row: usize| {
+            let code = dict.keys().value(row) as usize;
+            dict_values.value(code)
+        };
+        assert_eq!(resolve(0), "us");
+        assert_eq!(resolve(1), "us");
+        assert_eq!(resolve(2), "ca");
+        assert_eq!(resolve(3), "uk");
+    }
+
+    #[test]
+    fn dict_materialize_as_dict_preserves_nulls() {
+        let row_values = ["us", "uk", "us", "ca", "us"];
+        let valid = [true, false, true, true, false];
+        let (chunk, values, rows) = dict_string_chunk(&row_values, Some(&valid));
+        let sel = RowSelection::from_indices(SelectionVector::from_sorted(vec![0, 1, 2, 3, 4]));
+        let out =
+            materialize_dictionary_selected_as_dict(&chunk, &values, rows as usize, &sel).unwrap();
+        let dict = out
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .unwrap();
+        assert_eq!(dict.len(), 5);
+        assert!(!dict.keys().is_null(0));
+        assert!(dict.keys().is_null(1));
+        assert!(!dict.keys().is_null(2));
+        assert!(!dict.keys().is_null(3));
+        assert!(dict.keys().is_null(4));
+    }
+
+    #[test]
+    fn dict_materialize_as_dict_rejects_wide_codes() {
+        // Synthesise a chunk that claims bit_width = 9 — exceeds u8.
+        let mut params = vec![0u8; 4];
+        params.push(9u8);
+        let chunk = PinnedChunk {
+            payload: arc_bytes(vec![0; 16]),
+            nulls: None,
+            params: arc_bytes(params),
+        };
+        let values = vec![];
+        let sel = RowSelection::from_indices(SelectionVector::from_sorted(vec![0]));
+        let err = materialize_dictionary_selected_as_dict(&chunk, &values, 1, &sel)
+            .expect_err("code_bit_width > 8 must error");
         assert!(matches!(err, BqliteError::Execution(_)));
     }
 }

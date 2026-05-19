@@ -25,13 +25,16 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, UInt32Array};
 use arrow::compute;
-use arrow::datatypes::Schema as ArrowSchema;
+use arrow::datatypes::{Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::encoded::{EncodedBatch, RowSelection, StitchedBatch, StitchedRows};
 use bqlite_core::metrics::Metrics;
 use bqlite_core::{BqlType, BqliteError, Result};
-use bqlite_storage::{materialize_encoded_column, materialize_encoded_column_selected};
+use bqlite_storage::{
+    materialize_encoded_column, materialize_encoded_column_selected,
+    materialize_encoded_column_selected_with_options,
+};
 
 use crate::filtered_batch::FilteredBatch;
 use crate::selection::selection_to_bool_array;
@@ -63,6 +66,31 @@ pub fn materialize_selected(
     materialize_selected_with_metrics(batch, selection, types, schema, None)
 }
 
+/// Dict-aware variant of [`materialize_selected`] used by the scan
+/// operator to keep low-cardinality `BqlType::String` columns in
+/// `DictionaryArray<UInt8, Utf8View>` form across the boundary.
+///
+/// `schema` declares the **logical** Arrow types — typically
+/// `Utf8View` for every String column. When a batch produces a
+/// `DictionaryArray` for one of those columns the function rewrites
+/// the corresponding field's `data_type` for that batch only, so
+/// `RecordBatch::try_new` accepts the heterogeneous physical shape
+/// without forcing every downstream caller to track which columns are
+/// dictionary-encoded.
+///
+/// Downstream operators must already accept both shapes — that
+/// invariant is recorded in `docs/design/storage/zero-copy-scan-filter.md`
+/// and in the per-operator unit tests under `crates/bqlite-operators/src`.
+pub fn materialize_selected_dict_pushthrough(
+    batch: &EncodedBatch,
+    selection: Option<&RowSelection>,
+    types: &[BqlType],
+    schema: Arc<ArrowSchema>,
+    metrics: Option<&dyn Metrics>,
+) -> Result<FilteredBatch> {
+    materialize_selected_inner(batch, selection, types, schema, metrics, true)
+}
+
 /// Metrics-aware variant of [`materialize_selected`].
 ///
 /// When `metrics` is `Some`, records the copy-budget counters defined
@@ -86,6 +114,17 @@ pub fn materialize_selected_with_metrics(
     schema: Arc<ArrowSchema>,
     metrics: Option<&dyn Metrics>,
 ) -> Result<FilteredBatch> {
+    materialize_selected_inner(batch, selection, types, schema, metrics, false)
+}
+
+fn materialize_selected_inner(
+    batch: &EncodedBatch,
+    selection: Option<&RowSelection>,
+    types: &[BqlType],
+    schema: Arc<ArrowSchema>,
+    metrics: Option<&dyn Metrics>,
+    prefer_dict_string: bool,
+) -> Result<FilteredBatch> {
     if batch.columns.len() != types.len() {
         return Err(BqliteError::Execution(format!(
             "materialize_selected: batch has {} columns but {} types were provided",
@@ -108,9 +147,20 @@ pub fn materialize_selected_with_metrics(
     }
     let mut arrays = Vec::with_capacity(batch.columns.len());
     for (col, ty) in batch.columns.iter().zip(types.iter()) {
-        arrays.push(materialize_encoded_column_selected(col, ty, selection)?);
+        let arr = materialize_encoded_column_selected_with_options(
+            col,
+            ty,
+            selection,
+            prefer_dict_string,
+        )?;
+        arrays.push(arr);
     }
-    let record = RecordBatch::try_new(schema, arrays).map_err(|e| {
+    let effective_schema = if prefer_dict_string {
+        schema_matching_arrays(&schema, &arrays)?
+    } else {
+        schema
+    };
+    let record = RecordBatch::try_new(effective_schema, arrays).map_err(|e| {
         BqliteError::Execution(format!(
             "materialize_selected: record-batch build failed: {e}"
         ))
@@ -120,6 +170,45 @@ pub fn materialize_selected_with_metrics(
         m.record_bytes_materialized_after_filter(record_batch_bytes(&record));
     }
     Ok(FilteredBatch::dense(record))
+}
+
+/// Rebuild `schema` so each field's `data_type` matches the
+/// corresponding emitted array.
+///
+/// Only the data type can differ when `prefer_dict_string == true`:
+/// String fields may resolve to `Dict<UInt8, Utf8View>` in one batch
+/// and `Utf8View` in the next, depending on per-row-group encoding.
+/// Field names, nullability, and metadata are preserved.
+fn schema_matching_arrays(
+    schema: &Arc<ArrowSchema>,
+    arrays: &[ArrayRef],
+) -> Result<Arc<ArrowSchema>> {
+    if schema.fields().len() != arrays.len() {
+        return Err(BqliteError::Execution(format!(
+            "schema_matching_arrays: schema has {} fields but {} arrays",
+            schema.fields().len(),
+            arrays.len()
+        )));
+    }
+    let mut fields: Vec<Field> = Vec::with_capacity(arrays.len());
+    let mut differs = false;
+    for (field, arr) in schema.fields().iter().zip(arrays.iter()) {
+        if field.data_type() == arr.data_type() {
+            fields.push(field.as_ref().clone());
+        } else {
+            differs = true;
+            let mut updated = field.as_ref().clone();
+            updated = updated.with_data_type(arr.data_type().clone());
+            fields.push(updated);
+        }
+    }
+    if !differs {
+        return Ok(schema.clone());
+    }
+    Ok(Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
 }
 
 /// Collapse a [`FilteredBatch`] from the post-boundary kernel chain
@@ -221,6 +310,28 @@ pub fn materialize_stitched(
     types: &[BqlType],
     schema: Arc<ArrowSchema>,
 ) -> Result<FilteredBatch> {
+    materialize_stitched_inner(stitched, types, schema, false)
+}
+
+/// Dict-aware variant of [`materialize_stitched`]. The single-source
+/// arm honours dict push-through; the cross-source `Runs` and
+/// `Indices` arms force `prefer_dict_string == false` because their
+/// concat/take steps require homogeneous physical types and per-segment
+/// dictionaries are not unified.
+pub fn materialize_stitched_dict_pushthrough(
+    stitched: &StitchedBatch,
+    types: &[BqlType],
+    schema: Arc<ArrowSchema>,
+) -> Result<FilteredBatch> {
+    materialize_stitched_inner(stitched, types, schema, true)
+}
+
+fn materialize_stitched_inner(
+    stitched: &StitchedBatch,
+    types: &[BqlType],
+    schema: Arc<ArrowSchema>,
+    prefer_dict_string: bool,
+) -> Result<FilteredBatch> {
     if schema.fields().len() != types.len() {
         return Err(BqliteError::Execution(format!(
             "materialize_stitched: schema has {} fields but {} types provided",
@@ -237,7 +348,7 @@ pub fn materialize_stitched(
                     stitched.sources.len()
                 ))
             })?;
-            materialize_selected(src, selection.as_ref(), types, schema)
+            materialize_selected_inner(src, selection.as_ref(), types, schema, None, prefer_dict_string)
         }
         StitchedRows::Runs(runs) => {
             let arrays = materialize_stitched_runs(&stitched.sources, runs, types)?;

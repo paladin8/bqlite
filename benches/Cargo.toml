@@ -290,3 +290,15 @@ harness = false
 [[bin]]
 name = "perf_report"
 path = "src/bin/perf_report.rs"
+
+# Per-core profiling driver. Pair with samply / cargo flamegraph.
+[[bin]]
+name = "perf_profile"
+path = "src/bin/perf_profile.rs"
+
+# Debug helper: dumps per-column encoding distribution for the `small`
+# purchases fixture, so we can see which lazy decoders are worth
+# writing without grepping the writer's encoding selector.
+[[bin]]
+name = "dump_encodings"
+path = "src/bin/dump_encodings.rs"

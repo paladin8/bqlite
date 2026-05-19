@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int64Array,
-    Int64Builder, StringViewArray, StringViewBuilder, TimestampNanosecondArray,
+    Int64Builder, StringViewBuilder, TimestampNanosecondArray,
     TimestampNanosecondBuilder,
 };
 use arrow::record_batch::RecordBatch;
@@ -587,11 +587,13 @@ impl ForwardedBuilder {
                 b.append_value(arr.value(row));
             }
             ForwardedBuilder::String(b) => {
-                let arr = src
-                    .as_any()
-                    .downcast_ref::<StringViewArray>()
-                    .expect("String forwarded column expects StringViewArray");
-                b.append_value(arr.value(row));
+                // Accept both `StringViewArray` and
+                // `DictionaryArray<UInt8, Utf8View>` — the scan
+                // boundary may emit the dict layout for low-card
+                // source columns.
+                let view = crate::string_column::StringColumnView::resolve(src)
+                    .expect("String forwarded column expects Utf8View or Dict<UInt8, Utf8View>");
+                b.append_value(view.value(row));
             }
             ForwardedBuilder::Timestamp(b) => {
                 let arr = src
@@ -660,17 +662,23 @@ impl EntityOperator for AttributeOperator {
         // never wires an AttributeOperator without the adapter providing
         // entity_id/ts/event_type.
         let ts_col = column_as::<TimestampNanosecondArray>(batch, "ts");
-        let ev_col = column_as::<StringViewArray>(batch, "event_type");
+        // event_type may land as `StringViewArray` (dense) or
+        // `DictionaryArray<UInt8, Utf8View>` (low-card scan output).
+        let ev_col_raw = batch
+            .column_by_name("event_type")
+            .unwrap_or_else(|| panic!("AttributeOperator input batch missing column `event_type`"));
+        let ev_col = crate::string_column::StringColumnView::resolve(ev_col_raw.as_ref())
+            .expect("event_type column must be Utf8View or Dict<UInt8, Utf8View>");
 
         // Evaluate the touchpoint_key expression once per sub-batch —
         // the whole batch is a single entity, so per-row evaluation
         // inside the hot loop would be strictly wasteful (§11).
         let key_array = eval::evaluate(&self.touchpoint_key, batch)
             .expect("touchpoint_key expression evaluation failed — planner should have rejected");
-        let key_view = key_array
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("touchpoint_key must evaluate to StringViewArray (typed to String)");
+        // Expression eval may pass a Dict column through when the key
+        // is just a column ref; accept either layout.
+        let key_view = crate::string_column::StringColumnView::resolve(key_array.as_ref())
+            .expect("touchpoint_key must evaluate to Utf8View or Dict<UInt8, Utf8View>");
 
         // Resolve forwarded-column source arrays once per sub-batch.
         // They are dispatched into per-type builders at append time.

@@ -52,6 +52,7 @@ pub mod scan;
 pub mod selection;
 pub mod sessionize;
 pub mod sort;
+pub mod string_column;
 
 pub use aggregate::{
     Accumulator, AggState, GroupKey, HashAccumulator, HashAggregateOperator, SumState,
@@ -73,8 +74,8 @@ pub use fused_segment::{FusedStatelessSegment, KernelStep, SPARSITY_FACTOR_DEFAU
 pub use kernel::{FilterKernel, ProjectKernel, ProjectionExpr, StatelessKernel};
 pub use matcher::SequenceMatchOperator;
 pub use materialize::{
-    materialize_filtered_batch, materialize_selected, materialize_selected_with_metrics,
-    materialize_stitched,
+    materialize_filtered_batch, materialize_selected, materialize_selected_dict_pushthrough,
+    materialize_selected_with_metrics, materialize_stitched, materialize_stitched_dict_pushthrough,
 };
 pub use operator::{
     CancellationToken, EntityOperator, PhysicalOperator, DEFAULT_OUTPUT_BATCH_SIZE,

@@ -1471,6 +1471,15 @@ fn bind_scan(
         tombstones,
     )?;
 
+    // Plumb the per-query `AtomicMetrics` into the scan so the
+    // `bytes_scanned`/`bytes_decompressed`/`bytes_materialized_*`
+    // counters recorded inside `SegmentFileScan` surface in the
+    // `QueryMetrics` snapshot. Without this the storage layer falls
+    // back to `NoopMetrics` and the scan-bytes telemetry reads zero —
+    // exactly the gap that hid the per-core throughput data in the
+    // pre-fix perf_profile output.
+    op.with_metrics(ctx.metrics().clone());
+
     // TASK-522: engine-injected cohort entity-id pushdowns from the
     // bind tree's pending list. Empty in the common case (no
     // SubqueryFilter above this scan, or the gate rejected); when

@@ -44,9 +44,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringViewArray};
+use arrow::array::{
+    Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringViewArray, UInt8Array,
+};
 use arrow::compute::{concat_batches, kernels::cast::cast};
-use arrow::datatypes::{Int32Type, Schema as ArrowSchema, SchemaRef};
+use arrow::datatypes::{Int32Type, Schema as ArrowSchema, SchemaRef, UInt8Type};
 
 use bqlite_core::arrow::bql_type_to_arrow;
 use bqlite_core::{EntityId, OperatorSchema};
@@ -443,28 +445,26 @@ impl SessionizeState {
 
 /// Precomputed set of dictionary codes in a batch whose string value is an
 /// end-event type. Resolved once per sub-batch (§8.2).
+///
+/// Codes are stored as `u32` so the same set serves both `Dict<Int32>`
+/// (Arrow canonical) and `Dict<UInt8>` (scan dict push-through) keys.
 struct EndEventCodeSet {
-    matching_codes: HashSet<i32>,
+    matching_codes: HashSet<u32>,
 }
 
 impl EndEventCodeSet {
-    fn build(dict: &DictionaryArray<Int32Type>, end_events: &HashSet<String>) -> Self {
+    fn build_from_values(values: &dyn Array, end_events: &HashSet<String>) -> Self {
         let mut matching_codes = HashSet::new();
-        // Try Utf8View first (canonical bqlite layout), fall back to Utf8.
-        if let Some(values) = dict.values().as_any().downcast_ref::<StringViewArray>() {
-            for code in 0..values.len() {
-                if values.is_valid(code) && end_events.contains(values.value(code)) {
-                    matching_codes.insert(code as i32);
+        if let Some(view) = values.as_any().downcast_ref::<StringViewArray>() {
+            for code in 0..view.len() {
+                if view.is_valid(code) && end_events.contains(view.value(code)) {
+                    matching_codes.insert(code as u32);
                 }
             }
-        } else if let Some(values) = dict
-            .values()
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-        {
-            for code in 0..values.len() {
-                if values.is_valid(code) && end_events.contains(values.value(code)) {
-                    matching_codes.insert(code as i32);
+        } else if let Some(arr) = values.as_any().downcast_ref::<arrow::array::StringArray>() {
+            for code in 0..arr.len() {
+                if arr.is_valid(code) && end_events.contains(arr.value(code)) {
+                    matching_codes.insert(code as u32);
                 }
             }
         }
@@ -472,7 +472,7 @@ impl EndEventCodeSet {
     }
 
     #[inline]
-    fn contains_code(&self, code: i32) -> bool {
+    fn contains_code(&self, code: u32) -> bool {
         self.matching_codes.contains(&code)
     }
 }
@@ -481,13 +481,18 @@ impl EndEventCodeSet {
 // EventTypeView
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-sub-batch view of the `event_type` column. Supports the two layouts
-/// that show up in practice: `StringViewArray` (canonical) and
-/// `DictionaryArray<Int32, Utf8View>` (scan-side code-preserving layout).
+/// Per-sub-batch view of the `event_type` column. Supports the three
+/// layouts that show up in practice: `StringViewArray` (canonical),
+/// `DictionaryArray<Int32, Utf8View>` (Arrow canonical dict), and
+/// `DictionaryArray<UInt8, Utf8View>` (scan-side dict push-through).
 enum EventTypeView<'a> {
     Strings(&'a StringViewArray),
     Dictionary {
         keys: &'a arrow::array::PrimitiveArray<Int32Type>,
+        codes: EndEventCodeSet,
+    },
+    DictionaryU8 {
+        keys: &'a UInt8Array,
         codes: EndEventCodeSet,
     },
 }
@@ -497,8 +502,15 @@ impl<'a> EventTypeView<'a> {
         if let Some(s) = col.as_any().downcast_ref::<StringViewArray>() {
             return Some(EventTypeView::Strings(s));
         }
+        if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<UInt8Type>>() {
+            let codes = EndEventCodeSet::build_from_values(d.values().as_ref(), end_events);
+            return Some(EventTypeView::DictionaryU8 {
+                keys: d.keys(),
+                codes,
+            });
+        }
         if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
-            let codes = EndEventCodeSet::build(d, end_events);
+            let codes = EndEventCodeSet::build_from_values(d.values().as_ref(), end_events);
             return Some(EventTypeView::Dictionary {
                 keys: d.keys(),
                 codes,
@@ -521,7 +533,14 @@ impl<'a> EventTypeView<'a> {
                 if keys.is_null(row) {
                     false
                 } else {
-                    codes.contains_code(keys.value(row))
+                    codes.contains_code(keys.value(row) as u32)
+                }
+            }
+            EventTypeView::DictionaryU8 { keys, codes } => {
+                if keys.is_null(row) {
+                    false
+                } else {
+                    codes.contains_code(keys.value(row) as u32)
                 }
             }
         }

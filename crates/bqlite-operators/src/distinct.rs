@@ -256,6 +256,17 @@ fn extract_scalar(array: &ArrayRef, row: usize) -> ScalarValue {
             let arr = array.as_any().downcast_ref::<StringViewArray>().unwrap();
             ScalarValue::String(arr.value(row).to_owned())
         }
+        arrow::datatypes::DataType::Dictionary(key_type, _)
+            if matches!(key_type.as_ref(), arrow::datatypes::DataType::UInt8) =>
+        {
+            // Dict<UInt8, Utf8View> — the low-card layout emitted by
+            // the scan boundary. Use the shared `StringColumnView` so
+            // the row -> &str translation matches every other consumer.
+            match crate::string_column::StringColumnView::resolve(array.as_ref()) {
+                Some(view) => ScalarValue::String(view.value(row).to_owned()),
+                None => ScalarValue::Null,
+            }
+        }
         arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, _) => {
             let arr = array
                 .as_any()

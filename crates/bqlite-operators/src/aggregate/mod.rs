@@ -43,16 +43,19 @@
 pub mod percentile;
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem;
 
+use hashbrown::hash_table::Entry as HashTableEntry;
+use hashbrown::HashTable;
+
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringViewArray,
-    TimestampNanosecondArray,
+    Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, StringViewArray,
+    TimestampNanosecondArray, UInt8Array,
 };
-use arrow::datatypes::TimeUnit;
+use arrow::datatypes::{TimeUnit, UInt8Type};
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::{AggFunction, BqlType, BqliteError, OperatorSchema, Result, ScalarValue};
@@ -464,16 +467,44 @@ pub trait Accumulator: Send {
 /// Flat hash-map accumulator from group key to per-function state.
 ///
 /// This is the default (and only v1) `Accumulator` implementation.
-/// It maintains a `HashMap<GroupKey, Vec<AggState>>` where each group
-/// maps to one `AggState` per aggregate function.
+/// Conceptually still a map from `GroupKey` to `Vec<AggState>`, but the
+/// physical layout factors the storage into three parallel vectors
+/// indexed by a `u32` group ordinal, with a
+/// [`hashbrown::HashTable`] doing the lookup. The split avoids
+/// rebuilding the `Vec<ScalarValue>` group key for every row of every
+/// batch: the per-row hot path only allocates inside [`Vacant`] arms,
+/// and string columns no longer pay a per-row `String` clone for
+/// `Occupied` hits.
 ///
 /// Group cardinality is bounded by `max_groups` (default 1,000,000).
 /// When the cap is reached and a new group is encountered, `update`
 /// returns [`BqliteError::MaxGroupsExceeded`].
 /// There is no spill-to-disk for aggregation state in v1.
+///
+/// [`Vacant`]: hashbrown::hash_table::Entry::Vacant
 pub struct HashAccumulator {
-    /// Per-group state. Key is the group-by values tuple.
-    groups: HashMap<GroupKey, Vec<AggState>>,
+    /// Group-ordinal index: hash → position in `group_keys`. The stored
+    /// `u32` is an index into `group_keys` / `group_key_bytes` /
+    /// `group_states`, which all stay in lockstep.
+    table: HashTable<u32>,
+    /// Owned `GroupKey` per group, in insertion order. Used only on the
+    /// cold paths (`merge`, `finish`, `memory_usage`) — the hot lookup
+    /// runs against `group_key_bytes` so we never have to hash a
+    /// `GroupKey` (which would re-traverse a `Vec<ScalarValue>`).
+    group_keys: Vec<GroupKey>,
+    /// Packed-bytes encoding of each group key, parallel to
+    /// `group_keys`. The hot loop hashes / compares these (cheap
+    /// `&[u8]` work) instead of touching `GroupKey` at all. Encoded by
+    /// [`encode_typed_row`] / [`encode_group_key`] which guarantee
+    /// bit-equal output for equal `ScalarValue` tuples.
+    group_key_bytes: Vec<Box<[u8]>>,
+    /// Per-group accumulator state, parallel to `group_keys`.
+    group_states: Vec<Vec<AggState>>,
+    /// Seeded hasher shared between the hot row-lookup and the
+    /// fallback rehasher closure that `HashTable::entry` invokes on
+    /// resize. A single instance ensures both probes see the same
+    /// hash function.
+    hash_builder: ahash::RandomState,
     /// Schema of the final aggregated output.
     output_schema: OperatorSchema,
     /// Hard cap on distinct groups.
@@ -513,7 +544,11 @@ impl HashAccumulator {
         max_groups: usize,
     ) -> Self {
         Self {
-            groups: HashMap::new(),
+            table: HashTable::new(),
+            group_keys: Vec::new(),
+            group_key_bytes: Vec::new(),
+            group_states: Vec::new(),
+            hash_builder: ahash::RandomState::new(),
             output_schema,
             max_groups,
             functions,
@@ -572,7 +607,7 @@ impl HashAccumulator {
 
     /// Returns the number of distinct groups currently tracked.
     pub fn num_groups(&self) -> usize {
-        self.groups.len()
+        self.group_keys.len()
     }
 
     /// Returns the maximum groups limit.
@@ -580,37 +615,94 @@ impl HashAccumulator {
         self.max_groups
     }
 
-    /// Create the initial `Vec<AggState>` for a new group.
-    fn create_group_states(&self) -> Vec<AggState> {
-        self.functions
-            .iter()
-            .zip(self.input_types.iter())
-            .map(|(func, input_type)| AggState::new(*func, input_type.as_ref()))
-            .collect()
-    }
-
     /// Initialize the default (empty-key) group with zero-valued
     /// states. Used by `HashAggregateOperator` to ensure ungrouped
     /// aggregation always produces a single result row, even when no
     /// input rows are processed.
     pub fn ensure_default_group(&mut self) -> Result<()> {
-        self.get_or_create_group(GroupKey::empty())?;
+        let mut scratch: Vec<u8> = Vec::new();
+        self.get_or_create_group_from_key(GroupKey::empty(), &mut scratch)?;
         Ok(())
     }
 
-    /// Get or create the state vector for a group key, enforcing
-    /// the `max_groups` cap.
-    fn get_or_create_group(&mut self, key: GroupKey) -> Result<&mut Vec<AggState>> {
-        if !self.groups.contains_key(&key) {
-            if self.groups.len() >= self.max_groups {
-                return Err(BqliteError::MaxGroupsExceeded {
-                    limit: self.max_groups,
-                });
+    /// Get or create a group from an owned `GroupKey`, used by the
+    /// fused-operator path (`Accumulator::update`) and
+    /// `ensure_default_group`. Encodes the key into `scratch`, hashes,
+    /// and probes [`Self::table`] via the same single-probe
+    /// `entry` pattern as the per-row hot loop in
+    /// [`Self::update_evaluated`]. Returns the group ordinal — callers
+    /// dereference `group_states[idx]` afterwards rather than holding a
+    /// `&mut Vec<AggState>` across the borrow.
+    /// Single-probe lookup into [`Self::table`] keyed by `scratch`'s
+    /// byte-encoded form. On `Vacant`, calls `make_key` to reify the
+    /// owned `GroupKey`, clones `scratch` into [`Self::group_key_bytes`],
+    /// and initialises a fresh per-function state vector. Returns the
+    /// group ordinal — callers index `self.group_states[idx]`
+    /// afterwards rather than holding a `&mut Vec<AggState>` across the
+    /// borrow.
+    ///
+    /// Hoisting `make_key` behind a closure keeps the hot row path —
+    /// which only materialises a `GroupKey` on `Vacant` — and the
+    /// fused-operator path — which already owns one — driving the same
+    /// lookup body. The closure also gets the encoded `scratch` so its
+    /// implementation can avoid double-walking `TypedColumn`s.
+    #[inline]
+    fn lookup_or_insert<F>(&mut self, scratch: &mut Vec<u8>, make_key: F) -> Result<u32>
+    where
+        F: FnOnce() -> GroupKey,
+    {
+        let Self {
+            table,
+            group_keys,
+            group_key_bytes,
+            group_states,
+            hash_builder,
+            max_groups,
+            functions,
+            input_types,
+            ..
+        } = self;
+        let hash = hash_builder.hash_one(scratch.as_slice());
+        let entry = table.entry(
+            hash,
+            |&idx| group_key_bytes[idx as usize].as_ref() == scratch.as_slice(),
+            |&idx| hash_builder.hash_one(group_key_bytes[idx as usize].as_ref()),
+        );
+        match entry {
+            HashTableEntry::Occupied(o) => Ok(*o.get()),
+            HashTableEntry::Vacant(v) => {
+                if group_keys.len() >= *max_groups {
+                    return Err(BqliteError::MaxGroupsExceeded {
+                        limit: *max_groups,
+                    });
+                }
+                let idx = group_keys.len() as u32;
+                group_keys.push(make_key());
+                group_key_bytes.push(scratch.clone().into_boxed_slice());
+                let states: Vec<AggState> = functions
+                    .iter()
+                    .zip(input_types.iter())
+                    .map(|(func, input_type)| AggState::new(*func, input_type.as_ref()))
+                    .collect();
+                group_states.push(states);
+                v.insert(idx);
+                Ok(idx)
             }
-            let states = self.create_group_states();
-            self.groups.insert(key.clone(), states);
         }
-        Ok(self.groups.get_mut(&key).unwrap())
+    }
+
+    /// Slow-path entry used by [`Self::ensure_default_group`] and
+    /// [`Accumulator::update`]. Encodes the already-owned `GroupKey`
+    /// into `scratch` (reused across calls) before dispatching to
+    /// [`Self::lookup_or_insert`].
+    fn get_or_create_group_from_key(
+        &mut self,
+        key: GroupKey,
+        scratch: &mut Vec<u8>,
+    ) -> Result<u32> {
+        scratch.clear();
+        encode_group_key(&key, scratch);
+        self.lookup_or_insert(scratch, move || key)
     }
 
     /// Extract a `ScalarValue` from a column array at the given row.
@@ -643,7 +735,141 @@ impl HashAccumulator {
                     .unwrap();
                 ScalarValue::Timestamp(arr.value(row))
             }
+            arrow::datatypes::DataType::Dictionary(key_type, _)
+                if matches!(key_type.as_ref(), arrow::datatypes::DataType::UInt8) =>
+            {
+                match crate::string_column::StringColumnView::resolve(array.as_ref()) {
+                    Some(view) if !view.is_null(row) => {
+                        ScalarValue::String(view.value(row).to_owned())
+                    }
+                    _ => ScalarValue::Null,
+                }
+            }
             _ => ScalarValue::Null,
+        }
+    }
+}
+
+/// Pre-resolved typed view of a column for the agg hot loop.
+///
+/// `extract_scalar` walks `array.data_type()` + `as_any().downcast_ref()`
+/// per row, which dominates the per-core profile for low-cardinality
+/// `GROUP BY` queries. Resolving the downcast once per batch and
+/// dispatching off this enum per row collapses every hot probe into a
+/// pointer-chase + match — no virtual dispatch, no allocation for
+/// numeric / boolean / timestamp columns.
+enum TypedColumn<'a> {
+    Bool(&'a BooleanArray),
+    Int(&'a Int64Array),
+    Float(&'a Float64Array),
+    String(&'a StringViewArray),
+    /// `Dictionary<UInt8, Utf8View>` — emitted by the scan boundary's
+    /// dict push-through path. Per-row hashing reads the `u8` code,
+    /// resolves to `&str` via `values`, and feeds the same TAG_STRING
+    /// path as `String`. Avoids the per-row `to_owned()` that the
+    /// `Other` fallback incurs.
+    Dict {
+        keys: &'a UInt8Array,
+        values: &'a StringViewArray,
+    },
+    Timestamp(&'a TimestampNanosecondArray),
+    /// Anything we don't recognise lowers to the legacy
+    /// `extract_scalar` path (always null in the current type lattice).
+    Other(&'a ArrayRef),
+}
+
+impl<'a> TypedColumn<'a> {
+    fn resolve(array: &'a ArrayRef) -> Self {
+        match array.data_type() {
+            arrow::datatypes::DataType::Boolean => {
+                Self::Bool(array.as_any().downcast_ref::<BooleanArray>().unwrap())
+            }
+            arrow::datatypes::DataType::Int64 => {
+                Self::Int(array.as_any().downcast_ref::<Int64Array>().unwrap())
+            }
+            arrow::datatypes::DataType::Float64 => {
+                Self::Float(array.as_any().downcast_ref::<Float64Array>().unwrap())
+            }
+            arrow::datatypes::DataType::Utf8View => {
+                Self::String(array.as_any().downcast_ref::<StringViewArray>().unwrap())
+            }
+            arrow::datatypes::DataType::Dictionary(key_type, _)
+                if matches!(key_type.as_ref(), arrow::datatypes::DataType::UInt8) =>
+            {
+                let dict = array
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<UInt8Type>>()
+                    .unwrap();
+                if let Some(values) = dict.values().as_any().downcast_ref::<StringViewArray>() {
+                    Self::Dict {
+                        keys: dict.keys(),
+                        values,
+                    }
+                } else {
+                    Self::Other(array)
+                }
+            }
+            arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, _) => Self::Timestamp(
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap(),
+            ),
+            _ => Self::Other(array),
+        }
+    }
+
+    #[inline]
+    fn scalar_at(&self, row: usize) -> ScalarValue {
+        match self {
+            Self::Bool(a) => {
+                if a.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::Bool(a.value(row))
+                }
+            }
+            Self::Int(a) => {
+                if a.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::Int(a.value(row))
+                }
+            }
+            Self::Float(a) => {
+                if a.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::Float(a.value(row))
+                }
+            }
+            Self::String(a) => {
+                if a.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::String(a.value(row).to_owned())
+                }
+            }
+            Self::Dict { keys, values } => {
+                if keys.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    let code = keys.value(row) as usize;
+                    if values.is_null(code) {
+                        ScalarValue::Null
+                    } else {
+                        ScalarValue::String(values.value(code).to_owned())
+                    }
+                }
+            }
+            Self::Timestamp(a) => {
+                if a.is_null(row) {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::Timestamp(a.value(row))
+                }
+            }
+            Self::Other(arr) => HashAccumulator::extract_scalar(arr, row),
         }
     }
 }
@@ -661,28 +887,237 @@ impl HashAccumulator {
         group_arrays: &[ArrayRef],
         agg_arrays: &[Option<ArrayRef>],
     ) -> Result<()> {
+        // Resolve the per-column downcasts once per batch (rather than
+        // once per row) so the inner loop pays a pointer-chase + match
+        // instead of `array.data_type()` + `as_any().downcast_ref()`.
+        let typed_groups: Vec<TypedColumn<'_>> =
+            group_arrays.iter().map(TypedColumn::resolve).collect();
+        let typed_aggs: Vec<Option<TypedColumn<'_>>> = agg_arrays
+            .iter()
+            .map(|opt| opt.as_ref().map(TypedColumn::resolve))
+            .collect();
+
+        // Single-Dict<UInt8> GROUP BY fast paths. Dict push-through at
+        // the scan boundary delivers low-cardinality string GROUP BY
+        // columns as `Dict<UInt8, Utf8View>`; per row, the existing
+        // encode+hash work is identical to the materialised path even
+        // though most batches see only a handful of unique codes.
+        if typed_groups.len() == 1 {
+            if let TypedColumn::Dict { keys, values } = typed_groups[0] {
+                // If every aggregate is `COUNT(*)` the entire batch
+                // can be summarised as a per-code histogram — the hot
+                // loop becomes a single `Vec<u64>` increment and the
+                // encode + global-hash cost is paid once per *unique
+                // code* at flush time, not once per row.
+                if !self.functions.is_empty()
+                    && self
+                        .functions
+                        .iter()
+                        .all(|f| matches!(f, AggFunction::Count))
+                {
+                    return self.update_evaluated_single_dict_count_star(
+                        num_rows, keys, values,
+                    );
+                }
+                return self.update_evaluated_single_dict_group(
+                    num_rows,
+                    keys,
+                    values,
+                    &typed_aggs,
+                );
+            }
+        }
+
+        // Reuse one scratch buffer across rows so the steady-state path
+        // does no heap work for `GROUP BY` lookups. Pre-size for a
+        // reasonable inline cap; growing past it just amortises.
+        let mut scratch: Vec<u8> = Vec::with_capacity(64);
+
         for row in 0..num_rows {
-            let key = if group_arrays.is_empty() {
-                GroupKey::empty()
-            } else {
-                let key_values: Vec<ScalarValue> = group_arrays
-                    .iter()
-                    .map(|arr| Self::extract_scalar(arr, row))
-                    .collect();
-                GroupKey(key_values)
-            };
+            scratch.clear();
+            encode_typed_row(&typed_groups, row, &mut scratch);
+            let idx = self.lookup_or_insert(&mut scratch, || {
+                // Vacant arm only — pay the `Vec<ScalarValue>` cost
+                // once per *new* group rather than once per row.
+                let mut values = Vec::with_capacity(typed_groups.len());
+                for col in &typed_groups {
+                    values.push(col.scalar_at(row));
+                }
+                GroupKey(values)
+            })?;
 
-            let states = self.get_or_create_group(key)?;
-
+            let states = &mut self.group_states[idx as usize];
             for (i, state) in states.iter_mut().enumerate() {
                 match state {
                     AggState::Count(_) => state.update_count_star(),
                     _ => {
-                        if let Some(arr) = &agg_arrays[i] {
-                            let value = Self::extract_scalar(arr, row);
+                        if let Some(col) = &typed_aggs[i] {
+                            let value = col.scalar_at(row);
                             state.update(&value);
                         }
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Specialised inner loop for `GROUP BY <single dict-encoded
+    /// String column>`. Maintains a `code → group_idx` lookup sized to
+    /// the batch's dict cardinality (plus one trailing slot for the
+    /// null group); the encode + global-hash work fires once per unique
+    /// code, never per row.
+    ///
+    /// The encoding produced here must byte-match
+    /// [`encode_typed`]'s `TypedColumn::Dict` arm so the resulting
+    /// `group_key_bytes` are interchangeable with the slow path's —
+    /// otherwise a single-batch query would see one set of groups and
+    /// a multi-batch merge another. The arm above and the body below
+    /// are the same `TAG_NULL` / `TAG_STRING + len + bytes` pattern.
+    fn update_evaluated_single_dict_group(
+        &mut self,
+        num_rows: usize,
+        keys: &::arrow::array::UInt8Array,
+        values: &StringViewArray,
+        typed_aggs: &[Option<TypedColumn<'_>>],
+    ) -> Result<()> {
+        const UNRESOLVED: u32 = u32::MAX;
+        let dict_card = values.len();
+        let null_slot = dict_card;
+        let mut code_to_group: Vec<u32> = vec![UNRESOLVED; dict_card + 1];
+        let mut scratch: Vec<u8> = Vec::with_capacity(16);
+
+        for row in 0..num_rows {
+            let slot = if keys.is_null(row) {
+                null_slot
+            } else {
+                let code = keys.value(row) as usize;
+                if code >= dict_card || values.is_null(code) {
+                    null_slot
+                } else {
+                    code
+                }
+            };
+            let cached = code_to_group[slot];
+            let group_idx = if cached != UNRESOLVED {
+                cached
+            } else {
+                scratch.clear();
+                if slot == null_slot {
+                    scratch.push(TAG_NULL);
+                } else {
+                    let s = values.value(slot);
+                    scratch.push(TAG_STRING);
+                    scratch.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    scratch.extend_from_slice(s.as_bytes());
+                }
+                let idx = self.lookup_or_insert(&mut scratch, || {
+                    let value = if slot == null_slot {
+                        ScalarValue::Null
+                    } else {
+                        ScalarValue::String(values.value(slot).to_owned())
+                    };
+                    GroupKey(vec![value])
+                })?;
+                code_to_group[slot] = idx;
+                idx
+            };
+
+            let states = &mut self.group_states[group_idx as usize];
+            for (i, state) in states.iter_mut().enumerate() {
+                match state {
+                    AggState::Count(_) => state.update_count_star(),
+                    _ => {
+                        if let Some(col) = &typed_aggs[i] {
+                            let value = col.scalar_at(row);
+                            state.update(&value);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Histogram-specialised path for `STATS COUNT(*) [, COUNT(*) ...]
+    /// GROUP BY <single dict-encoded String column>`. The hot loop is a
+    /// tight `histogram[code] += 1` against a per-batch `Vec<u64>` —
+    /// no global hash-table touches, no `Vec<AggState>` indirection, no
+    /// per-row Arrow API calls (raw `keys.values()` slice + null buffer
+    /// fast path). The encode + `lookup_or_insert` cost is paid once
+    /// per *unique code seen in this batch*, at flush time.
+    fn update_evaluated_single_dict_count_star(
+        &mut self,
+        num_rows: usize,
+        keys: &::arrow::array::UInt8Array,
+        values: &StringViewArray,
+    ) -> Result<()> {
+        let dict_card = values.len();
+        let null_slot = dict_card;
+        let slots = dict_card + 1;
+        let mut histogram: Vec<u64> = vec![0u64; slots];
+
+        // Pre-fold codes that point to a null dict value into the null
+        // slot so the hot loop is a single indirection.
+        let slot_of_code: Vec<u32> = (0..dict_card)
+            .map(|c| {
+                if values.is_null(c) {
+                    null_slot as u32
+                } else {
+                    c as u32
+                }
+            })
+            .collect();
+
+        let keys_slice: &[u8] = &keys.values()[..num_rows];
+        match keys.nulls() {
+            None => {
+                for &code in keys_slice {
+                    let slot = slot_of_code[code as usize] as usize;
+                    histogram[slot] += 1;
+                }
+            }
+            Some(nulls) => {
+                for (row, &code) in keys_slice.iter().enumerate() {
+                    let slot = if nulls.is_null(row) {
+                        null_slot
+                    } else {
+                        slot_of_code[code as usize] as usize
+                    };
+                    histogram[slot] += 1;
+                }
+            }
+        }
+
+        // Flush: for each occupied slot, get-or-create the group once
+        // and bump every COUNT state by the slot's count.
+        let mut scratch: Vec<u8> = Vec::with_capacity(16);
+        for (slot, &count) in histogram.iter().enumerate().take(slots) {
+            if count == 0 {
+                continue;
+            }
+            scratch.clear();
+            if slot == null_slot {
+                scratch.push(TAG_NULL);
+            } else {
+                let s = values.value(slot);
+                scratch.push(TAG_STRING);
+                scratch.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                scratch.extend_from_slice(s.as_bytes());
+            }
+            let idx = self.lookup_or_insert(&mut scratch, || {
+                let value = if slot == null_slot {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::String(values.value(slot).to_owned())
+                };
+                GroupKey(vec![value])
+            })?;
+
+            let states = &mut self.group_states[idx as usize];
+            for state in states.iter_mut() {
+                if let AggState::Count(n) = state {
+                    *n += count;
                 }
             }
         }
@@ -696,7 +1131,9 @@ impl Accumulator for HashAccumulator {
             Some(k) => GroupKey::from_values(k),
             None => GroupKey::empty(),
         };
-        let states = self.get_or_create_group(key)?;
+        let mut scratch: Vec<u8> = Vec::new();
+        let idx = self.get_or_create_group_from_key(key, &mut scratch)?;
+        let states = &mut self.group_states[idx as usize];
         for (state, value) in states.iter_mut().zip(values.iter()) {
             match state {
                 AggState::Count(_) => state.update_count_star(),
@@ -749,18 +1186,24 @@ impl Accumulator for HashAccumulator {
                 BqliteError::Execution("Accumulator::merge: expected HashAccumulator".to_string())
             })?;
 
-        for (key, other_states) in &other.groups {
-            if let Some(self_states) = self.groups.get_mut(key) {
-                for (s, o) in self_states.iter_mut().zip(other_states.iter()) {
-                    s.merge(o);
-                }
-            } else {
-                if self.groups.len() >= self.max_groups {
-                    return Err(BqliteError::MaxGroupsExceeded {
-                        limit: self.max_groups,
-                    });
-                }
-                self.groups.insert(key.clone(), other_states.clone());
+        // Walk the parallel vectors so we can reuse the other side's
+        // already-encoded `group_key_bytes` for lookups — no
+        // re-encoding, no GroupKey rehash. `lookup_or_insert` handles
+        // the cap check; the `Vacant` closure clones the other side's
+        // owned key.
+        let mut scratch: Vec<u8> = Vec::new();
+        for ((other_key, other_bytes), other_states) in other
+            .group_keys
+            .iter()
+            .zip(other.group_key_bytes.iter())
+            .zip(other.group_states.iter())
+        {
+            scratch.clear();
+            scratch.extend_from_slice(other_bytes);
+            let idx = self.lookup_or_insert(&mut scratch, || other_key.clone())?;
+            let self_states = &mut self.group_states[idx as usize];
+            for (s, o) in self_states.iter_mut().zip(other_states.iter()) {
+                s.merge(o);
             }
         }
         Ok(())
@@ -778,7 +1221,11 @@ impl Accumulator for HashAccumulator {
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_group_cols + num_agg_cols);
 
         // Collect groups in deterministic order for testing.
-        let mut sorted_groups: Vec<(&GroupKey, &Vec<AggState>)> = self.groups.iter().collect();
+        let mut sorted_groups: Vec<(&GroupKey, &Vec<AggState>)> = self
+            .group_keys
+            .iter()
+            .zip(self.group_states.iter())
+            .collect();
         sorted_groups.sort_by_key(|(a, _)| *a);
 
         // Build group-by columns.
@@ -809,14 +1256,19 @@ impl Accumulator for HashAccumulator {
 
     fn memory_usage(&self) -> usize {
         let mut total = mem::size_of::<Self>();
-        for (key, states) in &self.groups {
+        for (key, states) in self.group_keys.iter().zip(self.group_states.iter()) {
             total += key.heap_size();
             total += states.iter().map(|s| s.heap_size()).sum::<usize>();
             total += mem::size_of::<GroupKey>() + mem::size_of::<Vec<AggState>>();
         }
-        // HashMap overhead.
-        total += self.groups.capacity()
-            * (mem::size_of::<GroupKey>() + mem::size_of::<Vec<AggState>>() + 8);
+        // Encoded-bytes side table.
+        total += self
+            .group_key_bytes
+            .iter()
+            .map(|b| b.len() + mem::size_of::<Box<[u8]>>())
+            .sum::<usize>();
+        // HashTable<u32> overhead — `capacity()` is the slot count.
+        total += self.table.capacity() * (mem::size_of::<u32>() + 8);
         total
     }
 
@@ -1026,6 +1478,151 @@ fn scalar_heap_size(v: &ScalarValue) -> usize {
     match v {
         ScalarValue::String(s) => s.capacity(),
         _ => 0,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Group-key byte encoding
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// `HashAccumulator` keys its hash table off a packed `[u8]` form rather
+// than a `Vec<ScalarValue>` so the per-row hot path can hash and
+// compare keys without allocating a `GroupKey` for `Occupied` lookups.
+// The encoding uses a one-byte type tag followed by a fixed or
+// length-prefixed payload:
+//
+// | Tag  | Variant                  | Payload                          |
+// |------|--------------------------|----------------------------------|
+// | 0x00 | Null                     | (none)                           |
+// | 0x01 | Bool                     | 1 byte (0 or 1)                  |
+// | 0x02 | Int                      | 8 bytes (i64, little-endian)     |
+// | 0x03 | Float                    | 8 bytes (f64 bits, LE)           |
+// | 0x04 | String                   | u32 LE length + UTF-8 bytes      |
+// | 0x05 | Timestamp                | 8 bytes (i64 ns, LE)             |
+//
+// `f64` payloads use `to_bits()` so `NaN == NaN` matches `ScalarValue`'s
+// `PartialEq` (which uses `total_cmp`). This makes byte equality
+// equivalent to `ScalarValue` equality across all six variants — both
+// for hashing and for merge correctness.
+
+const TAG_NULL: u8 = 0x00;
+const TAG_BOOL: u8 = 0x01;
+const TAG_INT: u8 = 0x02;
+const TAG_FLOAT: u8 = 0x03;
+const TAG_STRING: u8 = 0x04;
+const TAG_TIMESTAMP: u8 = 0x05;
+
+/// Encode one row's worth of group-by columns into `out`, reading from
+/// pre-resolved typed columns. This is the hot-path encoder: it sees
+/// the raw Arrow value at `row` and skips constructing a `ScalarValue`.
+#[inline]
+fn encode_typed_row(typed_groups: &[TypedColumn<'_>], row: usize, out: &mut Vec<u8>) {
+    for col in typed_groups {
+        encode_typed(col, row, out);
+    }
+}
+
+#[inline]
+fn encode_typed(col: &TypedColumn<'_>, row: usize, out: &mut Vec<u8>) {
+    match col {
+        TypedColumn::Bool(a) => {
+            if a.is_null(row) {
+                out.push(TAG_NULL);
+            } else {
+                out.push(TAG_BOOL);
+                out.push(u8::from(a.value(row)));
+            }
+        }
+        TypedColumn::Int(a) => {
+            if a.is_null(row) {
+                out.push(TAG_NULL);
+            } else {
+                out.push(TAG_INT);
+                out.extend_from_slice(&a.value(row).to_le_bytes());
+            }
+        }
+        TypedColumn::Float(a) => {
+            if a.is_null(row) {
+                out.push(TAG_NULL);
+            } else {
+                out.push(TAG_FLOAT);
+                out.extend_from_slice(&a.value(row).to_bits().to_le_bytes());
+            }
+        }
+        TypedColumn::String(a) => {
+            if a.is_null(row) {
+                out.push(TAG_NULL);
+            } else {
+                let s = a.value(row);
+                out.push(TAG_STRING);
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
+        TypedColumn::Dict { keys, values } => {
+            if keys.is_null(row) {
+                out.push(TAG_NULL);
+            } else {
+                let code = keys.value(row) as usize;
+                if values.is_null(code) {
+                    out.push(TAG_NULL);
+                } else {
+                    let s = values.value(code);
+                    out.push(TAG_STRING);
+                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+        TypedColumn::Timestamp(a) => {
+            if a.is_null(row) {
+                out.push(TAG_NULL);
+            } else {
+                out.push(TAG_TIMESTAMP);
+                out.extend_from_slice(&a.value(row).to_le_bytes());
+            }
+        }
+        TypedColumn::Other(arr) => {
+            encode_scalar(&HashAccumulator::extract_scalar(arr, row), out);
+        }
+    }
+}
+
+/// Encode an already-materialised `GroupKey` into `out`. Used by the
+/// slow paths (`Accumulator::update`, `ensure_default_group`) that
+/// already own a `Vec<ScalarValue>`.
+#[inline]
+fn encode_group_key(key: &GroupKey, out: &mut Vec<u8>) {
+    for v in &key.0 {
+        encode_scalar(v, out);
+    }
+}
+
+#[inline]
+fn encode_scalar(value: &ScalarValue, out: &mut Vec<u8>) {
+    match value {
+        ScalarValue::Null => out.push(TAG_NULL),
+        ScalarValue::Bool(b) => {
+            out.push(TAG_BOOL);
+            out.push(u8::from(*b));
+        }
+        ScalarValue::Int(n) => {
+            out.push(TAG_INT);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        ScalarValue::Float(f) => {
+            out.push(TAG_FLOAT);
+            out.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        ScalarValue::String(s) => {
+            out.push(TAG_STRING);
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        ScalarValue::Timestamp(t) => {
+            out.push(TAG_TIMESTAMP);
+            out.extend_from_slice(&t.to_le_bytes());
+        }
     }
 }
 
@@ -1576,6 +2173,70 @@ mod tests {
         let result = acc.finish().unwrap();
         assert_eq!(result.num_rows(), 2);
         // Groups are sorted by GroupKey (Ord), so UK < US.
+        let country_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let total_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(country_col.value(0), "UK");
+        assert_eq!(total_col.value(0), 600); // 200 + 400
+        assert_eq!(country_col.value(1), "US");
+        assert_eq!(total_col.value(1), 900); // 100 + 300 + 500
+    }
+
+    #[test]
+    fn update_batch_grouped_sum_dict_uint8_group_by() {
+        // Same shape as `update_batch_grouped_sum` but the group-by
+        // column arrives as `DictionaryArray<UInt8, Utf8View>` —
+        // exercises `TypedColumn::Dict` and ensures dict-encoded
+        // strings hash into the same groups as the StringView form.
+        use arrow::array::{DictionaryArray, Int64Array, StringViewArray, UInt8Array};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, UInt8Type};
+        use std::sync::Arc;
+
+        let schema = make_output_schema(
+            &[("country", BqlType::String, false)],
+            &[("total", BqlType::Int, true)],
+        );
+        let mut acc = HashAccumulator::new(
+            vec![AggFunction::Sum],
+            vec![Some(BqlType::Int)],
+            schema,
+            vec!["country".into()],
+            vec![Some("amount".into())],
+            DEFAULT_MAX_GROUPS,
+        );
+
+        // Dict<UInt8, Utf8View> with values ["UK", "US"] and keys per
+        // row picking out the right entry.
+        let dict_values = Arc::new(StringViewArray::from(vec!["UK", "US"])) as ArrayRef;
+        let keys = UInt8Array::from(vec![1u8, 0, 1, 0, 1]); // US, UK, US, UK, US
+        let countries: ArrayRef = Arc::new(
+            DictionaryArray::<UInt8Type>::try_new(keys, dict_values).expect("dict construction"),
+        );
+        let amounts: ArrayRef = Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "country",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt8),
+                    Box::new(DataType::Utf8View),
+                ),
+                false,
+            ),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema, vec![countries, amounts]).unwrap();
+
+        acc.update_batch(&batch).unwrap();
+
+        let result = acc.finish().unwrap();
+        assert_eq!(result.num_rows(), 2);
         let country_col = result
             .column(0)
             .as_any()

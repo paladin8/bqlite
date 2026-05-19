@@ -34,6 +34,10 @@ bqlite-ffi = { path = "crates/bqlite-ffi" }
 
 # External dependencies
 ahash = "0.8"
+# Direct dep so hot paths (HashAccumulator, …) can use `HashTable`'s
+# entry API with custom hash/eq closures and avoid per-row scalar-key
+# allocation. Version matches what arrow already brings in transitively.
+hashbrown = "0.16"
 arrow = "57"
 parquet = { version = "57", features = ["arrow", "snap", "brotli", "lz4", "zstd"] }
 thiserror = "2"

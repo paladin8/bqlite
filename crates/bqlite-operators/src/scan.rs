@@ -121,6 +121,7 @@ use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::encoded::{EncodedBatch, RowRun, RowSelection};
+use bqlite_core::metrics::{Metrics, NoopMetrics};
 use bqlite_core::{
     BqlType, BqliteError, ColumnDef, ColumnProjection, OperatorSchema, Predicate, PropertyValue,
     RangeOp, Result, ScanConjunct, ScanPredicate, SegmentHandle, SegmentReader, SegmentScan,
@@ -135,7 +136,23 @@ use bqlite_storage::{
 
 use crate::encoded_filter::{apply_encoded_eq, partition_encoded_eq, EncodedEqShape};
 use crate::eval;
-use crate::materialize::{materialize_selected, materialize_stitched};
+use crate::materialize::{
+    materialize_selected, materialize_selected_dict_pushthrough, materialize_stitched,
+    materialize_stitched_dict_pushthrough,
+};
+
+/// Read the `BQLITE_DICT_PUSHTHROUGH` env var. Set to `0`/`off`/`false`
+/// to disable Dict<UInt8> push-through at the scan boundary — the
+/// scan reverts to the materialised `Utf8View` shape and downstream
+/// dict fast paths become unreachable. Defaults to enabled. Exists
+/// strictly for A/B perf bisection during the wire-up; remove after
+/// the architecture is permanent.
+fn dict_pushthrough_enabled() -> bool {
+    match std::env::var("BQLITE_DICT_PUSHTHROUGH") {
+        Ok(v) => !matches!(v.as_str(), "0" | "off" | "OFF" | "false" | "FALSE"),
+        Err(_) => true,
+    }
+}
 use crate::operator::{CancellationToken, PhysicalOperator};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -328,6 +345,13 @@ pub struct ScanOperator {
     /// the engine bind step can call [`Self::with_extra_conjuncts`]
     /// after construction but before `open`.
     extra_conjuncts: Vec<ScanConjunct>,
+    /// Per-query metrics handle, plumbed through to every
+    /// `Box<dyn SegmentScan>` at `open()` time via `attach_metrics` so
+    /// `bytes_scanned` / `bytes_decompressed` / `bytes_materialized_*`
+    /// counters surface in `QueryMetrics`. Defaults to `NoopMetrics`;
+    /// the engine bind step calls [`Self::with_metrics`] to swap in the
+    /// `QueryContext`'s shared `AtomicMetrics`.
+    metrics: Arc<dyn Metrics>,
 }
 
 impl std::fmt::Debug for ScanOperator {
@@ -539,6 +563,7 @@ impl ScanOperator {
             ts_col_name,
             sample_filter: None,
             extra_conjuncts: Vec::new(),
+            metrics: Arc::new(NoopMetrics::new()),
         })
     }
 
@@ -574,6 +599,21 @@ impl ScanOperator {
     /// scan is the row-level source of truth for cohort membership.
     pub fn with_extra_conjuncts(&mut self, extra: Vec<ScanConjunct>) -> &mut Self {
         self.extra_conjuncts.extend(extra);
+        self
+    }
+
+    /// Attach the per-query [`Metrics`] handle from `QueryContext` so
+    /// every `Box<dyn SegmentScan>` opened by this operator reports
+    /// `bytes_scanned` / `bytes_decompressed` / `bytes_materialized_*`
+    /// counters into the shared aggregate surfaced by
+    /// `bqlite query --explain-perf`.
+    ///
+    /// Must be called before [`ScanOperator::open`]; the open loop
+    /// hands this `Arc` to every newly-constructed segment scan via
+    /// [`SegmentScan::attach_metrics`]. Returns `&mut self` so callers
+    /// can chain builders.
+    pub fn with_metrics(&mut self, metrics: Arc<dyn Metrics>) -> &mut Self {
+        self.metrics = metrics;
         self
     }
 
@@ -628,8 +668,17 @@ impl ScanOperator {
                 // paying a full materialization.
                 continue;
             }
-            let fb =
-                materialize_selected(&encoded, Some(&sel), &self.types, self.arrow_schema.clone())?;
+            let fb = if dict_pushthrough_enabled() {
+                materialize_selected_dict_pushthrough(
+                    &encoded,
+                    Some(&sel),
+                    &self.types,
+                    self.arrow_schema.clone(),
+                    None,
+                )?
+            } else {
+                materialize_selected(&encoded, Some(&sel), &self.types, self.arrow_schema.clone())?
+            };
             let batch = fb.batch;
             // Residual predicates: everything that didn't match the
             // encoded-eq shape. Runs the full post_filters list when
@@ -672,7 +721,15 @@ impl ScanOperator {
                 self.exhausted = true;
                 return Ok(None);
             };
-            let fb = materialize_stitched(&stitched, &self.types, self.arrow_schema.clone())?;
+            let fb = if dict_pushthrough_enabled() {
+                materialize_stitched_dict_pushthrough(
+                    &stitched,
+                    &self.types,
+                    self.arrow_schema.clone(),
+                )?
+            } else {
+                materialize_stitched(&stitched, &self.types, self.arrow_schema.clone())?
+            };
             let batch = fb.batch;
             if batch.num_rows() == 0 {
                 continue;
@@ -832,9 +889,21 @@ impl PhysicalOperator for ScanOperator {
         let mut encoded_tombstones: Vec<Option<TombstoneFile>> = Vec::with_capacity(handles.len());
         let mut any_encoded_tombstone = false;
         for handle in &handles {
-            let scan =
+            let mut scan =
                 self.reader
                     .open_segment(handle, &self.projection, zone_predicate.clone())?;
+            // Plumb the per-query metrics handle into the storage layer
+            // so `bytes_scanned`/`bytes_decompressed`/`bytes_materialized_*`
+            // counters record into the shared `AtomicMetrics`. Done
+            // before any wrapping so the inner `SegmentFileScan` (the
+            // only thing that actually writes these counters) is the
+            // recipient — `TombstoneScanWrapper`'s `attach_metrics`
+            // forwards to the same inner scan but only the wrap order
+            // for the materialized path lets us call it post-wrap, and
+            // on the encoded path the scan disappears behind
+            // `RawEncodedSource` (no `attach_metrics`). Attaching here
+            // is the one spot that covers both paths.
+            scan.attach_metrics(self.metrics.clone());
             // Tombstone wrapping (deletes.md §7): every segment whose
             // `(window_id, shard_id)` has a non-empty entry in the
             // per-query snapshot is wrapped so tombstone filtering runs
@@ -1893,7 +1962,28 @@ impl MergeSourcesOperator {
                 let desc = &self.descriptors[i];
                 match desc.reverse_col_map[out_col_idx] {
                     Some(sub_col_idx) => match self.subs[i].batch.as_ref() {
-                        Some(b) => per_sub_arrays.push(b.column(sub_col_idx).clone()),
+                        Some(b) => {
+                            let raw = b.column(sub_col_idx).clone();
+                            // Dict push-through can make different
+                            // sub-scans emit different physical types
+                            // (Dict<UInt8, Utf8View> vs Utf8View) for
+                            // the same logical column, and per-segment
+                            // dictionaries don't share codes. Cast each
+                            // per-sub array back to the declared field
+                            // type before `interleave` so the merge
+                            // boundary unifies the physical shape — the
+                            // cost lands here, not in the upstream scan.
+                            let arr = if raw.data_type() == field_type {
+                                raw
+                            } else {
+                                ::arrow::compute::cast(raw.as_ref(), field_type).map_err(|e| {
+                                    BqliteError::Execution(format!(
+                                        "MergeSourcesOperator: cast to {field_type:?} failed for sub-scan {i} col {sub_col_idx}: {e}"
+                                    ))
+                                })?
+                            };
+                            per_sub_arrays.push(arr);
+                        }
                         None => {
                             // Sub has no current batch — its scan_idx
                             // is guaranteed not to appear in `indices`

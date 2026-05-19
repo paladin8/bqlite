@@ -89,6 +89,7 @@ pub use writer::{SegmentWriter, WriterConfig, DEFAULT_ROW_GROUP_SIZE};
 pub use segment::encoded::pin_column_chunk;
 pub use segment::materialize::{
     materialize_encoded_batch, materialize_encoded_column, materialize_encoded_column_selected,
+    materialize_encoded_column_selected_with_options,
 };
 
 // Zero-copy scan/filter (CP5): stitched multi-segment merge.

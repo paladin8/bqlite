@@ -44,7 +44,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use arrow::array::{Array, BooleanArray, StringViewArray};
+use arrow::array::{Array, BooleanArray};
 use arrow::record_batch::RecordBatch;
 use smallvec::SmallVec;
 
@@ -459,11 +459,13 @@ impl StepCounterSimulator {
             return;
         }
 
+        // Accept both `StringViewArray` and
+        // `DictionaryArray<UInt8, Utf8View>` for the event_type column.
         let event_types = match batch
             .column_by_name(event_type_col)
-            .and_then(|c| c.as_any().downcast_ref::<StringViewArray>())
+            .and_then(|c| crate::string_column::StringColumnView::resolve(c.as_ref()))
         {
-            Some(arr) => arr,
+            Some(view) => view,
             None => return,
         };
 

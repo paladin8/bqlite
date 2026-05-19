@@ -27,9 +27,9 @@ use std::sync::Arc;
 
 use arrow::array::{
     new_null_array, Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringViewArray,
-    StringViewBuilder, TimestampNanosecondArray,
+    StringViewBuilder, TimestampNanosecondArray, UInt8Array,
 };
-use arrow::datatypes::{DataType, Int32Type, TimeUnit};
+use arrow::datatypes::{DataType, Int32Type, TimeUnit, UInt8Type};
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::{EntityId, OperatorSchema, ScalarValue};
@@ -96,24 +96,26 @@ pub struct EventSelectInputMap {
 /// matching integer codes are stored here.  Per-row membership is
 /// then an integer lookup (`O(1)`, no string comparison).
 struct EventTypeCodeSet {
-    matching_codes: HashSet<i32>,
+    matching_codes: HashSet<u32>,
 }
 
 impl EventTypeCodeSet {
     /// Build the code set from a dictionary column's value array and
-    /// the operator's configured event-type set.
+    /// the operator's configured event-type set. Codes are stored as
+    /// `u32` so the same set serves both `Dict<Int32>` and `Dict<UInt8>`
+    /// keys.
     fn from_dict(dict_values: &StringViewArray, event_types: &HashSet<String>) -> Self {
         let mut matching_codes = HashSet::new();
         for i in 0..dict_values.len() {
             if !dict_values.is_null(i) && event_types.contains(dict_values.value(i)) {
-                matching_codes.insert(i as i32);
+                matching_codes.insert(i as u32);
             }
         }
         EventTypeCodeSet { matching_codes }
     }
 
     #[inline]
-    fn code_matches(&self, code: i32) -> bool {
+    fn code_matches(&self, code: u32) -> bool {
         self.matching_codes.contains(&code)
     }
 }
@@ -500,6 +502,11 @@ enum EventTypeCheck<'a> {
         keys: &'a arrow::array::Int32Array,
         codes: EventTypeCodeSet,
     },
+    /// `event_type` is `DictionaryArray<UInt8, Utf8View>` — code lookup.
+    DictU8 {
+        keys: &'a UInt8Array,
+        codes: EventTypeCodeSet,
+    },
     /// Column format not recognised — always returns false.
     Unknown,
 }
@@ -515,7 +522,14 @@ impl<'a> EventTypeCheck<'a> {
                 if keys.is_null(row_idx) {
                     false
                 } else {
-                    codes.code_matches(keys.value(row_idx))
+                    codes.code_matches(keys.value(row_idx) as u32)
+                }
+            }
+            EventTypeCheck::DictU8 { keys, codes } => {
+                if keys.is_null(row_idx) {
+                    false
+                } else {
+                    codes.code_matches(keys.value(row_idx) as u32)
                 }
             }
             EventTypeCheck::Unknown => false,
@@ -529,7 +543,20 @@ fn build_event_type_check<'a>(
     col: &'a dyn Array,
     event_types: &'a HashSet<String>,
 ) -> EventTypeCheck<'a> {
-    // Try Dict<Int32, Utf8View> first — the common encoded form.
+    // Try Dict<UInt8, Utf8View> — emitted by per-segment dictionary materialise.
+    if let Some(dict) = col
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<UInt8Type>>()
+    {
+        if let Some(values) = dict.values().as_any().downcast_ref::<StringViewArray>() {
+            let codes = EventTypeCodeSet::from_dict(values, event_types);
+            return EventTypeCheck::DictU8 {
+                keys: dict.keys(),
+                codes,
+            };
+        }
+    }
+    // Try Dict<Int32, Utf8View> — Arrow canonical dictionary form.
     if let Some(dict) = col
         .as_any()
         .downcast_ref::<arrow::array::DictionaryArray<Int32Type>>()
@@ -622,8 +649,17 @@ fn extract_scalar(
                 .value(row_idx);
             ScalarValue::Bool(b)
         }
+        DataType::Dictionary(key_type, _) if matches!(key_type.as_ref(), DataType::UInt8) => {
+            // Dictionary<UInt8, Utf8View> — emitted by scan dict push-through.
+            match crate::string_column::StringColumnView::resolve(col) {
+                Some(view) if !view.is_null(row_idx) => {
+                    ScalarValue::String(view.value(row_idx).to_owned())
+                }
+                _ => ScalarValue::Null,
+            }
+        }
         DataType::Dictionary(key_type, _) if matches!(key_type.as_ref(), DataType::Int32) => {
-            // Dictionary<Int32, Utf8View> — resolve through the dictionary.
+            // Dictionary<Int32, Utf8View> — Arrow canonical dictionary form.
             let dict = col
                 .as_any()
                 .downcast_ref::<arrow::array::DictionaryArray<Int32Type>>()

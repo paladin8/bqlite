@@ -512,7 +512,7 @@ pub fn payload_byte_count(row_count: usize, bit_width: u8) -> usize {
 /// LSB-first within each byte. Pads up to the next [`SIMD_LANE_BYTES`]
 /// multiple so callers can unpack with a SIMD routine that reads one
 /// full lane past the last code.
-fn pack_codes(codes: &[u32], bit_width: u8, row_count: usize) -> Result<Vec<u8>> {
+pub(crate) fn pack_codes(codes: &[u32], bit_width: u8, row_count: usize) -> Result<Vec<u8>> {
     if !(1..=MAX_CODE_BIT_WIDTH).contains(&bit_width) {
         return Err(BqliteError::Execution(format!(
             "Dictionary::encode: code_bit_width {bit_width} out of valid range 1..={MAX_CODE_BIT_WIDTH}"

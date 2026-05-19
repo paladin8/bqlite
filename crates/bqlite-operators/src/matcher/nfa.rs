@@ -33,7 +33,7 @@
 
 use std::collections::VecDeque;
 
-use arrow::array::{Array, BooleanArray, StringViewArray};
+use arrow::array::{Array, BooleanArray};
 use arrow::record_batch::RecordBatch;
 
 use bqlite_core::TimeRange;
@@ -752,10 +752,13 @@ impl NfaSimulator {
             return;
         }
 
-        // Resolve event_type and timestamp columns.
+        // Resolve event_type column. Accepts both `StringViewArray` and
+        // `DictionaryArray<UInt8, Utf8View>` — scan may emit either
+        // layout depending on whether the source row-group was
+        // dict-encoded with `code_bit_width <= 8`.
         let event_types = match batch.column_by_name(event_type_col) {
-            Some(col) => match col.as_any().downcast_ref::<StringViewArray>() {
-                Some(arr) => arr,
+            Some(col) => match crate::string_column::StringColumnView::resolve(col.as_ref()) {
+                Some(view) => view,
                 None => return, // Wrong type — skip batch.
             },
             None => return,
