@@ -255,6 +255,47 @@ where
     F: FnMut(usize, Option<usize>) -> Result<()>,
 {
     let sel_len = selection.len();
+
+    // No-nulls fast path: skip rank tracking, skip per-row null-bitmap
+    // tests, and build the output null buffer in a single bulk
+    // `append_n(true)` instead of one bit per row. The closure always
+    // sees `Some(row_index)` and never `None`.
+    if null_bitmap.is_none() {
+        let mut out_idx = 0usize;
+        match selection {
+            RowSelection::Indices(sv) => {
+                for &row in sv.as_slice() {
+                    let r = row as usize;
+                    if r >= rows {
+                        return Err(BqliteError::Execution(format!(
+                            "materialize_selected: selection row {r} out of range (rows = {rows})"
+                        )));
+                    }
+                    emit(out_idx, Some(r))?;
+                    out_idx += 1;
+                }
+            }
+            RowSelection::Runs(runs) => {
+                for run in runs {
+                    for row in run.start..run.end() {
+                        let r = row as usize;
+                        if r >= rows {
+                            return Err(BqliteError::Execution(format!(
+                                "materialize_selected: selection row {r} out of range (rows = {rows})"
+                            )));
+                        }
+                        emit(out_idx, Some(r))?;
+                        out_idx += 1;
+                    }
+                }
+            }
+        }
+        let mut nulls_bb = ::arrow::array::builder::BooleanBufferBuilder::new(sel_len);
+        nulls_bb.append_n(sel_len, true);
+        return Ok(::arrow::buffer::NullBuffer::new(nulls_bb.finish()));
+    }
+
+    let bitmap = null_bitmap.expect("null_bitmap.is_some() — checked above");
     let mut nulls_bb = ::arrow::array::builder::BooleanBufferBuilder::new(sel_len);
 
     let process_row = |out_idx: &mut usize,
@@ -270,29 +311,20 @@ where
                 "materialize_selected: selection row {r} out of range (rows = {rows})"
             )));
         }
-        match null_bitmap {
-            None => {
-                emit(*out_idx, Some(r))?;
-                nulls_bb.append(true);
+        // Catch up rank to position r (exclusive), then test bit r itself.
+        while *last_walked < r {
+            if bitmap_is_set(bitmap, *last_walked) {
+                *running_rank += 1;
             }
-            Some(bitmap) => {
-                // Catch up rank to position r (exclusive), then test
-                // bit r itself.
-                while *last_walked < r {
-                    if bitmap_is_set(bitmap, *last_walked) {
-                        *running_rank += 1;
-                    }
-                    *last_walked += 1;
-                }
-                let valid = bitmap_is_set(bitmap, r);
-                if valid {
-                    emit(*out_idx, Some(*running_rank))?;
-                    nulls_bb.append(true);
-                } else {
-                    emit(*out_idx, None)?;
-                    nulls_bb.append(false);
-                }
-            }
+            *last_walked += 1;
+        }
+        let valid = bitmap_is_set(bitmap, r);
+        if valid {
+            emit(*out_idx, Some(*running_rank))?;
+            nulls_bb.append(true);
+        } else {
+            emit(*out_idx, None)?;
+            nulls_bb.append(false);
         }
         *out_idx += 1;
         Ok(())
