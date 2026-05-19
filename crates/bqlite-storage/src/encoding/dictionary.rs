@@ -588,6 +588,58 @@ pub fn unpack_codes(payload: &[u8], row_count: usize, bit_width: u8) -> Result<V
     Ok(codes)
 }
 
+/// Specialised unpacker for `bit_width ≤ 8`: returns codes as `Vec<u8>`
+/// directly, avoiding the 4× memory overhead and per-element widen +
+/// narrow round-trip the generic [`unpack_codes`] requires when the
+/// caller wants a `u8` keys buffer (e.g. the Dict<UInt8> push-through
+/// materialiser).
+///
+/// At `bit_width = 8`, this is effectively a memcpy of the leading
+/// `row_count` bytes from `payload`. At `bit_width < 8`, each code
+/// spans at most two adjacent payload bytes, so the inner loop is
+/// branchless after the per-row offset calculation.
+pub fn unpack_codes_u8(payload: &[u8], row_count: usize, bit_width: u8) -> Result<Vec<u8>> {
+    if !(1..=8).contains(&bit_width) {
+        return Err(BqliteError::Execution(format!(
+            "Dictionary::decode: unpack_codes_u8 requires bit_width in 1..=8, got {bit_width}"
+        )));
+    }
+    let mut codes = vec![0u8; row_count];
+    if row_count == 0 {
+        return Ok(codes);
+    }
+    // bit_width = 8 → aligned copy.
+    if bit_width == 8 {
+        if payload.len() < row_count {
+            return Err(BqliteError::Execution(format!(
+                "Dictionary::decode: payload {} bytes too short for {row_count} 8-bit codes",
+                payload.len()
+            )));
+        }
+        codes.copy_from_slice(&payload[..row_count]);
+        return Ok(codes);
+    }
+    // bit_width < 8 → each code spans at most 2 adjacent bytes.
+    let width = bit_width as usize;
+    let mask: u8 = (1u8 << width) - 1;
+    for (i, slot) in codes.iter_mut().enumerate() {
+        let bit_pos = i * width;
+        let byte_idx = bit_pos / 8;
+        let bit_in_byte = bit_pos % 8;
+        let low = payload[byte_idx] >> bit_in_byte;
+        let value = if bit_in_byte + width <= 8 {
+            low & mask
+        } else {
+            // Spans into the next byte.
+            let hi_bits = (bit_in_byte + width) - 8;
+            let hi = payload[byte_idx + 1] & ((1u8 << hi_bits) - 1);
+            (low | (hi << (8 - bit_in_byte))) & mask
+        };
+        *slot = value;
+    }
+    Ok(codes)
+}
+
 // ── dictionary-value parsing (decode side) ───────────────────────────────────
 
 fn parse_int_dict(bytes: &[u8], cardinality: usize) -> Result<Vec<i64>> {
@@ -1087,6 +1139,53 @@ mod tests {
             assert_eq!(packed.len() % SIMD_LANE_BYTES, 0);
             let unpacked = unpack_codes(&packed, row_count, width).unwrap();
             assert_eq!(unpacked, codes, "round trip failed at width {width}");
+        }
+    }
+
+    #[test]
+    fn unpack_codes_u8_matches_unpack_codes_for_widths_one_through_eight() {
+        // Cross-check the u8-specialised unpacker against the generic
+        // `unpack_codes` for every bit width it covers, over a value
+        // pattern that exercises both the in-byte and byte-spanning
+        // paths.
+        for width in 1u8..=8 {
+            let max_code = (1u32 << width) - 1;
+            let mut codes: Vec<u32> = (0..=max_code.min(255)).collect();
+            // Add a few wrapping patterns to stress byte boundaries.
+            for _ in 0..3 {
+                codes.extend([0u32, max_code, max_code / 2 + 1, 1, 0]);
+            }
+            let row_count = codes.len();
+            let packed = pack_codes(&codes, width, row_count).unwrap();
+            let unpacked_u32 = unpack_codes(&packed, row_count, width).unwrap();
+            let unpacked_u8 = unpack_codes_u8(&packed, row_count, width).unwrap();
+            assert_eq!(unpacked_u8.len(), row_count);
+            for (i, (&a, &b)) in unpacked_u32.iter().zip(unpacked_u8.iter()).enumerate() {
+                assert_eq!(
+                    a, b as u32,
+                    "mismatch at width {width}, row {i}: u32={a} u8={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unpack_codes_u8_rejects_widths_outside_one_through_eight() {
+        // The specialised path is only valid for `bit_width ∈ 1..=8`;
+        // wider codes don't fit a byte, narrower than 1 isn't a legal
+        // dict width per §10.3.
+        let payload = vec![0u8; 8];
+        assert!(unpack_codes_u8(&payload, 1, 0).is_err());
+        assert!(unpack_codes_u8(&payload, 1, 9).is_err());
+        assert!(unpack_codes_u8(&payload, 1, 24).is_err());
+    }
+
+    #[test]
+    fn unpack_codes_u8_handles_empty_row_count() {
+        // Empty input is legal for any in-range bit width.
+        for width in 1u8..=8 {
+            let out = unpack_codes_u8(&[], 0, width).unwrap();
+            assert!(out.is_empty(), "empty row_count should yield empty Vec");
         }
     }
 

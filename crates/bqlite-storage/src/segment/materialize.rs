@@ -784,8 +784,15 @@ pub(crate) fn materialize_dictionary_selected_as_dict(
         None => rows,
         Some(b) => super::reader::count_set_bits_pub(b, rows),
     };
-    let codes =
-        crate::encoding::dictionary::unpack_codes(&chunk.payload, non_null_count, code_bit_width)?;
+    // Codes fit in `u8` because `code_bit_width ≤ 8` (precondition above);
+    // pulling them out as a `Vec<u8>` directly avoids the 4× alloc and
+    // per-row `u32 → u8` cast that the generic `unpack_codes` would
+    // introduce here.
+    let codes = crate::encoding::dictionary::unpack_codes_u8(
+        &chunk.payload,
+        non_null_count,
+        code_bit_width,
+    )?;
 
     // Decode the dict-values region into a StringViewArray.
     let mut dict_builder = StringViewBuilder::with_capacity(16);
@@ -815,27 +822,70 @@ pub(crate) fn materialize_dictionary_selected_as_dict(
     let dict_values = dict_builder.finish();
     let dict_cardinality = dict_values.len();
 
-    let mut key_builder = UInt8Builder::with_capacity(selection.len());
-    walk_selection_with_nulls(chunk.nulls.as_deref(), rows, selection, |_, src| {
-        match src {
-            None => key_builder.append_null(),
-            Some(rank) => {
-                let code = *codes.get(rank).ok_or_else(|| {
-                    BqliteError::Execution(format!(
-                        "materialize_dictionary_selected_as_dict: rank {rank} out of bounds"
-                    ))
-                })? as usize;
-                if code >= dict_cardinality {
-                    return Err(BqliteError::Execution(format!(
-                        "materialize_dictionary_selected_as_dict: code {code} out of bounds (cardinality {dict_cardinality})"
-                    )));
-                }
-                key_builder.append_value(code as u8);
+    // Fast path: no nulls. Validate the max code once (single tight pass
+    // over the unpacked codes — SIMD-friendly) then either bulk-copy each
+    // run via `append_slice` (Runs) or index in a tight loop (Indices).
+    // Avoids both `walk_selection_with_nulls`' per-row rank tracking and
+    // the per-row cardinality branch.
+    let keys = if chunk.nulls.is_none() {
+        if let Some(&max) = codes.iter().max() {
+            if (max as usize) >= dict_cardinality {
+                return Err(BqliteError::Execution(format!(
+                    "materialize_dictionary_selected_as_dict: code {max} out of bounds (cardinality {dict_cardinality})"
+                )));
             }
         }
-        Ok(())
-    })?;
-    let keys = key_builder.finish();
+        let mut key_builder = UInt8Builder::with_capacity(selection.len());
+        match selection {
+            RowSelection::Runs(runs) => {
+                for run in runs {
+                    let start = run.start as usize;
+                    let end = start + run.len as usize;
+                    if end > codes.len() {
+                        return Err(BqliteError::Execution(format!(
+                            "materialize_dictionary_selected_as_dict: run end {end} > codes {} (rows = {rows})",
+                            codes.len()
+                        )));
+                    }
+                    key_builder.append_slice(&codes[start..end]);
+                }
+            }
+            RowSelection::Indices(sv) => {
+                for &row in sv.as_slice() {
+                    let r = row as usize;
+                    if r >= codes.len() {
+                        return Err(BqliteError::Execution(format!(
+                            "materialize_dictionary_selected_as_dict: selection row {r} out of range (rows = {rows})"
+                        )));
+                    }
+                    key_builder.append_value(codes[r]);
+                }
+            }
+        }
+        key_builder.finish()
+    } else {
+        let mut key_builder = UInt8Builder::with_capacity(selection.len());
+        walk_selection_with_nulls(chunk.nulls.as_deref(), rows, selection, |_, src| {
+            match src {
+                None => key_builder.append_null(),
+                Some(rank) => {
+                    let code = *codes.get(rank).ok_or_else(|| {
+                        BqliteError::Execution(format!(
+                            "materialize_dictionary_selected_as_dict: rank {rank} out of bounds"
+                        ))
+                    })?;
+                    if (code as usize) >= dict_cardinality {
+                        return Err(BqliteError::Execution(format!(
+                            "materialize_dictionary_selected_as_dict: code {code} out of bounds (cardinality {dict_cardinality})"
+                        )));
+                    }
+                    key_builder.append_value(code);
+                }
+            }
+            Ok(())
+        })?;
+        key_builder.finish()
+    };
 
     let dict = DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(dict_values)).map_err(|e| {
         BqliteError::Execution(format!(
