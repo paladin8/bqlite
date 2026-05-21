@@ -277,11 +277,34 @@ fn decode_impl(
         // — equivalent to the i128 cast for in-range values (offset fits in
         // u32, block_min + offset is a valid i64 by construction), but skips
         // both the per-block `Vec<u64>` allocation and the i128 arithmetic.
+        //
+        // The post-process loop writes through `spare_capacity_mut` so LLVM
+        // can autovectorize the u32→i64 widen + scalar add (NEON `vmovl_u32`
+        // + `vaddq_s64` on aarch64, AVX2 `vpmovzxdq` + `vpaddq` on x86_64)
+        // instead of paying a per-element `Vec::push` length check.
         if block_len == BLOCK_SIZE && bit_width <= BITPACKER4X_MAX_BIT_WIDTH {
             let block_bytes = bitpacker4x_block_bytes(bit_width);
             bitpacker.decompress(&packed[..block_bytes], &mut block_u32, bit_width);
-            for &offset in &block_u32 {
-                values.push(block_min.wrapping_add(offset as i64));
+            let len_before = values.len();
+            debug_assert!(values.capacity() - len_before >= BLOCK_SIZE);
+            // SAFETY: `Vec::with_capacity(row_count)` above reserved enough
+            // capacity for every block, so `len_before + BLOCK_SIZE` is in
+            // bounds. We initialise all `BLOCK_SIZE` slots before setting
+            // the new length.
+            //
+            // The index loop (rather than `enumerate()`) keeps the pointer
+            // arithmetic explicit; LLVM autovectorizes it on aarch64 to
+            // `uaddw.2d` widen-and-add across 8 u32 lanes per iteration.
+            #[allow(clippy::needless_range_loop)]
+            unsafe {
+                let dst = values.as_mut_ptr().add(len_before);
+                for i in 0..BLOCK_SIZE {
+                    std::ptr::write(
+                        dst.add(i),
+                        block_min.wrapping_add(block_u32[i] as i64),
+                    );
+                }
+                values.set_len(len_before + BLOCK_SIZE);
             }
         } else {
             // Scalar fallback for short final blocks or bit_width > 32.
