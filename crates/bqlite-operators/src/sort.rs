@@ -441,7 +441,17 @@ fn sort_buffer_into_one_batch(
     arrow_schema: &Arc<ArrowSchema>,
     keys: &[(CompiledExpr, SortDirection)],
 ) -> Result<RecordBatch> {
-    let batches: Vec<RecordBatch> = buffer.iter().map(|b| b.batch.clone()).collect();
+    // Dict push-through can leave per-batch columns as `Dict<UInt8, Utf8View>`
+    // with disjoint per-segment dictionaries. `concat_batches` would call
+    // Arrow's `concat`, which unifies the dict value tables and panics via
+    // `MutableArrayData::new` once the union exceeds the u8 key space.
+    // Canonicalise each batch to the schema's declared field types first so
+    // dict mismatches turn into a single cast per source rather than a
+    // overflow panic inside the concat kernel.
+    let batches: Vec<RecordBatch> = buffer
+        .iter()
+        .map(|b| canonicalise_batch_to_schema(&b.batch, arrow_schema))
+        .collect::<Result<_>>()?;
     let combined = concat_batches(arrow_schema, &batches)?;
     if combined.num_rows() == 0 || keys.is_empty() {
         return Ok(combined);
@@ -463,6 +473,44 @@ fn sort_buffer_into_one_batch(
         .map(|col| take(col.as_ref(), &indices, None).map_err(BqliteError::Arrow))
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(combined.schema(), sorted_cols).map_err(BqliteError::Arrow)
+}
+
+/// Cast every column of `batch` to the matching field type in
+/// `target_schema`. No-op for columns whose physical type already matches
+/// (the common case); reserved for the dict-push-through path where a
+/// source emits `Dict<UInt8, Utf8View>` but the declared output type is
+/// `Utf8View`. Casting here avoids a `MutableArrayData::new` panic when
+/// downstream Arrow kernels (`concat`, `interleave`) try to unify
+/// per-source dict tables that exceed the u8 key space.
+fn canonicalise_batch_to_schema(
+    batch: &RecordBatch,
+    target_schema: &Arc<ArrowSchema>,
+) -> Result<RecordBatch> {
+    let n_cols = batch.num_columns();
+    debug_assert_eq!(n_cols, target_schema.fields().len());
+    let mut casted: Vec<ArrayRef> = Vec::with_capacity(n_cols);
+    let mut any_changed = false;
+    for i in 0..n_cols {
+        let col = batch.column(i);
+        let target_ty = target_schema.field(i).data_type();
+        if col.data_type() == target_ty {
+            casted.push(col.clone());
+        } else {
+            any_changed = true;
+            let arr = ::arrow::compute::cast(col.as_ref(), target_ty).map_err(|e| {
+                BqliteError::Execution(format!(
+                    "sort: cast column {i} from {:?} to {target_ty:?} failed: {e}",
+                    col.data_type()
+                ))
+            })?;
+            casted.push(arr);
+        }
+    }
+    if any_changed {
+        RecordBatch::try_new(Arc::clone(target_schema), casted).map_err(BqliteError::Arrow)
+    } else {
+        Ok(batch.clone())
+    }
 }
 
 /// Map a `SortDirection` to Arrow `SortOptions` following the null-ordering
@@ -787,15 +835,35 @@ impl SortMerger {
         }
 
         // Materialize via interleave, one kernel call per column.
+        //
+        // Per-batch columns may be `Dict<UInt8, Utf8View>` with disjoint
+        // dictionaries (dict push-through, see `canonicalise_batch_to_schema`).
+        // Cast to the schema field type first; Arrow's `interleave` would
+        // otherwise call `MutableArrayData::new` and panic on dict union
+        // overflow.
         let num_cols = self.arrow_schema.fields().len();
         let mut out_columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
         for col_idx in 0..num_cols {
-            let arrays_per_batch: Vec<&dyn arrow::array::Array> = self
+            let field_ty = self.arrow_schema.field(col_idx).data_type();
+            let casted: Vec<ArrayRef> = self
                 .batches
                 .iter()
-                .map(|b| b.column(col_idx).as_ref() as &dyn arrow::array::Array)
-                .collect();
-            let merged = interleave(&arrays_per_batch, &indices).map_err(BqliteError::Arrow)?;
+                .map(|b| {
+                    let raw = b.column(col_idx);
+                    if raw.data_type() == field_ty {
+                        Ok(raw.clone())
+                    } else {
+                        ::arrow::compute::cast(raw.as_ref(), field_ty).map_err(|e| {
+                            BqliteError::Execution(format!(
+                                "sort k-way merge: cast column {col_idx} from {:?} to {field_ty:?} failed: {e}",
+                                raw.data_type()
+                            ))
+                        })
+                    }
+                })
+                .collect::<Result<_>>()?;
+            let refs: Vec<&dyn arrow::array::Array> = casted.iter().map(|a| a.as_ref()).collect();
+            let merged = interleave(&refs, &indices).map_err(BqliteError::Arrow)?;
             out_columns.push(merged);
         }
         let batch = RecordBatch::try_new(Arc::clone(&self.arrow_schema), out_columns)
