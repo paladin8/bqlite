@@ -672,9 +672,7 @@ impl HashAccumulator {
             HashTableEntry::Occupied(o) => Ok(*o.get()),
             HashTableEntry::Vacant(v) => {
                 if group_keys.len() >= *max_groups {
-                    return Err(BqliteError::MaxGroupsExceeded {
-                        limit: *max_groups,
-                    });
+                    return Err(BqliteError::MaxGroupsExceeded { limit: *max_groups });
                 }
                 let idx = group_keys.len() as u32;
                 group_keys.push(make_key());
@@ -915,9 +913,7 @@ impl HashAccumulator {
                         .iter()
                         .all(|f| matches!(f, AggFunction::Count))
                 {
-                    return self.update_evaluated_single_dict_count_star(
-                        num_rows, keys, values,
-                    );
+                    return self.update_evaluated_single_dict_count_star(num_rows, keys, values);
                 }
                 return self.update_evaluated_single_dict_group(
                     num_rows,
@@ -2223,10 +2219,7 @@ mod tests {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new(
                 "country",
-                DataType::Dictionary(
-                    Box::new(DataType::UInt8),
-                    Box::new(DataType::Utf8View),
-                ),
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8View)),
                 false,
             ),
             Field::new("amount", DataType::Int64, false),

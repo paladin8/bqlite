@@ -108,10 +108,20 @@ fn acceptance_gate_query_events_on_initialized_db_is_empty() {
 
     let stdout = String::from_utf8(output.stdout).expect("bqlite stdout must be valid UTF-8");
 
-    for column in ["entity_id", "ts", "event_type", "__seq_id", "__batch_id"] {
+    // `SELECT *` (the implicit shape of `bqlite query <table>`) skips the
+    // `__seq_id` / `__batch_id` system columns per `query-language.md` §10
+    // (landed in 7dc6df6 — Wave 2 review fix). The schema header therefore
+    // exposes only the user-visible columns.
+    for column in ["entity_id", "ts", "event_type"] {
         assert!(
             stdout.contains(column),
             "expected column `{column}` in CLI stdout, got:\n{stdout}"
+        );
+    }
+    for hidden in ["__seq_id", "__batch_id"] {
+        assert!(
+            !stdout.contains(hidden),
+            "system column `{hidden}` must not appear in `SELECT *` output, got:\n{stdout}"
         );
     }
 

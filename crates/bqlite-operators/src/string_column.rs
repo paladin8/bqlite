@@ -146,8 +146,7 @@ mod tests {
 
     #[test]
     fn dict_null_via_value() {
-        let values =
-            Arc::new(StringViewArray::from(vec![Some("x"), None])) as Arc<dyn Array>;
+        let values = Arc::new(StringViewArray::from(vec![Some("x"), None])) as Arc<dyn Array>;
         let keys = UInt8Array::from(vec![0u8, 1, 0]);
         let dict =
             DictionaryArray::<UInt8Type>::try_new(keys, values).expect("dict construction works");

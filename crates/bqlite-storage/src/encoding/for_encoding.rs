@@ -299,10 +299,7 @@ fn decode_impl(
             unsafe {
                 let dst = values.as_mut_ptr().add(len_before);
                 for i in 0..BLOCK_SIZE {
-                    std::ptr::write(
-                        dst.add(i),
-                        block_min.wrapping_add(block_u32[i] as i64),
-                    );
+                    std::ptr::write(dst.add(i), block_min.wrapping_add(block_u32[i] as i64));
                 }
                 values.set_len(len_before + BLOCK_SIZE);
             }

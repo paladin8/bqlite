@@ -1258,8 +1258,9 @@ fn build_fixture_database(db_path: &Path, generator: &StreamingEventGenerator) -
 
     std::fs::create_dir_all(db_path).expect("create fixture db dir");
     let schema = purchases_schema();
-    let mut db = bqlite_storage::Database::create_with_shards(db_path, PersistentFixture::SHARD_COUNT)
-        .expect("create fixture db");
+    let mut db =
+        bqlite_storage::Database::create_with_shards(db_path, PersistentFixture::SHARD_COUNT)
+            .expect("create fixture db");
     db.create_table(PersistentFixture::DEFAULT_TABLE.to_string(), schema)
         .expect("create fixture table");
 
@@ -1686,12 +1687,7 @@ mod tests {
             for ev in chunk {
                 let key = (ev.entity.clone(), ev.timestamp);
                 if let Some(prev) = &last {
-                    assert!(
-                        prev <= &key,
-                        "events not sorted: {:?} > {:?}",
-                        prev,
-                        key,
-                    );
+                    assert!(prev <= &key, "events not sorted: {:?} > {:?}", prev, key,);
                 }
                 last = Some(key);
             }
@@ -1713,7 +1709,10 @@ mod tests {
         let fixture = PersistentFixture::load_or_build(BenchScale::Small);
         assert_eq!(fixture.manifest.scale, "small");
         assert_eq!(fixture.manifest.seed, STREAMING_DEFAULT_SEED);
-        assert_eq!(fixture.manifest.schema_version, PersistentFixture::SCHEMA_VERSION);
+        assert_eq!(
+            fixture.manifest.schema_version,
+            PersistentFixture::SCHEMA_VERSION
+        );
         assert_eq!(fixture.manifest.rows, BenchScale::Small.rows());
         assert!(fixture.manifest.bytes_logical > 0);
         assert!(fixture.db_path().is_dir());

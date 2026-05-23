@@ -113,12 +113,7 @@ fn bench_concurrent(
         eprintln!(
             "  [concurrent] {} threads={} probe={:.2}s queries/s={:.1} \
              per-thread-avg={:.1}ms rows={}",
-            point.label,
-            point.threads,
-            secs,
-            queries_per_sec,
-            per_thread_avg_ms,
-            probe_rows,
+            point.label, point.threads, secs, queries_per_sec, per_thread_avg_ms, probe_rows,
         );
 
         group.bench_function(point.label, |b| {
@@ -143,8 +138,7 @@ fn bench_concurrent(
         );
         // Total scan throughput across all clients on the probe pass
         // (each client scans the whole fixture per query).
-        let scan_rows_per_sec =
-            (queries_per_iter as f64) * (total_rows as f64) / secs;
+        let scan_rows_per_sec = (queries_per_iter as f64) * (total_rows as f64) / secs;
         collector.record(
             &format!("{base}/aggregate_rows_per_sec"),
             scan_rows_per_sec,

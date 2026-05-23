@@ -42,8 +42,9 @@ use crate::selection::selection_to_bool_array;
 /// [`FilteredBatch`] with `selection: None`.
 ///
 /// Each column is decoded through
-/// [`materialize_encoded_column_selected`], which dispatches to the
-/// right per-encoding materializer and applies the row selection once.
+/// `bqlite_storage::segment::materialize::materialize_encoded_column_selected`,
+/// which dispatches to the right per-encoding materializer and applies
+/// the row selection once.
 /// The result is a `RecordBatch` whose row count equals
 /// `selection.len()` (or `batch.row_count` when `selection` is `None`).
 ///
@@ -316,7 +317,7 @@ pub fn materialize_stitched(
 /// honour dict push-through:
 ///
 /// - **SingleSource** — delegates straight to
-///   [`materialize_selected_inner`] with `prefer_dict_string=true`.
+///   `materialize_selected_inner` with `prefer_dict_string=true`.
 /// - **Runs** — materialises each per-source slice as Dict<UInt8,
 ///   Utf8View> when its segment encoding allows, then unifies the
 ///   per-segment dictionaries at concat time. Chunks that exceed the
@@ -355,7 +356,14 @@ fn materialize_stitched_inner(
                     stitched.sources.len()
                 ))
             })?;
-            materialize_selected_inner(src, selection.as_ref(), types, schema, None, prefer_dict_string)
+            materialize_selected_inner(
+                src,
+                selection.as_ref(),
+                types,
+                schema,
+                None,
+                prefer_dict_string,
+            )
         }
         StitchedRows::Runs(runs) => {
             let arrays =
@@ -623,9 +631,7 @@ fn try_unify_dict_uint8_utf8view(chunks: &[ArrayRef]) -> Result<Option<ArrayRef>
             .as_any()
             .downcast_ref::<DictionaryArray<UInt8Type>>()
             .ok_or_else(|| {
-                BqliteError::Execution(
-                    "materialize_stitched: dict downcast failed (UInt8)".into(),
-                )
+                BqliteError::Execution("materialize_stitched: dict downcast failed (UInt8)".into())
             })?;
         let values = dict
             .values()
@@ -638,7 +644,11 @@ fn try_unify_dict_uint8_utf8view(chunks: &[ArrayRef]) -> Result<Option<ArrayRef>
             })?;
         let mut remap: Vec<u8> = Vec::with_capacity(values.len());
         for i in 0..values.len() {
-            let s = if values.is_null(i) { "" } else { values.value(i) };
+            let s = if values.is_null(i) {
+                ""
+            } else {
+                values.value(i)
+            };
             let code = match value_to_code.get(s) {
                 Some(&c) => c,
                 None => {
@@ -1065,9 +1075,7 @@ mod tests {
     // ── Dict<UInt8, Utf8View> unification at concat time ──────────────
 
     fn dict_chunk(values: &[&str], keys: &[Option<u8>]) -> ArrayRef {
-        use ::arrow::array::{
-            builder::UInt8Builder, DictionaryArray, StringViewBuilder,
-        };
+        use ::arrow::array::{builder::UInt8Builder, DictionaryArray, StringViewBuilder};
         use ::arrow::datatypes::UInt8Type;
         let mut vb = StringViewBuilder::with_capacity(values.len());
         for v in values {
@@ -1082,9 +1090,7 @@ mod tests {
             }
         }
         let keys_arr = kb.finish();
-        Arc::new(
-            DictionaryArray::<UInt8Type>::try_new(keys_arr, Arc::new(values_arr)).unwrap(),
-        )
+        Arc::new(DictionaryArray::<UInt8Type>::try_new(keys_arr, Arc::new(values_arr)).unwrap())
     }
 
     #[test]
@@ -1097,7 +1103,9 @@ mod tests {
             dict_chunk(&["x", "y"], &[Some(0), Some(1), Some(0)]),
             dict_chunk(&["y", "z"], &[Some(1), Some(0)]),
         ];
-        let unified = super::try_unify_dict_uint8_utf8view(&chunks).unwrap().unwrap();
+        let unified = super::try_unify_dict_uint8_utf8view(&chunks)
+            .unwrap()
+            .unwrap();
         let dict = unified
             .as_any()
             .downcast_ref::<::arrow::array::DictionaryArray<::arrow::datatypes::UInt8Type>>()
@@ -1123,7 +1131,9 @@ mod tests {
             dict_chunk(&["a", "b"], &[Some(0), None, Some(1)]),
             dict_chunk(&["b"], &[Some(0)]),
         ];
-        let unified = super::try_unify_dict_uint8_utf8view(&chunks).unwrap().unwrap();
+        let unified = super::try_unify_dict_uint8_utf8view(&chunks)
+            .unwrap()
+            .unwrap();
         let dict = unified
             .as_any()
             .downcast_ref::<::arrow::array::DictionaryArray<::arrow::datatypes::UInt8Type>>()

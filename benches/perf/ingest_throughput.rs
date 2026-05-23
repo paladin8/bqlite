@@ -225,8 +225,7 @@ fn write_parquet_fixture(path: &Path, events: &[Event]) -> u64 {
 /// `(user_id, ts, event_type, amount, price, category, quantity,
 /// discount, region, flag)`.
 fn build_insert_values_sql(events: &[Event]) -> String {
-    let mut sql =
-        String::with_capacity(128 * events.len());
+    let mut sql = String::with_capacity(128 * events.len());
     sql.push_str("INSERT INTO purchases VALUES ");
     for (i, ev) in events.iter().enumerate() {
         if i > 0 {
@@ -497,7 +496,10 @@ fn main() {
         entity_count,
     );
 
-    eprintln!("  [perf_ingest] generating {} events in memory...", main_count);
+    eprintln!(
+        "  [perf_ingest] generating {} events in memory...",
+        main_count
+    );
     let events = materialize_events(main_count as u64, entity_count);
     let event_bytes = compute_event_bytes(&events);
 

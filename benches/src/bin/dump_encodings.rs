@@ -98,7 +98,10 @@ fn main() {
     // Group tallies by column for readability.
     let mut by_col: BTreeMap<String, Vec<(&'static str, u64, u64, u64)>> = BTreeMap::new();
     for ((col, enc), (chunks, bytes, rows)) in tallies {
-        by_col.entry(col).or_default().push((enc, chunks, bytes, rows));
+        by_col
+            .entry(col)
+            .or_default()
+            .push((enc, chunks, bytes, rows));
     }
 
     println!(

@@ -91,7 +91,12 @@ fn bench_funnel(
         let rows_per_sec = total_rows as f64 / elapsed_secs;
         let gb_per_sec = (bytes_logical as f64 / elapsed_secs) / (1u64 << 30) as f64;
         let base = format!("perf/funnel_depth/{}/{}", scale.label(), point.label);
-        collector.record(&format!("{base}/matches"), match_rows as f64, "matches", None);
+        collector.record(
+            &format!("{base}/matches"),
+            match_rows as f64,
+            "matches",
+            None,
+        );
         collector.record(
             &format!("{base}/rows_per_sec"),
             rows_per_sec,

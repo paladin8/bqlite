@@ -123,7 +123,11 @@ fn bench_sort_topk(
             returned_rows,
             peak_mem / (1024 * 1024),
             probe_elapsed.as_secs_f64() * 1000.0,
-            if point.probe_only { " (probe-only)" } else { "" },
+            if point.probe_only {
+                " (probe-only)"
+            } else {
+                ""
+            },
         );
 
         if !point.probe_only {

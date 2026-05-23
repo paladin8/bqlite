@@ -38,7 +38,7 @@ struct RawEntry {
     value: f64,
 }
 
-/// Parsed key: <mode>/perf/<bench>/<scale>/<point>/<metric>.
+/// Parsed key: `<mode>/perf/<bench>/<scale>/<point>/<metric>`.
 #[derive(Debug, Clone)]
 struct ParsedKey {
     bench: String,
@@ -78,8 +78,7 @@ type HeadlineRow = (&'static str, &'static str, &'static str, Fmt);
 type MetricCol = (&'static str, &'static str, Fmt);
 
 fn load_db(path: &Path) -> Db {
-    let raw = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let parsed: BTreeMap<String, RawEntry> =
         serde_json::from_str(&raw).expect("parse bench-results.json");
     let mut db: Db = BTreeMap::new();
@@ -227,13 +226,48 @@ fn render_headline(db: &Db, scales: &[String], out: &mut String) {
     out.push('\n');
 
     let rows: &[HeadlineRow] = &[
-        ("scan_selectivity", "Scan (peak rows/s)", "rows_per_sec", fmt_rows_per_sec),
-        ("aggregation_cardinality", "Aggregation (peak rows/s)", "rows_per_sec", fmt_rows_per_sec),
-        ("funnel_depth", "Funnel (peak rows/s)", "rows_per_sec", fmt_rows_per_sec),
-        ("sort_topk", "Sort top-k (peak rows/s)", "rows_per_sec", fmt_rows_per_sec),
-        ("ingest_throughput", "Ingest JSONL (peak rows/s)", "rows_per_sec", fmt_rows_per_sec),
-        ("mc_scaling", "MC-scaling (peak rows/s)", "rows_per_sec", fmt_rows_per_sec),
-        ("concurrent_queries", "Concurrent (peak queries/s)", "queries_per_sec", |v| format!("{v:.1}/s")),
+        (
+            "scan_selectivity",
+            "Scan (peak rows/s)",
+            "rows_per_sec",
+            fmt_rows_per_sec,
+        ),
+        (
+            "aggregation_cardinality",
+            "Aggregation (peak rows/s)",
+            "rows_per_sec",
+            fmt_rows_per_sec,
+        ),
+        (
+            "funnel_depth",
+            "Funnel (peak rows/s)",
+            "rows_per_sec",
+            fmt_rows_per_sec,
+        ),
+        (
+            "sort_topk",
+            "Sort top-k (peak rows/s)",
+            "rows_per_sec",
+            fmt_rows_per_sec,
+        ),
+        (
+            "ingest_throughput",
+            "Ingest JSONL (peak rows/s)",
+            "rows_per_sec",
+            fmt_rows_per_sec,
+        ),
+        (
+            "mc_scaling",
+            "MC-scaling (peak rows/s)",
+            "rows_per_sec",
+            fmt_rows_per_sec,
+        ),
+        (
+            "concurrent_queries",
+            "Concurrent (peak queries/s)",
+            "queries_per_sec",
+            |v| format!("{v:.1}/s"),
+        ),
     ];
 
     for (bench, label, metric, fmt) in rows {
@@ -271,7 +305,9 @@ fn render_methodology(scales: &[String], out: &mut String) {
     out.push_str(&format!(
         "\n  Scales present in this report: **{present}**.\n"
     ));
-    out.push_str("\n- **Seed**: `0x00000000beaca15e` — fixed per `docs/design/perf-suite.md` §3.2.\n");
+    out.push_str(
+        "\n- **Seed**: `0x00000000beaca15e` — fixed per `docs/design/perf-suite.md` §3.2.\n",
+    );
     out.push_str("- **Mode**: `BQLITE_BENCH_MODE=ci` (default) vs `reference` controls which bench-result records are emitted; both modes still drive Criterion the same way.\n");
     out.push_str("- **Criterion config** (`benches/common/mod.rs::criterion_for_scale`):\n");
     out.push_str("  - small: sample_size=50, warm_up=1s, measurement=3s\n");
@@ -576,8 +612,7 @@ fn main() {
     render_memory_pressure(&db, &scales, &mut report);
 
     if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)
-            .unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
+        fs::create_dir_all(parent).unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
     }
     fs::write(&output, report).unwrap_or_else(|e| panic!("write {}: {e}", output.display()));
     eprintln!("[perf_report] wrote {}", output.display());

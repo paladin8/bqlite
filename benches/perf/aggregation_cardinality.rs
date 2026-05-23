@@ -103,7 +103,12 @@ fn bench_aggregation(
             scale.label(),
             point.label,
         );
-        collector.record(&format!("{base}/group_count"), group_count as f64, "groups", None);
+        collector.record(
+            &format!("{base}/group_count"),
+            group_count as f64,
+            "groups",
+            None,
+        );
         collector.record(
             &format!("{base}/rows_per_sec"),
             rows_per_sec,

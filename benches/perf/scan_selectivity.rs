@@ -122,7 +122,12 @@ fn bench_scan_selectivity(
             scale.label(),
             point.label
         );
-        collector.record(&format!("{base}/matched_rows"), matched_rows as f64, "rows", None);
+        collector.record(
+            &format!("{base}/matched_rows"),
+            matched_rows as f64,
+            "rows",
+            None,
+        );
         collector.record(
             &format!("{base}/matched_ratio"),
             matched_ratio,

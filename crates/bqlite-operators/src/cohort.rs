@@ -421,9 +421,7 @@ fn extract_scalar(array: &ArrayRef, row: usize) -> ScalarValue {
                 .expect("Utf8View type must downcast to StringViewArray");
             ScalarValue::String(arr.value(row).to_owned())
         }
-        DataType::Dictionary(key_type, _)
-            if matches!(key_type.as_ref(), DataType::UInt8) =>
-        {
+        DataType::Dictionary(key_type, _) if matches!(key_type.as_ref(), DataType::UInt8) => {
             // Dict<UInt8, Utf8View> — the low-card scan-output layout.
             match crate::string_column::StringColumnView::resolve(array.as_ref()) {
                 Some(view) => ScalarValue::String(view.value(row).to_owned()),

@@ -318,11 +318,7 @@ fn scan_runtime_schema(scan: &ScanPhysical) -> OperatorSchema {
         // `output_schema` is already the runtime schema.
         return scan.output_schema.clone();
     }
-    let projected: HashSet<&str> = scan
-        .projected_columns
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let projected: HashSet<&str> = scan.projected_columns.iter().map(String::as_str).collect();
     let cols = scan
         .output_schema
         .columns()
@@ -368,16 +364,10 @@ fn rewrite_expr(expr: CompiledExpr, schema: &OperatorSchema) -> CompiledExpr {
     let new_node = match node {
         CompiledNode::Literal(v) => CompiledNode::Literal(v),
         CompiledNode::Column { index: _, name } => {
-            let new_index = schema
-                .column(&name)
-                .map(|(idx, _)| idx)
-                .unwrap_or_else(|| {
-                    let have: Vec<&str> =
-                        schema.columns().iter().map(|c| c.name.as_str()).collect();
-                    panic!(
-                        "remap_column_indices: column `{name}` not in input schema; have {have:?}"
-                    )
-                });
+            let new_index = schema.column(&name).map(|(idx, _)| idx).unwrap_or_else(|| {
+                let have: Vec<&str> = schema.columns().iter().map(|c| c.name.as_str()).collect();
+                panic!("remap_column_indices: column `{name}` not in input schema; have {have:?}")
+            });
             CompiledNode::Column {
                 index: new_index,
                 name,

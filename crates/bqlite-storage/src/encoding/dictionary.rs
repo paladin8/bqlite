@@ -591,7 +591,7 @@ pub fn unpack_codes(payload: &[u8], row_count: usize, bit_width: u8) -> Result<V
 /// Specialised unpacker for `bit_width ≤ 8`: returns codes as `Vec<u8>`
 /// directly, avoiding the 4× memory overhead and per-element widen +
 /// narrow round-trip the generic [`unpack_codes`] requires when the
-/// caller wants a `u8` keys buffer (e.g. the Dict<UInt8> push-through
+/// caller wants a `u8` keys buffer (e.g. the `Dict<UInt8>` push-through
 /// materialiser).
 ///
 /// At `bit_width = 8`, this is effectively a memcpy of the leading

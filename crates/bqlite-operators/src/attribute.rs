@@ -21,8 +21,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int64Array,
-    Int64Builder, StringViewBuilder, TimestampNanosecondArray,
-    TimestampNanosecondBuilder,
+    Int64Builder, StringViewBuilder, TimestampNanosecondArray, TimestampNanosecondBuilder,
 };
 use arrow::record_batch::RecordBatch;
 use compact_str::CompactString;

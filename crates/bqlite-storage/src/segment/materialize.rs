@@ -71,7 +71,7 @@ pub fn materialize_encoded_column_selected(
 }
 
 /// Variant of [`materialize_encoded_column_selected`] that opts a column
-/// into the Dict<UInt8> push-through fast path.
+/// into the `Dict<UInt8>` push-through fast path.
 ///
 /// When `prefer_dict_string == true` and the column is a Dictionary-encoded
 /// `BqlType::String` whose `code_bit_width <= 8`, the materialized output is
@@ -1147,10 +1147,7 @@ fn select_bool(
                                 "select_bool: run end {end} out of range (rows = {rows})"
                             )));
                         }
-                        out_bb.append_packed_range(
-                            src_offset + start..src_offset + end,
-                            src_bytes,
-                        );
+                        out_bb.append_packed_range(src_offset + start..src_offset + end, src_bytes);
                     }
                 }
                 RowSelection::Indices(sv) => {
@@ -1173,10 +1170,10 @@ fn select_bool(
             let mut last_walked = 0usize;
             let mut running_rank = 0usize;
             let emit = |r: usize,
-                            out_bb: &mut ::arrow::array::builder::BooleanBufferBuilder,
-                            nulls_bb: &mut ::arrow::array::builder::BooleanBufferBuilder,
-                            last_walked: &mut usize,
-                            running_rank: &mut usize|
+                        out_bb: &mut ::arrow::array::builder::BooleanBufferBuilder,
+                        nulls_bb: &mut ::arrow::array::builder::BooleanBufferBuilder,
+                        last_walked: &mut usize,
+                        running_rank: &mut usize|
              -> Result<()> {
                 if r >= rows {
                     return Err(BqliteError::Execution(format!(
@@ -1276,9 +1273,9 @@ fn select_string(
             let mut last_walked = 0usize;
             let mut running_rank = 0usize;
             let emit = |r: usize,
-                            builder: &mut StringViewBuilder,
-                            last_walked: &mut usize,
-                            running_rank: &mut usize|
+                        builder: &mut StringViewBuilder,
+                        last_walked: &mut usize,
+                        running_rank: &mut usize|
              -> Result<()> {
                 if r >= rows {
                     return Err(BqliteError::Execution(format!(

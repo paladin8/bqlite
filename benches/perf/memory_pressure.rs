@@ -96,8 +96,11 @@ fn bench_memory_pressure(
     let total_rows = fixture.manifest.rows;
 
     for query in QUERIES {
-        let mut group =
-            c.benchmark_group(format!("perf/memory_pressure/{}/{}", scale.label(), query.label));
+        let mut group = c.benchmark_group(format!(
+            "perf/memory_pressure/{}/{}",
+            scale.label(),
+            query.label
+        ));
         group.throughput(Throughput::Elements(total_rows));
 
         for point in POINTS {
